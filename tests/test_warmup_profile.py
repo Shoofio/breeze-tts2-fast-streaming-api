@@ -44,11 +44,29 @@ def test_bundled_config_covers_cfg1_cfg4_and_voice_direction() -> None:
         for graph in profile.text_encoder_graphs
         if graph.batch_size == 4
     ]
-    assert cfg1_text_lengths == list(range(32, 257, 32))
+    # The text encoder cache picks the smallest fitting bucket, so a single
+    # 512 entry gives cfg-1 single-segment requests the same reach as cfg 4.
+    assert cfg1_text_lengths == [*range(32, 257, 32), 512]
     assert cfg_guided_text_lengths == list(range(32, 513, 32))
     # ref_edit_tata merges the positive and negative branches' two text
     # segments each, so fast CFG-4 voice direction reaches batch size 4.
     assert voice_direction_text_lengths == [32, 64, 96, 128, 160, 256]
+    # Voice cloning at cfg 1 (branch batch 1) carries the same reference-audio
+    # prompt as voice direction at cfg 4 (branch batch 2), so both need the
+    # same prefill length coverage. The prefill cache uses exact-bucket lookup,
+    # so every 32-token bucket must be declared.
+    cfg1_prefill_lengths = [
+        graph.sequence_length
+        for graph in profile.backbone_prefill_graphs
+        if graph.branch_batch_size == 1
+    ]
+    cfg_guided_prefill_lengths = [
+        graph.sequence_length
+        for graph in profile.backbone_prefill_graphs
+        if graph.branch_batch_size == 2
+    ]
+    assert cfg1_prefill_lengths == list(range(32, 513, 32))
+    assert cfg_guided_prefill_lengths == list(range(32, 513, 32))
 
 
 def test_config_requires_decode_graph_for_each_cfg_shape() -> None:
@@ -85,3 +103,17 @@ def test_config_requires_synthetic_request() -> None:
 
     with pytest.raises(ValueError, match="warmup_request"):
         parse_warmup_profile(payload)
+
+
+def test_prefill_buckets_serve_saved_voice_suffixes_without_a_second_stage() -> None:
+    bundled = load_warmup_profile(REPO_ROOT / "configs" / "fast.json")
+
+    assert "backbone_prefill_continuation" not in bundled.to_dict()["stages"]
+    assert not hasattr(bundled, "backbone_prefill_continuation_graphs")
+
+    legacy = _payload()
+    legacy["stages"]["backbone_prefill_continuation"] = {
+        "graphs": [{"branch_batch_size": 1, "sequence_length": 32}]
+    }
+    with pytest.raises(ValueError, match="no longer a stage"):
+        parse_warmup_profile(legacy)

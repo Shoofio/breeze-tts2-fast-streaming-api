@@ -19,6 +19,24 @@ from transformers import StaticCache
 from transformers.masking_utils import create_causal_mask
 
 
+def decode_valid_keys(
+    kv_indices: torch.Tensor,
+    pad_lens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    position: int | torch.Tensor,
+) -> torch.Tensor:
+    """Which cache slots a decode step may attend to, as ``bool[B, S]``.
+
+    A slot is valid when it lies inside a cached prefix ``[0, prefix_len)`` or
+    inside the contiguous range ``[pad_len, position]``. With ``prefix_lens``
+    all zero this is the original left-padding rule.
+    """
+    kv = kv_indices  # [S]
+    lo = pad_lens.unsqueeze(1)  # [B, 1]
+    prefix = prefix_lens.unsqueeze(1)  # [B, 1]
+    return (kv < prefix) | ((kv >= lo) & (kv <= position))
+
+
 class BackboneGraph:
     """
     Captures the Breeze backbone's single-token decode step as a CUDA graph,
@@ -97,6 +115,8 @@ class BackboneGraph:
         self.attn_mask = None
         # Per-batch left-padding lengths for vectorized mask construction
         self._pad_lens = torch.zeros(self.batch_size, dtype=torch.long, device=device)
+        # Per-batch cached-prefix lengths (0 unless continuing from a prefix)
+        self._prefix_lens = torch.zeros(self.batch_size, dtype=torch.long, device=device)
         # Pre-allocated index range [0, 1, ..., max_seq_len-1] for broadcasting
         self._kv_indices = torch.arange(max_seq_len, dtype=torch.long, device=device)
 
@@ -160,6 +180,9 @@ class BackboneGraph:
         self.graph = None
         self.attn_mask = None
         self._pad_lens = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        self._prefix_lens = torch.zeros(
+            batch_size, dtype=torch.long, device=self.device
+        )
         self._kv_indices = torch.arange(
             self.max_seq_len, dtype=torch.long, device=self.device
         )
@@ -244,10 +267,9 @@ class BackboneGraph:
 
         attn_mask shape: [batch, 1, 1, max_seq_len]
         """
-        # kv_indices: [max_seq_len], pad_lens: [batch, 1], position: scalar
-        kv = self._kv_indices  # [S]
-        lo = self._pad_lens.unsqueeze(1)  # [B, 1]
-        valid = (kv >= lo) & (kv <= position)  # [B, S]
+        valid = decode_valid_keys(
+            self._kv_indices, self._pad_lens, self._prefix_lens, position
+        )  # [B, S]
         self.attn_mask.fill_(self._mask_min_val)
         self.attn_mask[:, 0, 0, :].masked_fill_(valid, 0.0)
 
@@ -296,6 +318,7 @@ class BackboneGraph:
         self.cache_position[0] = prefill_len
         self.position_ids.fill_(prefill_len)
         self._pad_lens.zero_()
+        self._prefix_lens.zero_()
         self._set_attention_mask(prefill_len)
 
         for _ in range(num_warmup):
@@ -359,6 +382,7 @@ class BackboneGraph:
         attention_mask[i]. The mask is then constructed on-the-fly in
         _set_attention_mask() using pad_lens — no 512-iter table rebuild.
         """
+        self._prefix_lens.zero_()
         if attention_mask is not None:
             per_batch_pos = attention_mask.sum(dim=1).long()  # [batch_size]
             self._base_position.copy_(per_batch_pos)
@@ -371,6 +395,29 @@ class BackboneGraph:
             self._pad_lens.copy_(seq_len - per_batch_pos)
         else:
             self._pad_lens.zero_()
+
+    @torch.inference_mode()
+    def set_generation_state_with_prefix(
+        self, prefix_len: int, suffix_attention_mask: torch.Tensor
+    ) -> None:
+        """Continue decoding after a cached prefix plus a right-aligned suffix.
+
+        The prefix occupies cache slots ``[0, prefix_len)`` in every row. The
+        suffix bucket occupies ``[prefix_len, prefix_len + bucket)``; row ``i``
+        has ``real_i`` real tokens at the end of the bucket, so its padding hole
+        is ``[prefix_len, prefix_len + bucket - real_i)``. Decoding appends at
+        ``prefix_len + bucket`` and each row's logical position is
+        ``prefix_len + real_i``.
+        """
+        prefix_len = int(prefix_len)
+        bucket = int(suffix_attention_mask.shape[1])
+        real = suffix_attention_mask.sum(dim=1).long()  # [batch]
+        self._prefix_lens.fill_(prefix_len)
+        self._pad_lens.copy_(prefix_len + bucket - real)
+        self._base_position.copy_(prefix_len + real)
+        self.position_ids.copy_(self._base_position.unsqueeze(-1))
+        self._prefill_len = prefix_len + bucket
+        self.cache_position[0] = self._prefill_len
 
     @torch.inference_mode()
     def run(self, input_ids, step_idx):

@@ -12,7 +12,11 @@ import numpy as np
 import torch
 
 from .cudagraph.backbone_graph import BackboneGraph
-from .cudagraph.backbone_prefill_graph import BackbonePrefillGraphCache
+from .cudagraph.backbone_prefill_graph import (
+    BackbonePrefillGraphCache,
+    continuation_allowed_keys,
+    continuation_positions,
+)
 from .cudagraph.depth_decoder_graph import DepthDecoderGraph
 from .cudagraph.sampling import sample_logits
 from .warmup_profile import FastStreamingWarmupProfile
@@ -62,6 +66,18 @@ class FastStreamingChunk:
     codec_frames: int
     is_final: bool
     timing: dict[str, float | int | bool] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ReferencePrefix:
+    """Backbone key/value state for a reference prefix at positions ``0..prefix_len-1``.
+
+    ``kv`` is ``[layers, 2 (key, value), kv_heads, prefix_len, head_dim]`` for one
+    row; the runtime copies it into every branch row before a continuation prefill.
+    """
+
+    prefix_len: int
+    kv: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -749,6 +765,150 @@ class FastBreezeStreamingRuntime:
         return manifest
 
     @torch.inference_mode()
+    def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> ReferencePrefix:
+        """Run the reference prefix alone (batch 1) and keep its backbone KV."""
+        self._ensure_graphs(1, 1.0)
+        assert self._backbone_graph is not None
+        embeds, mask = self._merge_branch(
+            input_ids=prefix_inputs["input_ids"],
+            attention_mask=prefix_inputs["attention_mask"],
+            text_ids_mask=prefix_inputs["text_ids_mask"],
+            text_ids_len=prefix_inputs["text_ids_len"],
+            input_values=prefix_inputs.get("input_values"),
+        )
+        embeds = embeds.contiguous()
+        mask = mask.contiguous()
+        prefix_len = int(mask.shape[1])
+        if int(mask.sum().item()) != prefix_len or embeds.shape[0] != 1:
+            raise ValueError("reference prefix must be a single unpadded row")
+        if prefix_len + self.config.max_new_tokens > self.config.max_seq_len:
+            raise ValueError(
+                f"reference prefix of {prefix_len} tokens leaves no room to generate"
+            )
+
+        keys: list[torch.Tensor] = []
+        values: list[torch.Tensor] = []
+        if self._fast_backbone_prefill:
+            if self._backbone_prefill_graph is None:
+                self._backbone_prefill_graph = BackbonePrefillGraphCache(
+                    self._backbone_graph, token_granularity=32
+                )
+            output = self._backbone_prefill_graph(embeds, mask)
+            bucket = output.prefill_len
+            for layer in self._backbone_graph.static_cache.layers:
+                keys.append(layer.keys[0, :, bucket - prefix_len : bucket])
+                values.append(layer.values[0, :, bucket - prefix_len : bucket])
+        else:
+            position_ids = mask.long().cumsum(-1) - 1
+            backbone_out = self.model.backbone_model(
+                inputs_embeds=embeds,
+                attention_mask=mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=True,
+            )
+            for layer_index in range(self._backbone_graph.num_layers):
+                key, value = backbone_out.past_key_values[layer_index]
+                keys.append(key[0])
+                values.append(value[0])
+        kv = torch.stack(
+            [torch.stack([key, value]) for key, value in zip(keys, values)]
+        )
+        return ReferencePrefix(
+            prefix_len=prefix_len, kv=kv.to(dtype=self.dtype).contiguous()
+        )
+
+    def _load_prefix_kv(self, prefix: ReferencePrefix, branch_batch_size: int) -> None:
+        assert self._backbone_graph is not None
+        prefix_len = int(prefix.prefix_len)
+        for layer_index, layer in enumerate(self._backbone_graph.static_cache.layers):
+            layer.keys[:, :, :prefix_len].copy_(
+                prefix.kv[layer_index, 0].unsqueeze(0).expand(branch_batch_size, -1, -1, -1)
+            )
+            layer.values[:, :, :prefix_len].copy_(
+                prefix.kv[layer_index, 1].unsqueeze(0).expand(branch_batch_size, -1, -1, -1)
+            )
+
+    def _run_prefill(
+        self, branch: _BranchBatch, prefix: ReferencePrefix | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, str]:
+        """Prefill the branch batch.
+
+        Returns ``(hidden, logits, generation_mask, prefill_len, path)`` where
+        ``path`` is ``"graph"`` or ``"eager"``. With ``prefix`` the static cache
+        already holds ``prefix.kv`` in slots ``[0, prefix_len)`` and only the
+        suffix in ``branch`` is processed.
+        """
+        assert self._backbone_graph is not None
+        attention_mask = branch.attention_mask
+        prefix_len = 0 if prefix is None else int(prefix.prefix_len)
+        if prefix is not None:
+            self._load_prefix_kv(prefix, branch.branch_batch_size)
+
+        if self._fast_backbone_prefill:
+            if self._backbone_prefill_graph is None:
+                self._backbone_prefill_graph = BackbonePrefillGraphCache(
+                    self._backbone_graph, token_granularity=32
+                )
+            cache = self._backbone_prefill_graph
+            graph_available = not cache.frozen or cache.has_bucket(
+                branch.branch_batch_size, int(attention_mask.shape[1]), prefix_len
+            )
+            if graph_available:
+                output = cache(branch.inputs_embeds, attention_mask, prefix_len=prefix_len)
+                return (
+                    output.hidden_states,
+                    output.logits,
+                    output.attention_mask,
+                    output.prefill_len,
+                    "graph",
+                )
+
+        if prefix is None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            backbone_out = self.model.backbone_model(
+                inputs_embeds=branch.inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                cache_position=None,
+                use_cache=True,
+            )
+            hidden = backbone_out.last_hidden_state
+            logits = self.model.lm_head(hidden[:, -1, :].float()).float()
+            prefill_len = self._backbone_graph.prefill_kv(backbone_out.past_key_values)
+            return hidden, logits, attention_mask, prefill_len, "eager"
+
+        # Eager continuation: same math as the captured graph, explicit 4D mask.
+        batch_size, suffix_len = attention_mask.shape
+        graph = self._backbone_graph
+        allowed = continuation_allowed_keys(attention_mask, graph.max_seq_len, prefix_len)
+        causal_mask = torch.full(
+            (batch_size, 1, suffix_len, graph.max_seq_len),
+            torch.finfo(self.dtype).min,
+            dtype=self.dtype,
+            device=self.device,
+        )
+        causal_mask[:, 0].masked_fill_(allowed, 0.0)
+        position_ids = continuation_positions(attention_mask, prefix_len)
+        cache_position = torch.arange(
+            prefix_len, prefix_len + suffix_len, device=self.device, dtype=torch.long
+        )
+        backbone_out = self.model.backbone_model(
+            inputs_embeds=branch.inputs_embeds,
+            attention_mask=causal_mask,
+            position_ids=position_ids,
+            past_key_values=graph.static_cache,
+            cache_position=cache_position,
+            use_cache=True,
+        )
+        hidden = backbone_out.last_hidden_state
+        logits = self.model.lm_head(hidden[:, -1, :].float()).float()
+        prefill_len = graph.finish_direct_prefill(prefix_len + suffix_len)
+        return hidden, logits, attention_mask, prefill_len, "eager"
+
+    @torch.inference_mode()
     def iter_audio_chunks(
         self,
         inputs: dict[str, Any],
@@ -756,6 +916,7 @@ class FastBreezeStreamingRuntime:
         request_id: str | None = None,
         seed: int | None = None,
         token_observer: Callable[[torch.Tensor], None] | None = None,
+        prefix: ReferencePrefix | None = None,
     ) -> Iterator[FastStreamingChunk]:
         cfg = select_fast_cfg(inputs)
         branch_batch_size = 2 if cfg.mode == "single_cfg" else 1
@@ -796,38 +957,13 @@ class FastBreezeStreamingRuntime:
             prefill_start_event.record()
 
         try:
-            attention_mask = branch.attention_mask
-            if self._fast_backbone_prefill:
-                if self._backbone_prefill_graph is None:
-                    self._backbone_prefill_graph = BackbonePrefillGraphCache(
-                        self._backbone_graph, token_granularity=32
-                    )
-                prefill_output = self._backbone_prefill_graph(
-                    branch.inputs_embeds, attention_mask
-                )
-                hidden = prefill_output.hidden_states
-                logits = prefill_output.logits
-                prefill_len = prefill_output.prefill_len
-                generation_attention_mask = prefill_output.attention_mask
-            else:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-                prefill_cache = None
-                cache_position = None
-                backbone_out = self.model.backbone_model(
-                    inputs_embeds=branch.inputs_embeds,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=prefill_cache,
-                    cache_position=cache_position,
-                    use_cache=True,
-                )
-                hidden = backbone_out.last_hidden_state
-                logits = self.model.lm_head(hidden[:, -1, :].float()).float()
-                prefill_len = self._backbone_graph.prefill_kv(
-                    backbone_out.past_key_values
-                )
-                generation_attention_mask = attention_mask
+            (
+                hidden,
+                logits,
+                generation_attention_mask,
+                prefill_len,
+                prefill_path,
+            ) = self._run_prefill(branch, prefix)
 
             if branch.branch_batch_size == 2:
                 cond_logits = logits[:1]
@@ -842,7 +978,12 @@ class FastBreezeStreamingRuntime:
                 suppress_tokens=self._reserved_codec_token_ids,
                 **backbone_params,
             ).view(1)
-            self._backbone_graph.set_generation_state(generation_attention_mask)
+            if prefix is None:
+                self._backbone_graph.set_generation_state(generation_attention_mask)
+            else:
+                self._backbone_graph.set_generation_state_with_prefix(
+                    prefix.prefix_len, generation_attention_mask
+                )
             if prefill_end_event is not None:
                 prefill_end_event.record()
 
@@ -902,6 +1043,7 @@ class FastBreezeStreamingRuntime:
                                 **chunk.timing,
                                 "ttfa_internal_ms": (time.perf_counter() - t_start)
                                 * 1000.0,
+                                "prefill_path": prefill_path,
                             }
                             if (
                                 prefill_start_event is not None

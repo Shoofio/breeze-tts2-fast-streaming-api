@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: loads the Breeze checkpoint on a CUDA device; skipped unless BREEZE_MODEL is set",
+]

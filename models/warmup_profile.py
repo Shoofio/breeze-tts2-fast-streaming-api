@@ -116,11 +116,17 @@ def _positive_int(value: Any, path: str) -> int:
     return value
 
 
-def _graphs(stages: dict[str, Any], stage: str) -> list[dict[str, Any]]:
+def _graphs(
+    stages: dict[str, Any], stage: str, *, optional: bool = False
+) -> list[dict[str, Any]]:
     value = stages.get(stage)
+    if value is None and optional:
+        return []
     if not isinstance(value, dict):
         raise ValueError(f"stages.{stage} must be an object")
     graphs = value.get("graphs")
+    if optional and graphs == []:
+        return []
     if not isinstance(graphs, list) or not graphs:
         raise ValueError(f"stages.{stage}.graphs must be a non-empty list")
     if not all(isinstance(graph, dict) for graph in graphs):
@@ -185,6 +191,11 @@ def parse_warmup_profile(
     if any(graph.sequence_length % 32 for graph in prefill_graphs):
         raise ValueError(
             "backbone_prefill sequence_length values must be multiples of 32"
+        )
+    if "backbone_prefill_continuation" in stages:
+        raise ValueError(
+            "backbone_prefill_continuation is no longer a stage; the backbone_prefill "
+            "buckets serve saved-voice suffixes too, so drop the stage from the profile"
         )
 
     decode_batches = tuple(

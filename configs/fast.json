@@ -45,6 +45,10 @@
           "token_length": 256
         },
         {
+          "batch_size": 1,
+          "token_length": 512
+        },
+        {
           "batch_size": 2,
           "token_length": 32
         },
@@ -167,6 +171,38 @@
         {
           "branch_batch_size": 1,
           "sequence_length": 256
+        },
+        {
+          "branch_batch_size": 1,
+          "sequence_length": 288
+        },
+        {
+          "branch_batch_size": 1,
+          "sequence_length": 320
+        },
+        {
+          "branch_batch_size": 1,
+          "sequence_length": 352
+        },
+        {
+          "branch_batch_size": 1,
+          "sequence_length": 384
+        },
+        {
+          "branch_batch_size": 1,
+          "sequence_length": 416
+        },
+        {
+          "branch_batch_size": 1,
+          "sequence_length": 448
+        },
+        {
+          "branch_batch_size": 1,
+          "sequence_length": 480
+        },
+        {
+          "branch_batch_size": 1,
+          "sequence_length": 512
         },
         {
           "branch_batch_size": 2,
