@@ -22,7 +22,7 @@ def test_runtime_fast_properties_return_values_not_methods() -> None:
     assert runtime.codec_chunk_frames == 1
 
 
-def test_configure_compile_cache_exports_chosen_dir(tmp_path) -> None:
+def test_configure_compile_cache_exports_chosen_dir(tmp_path, monkeypatch) -> None:
     import os
 
     from breeze_infer.api import ApiSettings, configure_compile_cache
@@ -39,13 +39,10 @@ def test_configure_compile_cache_exports_chosen_dir(tmp_path) -> None:
         compile_cache_dir=tmp_path / "cc",
     )
 
-    saved = os.environ.get(CACHE_DIR_ENV)
-    try:
-        chosen = configure_compile_cache(settings)
-        assert chosen == (tmp_path / "cc").resolve()
-        assert os.environ[CACHE_DIR_ENV] == str(chosen)
-    finally:
-        if saved is None:
-            os.environ.pop(CACHE_DIR_ENV, None)
-        else:
-            os.environ[CACHE_DIR_ENV] = saved
+    monkeypatch.delenv(CACHE_DIR_ENV, raising=False)
+    monkeypatch.setattr(
+        "breeze_infer.api.pin_torch_key", lambda cache_dir: "skipped"
+    )
+    configured = configure_compile_cache(settings)
+    assert configured.compile_cache_dir == (tmp_path / "cc").resolve()
+    assert os.environ[CACHE_DIR_ENV] == str(configured.compile_cache_dir)

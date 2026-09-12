@@ -21,7 +21,8 @@ CACHE_DIR_ENV = "TORCHINDUCTOR_CACHE_DIR"
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parents[1] / ".cache" / "torchinductor"
 MANIFEST_NAME = "warmup_manifest.json"
 TORCH_KEY_FILE = "torch_key.json"
-_SOURCE_SUFFIXES = (".py", ".cpp", ".h", ".ld")
+_SOURCE_SUFFIXES = (".py", ".cpp", ".ld")
+_NON_PACKAGE_DIRS = frozenset({"include", "lib", "bin", "share", "__pycache__"})
 _torch_key_status = "not-attempted"
 
 _COUNTER_KEYS: dict[str, tuple[str, ...]] = {
@@ -32,6 +33,8 @@ _COUNTER_KEYS: dict[str, tuple[str, ...]] = {
         "autograd_cache_bypass",
         "autograd_cache_guard_miss",
     ),
+    # Dynamo's own trace counters: graphs it traced and frames it captured.
+    # Unrelated to this project's CUDA graph capture.
     "stats": ("unique_graphs", "calls_captured"),
 }
 
@@ -61,28 +64,47 @@ def resolve_cache_dir(
     return chosen
 
 
-def inductor_source_fingerprint() -> str:
-    """Cheap stat-only digest of torch's inductor source tree.
+def torch_install_fingerprint() -> str:
+    """Cheap digest standing in for ``torch_key``'s content hash of all of torch.
 
-    Reading every file (what ``torch_key`` does) costs seconds on a slow or
-    cold filesystem; sizes and mtimes change on any reinstall, which is the
-    only event that should invalidate the pinned key.
+    ``torch_key`` reads every Python file under the ``torch`` package, which
+    costs seconds on a slow or cold filesystem. This digest combines the
+    version, the install location, the wheel's ``RECORD`` file (per-file
+    content hashes rewritten by any reinstall), and a stat-only walk of the
+    same tree (sizes and mtimes, which catch in-place edits). Any of those
+    changing invalidates the pinned key.
     """
     import torch
-    import torch._inductor
 
-    root = Path(torch._inductor.__file__).resolve().parent
+    root = Path(torch.__file__).resolve().parent
     digest = hashlib.sha256()
     digest.update(torch.__version__.encode("utf-8"))
     digest.update(str(root).encode("utf-8"))
-    for path in sorted(root.rglob("*")):
-        if path.suffix not in _SOURCE_SUFFIXES or not path.is_file():
-            continue
-        stat = path.stat()
-        digest.update(
-            f"{path.relative_to(root)}:{stat.st_size}:{stat.st_mtime_ns}".encode()
-        )
+    digest.update(_wheel_record().encode("utf-8"))
+    # os.walk + scandir: directory listings give file types without a stat,
+    # so only source files are stat'ed. Matters on slow mounts such as 9p.
+    # torch_key itself only descends into Python packages, so skip the large
+    # non-package trees (headers, shared libraries, bytecode caches).
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in _NON_PACKAGE_DIRS)
+        for name in sorted(filenames):
+            if not name.endswith(_SOURCE_SUFFIXES):
+                continue
+            full = os.path.join(dirpath, name)
+            stat = os.stat(full)
+            rel = os.path.relpath(full, root)
+            digest.update(f"{rel}:{stat.st_size}:{stat.st_mtime_ns}".encode())
     return digest.hexdigest()
+
+
+def _wheel_record() -> str:
+    """Contents of torch's dist-info RECORD, or empty when not pip-installed."""
+    try:
+        from importlib.metadata import distribution
+
+        return distribution("torch").read_text("RECORD") or ""
+    except Exception:  # noqa: BLE001 - any metadata failure just weakens the digest
+        return ""
 
 
 def pin_torch_key(
@@ -95,8 +117,8 @@ def pin_torch_key(
 
     Inductor hashes its own source tree once per process to key every cache
     entry. The hook ``torch_key.set`` lets a caller prepopulate that value, so
-    it is stored next to the cache with a stat-based fingerprint and reused
-    while the install is unchanged. Returns ``hit``, ``miss`` (computed and
+    it is stored next to the cache with ``torch_install_fingerprint`` and
+    reused while that fingerprint is unchanged. Returns ``hit``, ``miss`` (computed and
     saved), or ``unavailable``. Must run before the first ``torch.compile``.
     """
     global _torch_key_status
@@ -112,7 +134,7 @@ def pin_torch_key(
         _torch_key_status = "unavailable"
         return _torch_key_status
     if fingerprint is None:
-        fingerprint = inductor_source_fingerprint()
+        fingerprint = torch_install_fingerprint()
     record = Path(cache_dir) / TORCH_KEY_FILE
     try:
         saved = json.loads(record.read_text(encoding="utf-8"))
@@ -123,12 +145,20 @@ def pin_torch_key(
     except (OSError, ValueError, KeyError, TypeError, AssertionError):
         pass
     key = torch_key()
-    record.write_text(
+    _write_atomic(
+        record,
         json.dumps({"fingerprint": fingerprint, "key": key.hex()}, indent=2) + "\n",
-        encoding="utf-8",
     )
     _torch_key_status = "miss"
     return _torch_key_status
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Write via a sibling temp file and rename, so a concurrent reader never
+    sees a torn file."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def compile_cache_stats() -> dict[str, int]:
@@ -143,7 +173,7 @@ def compile_cache_stats() -> dict[str, int]:
         counters = {}
     stats: dict[str, int] = {}
     for group, keys in _COUNTER_KEYS.items():
-        bucket = counters.get(group, {}) if hasattr(counters, "get") else {}
+        bucket = counters.get(group, {})
         for key in keys:
             stats[f"{group}.{key}"] = int(bucket.get(key, 0))
     return stats

@@ -152,8 +152,11 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     if runtime.fast_enabled:
         profile = load_warmup_profile(FAST_CONFIG)
         profile = replace(profile, codec_chunk_frames=runtime.codec_chunk_frames)
-        cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
-        manifest_path = Path(cache_dir) / MANIFEST_NAME if cache_dir else None
+        manifest_path = (
+            settings.compile_cache_dir / MANIFEST_NAME
+            if settings.compile_cache_dir is not None
+            else None
+        )
         manifest = runtime.warmup_from_profile(profile, manifest_path=manifest_path)
         print(_warmup_summary(manifest), flush=True)
 
@@ -280,12 +283,16 @@ async def speech(
     )
 
 
-def configure_compile_cache(settings: ApiSettings) -> Path:
-    """Export the compile cache dir; must run before any torch.compile."""
+def configure_compile_cache(settings: ApiSettings) -> ApiSettings:
+    """Export the compile cache dir; must run before any torch.compile.
+
+    Returns settings with ``compile_cache_dir`` set to the resolved location so
+    later stages never have to read it back out of the environment.
+    """
     cache_dir = resolve_cache_dir(settings.compile_cache_dir)
     status = pin_torch_key(cache_dir)
     print(f"compile cache: {cache_dir} (torch key {status})", flush=True)
-    return cache_dir
+    return replace(settings, compile_cache_dir=cache_dir)
 
 
 def main() -> None:
@@ -335,7 +342,7 @@ def main() -> None:
         fast_codec=args.fast_codec,
         compile_cache_dir=args.compile_cache_dir,
     )
-    configure_compile_cache(_settings)
+    _settings = configure_compile_cache(_settings)
 
     import uvicorn
 

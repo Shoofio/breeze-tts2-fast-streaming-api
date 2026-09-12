@@ -130,8 +130,43 @@ def test_pin_torch_key_without_hook_is_unavailable(tmp_path: Path) -> None:
     assert status == "unavailable"
 
 
-def test_inductor_source_fingerprint_is_stable() -> None:
-    a = compile_cache.inductor_source_fingerprint()
-    b = compile_cache.inductor_source_fingerprint()
+def test_pin_torch_key_recovers_when_torch_already_computed_key(tmp_path: Path) -> None:
+    """torch_key.set asserts its cache is empty; if something compiled first,
+    fall through to the (memoized) real value instead of crashing."""
+
+    class _AlreadyComputed(_FakeTorchKey):
+        def set(self, value: bytes) -> None:
+            raise AssertionError("cache already populated")
+
+    compile_cache.pin_torch_key(
+        tmp_path, torch_key=_FakeTorchKey(b"\x01"), fingerprint="fp"
+    )
+    live = _AlreadyComputed(b"\x09")
+    status = compile_cache.pin_torch_key(tmp_path, torch_key=live, fingerprint="fp")
+    assert status == "miss"
+    assert live.calls == 1
+    import json
+
+    saved = json.loads((tmp_path / compile_cache.TORCH_KEY_FILE).read_text())
+    assert saved["key"] == "09"
+
+
+def test_torch_install_fingerprint_is_stable_and_covers_whole_package() -> None:
+    a = compile_cache.torch_install_fingerprint()
+    b = compile_cache.torch_install_fingerprint()
     assert a == b
     assert len(a) == 64
+
+
+def test_torch_install_fingerprint_tracks_the_wheel_record(monkeypatch) -> None:
+    base = compile_cache.torch_install_fingerprint()
+    monkeypatch.setattr(compile_cache, "_wheel_record", lambda: "different RECORD")
+    assert compile_cache.torch_install_fingerprint() != base
+
+
+def test_torch_key_record_write_is_atomic(tmp_path: Path) -> None:
+    compile_cache.pin_torch_key(
+        tmp_path, torch_key=_FakeTorchKey(b"\x01"), fingerprint="fp"
+    )
+    leftovers = [p for p in tmp_path.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []
