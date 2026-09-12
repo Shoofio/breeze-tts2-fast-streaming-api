@@ -386,8 +386,21 @@ class MultiRequestStreamRuntime:
             device=self.config.device,
             dtype=torch.long,
         )
+        # First decoder forward after _compile_snakes: this is where the lazy
+        # torch.compile of every SnakeBeta actually runs (or hits the cache).
+        self._sync_device()
+        first_forward_started = time.perf_counter()
         with torch.inference_mode():
             observed = self.tokenizer.model.decoder(dummy_codes)  # type: ignore[union-attr]
+        self._sync_device()
+        self.snake_compile_elapsed_ms = (
+            time.perf_counter() - first_forward_started
+        ) * 1000.0
+        if self.config.fast:
+            logger.info(
+                "breeze_codec first decoder forward (SnakeBeta compile): elapsed_ms=%.0f",
+                self.snake_compile_elapsed_ms,
+            )
         observed_chunk_out = int(observed.shape[-1])
         if observed_chunk_out % self.config.chunk_frames != 0:
             logger.error(
@@ -526,6 +539,7 @@ class MultiRequestStreamRuntime:
         self._record_tombstone(req_id, "evicted_lru")
 
     def _maybe_warmup_fast_codec(self) -> None:
+        self.graph_warmup_elapsed_ms = 0.0
         if not self.config.fast:
             return
         self._sync_device()
@@ -536,9 +550,10 @@ class MultiRequestStreamRuntime:
                 lane.warmup_cuda_graph(warmup_rounds=2)
                 lane.reset_hot_state()
         self._sync_device()
+        self.graph_warmup_elapsed_ms = (time.perf_counter() - t0) * 1000.0
         logger.info(
             "breeze_codec fast codec warmup done: elapsed_ms=%.3f",
-            (time.perf_counter() - t0) * 1000.0,
+            self.graph_warmup_elapsed_ms,
         )
 
     def create_request(self, req_id: str, reset: bool = True) -> RequestStateSlot:

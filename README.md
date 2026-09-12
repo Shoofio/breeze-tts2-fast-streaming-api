@@ -174,6 +174,28 @@ Both the CLI and API use eager streaming by default and skip graph warmup. Pass 
 
 Individual stage flags are intended for profiling and debugging.
 
+#### Startup time and the compile cache
+
+The fast path captures every CUDA graph again on each start. A captured graph is bound to live device memory (its static buffers, the KV cache, the shared graph pool), and neither PyTorch nor CUDA can serialize one, so capture is unavoidable. Most of the warmup time is not capture, though: it is `torch.compile` of the depth decoder and the codec's SnakeBeta activations, which runs lazily during the eager warmup passes before capture. That work is cacheable, and torch caches it on disk by default, but in the system temp directory, which Ubuntu and WSL clear on boot.
+
+The server pins that cache to a persistent location, chosen in this order: `--compile-cache-dir`, then an existing `TORCHINDUCTOR_CACHE_DIR`, then `./.cache/torchinductor`. It also stores torch's own source-tree hash there (`torch_key.json`), which Inductor otherwise recomputes on every start by reading its whole source tree; the stored value is reused while the torch install is unchanged. After every fast warmup the server writes `warmup_manifest.json` next to the cache with per-stage timings, torch's per-phase compile timers, and cache hit/miss counters, and prints a one-line summary such as `fast warmup: 33668 ms (fx graph cache hits 65 / misses 0)`. A warm start shows hits and no misses; a cold one shows the reverse.
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `--compile-cache-dir PATH` | env or `./.cache/torchinductor` | Where compiled kernels persist between starts |
+
+Measured on an RTX 4090 with `--fast-all` (warmup only, after the checkpoint is loaded):
+
+| Start | Windows native | WSL2 (repo on a Windows drive) |
+| --- | --- | --- |
+| Empty cache | 102 s | 157 s |
+| Warm cache, torch hash recomputed | 50 s | 79 s |
+| Warm cache, torch hash reused | 34 s | not measured |
+
+What remains on a warm start is capture and its eager warmup passes (about 10 s for the 63 text-encoder and prefill graphs), the codec (about 3 s), and Dynamo re-tracing the compiled depth decoder (about 13 s), which torch 2.9 cannot cache for module compiles: its experimental precompile cache was tried and made startup slower.
+
+On Linux, Triton builds a small helper with `gcc` the first time it populates a cache directory. Run the server from a directory other than the repo root when doing that: gcc treats a `./specs` directory in its working directory as a spec file and aborts.
+
 
 ## License and Responsible Use
 

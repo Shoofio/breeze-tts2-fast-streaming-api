@@ -12,11 +12,13 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from breeze_infer.compile_cache import MANIFEST_NAME, pin_torch_key, resolve_cache_dir
 from breeze_infer.runtime import (
     load_runtime,
     resolve_device,
@@ -49,6 +51,7 @@ class ApiSettings:
     fast_backbone_decode: bool
     fast_depth_decoder: bool
     fast_codec: bool
+    compile_cache_dir: Path | None = None
 
 
 _settings: ApiSettings | None = None
@@ -149,13 +152,26 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     if runtime.fast_enabled:
         profile = load_warmup_profile(FAST_CONFIG)
         profile = replace(profile, codec_chunk_frames=runtime.codec_chunk_frames)
-        manifest = runtime.warmup_from_profile(profile)
-        print(f"fast warmup: {manifest['total_elapsed_ms']:.2f} ms", flush=True)
+        cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR")
+        manifest_path = Path(cache_dir) / MANIFEST_NAME if cache_dir else None
+        manifest = runtime.warmup_from_profile(profile, manifest_path=manifest_path)
+        print(_warmup_summary(manifest), flush=True)
 
     app.state.tokenizer = tokenizer
     app.state.model = model
     app.state.audio_tokenizer = audio_tokenizer
     app.state.runtime = runtime
+
+
+def _warmup_summary(manifest: dict[str, Any]) -> str:
+    """One-line startup report: total warmup plus compile-cache hit/miss counts."""
+    counters = manifest.get("compile_cache", {}).get("counters", {})
+    hits = counters.get("inductor.fxgraph_cache_hit", 0)
+    misses = counters.get("inductor.fxgraph_cache_miss", 0)
+    return (
+        f"fast warmup: {manifest['total_elapsed_ms']:.2f} ms "
+        f"(fx graph cache hits {hits} / misses {misses})"
+    )
 
 
 @asynccontextmanager
@@ -264,6 +280,14 @@ async def speech(
     )
 
 
+def configure_compile_cache(settings: ApiSettings) -> Path:
+    """Export the compile cache dir; must run before any torch.compile."""
+    cache_dir = resolve_cache_dir(settings.compile_cache_dir)
+    status = pin_torch_key(cache_dir)
+    print(f"compile cache: {cache_dir} (torch key {status})", flush=True)
+    return cache_dir
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Serve Breeze TTS 2 streaming inference"
@@ -289,6 +313,15 @@ def main() -> None:
     parser.add_argument(
         "--fast-codec", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument(
+        "--compile-cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Where torch.compile artifacts persist between starts "
+            "(default: $TORCHINDUCTOR_CACHE_DIR if set, else ./.cache/torchinductor)"
+        ),
+    )
     args = parser.parse_args()
 
     global _settings
@@ -300,7 +333,9 @@ def main() -> None:
         fast_backbone_decode=args.fast_backbone_decode,
         fast_depth_decoder=args.fast_depth_decoder,
         fast_codec=args.fast_codec,
+        compile_cache_dir=args.compile_cache_dir,
     )
+    configure_compile_cache(_settings)
 
     import uvicorn
 

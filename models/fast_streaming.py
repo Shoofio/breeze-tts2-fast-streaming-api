@@ -206,6 +206,7 @@ class FastBreezeStreamingRuntime:
         self._backbone_prefill_graph: BackbonePrefillGraphCache | None = None
         self._backbone_prefill_graphs: dict[int, BackbonePrefillGraphCache] = {}
         self._depth_decoder_graph: DepthDecoderGraph | None = None
+        self._depth_decoder_timing: dict[str, float] = {}
         self._codec_runtime = None
         self._warmup_profile: FastStreamingWarmupProfile | None = None
         self._warmup_manifest: dict[str, Any] | None = None
@@ -284,6 +285,7 @@ class FastBreezeStreamingRuntime:
             depth_gen = self.model.depth_decoder.generation_config
             depth_params = self._sampling_params(depth_gen)
             depth_bucket_sizes = depth_bucket_sizes or [1, 2]
+            depth_started = time.perf_counter()
             self._depth_decoder_graph = DepthDecoderGraph(
                 depth_decoder=self.model.depth_decoder,
                 config=self.model.config.depth_decoder_config,
@@ -301,6 +303,18 @@ class FastBreezeStreamingRuntime:
                 self._depth_decoder_graph.capture()
             else:
                 self._depth_decoder_graph.prepare_eager()
+            torch.cuda.synchronize(self.device)
+            # torch.compile is lazy: the compile cost lands in the eager warmup
+            # runs before capture, so "warmup" here is "compile + warmup".
+            self._depth_decoder_timing = {
+                "warmup_ms_including_compile": float(
+                    getattr(self._depth_decoder_graph, "warmup_elapsed_ms", 0.0)
+                ),
+                "capture_ms": float(
+                    getattr(self._depth_decoder_graph, "capture_elapsed_ms", 0.0)
+                ),
+                "total_ms": (time.perf_counter() - depth_started) * 1000.0,
+            }
         else:
             self._depth_decoder_graph.set_guidance_scale(guidance_scale)
 
@@ -541,10 +555,14 @@ class FastBreezeStreamingRuntime:
                 "profile prefill sequence_length exceeds runtime max_seq_len"
             )
 
+        from breeze_infer.compile_cache import compile_cache_stats, describe, diff_stats
+
         total_started = time.perf_counter()
         stages: dict[str, Any] = {}
+        counters_at_start = compile_cache_stats()
 
         graph_started = time.perf_counter()
+        counters_before = compile_cache_stats()
         cfg_scale_by_batch = {
             1 if cfg_scale == 1.0 else 2: cfg_scale for cfg_scale in profile.cfg_scales
         }
@@ -572,6 +590,8 @@ class FastBreezeStreamingRuntime:
                 for batch_size in sorted(self._depth_decoder_graph._bucket_graphs)
             ],
             "elapsed_ms_with_backbone_decode": graph_elapsed_ms,
+            **self._depth_decoder_timing,
+            "cache_counters": diff_stats(counters_before, compile_cache_stats()),
         }
 
         sampling_started = time.perf_counter()
@@ -656,6 +676,7 @@ class FastBreezeStreamingRuntime:
         }
 
         codec_started = time.perf_counter()
+        counters_before = compile_cache_stats()
         codec = self._codec()
         codec_request_id = "profile-codec-warmup"
         codec.open_request(codec_request_id, reset=True, is_first_decode=True)
@@ -686,6 +707,11 @@ class FastBreezeStreamingRuntime:
                 }
             ],
             "elapsed_ms": (time.perf_counter() - codec_started) * 1000.0,
+            "snake_first_forward_ms_including_compile": float(
+                getattr(codec, "snake_compile_elapsed_ms", 0.0)
+            ),
+            "graph_warmup_ms": float(getattr(codec, "graph_warmup_elapsed_ms", 0.0)),
+            "cache_counters": diff_stats(counters_before, compile_cache_stats()),
         }
 
         if profile.freeze_after_warmup:
@@ -752,6 +778,10 @@ class FastBreezeStreamingRuntime:
             "profile": profile.to_dict(),
             "stages": stages,
             "frozen": profile.freeze_after_warmup,
+            "compile_cache": {
+                **describe(),
+                "counters_delta": diff_stats(counters_at_start, compile_cache_stats()),
+            },
             "total_elapsed_ms": (time.perf_counter() - total_started) * 1000.0,
         }
         self._warmup_manifest = manifest

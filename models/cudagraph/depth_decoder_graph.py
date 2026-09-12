@@ -26,6 +26,7 @@ Strategy:
 """
 
 import logging
+import time
 from dataclasses import dataclass
 
 import torch
@@ -160,6 +161,10 @@ class DepthDecoderGraph:
         # (module forward still fires hooks, and F.linear works with fp32 input)
         self.codebooks_head.weight.data = self.codebooks_head.weight.data.float()
         self.fast = bool(fast)
+        # Accumulated across buckets by capture(). torch.compile is lazy, so the
+        # first warmup runs carry the whole compile cost.
+        self.warmup_elapsed_ms = 0.0
+        self.capture_elapsed_ms = 0.0
 
         # The fast path uses one maintained compile configuration before
         # manual CUDA Graph capture. Compile modes are intentionally not public.
@@ -783,12 +788,16 @@ class DepthDecoderGraph:
         self._build_attention_masks()
 
         # Warmup
+        warmup_started = time.perf_counter()
         for _ in range(num_warmup):
             self.static_cache.reset()
             self._full_loop()
         torch.cuda.synchronize(device=self.device)
+        warmup_ms = (time.perf_counter() - warmup_started) * 1000.0
+        self.warmup_elapsed_ms += warmup_ms
 
         # Capture
+        capture_started = time.perf_counter()
         s = torch.cuda.Stream(device=self.device)
         s.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(s):
@@ -803,10 +812,15 @@ class DepthDecoderGraph:
 
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize(device=self.device)
+        capture_ms = (time.perf_counter() - capture_started) * 1000.0
+        self.capture_elapsed_ms += capture_ms
 
         # Save state for this bucket
         self._bucket_graphs[bsz] = self._snapshot_state()
-        print(f"  Depth decoder CUDA graph captured for bucket_size={bsz}")
+        print(
+            f"  Depth decoder CUDA graph captured for bucket_size={bsz} "
+            f"(warmup {warmup_ms:.0f} ms, capture {capture_ms:.0f} ms)"
+        )
 
     @torch.inference_mode()
     def capture(self, num_warmup=3):

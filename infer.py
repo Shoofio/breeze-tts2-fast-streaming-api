@@ -9,6 +9,7 @@ from pathlib import Path
 
 import soundfile as sf
 
+from breeze_infer.compile_cache import MANIFEST_NAME, pin_torch_key, resolve_cache_dir
 from breeze_infer.runtime import (
     load_runtime,
     resolve_device,
@@ -55,10 +56,13 @@ def main() -> None:
     parser.add_argument(
         "--fast-codec", action=argparse.BooleanOptionalAction, default=False
     )
+    parser.add_argument("--compile-cache-dir", type=Path, default=None)
     args = parser.parse_args()
 
     if not math.isfinite(args.cfg_scale) or args.cfg_scale <= 0:
         raise ValueError("--cfg-scale must be greater than 0")
+    cache_dir = resolve_cache_dir(args.compile_cache_dir)
+    pin_torch_key(cache_dir)
 
     has_ref_audio = args.ref_audio is not None
     has_ref_text = bool(args.ref_text and args.ref_text.strip())
@@ -92,8 +96,15 @@ def main() -> None:
     if runtime.fast_enabled:
         profile = load_warmup_profile(FAST_CONFIG)
         profile = replace(profile, codec_chunk_frames=runtime.codec_chunk_frames)
-        manifest = runtime.warmup_from_profile(profile)
-        print(f"fast warmup: {manifest['total_elapsed_ms']:.2f} ms")
+        manifest = runtime.warmup_from_profile(
+            profile, manifest_path=cache_dir / MANIFEST_NAME
+        )
+        counters = manifest["compile_cache"]["counters"]
+        print(
+            f"fast warmup: {manifest['total_elapsed_ms']:.2f} ms "
+            f"(fx graph cache hits {counters['inductor.fxgraph_cache_hit']} "
+            f"/ misses {counters['inductor.fxgraph_cache_miss']})"
+        )
 
     request = {
         "id": "single-request",
