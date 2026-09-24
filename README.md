@@ -174,6 +174,13 @@ Both the CLI and API use eager streaming by default and skip graph warmup. Pass 
 
 Individual stage flags are intended for profiling and debugging.
 
+`--attn-implementation {eager,sdpa}` (default `eager`) selects the attention kernel for the
+backbone and text encoder. The fast text-encoder stage always runs `sdpa` for graph capture
+regardless of this setting. On an RTX 4090 with `--fast-all`, `sdpa` was no faster than `eager`
+(about 9% slower on a ~2000-character request) but used about 2.7 GB less peak VRAM.
+FlashAttention 2 is not offered: Hugging Face's FA2 path rejects the backbone's 4D attention
+masks in both eager and fast modes.
+
 #### Startup time and the compile cache
 
 The fast path captures every CUDA graph again on each start. A captured graph is bound to live device memory (its static buffers, the KV cache, the shared graph pool), and neither PyTorch nor CUDA can serialize one, so capture is unavoidable. Most of the warmup time is not capture, though: it is `torch.compile` of the depth decoder and the codec's SnakeBeta activations, which runs lazily during the eager warmup passes before capture. That work is cacheable, and torch caches it on disk by default, but in the system temp directory, which Ubuntu and WSL clear on boot.

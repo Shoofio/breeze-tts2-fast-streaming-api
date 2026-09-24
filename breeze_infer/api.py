@@ -52,6 +52,7 @@ class ApiSettings:
     fast_depth_decoder: bool
     fast_codec: bool
     compile_cache_dir: Path | None = None
+    attn_implementation: str = "eager"
 
 
 _settings: ApiSettings | None = None
@@ -131,7 +132,7 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     tokenizer, model, audio_tokenizer = load_runtime(
         settings.model,
         device=resolve_device(),
-        attn_implementation="eager",
+        attn_implementation=settings.attn_implementation,
     )
     update_generation_config_for_breeze(model)
 
@@ -329,6 +330,19 @@ def main() -> None:
             "(default: $TORCHINDUCTOR_CACHE_DIR if set, else ./.cache/torchinductor)"
         ),
     )
+    parser.add_argument(
+        "--attn-implementation",
+        # flash_attention_2 is deliberately absent: Hugging Face's FA2 path
+        # rejects the backbone's 4D attention masks ("cu_seqlens_k must have
+        # shape (batch_size + 1)") in both eager and CUDA-graph modes.
+        choices=("eager", "sdpa"),
+        default="eager",
+        help=(
+            "Attention kernel for the backbone and text encoder; the fast "
+            "text-encoder stage always runs sdpa for graph capture regardless "
+            "of this setting (default: eager)"
+        ),
+    )
     args = parser.parse_args()
 
     global _settings
@@ -341,6 +355,7 @@ def main() -> None:
         fast_depth_decoder=args.fast_depth_decoder,
         fast_codec=args.fast_codec,
         compile_cache_dir=args.compile_cache_dir,
+        attn_implementation=args.attn_implementation,
     )
     _settings = configure_compile_cache(_settings)
 
