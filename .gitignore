@@ -2,6 +2,9 @@ runs/
 outputs/
 warmup_manifest.json
 *.wav
+.cache
+
+.claude
 
 __pycache__/
 *.py[cod]
