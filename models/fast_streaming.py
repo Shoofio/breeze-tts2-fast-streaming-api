@@ -31,6 +31,10 @@ _DUAL_CFG_KEYS = (
     "cfg_ins_prompt_ids",
 )
 
+# Bucket size for backbone prefill graphs. The eager-fallback decision must pad
+# a prompt exactly as the graph prefill does, so both read this one value.
+_PREFILL_TOKEN_GRANULARITY = 32
+
 
 @dataclass(frozen=True)
 class FastStreamingConfig:
@@ -649,7 +653,7 @@ class FastBreezeStreamingRuntime:
             for branch_batch_size in profile.backbone_decode_branch_batch_sizes:
                 backbone_graph = self._backbone_graphs[branch_batch_size]
                 prefill_cache = BackbonePrefillGraphCache(
-                    backbone_graph, token_granularity=32
+                    backbone_graph, token_granularity=_PREFILL_TOKEN_GRANULARITY
                 )
                 for graph in profile.backbone_prefill_graphs:
                     if graph.branch_batch_size == branch_batch_size:
@@ -794,6 +798,52 @@ class FastBreezeStreamingRuntime:
             )
         return manifest
 
+    def _prefill_plan(
+        self, branch_batch_size: int, seq_len: int, prefix_len: int
+    ) -> bool:
+        """Whether the backbone prefill of ``seq_len`` tokens can use a graph.
+
+        A graph pads ``seq_len`` up to its bucket; it is used only when that
+        bucket still fits in ``max_seq_len`` after ``prefix_len`` and, for a
+        cache frozen after warmup, was captured. Otherwise the prefill runs
+        eagerly at the exact length instead of failing the request.
+        """
+        if not self._fast_backbone_prefill:
+            return False
+        # No cache yet means _prefill_graph_cache will create an unfrozen one
+        # with the default granularity, which captures any bucket on demand.
+        cache = self._backbone_prefill_graphs.get(branch_batch_size)
+        granularity = (
+            _PREFILL_TOKEN_GRANULARITY if cache is None else cache.token_granularity
+        )
+        bucketed_len = prefix_len + -(-seq_len // granularity) * granularity
+        if bucketed_len > self.config.max_seq_len:
+            return False
+        if (
+            cache is not None
+            and cache.frozen
+            and not cache.has_bucket(branch_batch_size, seq_len, prefix_len)
+        ):
+            return False
+        return True
+
+    def _prefill_graph_cache(self, branch_batch_size: int) -> BackbonePrefillGraphCache:
+        """The prefill graph cache for the current backbone graph, created on first use.
+
+        It is kept in ``_backbone_prefill_graphs`` so ``_prefill_plan`` decides
+        from the same cache that later runs the prefill, and so graphs captured
+        on demand survive the next ``_ensure_graphs`` call.
+        """
+        assert self._backbone_graph is not None
+        cache = self._backbone_prefill_graphs.get(branch_batch_size)
+        if cache is None:
+            cache = BackbonePrefillGraphCache(
+                self._backbone_graph, token_granularity=_PREFILL_TOKEN_GRANULARITY
+            )
+            self._backbone_prefill_graphs[branch_batch_size] = cache
+        self._backbone_prefill_graph = cache
+        return cache
+
     @torch.inference_mode()
     def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> ReferencePrefix:
         """Run the reference prefix alone (batch 1) and keep its backbone KV."""
@@ -818,12 +868,10 @@ class FastBreezeStreamingRuntime:
 
         keys: list[torch.Tensor] = []
         values: list[torch.Tensor] = []
-        if self._fast_backbone_prefill:
-            if self._backbone_prefill_graph is None:
-                self._backbone_prefill_graph = BackbonePrefillGraphCache(
-                    self._backbone_graph, token_granularity=32
-                )
-            output = self._backbone_prefill_graph(embeds, mask)
+        # A prefix longer than every warmed bucket runs eagerly, as an
+        # over-long request prompt does in _run_prefill.
+        if self._prefill_plan(1, prefix_len, 0):
+            output = self._prefill_graph_cache(1)(embeds, mask)
             bucket = output.prefill_len
             for layer in self._backbone_graph.static_cache.layers:
                 keys.append(layer.keys[0, :, bucket - prefix_len : bucket])
@@ -875,24 +923,18 @@ class FastBreezeStreamingRuntime:
         if prefix is not None:
             self._load_prefix_kv(prefix, branch.branch_batch_size)
 
-        if self._fast_backbone_prefill:
-            if self._backbone_prefill_graph is None:
-                self._backbone_prefill_graph = BackbonePrefillGraphCache(
-                    self._backbone_graph, token_granularity=32
-                )
-            cache = self._backbone_prefill_graph
-            graph_available = not cache.frozen or cache.has_bucket(
-                branch.branch_batch_size, int(attention_mask.shape[1]), prefix_len
+        if self._prefill_plan(
+            branch.branch_batch_size, int(attention_mask.shape[1]), prefix_len
+        ):
+            cache = self._prefill_graph_cache(branch.branch_batch_size)
+            output = cache(branch.inputs_embeds, attention_mask, prefix_len=prefix_len)
+            return (
+                output.hidden_states,
+                output.logits,
+                output.attention_mask,
+                output.prefill_len,
+                "graph",
             )
-            if graph_available:
-                output = cache(branch.inputs_embeds, attention_mask, prefix_len=prefix_len)
-                return (
-                    output.hidden_states,
-                    output.logits,
-                    output.attention_mask,
-                    output.prefill_len,
-                    "graph",
-                )
 
         if prefix is None:
             position_ids = attention_mask.long().cumsum(-1) - 1

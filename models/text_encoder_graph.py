@@ -37,6 +37,9 @@ class TextEncoderGraphCache:
         self._graph_pool = torch.cuda.graph_pool_handle()
         self.captures = 0
         self.replays = 0
+        # Calls a frozen cache declined because no warmed bucket fits; the
+        # caller ran those eagerly.
+        self.misses = 0
         self._frozen = False
 
     def _bucket(self, length: int) -> int:
@@ -79,7 +82,13 @@ class TextEncoderGraphCache:
     @torch.inference_mode()
     def __call__(
         self, segments: Sequence[torch.Tensor]
-    ) -> tuple[list[torch.Tensor], list[Any]]:
+    ) -> tuple[list[torch.Tensor], list[Any]] | None:
+        """Replay (capturing first while unfrozen) the smallest fitting bucket.
+
+        Returns ``None`` when the cache is frozen and no warmed bucket fits.
+        The caller must then run the text encoder eagerly: capturing after
+        warmup would add latency and GPU memory the profile never budgeted.
+        """
         if not segments:
             return [], []
         lengths = [int(segment.shape[0]) for segment in segments]
@@ -98,10 +107,8 @@ class TextEncoderGraphCache:
             record = self._records.get(key) if key is not None else None
             if record is None:
                 if self._frozen:
-                    raise RuntimeError(
-                        f"text encoder CUDA graph {requested_key} has no fitting bucket "
-                        "in the warmup profile"
-                    )
+                    self.misses += 1
+                    return None
                 key = requested_key
                 device = segments[0].device
                 static_ids = torch.zeros(

@@ -179,3 +179,127 @@ def test_single_cfg_merges_cond_and_uncond_in_one_batched_text_path() -> None:
 
     assert eager_branch.branch_batch_size == 2
     assert len(runtime.model.calls) == 2
+
+
+class _FakePrefillCache:
+    """A prefill graph cache with a fixed set of captured ``(batch, bucket)`` keys."""
+
+    token_granularity = 32
+
+    def __init__(
+        self, buckets, *, frozen: bool = True, max_seq_len: int = 2048
+    ) -> None:
+        self.buckets = set(buckets)
+        self.frozen = frozen
+        self.max_seq_len = max_seq_len
+        self.calls: list[int] = []
+
+    def _bucket(self, seq_len: int) -> int:
+        return -(-seq_len // self.token_granularity) * self.token_granularity
+
+    def has_bucket(self, batch_size, seq_len, prefix_len=0) -> bool:
+        bucket = self._bucket(seq_len)
+        return (batch_size, bucket) in self.buckets and (
+            prefix_len + bucket <= self.max_seq_len
+        )
+
+    def __call__(self, inputs_embeds, attention_mask, *, prefix_len=0):
+        self.calls.append(int(attention_mask.shape[1]))
+        return SimpleNamespace(
+            prefill_len=prefix_len + self._bucket(int(attention_mask.shape[1]))
+        )
+
+
+# The fast profile's frozen batch-1 prefill buckets (configs/fast.json).
+_PROFILE_BUCKETS = {(1, n) for n in range(32, 513, 32)}
+
+
+@pytest.mark.parametrize(
+    ("fast", "cache", "seq_len", "prefix_len", "use_graph"),
+    [
+        # Fast prefill off: always eager.
+        (False, None, 40, 0, False),
+        # No cache yet: _run_prefill creates an unfrozen one and pads.
+        (True, None, 40, 0, True),
+        (True, None, 40, 100, True),
+        # Frozen profile cache: graph when a bucket fits, else eager.
+        (True, _FakePrefillCache(_PROFILE_BUCKETS), 500, 0, True),
+        (True, _FakePrefillCache(_PROFILE_BUCKETS), 600, 0, False),
+        # Unfrozen cache: a bucket past max_seq_len runs eagerly, not raises.
+        (True, _FakePrefillCache(set(), frozen=False), 1000, 1030, False),
+        (True, None, 1000, 1030, False),
+        (True, _FakePrefillCache(set(), frozen=False), 1000, 1024, True),
+    ],
+)
+def test_prefill_plan(fast, cache, seq_len, prefix_len, use_graph) -> None:
+    runtime = object.__new__(FastBreezeStreamingRuntime)
+    runtime.config = FastStreamingConfig(max_seq_len=2048)
+    runtime._fast_backbone_prefill = fast
+    runtime._backbone_prefill_graphs = {} if cache is None else {1: cache}
+
+    assert runtime._prefill_plan(1, seq_len, prefix_len) is use_graph
+
+
+def _prefix_runtime(
+    prefix_len: int, prefill_cache: _FakePrefillCache
+) -> FastBreezeStreamingRuntime:
+    """A CPU runtime whose reference-prefix paths return fake KV."""
+    runtime = object.__new__(FastBreezeStreamingRuntime)
+    runtime.config = FastStreamingConfig(max_seq_len=2048)
+    runtime.dtype = torch.float32
+    runtime._fast_backbone_prefill = True
+    runtime._backbone_prefill_graphs = {1: prefill_cache}
+    runtime._ensure_graphs = lambda *args, **kwargs: None
+    graph_kv = torch.ones(1, 2, 2048, 3)
+    runtime._backbone_graph = SimpleNamespace(
+        num_layers=1,
+        static_cache=SimpleNamespace(
+            layers=[SimpleNamespace(keys=graph_kv, values=graph_kv)]
+        ),
+    )
+    runtime._merge_branch = lambda **kwargs: (
+        torch.zeros(1, prefix_len, 4),
+        torch.ones(1, prefix_len, dtype=torch.long),
+    )
+    kv = torch.zeros(1, 2, prefix_len, 3)
+    runtime.eager_calls = 0
+
+    def backbone_model(**kwargs):
+        runtime.eager_calls += 1
+        return SimpleNamespace(past_key_values=[(kv, kv)])
+
+    runtime.model = SimpleNamespace(backbone_model=backbone_model)
+    return runtime
+
+
+# _merge_branch is faked, so the prefix inputs only need their keys.
+_PREFIX_INPUTS = dict.fromkeys(
+    ("input_ids", "attention_mask", "text_ids_mask", "text_ids_len")
+)
+
+
+def test_reference_prefix_longer_than_every_frozen_bucket_runs_eagerly() -> None:
+    # 600 tokens pad to a 608 bucket the fast profile never captured; replaying
+    # it would raise "backbone prefill CUDA graph (1, 608) was not declared".
+    cache = _FakePrefillCache(_PROFILE_BUCKETS)
+    runtime = _prefix_runtime(600, cache)
+
+    prefix = runtime.build_reference_prefix(_PREFIX_INPUTS)
+
+    assert cache.calls == []
+    assert runtime.eager_calls == 1
+    assert prefix.prefix_len == 600
+    assert prefix.kv.shape == (1, 2, 2, 600, 3)
+
+
+def test_reference_prefix_with_a_frozen_bucket_replays_the_graph() -> None:
+    cache = _FakePrefillCache(_PROFILE_BUCKETS)
+    runtime = _prefix_runtime(500, cache)
+
+    prefix = runtime.build_reference_prefix(_PREFIX_INPUTS)
+
+    assert cache.calls == [500]
+    assert runtime.eager_calls == 0
+    # The KV comes from the graph's static cache (ones), not the eager path.
+    assert prefix.kv.shape == (1, 2, 2, 500, 3)
+    assert bool((prefix.kv == 1).all())

@@ -1264,7 +1264,12 @@ class BreezeForConditionalGeneration(BreezePreTrainedModel, BreezeGenerationMixi
             if cache is None:
                 cache = TextEncoderGraphCache(self.text_encoder, token_granularity=32)
                 self._fast_text_encoder_graph_cache = cache
-            return cache(segments)
+            encoded = cache(segments)
+            # A frozen cache has no bucket for an overlong segment. The eager
+            # path below handles any length, so degrade to it instead of failing
+            # the request (as backbone prefill does when no graph fits).
+            if encoded is not None:
+                return encoded
 
         device = segments[0].device
         lengths = [s.shape[0] for s in segments]
