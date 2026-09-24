@@ -3,9 +3,9 @@ outputs/
 warmup_manifest.json
 .cache/
 *.wav
-.cache
 
-.claude
+.claude/
+.specify/
 
 __pycache__/
 *.py[cod]
