@@ -4,8 +4,10 @@ qwen-tts==0.1.1
 transformers==4.57.3
 numpy>=2.0
 soundfile>=0.13
-# The web stack is pinned exactly: abort-on-failure and disconnect handling
-# rely on library internals (specs/003-cpp-compatible-api research R2, R3).
+# The web stack is pinned exactly because abort-on-failure and disconnect
+# handling rely on its internals (specs/003-cpp-compatible-api research R2, R3).
+# Transitive dependencies (anyio, h11) still float; test_speech_abort.py is
+# the guard. docker/smoke_check.py checks these pins in the image.
 fastapi==0.141.1
 starlette==1.6.0
 uvicorn==0.52.4

@@ -22,6 +22,12 @@ EXPECTED = {
     "transformers": "4.57.3",
     "qwen-tts": "0.1.1",
     "flash-attn": "2.8.3",
+    # The web stack is pinned because stream-abort and disconnect handling
+    # depend on its internals; a reinstall must not silently change it.
+    "fastapi": "0.141.1",
+    "starlette": "1.6.0",
+    "uvicorn": "0.52.4",
+    "python-multipart": "0.0.32",
 }
 
 
