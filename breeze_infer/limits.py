@@ -4,11 +4,11 @@ Constants rather than launch options: nothing needs to change them at run time, 
 part of the documented contract.
 """
 
-MIB = 1024 * 1024
+_MIB = 1024 * 1024
 
 # HTTP bodies: 25 MiB of reference audio plus room for the other form fields.
-MAX_BODY_BYTES = 26 * MIB
-MAX_AUDIO_BYTES = 25 * MIB
+MAX_BODY_BYTES = 26 * _MIB
+MAX_AUDIO_BYTES = 25 * _MIB
 
 MAX_REF_SECONDS = 30
 MAX_TEXT_CHARS = 10_000
@@ -22,10 +22,10 @@ ANCHOR_CHARS = 200
 
 UNNAMED_VOICE_CAP = 64
 
-WS_MAX_MESSAGE_BYTES = 1 * MIB
+WS_MAX_MESSAGE_BYTES = 1 * _MIB
 WS_MAX_CONNECTIONS = 16
 WS_HANDSHAKE_SECONDS = 10
-WS_OUTBOX_BYTES = 2 * MIB
+WS_OUTBOX_BYTES = 2 * _MIB
 
 HTTP_SEND_TIMEOUT_SECONDS = 30
 TCP_USER_TIMEOUT_MS = 30_000
