@@ -324,17 +324,43 @@ async def serve(
             host=components.settings.host,
             addresses=[_address(sock) for sock in sockets],
         )
+        crash: BaseException | None = None
         try:
             await server.serve(sockets=sockets)
+        except BaseException as exc:
+            crash = exc
+            raise
         finally:
             serving = False
             await _stop_gpu(components, server, loading, drain_interrupted, outcome)
+            if crash is not None and outcome.hard_exit:
+                _report_crash(components.events, crash, outcome)
     finally:
         # Only now that the hard-exit decision is made: until then a signal must still reach
         # `on_signal`.
         restore_signals()
         if outcome.hard_exit:
             _ignore_sigint()
+
+
+def _report_crash(events: Emitter, exc: BaseException, outcome: ServeOutcome) -> None:
+    """serve() is raising, but `main()` will hard-exit, and `os._exit` would swallow the
+    exception: no traceback, and a crash that looks like a clean stop to Docker or Kubernetes.
+    So report it here and make the exit code non-zero (keeping `EXIT_GPU_STUCK`)."""
+    if outcome.exit_code == 0:
+        outcome.exit_code = 1
+    trace = "".join(traceback.format_exception(exc))
+    events.emit(
+        "server.stopping",
+        level="error",
+        reason="serve raised",
+        error=repr(exc),
+        traceback=trace,
+    )
+    # stderr as well, where an uncaught exception's traceback would normally have gone.
+    with contextlib.suppress(Exception):
+        sys.stderr.write(trace)
+        sys.stderr.flush()
 
 
 async def _stop_gpu(

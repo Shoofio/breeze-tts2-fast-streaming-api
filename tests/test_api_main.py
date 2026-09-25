@@ -577,9 +577,10 @@ def test_a_signal_during_the_load_asks_main_for_a_hard_exit() -> None:
 
 
 @pytest.mark.usefixtures("keep_sigint")
-def test_serve_raising_still_reports_the_hard_exit_decision(
-    monkeypatch: pytest.MonkeyPatch,
+def test_serve_raising_during_the_load_hard_exits_non_zero_with_the_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """os._exit would swallow the exception: a crash must not look like a clean stop (0)."""
     sink = io.StringIO()
     components = _components(sink)
     started, release = threading.Event(), threading.Event()
@@ -606,7 +607,57 @@ def test_serve_raising_still_reports_the_hard_exit_decision(
     finally:
         release.set()
         components.gpu.shutdown()
-    assert outcome.hard_exit is True
+    assert outcome == ServeOutcome(1, hard_exit=True)
+    stderr = capsys.readouterr().err
+    assert "Traceback" in stderr
+    assert "RuntimeError: uvicorn broke" in stderr
+    crashed = _events(sink)[-1]
+    assert (crashed["event"], crashed["level"]) == ("server.stopping", "error")
+    assert crashed["reason"] == "serve raised"
+    assert "uvicorn broke" in crashed["error"]
+    assert "RuntimeError" in crashed["traceback"]
+
+
+@posix_only
+@pytest.mark.usefixtures("keep_sigint")
+def test_serve_raising_with_a_stuck_drain_keeps_ex_software(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(api, "GPU_DRAIN_SECONDS", 0.5)
+    sink = io.StringIO()
+    components = _components(sink)
+    proceed, cancelled, streaming = (threading.Event() for _ in range(3))
+    outcome = ServeOutcome()
+    app = _stuck_close_app(components, proceed, cancelled, streaming)
+
+    async def broken_main_loop(self: Any) -> None:
+        await asyncio.to_thread(streaming.wait, 10)  # a request holds the GPU
+        raise RuntimeError("uvicorn broke")
+
+    monkeypatch.setattr(api._Server, "main_loop", broken_main_loop)
+
+    async def scenario() -> None:
+        sock = _bind_one("127.0.0.1", 0)
+        port = sock.getsockname()[1]
+        serving = asyncio.create_task(serve(components, app, [sock], _loaded, outcome))
+        await _wait_until(lambda: components.readiness.runtime is not None)
+        writer = await _start_request(port)
+        try:
+            with pytest.raises(RuntimeError, match="uvicorn broke"):
+                await asyncio.wait_for(serving, 10)
+        finally:
+            proceed.set()  # unstick the GPU before asyncio.run's cleanup
+            writer.close()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        proceed.set()
+        components.gpu.shutdown()
+    assert outcome == ServeOutcome(70, hard_exit=True)
+    assert "RuntimeError: uvicorn broke" in capsys.readouterr().err
+    reasons = [event.get("reason") for event in _events(sink)]
+    assert reasons[-2:] == ["gpu drain timed out", "serve raised"]
 
 
 def test_hard_exit_survives_a_broken_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -627,7 +678,10 @@ def test_hard_exit_survives_a_broken_stdout(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def _stuck_close_app(
-    components: Components, proceed: threading.Event, cancelled: threading.Event
+    components: Components,
+    proceed: threading.Event,
+    cancelled: threading.Event,
+    streaming: threading.Event | None = None,
 ) -> Any:
     """A streaming request whose gen.close() is stuck behind other GPU work."""
 
@@ -642,6 +696,8 @@ def _stuck_close_app(
         try:
             await session.step()
             await send({"type": "http.response.start", "status": 200, "headers": []})
+            if streaming is not None:
+                streaming.set()
             await asyncio.sleep(60)
         finally:
             cancelled.set()
