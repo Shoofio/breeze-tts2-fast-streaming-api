@@ -471,7 +471,7 @@ the GPU smoke test.
   - `test_client_disconnect_releases_the_gate_within_one_chunk`;
   - `test_gate_released_if_body_never_starts`;
   - `test_stalled_reader_hits_send_timeout` (patch the timeout down to 0.5 s via injection).
-- [ ] T041 [US1] Create `breeze_infer/routes_speech.py`, `POST /v1/audio/speech`:
+- [X] T041 [US1] Create `breeze_infer/routes_speech.py`, `POST /v1/audio/speech`:
   1. `require_ready`;
   2. `read_fields` and `parse_speech`;
   3. reference checks (the full order arrives with US2);
@@ -483,7 +483,7 @@ the GPU smoke test.
 
   Split with `split_text(text, budget=split_chars)`; anchoring arrives in US3. Emit
   `speech.accepted` and `speech.first_audio`. Register the router in `api.py`.
-- [ ] T042 [US1] Create `tests/test_routes_speech.py` (`FakeRuntime`, TestClient):
+- [X] T042 [US1] Create `tests/test_routes_speech.py` (`FakeRuntime`, TestClient):
   - `200` headers `audio/pcm`, `X-Sample-Rate`, `X-Sample-Format` and `Cache-Control`, with a
     non-empty body;
   - voice design and inline reference;

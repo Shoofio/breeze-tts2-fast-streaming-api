@@ -17,6 +17,7 @@ import socket
 import sys
 import time
 import traceback
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
@@ -36,6 +37,7 @@ from breeze_infer.gpu import GPU_CLOSE_TIMEOUT_SECONDS, GpuGate, GpuThread
 from breeze_infer.limits import TCP_USER_TIMEOUT_MS
 from breeze_infer.model_loading import LoadedModel, load_model
 from breeze_infer.routes_health import Readiness, install_health
+from breeze_infer.routes_speech import install_speech
 from breeze_infer.runtime import get_dist_info
 from breeze_infer.settings import Settings, settings_from_args
 from breeze_infer.version_header import VersionHeaderMiddleware
@@ -61,6 +63,9 @@ def create_app(components: Components) -> ASGIApp:
     app = FastAPI(title="Breeze TTS", docs_url=None, redoc_url=None, openapi_url=None)
     install_error_handlers(app, components.events)
     install_health(app, components.readiness, components.ws_port)
+    install_speech(
+        app, components, clock=time.perf_counter, new_request_id=lambda: uuid.uuid4().hex
+    )
 
     policy = CorsPolicy(origins=components.settings.cors)
     inner: ASGIApp = CorsMiddleware(BodyLimitMiddleware(app), policy, app.router)
