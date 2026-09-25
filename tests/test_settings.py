@@ -232,6 +232,122 @@ def test_settings_never_reads_environ(
 
 
 @pytest.mark.parametrize("value", ["", ",", " , "])
-def test_cors_with_an_empty_allowlist_is_rejected(value):
+def test_cors_with_an_empty_allowlist_is_rejected(
+    tmp_path: Path, value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
     with pytest.raises(SystemExit):
-        settings_from_args(["/models/breeze", "--cors", value])
+        settings_from_args([str(tmp_path), "--cors", value])
+    assert "empty" in capsys.readouterr().err
+
+
+def test_cors_wildcard_repeated_collapses_to_single_star(tmp_path: Path) -> None:
+    settings = settings_from_args([str(tmp_path), "--cors", "*,*"])
+    assert settings.cors == ("*",)
+
+
+def test_cors_entries_are_deduped_preserving_order(tmp_path: Path) -> None:
+    settings = settings_from_args(
+        [
+            str(tmp_path),
+            "--cors",
+            "https://b.example,https://a.example,https://b.example",
+        ]
+    )
+    assert settings.cors == ("https://b.example", "https://a.example")
+
+
+def test_cors_scheme_and_host_are_lowercased(tmp_path: Path) -> None:
+    settings = settings_from_args(
+        [str(tmp_path), "--cors", "HTTPS://Example.COM:8443"]
+    )
+    assert settings.cors == ("https://example.com:8443",)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "https://a.example/",
+        "https://a.example/path",
+        "https://a.example?x=1",
+        "https://a.example#frag",
+    ],
+)
+def test_cors_origin_with_path_query_or_fragment_rejected(
+    tmp_path: Path, entry: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", entry])
+    # The message names the offending entry so an operator can find it in a
+    # long allowlist.
+    assert entry in capsys.readouterr().err
+
+
+def test_cors_origin_trailing_slash_suggests_the_value_without_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "https://a.example/"])
+    assert "https://a.example'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("entry", ["a.example", "ftp://a.example", "//a.example"])
+def test_cors_origin_missing_or_wrong_scheme_rejected(
+    tmp_path: Path, entry: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", entry])
+    assert entry in capsys.readouterr().err
+
+
+def test_model_path_must_be_an_existing_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / "does-not-exist"
+    with pytest.raises(SystemExit):
+        settings_from_args([str(missing)])
+    assert "model_path" in capsys.readouterr().err
+
+
+def test_model_path_that_is_a_file_is_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    a_file = tmp_path / "not-a-directory"
+    a_file.write_text("x")
+    with pytest.raises(SystemExit):
+        settings_from_args([str(a_file)])
+    assert "model_path" in capsys.readouterr().err
+
+
+def test_ws_port_derived_out_of_range_names_the_derived_port(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--port", "65535"])
+    err = capsys.readouterr().err
+    assert "derived" in err
+    assert "--ws-port" in err
+
+
+@pytest.mark.parametrize(
+    "value", ["+8080", "8080.0", " 8080", "8080 ", "0x1f90", "1e3", "-1"]
+)
+def test_port_rejects_non_strict_digit_forms(
+    tmp_path: Path, value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--port", value])
+    assert "--port" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["+9000", "9000.0", " 9000", "0x2328"])
+def test_ws_port_rejects_non_strict_digit_forms(
+    tmp_path: Path, value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--ws-port", value])
+    assert "--ws-port" in capsys.readouterr().err
+
+
+def test_cors_ipv6_origin_keeps_its_brackets(tmp_path):
+    settings = settings_from_args([str(tmp_path), "--cors", "http://[::1]:8000"])
+    assert settings.cors == ("http://[::1]:8000",)

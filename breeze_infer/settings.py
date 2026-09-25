@@ -9,9 +9,11 @@ root that consumes ``compile_cache_dir``, not to argument parsing).
 from __future__ import annotations
 
 import argparse
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
@@ -30,65 +32,140 @@ _WS_PORT_UNSET = object()
 class Settings:
     """Launch configuration. Every field is already validated.
 
+    Every field is required: ``Settings`` is only ever built by
+    ``settings_from_args``, which fills in every default and runs every
+    check, so there is no partially-defaulted instance to accidentally ship.
+    Tests that need a ``Settings`` build one through ``settings_from_args``
+    too, not by constructing this dataclass directly.
+
     ``ws_port`` is ``None`` when the WebSocket server is disabled (either by
     ``--ws-port disabled`` or, going forward, any other way disabling is
     spelled); otherwise it is a validated port distinct from ``port``.
 
     ``cors`` is empty when CORS is off (the default); ``("*",)`` when any
-    origin is allowed; otherwise a tuple of trimmed, exact-match origins.
+    origin is allowed; otherwise a tuple of validated, deduplicated origins
+    (see ``_parse_cors_origins``).
     """
 
     model_path: Path
-    host: str = DEFAULT_HOST
-    port: int = DEFAULT_PORT
-    ws_port: int | None = DEFAULT_PORT + 1
-    cors: tuple[str, ...] = ()
-    split_chars: int = DEFAULT_SPLIT_CHARS
-    chunk_first: int = DEFAULT_CHUNK_FIRST
-    chunk_max: int = DEFAULT_CHUNK_MAX
-    voices_dir: Path = DEFAULT_VOICES_DIR
-    fast_all: bool | None = None
-    fast_text_encoder: bool = False
-    fast_backbone_prefill: bool = False
-    fast_backbone_decode: bool = False
-    fast_depth_decoder: bool = False
-    fast_codec: bool = False
-    attn_implementation: str = DEFAULT_ATTN_IMPLEMENTATION
-    compile_cache_dir: Path | None = None
+    host: str
+    port: int
+    ws_port: int | None
+    cors: tuple[str, ...]
+    split_chars: int
+    chunk_first: int
+    chunk_max: int
+    voices_dir: Path
+    fast_all: bool | None
+    fast_text_encoder: bool
+    fast_backbone_prefill: bool
+    fast_backbone_decode: bool
+    fast_depth_decoder: bool
+    fast_codec: bool
+    attn_implementation: str
+    compile_cache_dir: Path | None
+
+
+# --port and --ws-port must be plain unsigned integers: no leading '+' or
+# '-', no decimal point, no exponent, no surrounding whitespace. int() itself
+# accepts all of those, so the strict shape is enforced separately.
+_STRICT_PORT_RE = re.compile(r"\d+")
+
+
+def _parse_port(value: str) -> int:
+    """argparse ``type=`` for ``--port``: a plain, strictly-digit port number."""
+    if not _STRICT_PORT_RE.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            f"--port must be a plain number (got {value!r})"
+        )
+    return int(value)
 
 
 def _parse_ws_port(value: str) -> int | None:
-    """argparse ``type=`` for ``--ws-port``: a port number, or ``disabled``."""
+    """argparse ``type=`` for ``--ws-port``: a plain digit port number, or ``disabled``."""
     if value.strip().lower() == "disabled":
         return None
-    try:
-        return int(value)
-    except ValueError as exc:
+    if not _STRICT_PORT_RE.fullmatch(value):
         raise argparse.ArgumentTypeError(
             f"--ws-port must be a port number or 'disabled' (got {value!r})"
-        ) from exc
+        )
+    return int(value)
+
+
+def _validate_cors_origin(entry: str) -> str:
+    """Validate one ``--cors`` allowlist entry and return it normalized.
+
+    An entry must be a bare ``scheme://host[:port]`` origin: scheme ``http``
+    or ``https``, a host, an optional port, and no userinfo, path, query or
+    fragment -- none of those can ever appear in a browser's ``Origin``
+    header, so an entry carrying one could never match and is rejected at
+    startup instead of silently never matching at request time.
+
+    Browsers send a lowercase scheme and host in ``Origin``, so the scheme
+    and host are lowercased here; the allowlist is compared against that
+    lowercased form.
+    """
+    parsed = urlsplit(entry)
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise ValueError(
+            f"--cors origin {entry!r} must start with http:// or https://"
+        )
+    if "@" in parsed.netloc:
+        raise ValueError(
+            f"--cors origin {entry!r} must be a bare scheme://host[:port] origin "
+            "(no userinfo)"
+        )
+    try:
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"--cors origin {entry!r} has an invalid port") from exc
+    if not host:
+        raise ValueError(f"--cors origin {entry!r} must be a bare scheme://host[:port] origin")
+    if parsed.path == "/" and not parsed.query and not parsed.fragment:
+        without_slash = entry[: entry.rindex("/")]
+        raise ValueError(
+            f"--cors origin {entry!r} must not have a trailing slash; use {without_slash!r}"
+        )
+    if parsed.path or parsed.query or parsed.fragment:
+        raise ValueError(
+            f"--cors origin {entry!r} must be a bare scheme://host[:port] origin, "
+            "with no path, query or fragment"
+        )
+    port_suffix = f":{port}" if port is not None else ""
+    # urlsplit drops an IPv6 host's brackets, but the Origin header keeps them.
+    host = f"[{host.lower()}]" if ":" in host else host.lower()
+    return f"{parsed.scheme.lower()}://{host}{port_suffix}"
 
 
 def _parse_cors_origins(value: str | None) -> tuple[str, ...]:
     """``None`` (flag absent) disables CORS; ``"*"`` (bare flag) allows any origin.
 
-    Ported from ``breeze_infer/api.py`` (``api-alignment`` branch). ``"*"``
-    means any origin only when it is the whole value (``"*,"`` and ``" * "``
-    count). Mixed with other origins it is rejected at startup.
+    Otherwise ``value`` is a comma-separated list. Each entry is trimmed,
+    validated as a bare origin (see ``_validate_cors_origin``) and
+    deduplicated, preserving first-seen order. ``"*"`` means any origin only
+    when every entry is ``"*"`` (so ``"*,*"`` collapses to ``("*",)``);
+    mixed with any other origin it is rejected, as is an allowlist that is
+    empty after trimming.
     """
     if value is None:
         return ()
-    if value == "*":
-        return ("*",)
-    origins = tuple(origin.strip() for origin in value.split(",") if origin.strip())
-    if origins == ("*",):
-        return origins
-    if "*" in origins:
-        raise ValueError("'*' can't be combined with other origins")
-    if not origins:
+    raw_entries = [entry.strip() for entry in value.split(",") if entry.strip()]
+    if not raw_entries:
         # An empty allowlist would silently mean "CORS off" despite the flag.
         raise ValueError("--cors was given an empty origin list")
-    return origins
+    if "*" in raw_entries:
+        if any(entry != "*" for entry in raw_entries):
+            raise ValueError("'*' can't be combined with other origins")
+        return ("*",)
+    origins: list[str] = []
+    seen: set[str] = set()
+    for entry in raw_entries:
+        normalized = _validate_cors_origin(entry)
+        if normalized not in seen:
+            seen.add(normalized)
+            origins.append(normalized)
+    return tuple(origins)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -98,7 +175,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("model_path", type=Path, help="Path to the model directory")
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"Bind address for HTTP and WebSocket (default: {DEFAULT_HOST})")
     parser.add_argument(
-        "--port", type=int, default=DEFAULT_PORT, help=f"HTTP port (default: {DEFAULT_PORT})"
+        "--port",
+        type=_parse_port,
+        default=DEFAULT_PORT,
+        help=f"HTTP port (default: {DEFAULT_PORT})",
     )
     parser.add_argument(
         "--ws-port",
@@ -118,7 +198,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ORIGINS",
         help=(
             "Enable CORS: bare flag allows any origin, or pass a "
-            "comma-separated allowlist (default: disabled)"
+            "comma-separated allowlist (default: disabled). Takes an "
+            "optional value, so pass it after model_path, or use "
+            "--cors=ORIGINS, to avoid swallowing the next argument"
         ),
     )
     parser.add_argument(
@@ -204,15 +286,24 @@ def settings_from_args(argv: Sequence[str] | None = None) -> Settings:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if not args.model_path.is_dir():
+        parser.error(f"model_path must be an existing directory (got {args.model_path})")
+
     port = args.port
     if not 1 <= port <= 65535:
         parser.error(f"--port must be between 1 and 65535 (got {port})")
 
     ws_port = args.ws_port
-    if ws_port is _WS_PORT_UNSET:
+    ws_port_derived = ws_port is _WS_PORT_UNSET
+    if ws_port_derived:
         ws_port = port + 1
     if ws_port is not None:
         if not 1 <= ws_port <= 65535:
+            if ws_port_derived:
+                parser.error(
+                    f"the derived --ws-port (--port + 1 = {ws_port}) is out of "
+                    "range; pass --ws-port to set it explicitly"
+                )
             parser.error(
                 f"--ws-port must be between 1 and 65535, or 'disabled' (got {ws_port})"
             )
