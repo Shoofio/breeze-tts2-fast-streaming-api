@@ -526,20 +526,27 @@ class DepthDecoderGraph:
             MIN_TEMPERATURE, MAX_TEMPERATURE
         )  # [half, vocab]
 
-        # Capture-safe guard (no host sync), on the values softmax and argmax
-        # will see. A row with any NaN or +inf (a model NaN, a CFG overflow,
-        # or finite logits overflowing at the 1e-5 temperature floor), or with
-        # no finite value, cannot be trusted: multinomial on it is a CUDA
-        # device assert that poisons the process. One reduction finds all
-        # three (amax propagates NaN, is +inf if any entry is, and -inf if
-        # none is finite). Such a row samples from zeros, gets the fixed code
-        # 0 below, and sets nonfinite_logits for the caller to raise on. -inf
-        # alone is fine; it is how tokens are masked. Greedy rows are judged
-        # on the same scaled values; argmax is unchanged by a positive scale.
-        row_ok = torch.isfinite(scaled.amax(dim=-1))  # [half]
+        # Capture-safe guard (no host sync), on the values each path really
+        # uses: the scaled logits for a sampled row (softmax sees them) and the
+        # unscaled ones for a greedy row (argmax sees them; greedy ignores the
+        # temperature, as the backbone's greedy path does). A row with any NaN
+        # or +inf (a model NaN, a CFG overflow, or finite logits overflowing at
+        # the 1e-5 temperature floor), or with no finite value, cannot be
+        # trusted. One reduction per view finds all three (amax propagates
+        # NaN, is +inf if any entry is, and -inf if none is finite). -inf alone
+        # is fine; it is how tokens are masked. Both views are sanitized either
+        # way, because the graph computes both paths for every row and
+        # multinomial on a bad row is a CUDA device assert that poisons the
+        # process. A bad row gets the fixed code 0 below and sets
+        # nonfinite_logits for the caller to raise on.
+        scaled_ok = torch.isfinite(scaled.amax(dim=-1))  # [half]
+        raw_ok = torch.isfinite(cfg.amax(dim=-1))  # [half]
+        row_ok = torch.where(self.do_sample_buf.bool(), scaled_ok, raw_ok)
         self.nonfinite_logits.logical_or_(~row_ok.all())
-        scaled = torch.where(row_ok.unsqueeze(-1), scaled, 0.0)
-        greedy_toks = torch.argmax(scaled, dim=-1)  # [half]
+        scaled = torch.where(scaled_ok.unsqueeze(-1), scaled, 0.0)
+        greedy_toks = torch.argmax(
+            torch.where(raw_ok.unsqueeze(-1), cfg, 0.0), dim=-1
+        )  # [half]
 
         # top_k on raw logits (graph-safe: fixed _max_k workspace)
         effective_k = torch.where(
@@ -904,6 +911,10 @@ class DepthDecoderGraph:
             self.set_guidance_scale(guidance_scale)
 
         self.static_cache.reset()
+        # ensure_batch_size may have just rebuilt and recaptured, and its
+        # warm-up passes on dummy buffers OR into the flag; only this
+        # request's own pass may set it.
+        self.nonfinite_logits.zero_()
         self._full_loop()
         return self.output_tokens[: self.half].clone()
 

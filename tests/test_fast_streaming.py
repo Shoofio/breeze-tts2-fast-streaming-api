@@ -821,6 +821,73 @@ def test_depth_decoder_catches_overflow_from_the_temperature_floor() -> None:
     assert graph._tok_buf.tolist() == [0]
 
 
+@pytest.mark.parametrize(
+    "row",
+    [
+        # Overflows only at the 1e-5 temperature floor, which greedy never uses.
+        [3e34, 1.0, 0.0, 1.0],
+        [float("-inf"), 30.0, float("-inf"), 0.0],
+    ],
+)
+def test_depth_decoder_judges_greedy_rows_on_the_unscaled_logits(row) -> None:
+    graph = _depth_sampler(MIN_TEMPERATURE, do_sample=False)
+
+    graph._cfg_sample(torch.tensor([[row]]))
+
+    assert graph.nonfinite_logits.tolist() == [False]
+    assert graph._tok_buf.tolist() == [int(torch.tensor(row).argmax())]
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        [float("nan"), 30.0, 1.0, 0.0],
+        [float("inf"), 30.0, 1.0, 0.0],
+        [float("-inf")] * 4,
+    ],
+)
+def test_depth_decoder_still_flags_bad_greedy_rows(row) -> None:
+    graph = _depth_sampler(MIN_TEMPERATURE, do_sample=False)
+
+    graph._cfg_sample(torch.tensor([[row]]))
+
+    assert graph.nonfinite_logits.tolist() == [True]
+    assert graph._tok_buf.tolist() == [0]
+
+
+def test_depth_decoder_eager_run_ignores_flags_from_a_rebuild_capture() -> None:
+    # A batch size with no captured bucket rebuilds and recaptures the graph;
+    # its warm-up passes run on dummy buffers and OR into the same flag. Only
+    # the request's own pass may decide it.
+    graph = object.__new__(DepthDecoderGraph)
+    graph.nonfinite_logits = torch.zeros(1, dtype=torch.bool)
+    graph.num_decode_codebooks = 3
+    graph.device = "cpu"
+    graph.bucket_sizes = [1, 2]
+    graph.no_graph = False
+    graph.half = 2
+    graph.backbone_hidden_buf = torch.zeros(4, 4)
+    graph.first_cb_token_buf = torch.zeros(4, dtype=torch.long)
+    graph.output_tokens = torch.zeros(4, 3, dtype=torch.long)
+    graph.static_cache = SimpleNamespace(reset=lambda: None)
+    passes = []
+
+    def rebuild_with_dirty_capture(batch_size):
+        graph.nonfinite_logits.fill_(True)
+
+    def real_pass():
+        passes.append(graph.nonfinite_logits.tolist())
+
+    graph.ensure_batch_size = rebuild_with_dirty_capture
+    graph._full_loop = real_pass
+
+    graph.run(torch.zeros(4, 4), torch.zeros(4, dtype=torch.long))
+
+    # The request's own pass starts from a clear flag.
+    assert passes == [[False]]
+    assert graph.nonfinite_logits.tolist() == [False]
+
+
 def test_depth_decoder_run_clears_a_stale_flag_even_on_its_early_return() -> None:
     graph = object.__new__(DepthDecoderGraph)
     graph.nonfinite_logits = torch.ones(1, dtype=torch.bool)
