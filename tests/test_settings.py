@@ -351,3 +351,95 @@ def test_ws_port_rejects_non_strict_digit_forms(
 def test_cors_ipv6_origin_keeps_its_brackets(tmp_path):
     settings = settings_from_args([str(tmp_path), "--cors", "http://[::1]:8000"])
     assert settings.cors == ("http://[::1]:8000",)
+
+
+def test_cors_origin_with_userinfo_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "https://user:pw@a.example"])
+    assert "userinfo" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("entry", ["https://a.example:0", "https://a.example:99999"])
+def test_cors_origin_bad_or_out_of_range_port_rejected(
+    tmp_path: Path, entry: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", entry])
+    assert entry in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [("http://a.example:80", "http://a.example"), ("https://a.example:443", "https://a.example")],
+)
+def test_cors_default_port_is_dropped(tmp_path: Path, entry: str, expected: str) -> None:
+    settings = settings_from_args([str(tmp_path), "--cors", entry])
+    assert settings.cors == (expected,)
+
+
+def test_cors_idn_host_becomes_punycode(tmp_path: Path) -> None:
+    settings = settings_from_args([str(tmp_path), "--cors", "https://café.example"])
+    assert settings.cors == ("https://xn--caf-dma.example",)
+
+
+def test_cors_ipv6_uppercase_and_expanded_form_canonicalizes(tmp_path: Path) -> None:
+    settings = settings_from_args(
+        [
+            str(tmp_path),
+            "--cors",
+            "http://[0:0:0:0:0:0:0:1]:8000,http://[FE80::1]:8000",
+        ]
+    )
+    assert settings.cors == ("http://[::1]:8000", "http://[fe80::1]:8000")
+
+
+def test_cors_ipv4_non_dotted_quad_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "http://127.1"])
+    assert "dotted-quad" in capsys.readouterr().err
+
+
+def test_cors_ipv6_zone_id_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "http://[fe80::1%eth0]"])
+    assert "zone id" in capsys.readouterr().err
+
+
+def test_cors_wildcard_host_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "https://*.example"])
+    assert "wildcard" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["８０８０", "٨٠٨٠"])
+def test_port_rejects_unicode_digits(
+    tmp_path: Path, value: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--port", value])
+    assert "--port" in capsys.readouterr().err
+
+
+def test_cors_incomplete_ipv6_bracket_error_names_the_entry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "http://[::1"])
+    assert "http://[::1" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("entry", ["https://a.example?", "https://a.example#"])
+def test_cors_origin_with_empty_query_or_fragment_rejected(
+    tmp_path: Path, entry: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", entry])
+    assert entry in capsys.readouterr().err

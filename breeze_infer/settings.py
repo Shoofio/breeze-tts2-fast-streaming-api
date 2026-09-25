@@ -13,7 +13,8 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+
+from breeze_infer.cors import canonical_origin
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
@@ -67,9 +68,12 @@ class Settings:
 
 
 # --port and --ws-port must be plain unsigned integers: no leading '+' or
-# '-', no decimal point, no exponent, no surrounding whitespace. int() itself
-# accepts all of those, so the strict shape is enforced separately.
-_STRICT_PORT_RE = re.compile(r"\d+")
+# '-', no decimal point, no exponent, no surrounding whitespace, and no
+# non-ASCII digit (e.g. full-width '８０８０' or Arabic-Indic '٨٠٨٠') -- int()
+# itself accepts all of those, so the strict, ASCII-only shape is enforced
+# separately. An explicit [0-9] class (rather than \d with re.ASCII) keeps
+# that ASCII-only intent visible at the call site.
+_STRICT_PORT_RE = re.compile(r"[0-9]+")
 
 
 def _parse_port(value: str) -> int:
@@ -92,61 +96,17 @@ def _parse_ws_port(value: str) -> int | None:
     return int(value)
 
 
-def _validate_cors_origin(entry: str) -> str:
-    """Validate one ``--cors`` allowlist entry and return it normalized.
-
-    An entry must be a bare ``scheme://host[:port]`` origin: scheme ``http``
-    or ``https``, a host, an optional port, and no userinfo, path, query or
-    fragment -- none of those can ever appear in a browser's ``Origin``
-    header, so an entry carrying one could never match and is rejected at
-    startup instead of silently never matching at request time.
-
-    Browsers send a lowercase scheme and host in ``Origin``, so the scheme
-    and host are lowercased here; the allowlist is compared against that
-    lowercased form.
-    """
-    parsed = urlsplit(entry)
-    if parsed.scheme.lower() not in ("http", "https"):
-        raise ValueError(
-            f"--cors origin {entry!r} must start with http:// or https://"
-        )
-    if "@" in parsed.netloc:
-        raise ValueError(
-            f"--cors origin {entry!r} must be a bare scheme://host[:port] origin "
-            "(no userinfo)"
-        )
-    try:
-        host = parsed.hostname
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError(f"--cors origin {entry!r} has an invalid port") from exc
-    if not host:
-        raise ValueError(f"--cors origin {entry!r} must be a bare scheme://host[:port] origin")
-    if parsed.path == "/" and not parsed.query and not parsed.fragment:
-        without_slash = entry[: entry.rindex("/")]
-        raise ValueError(
-            f"--cors origin {entry!r} must not have a trailing slash; use {without_slash!r}"
-        )
-    if parsed.path or parsed.query or parsed.fragment:
-        raise ValueError(
-            f"--cors origin {entry!r} must be a bare scheme://host[:port] origin, "
-            "with no path, query or fragment"
-        )
-    port_suffix = f":{port}" if port is not None else ""
-    # urlsplit drops an IPv6 host's brackets, but the Origin header keeps them.
-    host = f"[{host.lower()}]" if ":" in host else host.lower()
-    return f"{parsed.scheme.lower()}://{host}{port_suffix}"
-
-
 def _parse_cors_origins(value: str | None) -> tuple[str, ...]:
     """``None`` (flag absent) disables CORS; ``"*"`` (bare flag) allows any origin.
 
     Otherwise ``value`` is a comma-separated list. Each entry is trimmed,
-    validated as a bare origin (see ``_validate_cors_origin``) and
-    deduplicated, preserving first-seen order. ``"*"`` means any origin only
-    when every entry is ``"*"`` (so ``"*,*"`` collapses to ``("*",)``);
-    mixed with any other origin it is rejected, as is an allowlist that is
-    empty after trimming.
+    validated and canonicalized as a bare origin (``canonical_origin``, in
+    ``cors.py`` so ``CorsMiddleware`` can canonicalize an incoming ``Origin``
+    header the same way before comparing) and deduplicated, preserving
+    first-seen order -- so ``http://a.example:80`` and ``http://a.example``
+    collapse to one entry. ``"*"`` means any origin only when every entry is
+    ``"*"`` (so ``"*,*"`` collapses to ``("*",)``); mixed with any other
+    origin it is rejected, as is an allowlist that is empty after trimming.
     """
     if value is None:
         return ()
@@ -161,7 +121,7 @@ def _parse_cors_origins(value: str | None) -> tuple[str, ...]:
     origins: list[str] = []
     seen: set[str] = set()
     for entry in raw_entries:
-        normalized = _validate_cors_origin(entry)
+        normalized = canonical_origin(entry)
         if normalized not in seen:
             seen.add(normalized)
             origins.append(normalized)

@@ -404,3 +404,37 @@ def test_x_breeze_version_present_on_preflight_204_and_on_403(
     assert preflight.headers["x-breeze-version"] == __version__
     assert forbidden.status_code == 403
     assert forbidden.headers["x-breeze-version"] == __version__
+
+
+# ------------------------------------------------------------------- canonical_origin matching
+
+
+@pytest.mark.parametrize(
+    "incoming_origin",
+    ["https://good.example:443", "HTTPS://GOOD.EXAMPLE"],
+)
+def test_incoming_origin_with_default_port_or_uppercase_matches_allowlist(
+    incoming_origin: str,
+) -> None:
+    """The allowlist entry is canonicalized at startup (default port dropped, lowercased); the
+    incoming ``Origin`` header must be canonicalized the same way before comparing, so a browser
+    that sends a redundant default port or (never happens in practice, but the check must not
+    depend on it) different case still matches."""
+    client, calls = _counting_app(CorsPolicy((GOOD_ORIGIN,)))
+
+    response = client.post("/v1/voices", headers={"Origin": incoming_origin})
+
+    assert response.status_code == 200
+    assert calls == ["post"]
+
+
+def test_garbage_origin_header_is_treated_as_disallowed() -> None:
+    """A malformed ``Origin`` header (never sent by a real browser) must never raise out of
+    ``canonical_origin`` -- it's simply not allowed, same as any other disallowed origin."""
+    client, calls = _counting_app(CorsPolicy((GOOD_ORIGIN,)))
+
+    response = client.post("/v1/voices", headers={"Origin": "not a valid origin"})
+
+    assert response.status_code == 403
+    assert response.json() == ORIGIN_NOT_ALLOWED
+    assert calls == []

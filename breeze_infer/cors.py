@@ -11,14 +11,20 @@ with ``200`` regardless of whether the path exists, and lets a ``POST`` from a d
 reach the endpoint and run. This is a from-scratch replacement covering exactly the behaviour in
 ``specs/003-cpp-compatible-api/contracts/http-api.md`` "CORS".
 
-Parsing and validating ``--cors`` (trimming, ``*`` mixed with other entries, deduplication, the
-lowercase-scheme-and-host normalization) lives in ``settings.py``: this module only consumes the
-already-normalized ``Settings.cors`` tuple.
+Parsing and validating ``--cors`` (trimming, ``*`` mixed with other entries, deduplication) lives
+in ``settings.py``, which imports ``canonical_origin`` from here to validate and normalize each
+allowlist entry at startup; this module must never import ``settings`` back. This module's own
+``origin_allowed`` runs the same ``canonical_origin`` over the incoming ``Origin`` header before
+comparing, so a request whose origin differs from an allowlist entry only by a default port or
+letter case still matches (a malformed ``Origin`` is simply treated as not allowed, never raised).
 """
 
 from __future__ import annotations
 
+import ipaddress
+import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from fastapi.responses import JSONResponse
 from starlette.responses import Response
@@ -28,6 +34,124 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from breeze_infer.errors import _HTTP_EXCEPTION_RESPONSES
 
 _UNSAFE_METHODS = frozenset({"POST", "DELETE"})
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+# What's left of a hostname once it's lowercase and, if it was an IDN, already turned to
+# punycode -- ASCII letters, digits, '.' and '-' are the only characters a real DNS label (or a
+# bracketed IP literal, handled separately below) can contain.
+_HOST_CHARS_RE = re.compile(r"[a-z0-9.-]+")
+
+
+def canonical_origin(value: str) -> str:
+    """Canonicalize one ``scheme://host[:port]`` origin to the exact form a browser's ``Origin``
+    header carries, so an allowlist entry and an incoming header that only differ cosmetically
+    (case, a redundant default port, an expanded IPv6 literal, ...) compare equal.
+
+    Used both by ``settings.py`` (to validate and normalize each ``--cors`` allowlist entry at
+    startup) and by this module's own ``origin_allowed`` (to canonicalize the incoming ``Origin``
+    header before comparing). Raises ``ValueError`` naming ``value`` on anything that isn't a bare
+    origin; callers decide what that means -- a startup error in ``settings.py``, but never raised
+    in ``origin_allowed``, which treats a malformed incoming ``Origin`` as simply not allowed.
+
+    - Scheme must be ``http`` or ``https`` (lowercased).
+    - Host is lowercased; an IDN is turned to punycode; an IP literal (IPv4 dotted-quad, or IPv6
+      in brackets) is canonicalized with ``ipaddress`` -- so ``127.1`` (which browsers never send;
+      ``ipaddress`` requires all four octets) and an IPv6 zone id are both rejected, and
+      ``[0:0:0:0:0:0:0:1]`` canonicalizes to ``[::1]``. A hostname of ``*`` or containing any
+      character outside ``[a-z0-9.-]`` after punycode conversion is rejected -- CORS has no
+      wildcard-host concept; each origin must be listed.
+    - Port must be plain digits, 1-65535 (browsers never send port ``0``); the scheme's own
+      default port (80 for http, 443 for https) is dropped, since browsers omit it.
+    - Userinfo, a path (including a lone trailing ``/``), a query or a fragment are all rejected,
+      including an empty ``?`` or ``#`` -- none of those can ever appear in an ``Origin`` header.
+    """
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ValueError(f"--cors origin {value!r} is invalid: {exc}") from exc
+
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"--cors origin {value!r} must start with http:// or https://")
+
+    if "@" in parsed.netloc:
+        raise ValueError(
+            f"--cors origin {value!r} must be a bare scheme://host[:port] origin (no userinfo)"
+        )
+
+    # `parsed.query`/`parsed.fragment` are empty strings both when the header is absent and when
+    # it's present but empty (a bare trailing '?' or '#'), so the raw value is checked instead.
+    has_query_or_fragment = "?" in value or "#" in value
+    if parsed.path == "/" and not has_query_or_fragment:
+        without_slash = value[: value.rindex("/")]
+        raise ValueError(
+            f"--cors origin {value!r} must not have a trailing slash; use {without_slash!r}"
+        )
+    if parsed.path or has_query_or_fragment:
+        raise ValueError(
+            f"--cors origin {value!r} must be a bare scheme://host[:port] origin, "
+            "with no path, query or fragment"
+        )
+
+    try:
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"--cors origin {value!r} has an invalid port") from exc
+
+    if not host:
+        raise ValueError(f"--cors origin {value!r} must be a bare scheme://host[:port] origin")
+    if port == 0:
+        raise ValueError(f"--cors origin {value!r} port must be between 1 and 65535")
+
+    host = _canonical_host(value, host)
+
+    port_suffix = "" if port is None or port == _DEFAULT_PORTS[scheme] else f":{port}"
+    return f"{scheme}://{host}{port_suffix}"
+
+
+def _canonical_host(value: str, host: str) -> str:
+    """``host`` is ``urlsplit(value).hostname``: already lowercased, brackets stripped, and, for
+    an IPv6 literal, hex digits already lowercased too."""
+    if "%" in host:
+        # A percent means an IPv6 zone id (`fe80::1%eth0`, or the URL-escaped `%25eth0`) --
+        # meaningful only on the machine that assigned the zone, so it can never appear in a
+        # browser's Origin header.
+        raise ValueError(f"--cors origin {value!r} must not include an IPv6 zone id")
+
+    if ":" in host:
+        # Only reachable via a bracketed IPv6 literal -- urlsplit treats an unbracketed ':' as
+        # the host/port separator -- so this must parse as IPv6 or the entry is malformed.
+        try:
+            return f"[{ipaddress.IPv6Address(host).compressed}]"
+        except ValueError as exc:
+            raise ValueError(f"--cors origin {value!r} has an invalid IPv6 host: {exc}") from exc
+
+    if re.fullmatch(r"[0-9.]+", host):
+        # All-digits-and-dots: this was clearly meant as an IPv4 literal, so a failure here (e.g.
+        # '127.1', which ipaddress rejects since it isn't all four dotted-quad octets) is reported
+        # as a bad IPv4 address rather than falling through to the hostname-syntax checks below.
+        try:
+            return str(ipaddress.IPv4Address(host))
+        except ValueError as exc:
+            raise ValueError(
+                f"--cors origin {value!r} host must be dotted-quad IPv4 (got {host!r}): {exc}"
+            ) from exc
+
+    try:
+        canonical = host.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError(f"--cors origin {value!r} has an invalid IDN host: {exc}") from exc
+
+    if "*" in canonical:
+        raise ValueError(
+            f"--cors origin {value!r}: wildcard hosts aren't supported; list each origin"
+        )
+    if not _HOST_CHARS_RE.fullmatch(canonical):
+        raise ValueError(
+            f"--cors origin {value!r} host must contain only letters, digits, '.' or '-' "
+            f"(got {host!r})"
+        )
+    return canonical
 _MAX_AGE = b"86400"
 _EXPOSE_HEADERS = b"X-Sample-Rate, X-Sample-Format, X-Breeze-Version"
 
@@ -64,13 +188,21 @@ def origin_allowed(policy: CorsPolicy, origin: str | None) -> bool:
     """Whether ``origin`` (an ``Origin`` header value, or ``None`` if the header is absent) may
     be served.
 
-    Comparison is exact, not case-insensitive: a browser's ``Origin`` header already carries a
-    lowercase scheme and host, and ``settings.py`` normalizes the allowlist the same way, so no
-    further folding happens here (an ``Origin`` header never carries a path to normalize).
+    A well-behaved browser already sends a lowercase scheme and host with no default port, which
+    is exactly the form ``settings.py`` normalizes the allowlist to -- but ``origin`` is run
+    through the same ``canonical_origin`` anyway, so a redundant default port or a stray uppercase
+    letter still matches. A malformed ``origin`` (never sent by a real browser) canonicalizes to
+    nothing and is simply treated as not allowed, not raised.
     """
     if origin is None:
         return False
-    return policy.wildcard or origin in policy.origins
+    if policy.wildcard:
+        return True
+    try:
+        canonical = canonical_origin(origin)
+    except ValueError:
+        return False
+    return canonical in policy.origins
 
 
 def response_headers(policy: CorsPolicy, origin: str | None) -> list[tuple[bytes, bytes]]:
