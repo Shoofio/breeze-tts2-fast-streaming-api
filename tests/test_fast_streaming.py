@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import itertools
 from types import SimpleNamespace
 
 import numpy as np
@@ -8,11 +9,15 @@ import pytest
 import torch
 
 from breeze_infer.templates import get_template
+from models.cudagraph.depth_decoder_graph import DepthDecoderGraph
 from models.cudagraph.sampling import (
+    MAX_REPETITION_PENALTY,
     MAX_TEMPERATURE,
     MIN_REPETITION_PENALTY,
     MIN_TEMPERATURE,
+    NumberRule,
     apply_repetition_penalty,
+    require_number,
     sample_logits,
 )
 from models.fast_streaming import (
@@ -182,6 +187,34 @@ def test_fast_cfg_zero_uses_negative_as_main() -> None:
     assert cfg.mode == "no_cfg"
     assert cfg.guidance_scale == 1.0
     assert cfg.use_negative_as_main is True
+
+
+@pytest.mark.parametrize("cfg_scale", [0.0, 0, 2.5, 100.0, np.float32(7.5)])
+def test_fast_cfg_accepts_scales_from_0_to_100(cfg_scale) -> None:
+    cfg = select_fast_cfg(
+        {
+            "cfg_scale": cfg_scale,
+            "cfg_negative_prompt_ids": torch.ones(1, 2, dtype=torch.long),
+        }
+    )
+
+    if cfg_scale != 0:
+        assert cfg.guidance_scale == pytest.approx(float(cfg_scale))
+
+
+@pytest.mark.parametrize(
+    "cfg_scale",
+    [float("nan"), float("inf"), -0.5, 100.5, 10**400, "4", True, None],
+)
+def test_fast_cfg_rejects_scales_outside_0_to_100(cfg_scale) -> None:
+    # Checked before the scale reaches a graph's guidance buffer.
+    with pytest.raises(ValueError, match="cfg_scale"):
+        select_fast_cfg(
+            {
+                "cfg_scale": cfg_scale,
+                "cfg_negative_prompt_ids": torch.ones(1, 2, dtype=torch.long),
+            }
+        )
 
 
 def test_fast_streaming_rejects_dual_cfg_fields() -> None:
@@ -510,36 +543,151 @@ def test_sampling_caps_the_temperature_at_the_override_maximum() -> None:
     assert tokens == {0}
 
 
-def test_tiny_repetition_penalty_is_floored() -> None:
-    # 30 / 1e-40 overflows float32 to inf, and softmax turns it into NaN.
+def test_smallest_repetition_penalty_keeps_logits_finite() -> None:
     logits = torch.tensor([[30.0, -30.0, 29.0, 0.0]])
     history = torch.tensor([0, 1])
 
-    floored = apply_repetition_penalty(logits.clone(), history, 1e-40)
-    expected = apply_repetition_penalty(logits.clone(), history, MIN_REPETITION_PENALTY)
+    penalised = apply_repetition_penalty(
+        logits.clone(), history, MIN_REPETITION_PENALTY
+    )
 
-    assert torch.isfinite(floored).all()
-    assert torch.equal(floored, expected)
+    assert torch.isfinite(penalised).all()
+    assert penalised[0].tolist() == pytest.approx([3e5, -3e-3, 29.0, 0.0])
+
+
+@pytest.mark.parametrize(
+    "penalty",
+    [
+        # 0 or a negative used to be floored into the strongest reward.
+        0.0,
+        -1.0,
+        1e-40,
+        MIN_REPETITION_PENALTY * (1 - 1e-9),
+        MAX_REPETITION_PENALTY * (1 + 1e-9),
+        float("nan"),
+        float("inf"),
+        10**400,
+        True,
+    ],
+)
+def test_repetition_penalty_outside_its_range_is_rejected(penalty) -> None:
+    logits = torch.tensor([[1.0, 2.0]])
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        apply_repetition_penalty(logits, torch.tensor([0]), penalty)
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        sample_logits(
+            logits,
+            temperature=1.0,
+            top_k=0,
+            top_p=1.0,
+            do_sample=True,
+            token_history=torch.tensor([0]),
+            repetition_penalty=penalty,
+        )
+
+
+def test_repetition_penalty_none_is_disabled() -> None:
+    logits = torch.tensor([[1.0, -2.0]])
+
+    assert torch.equal(
+        apply_repetition_penalty(logits.clone(), torch.tensor([0, 1]), None), logits
+    )
+
+
+@pytest.mark.parametrize("temperature", [float("nan"), float("inf"), 0.0, -1.0, 10**400])
+def test_invalid_sampling_temperature_is_rejected(temperature) -> None:
+    with pytest.raises(ValueError, match="temperature"):
+        sample_logits(
+            torch.tensor([[1.0, 2.0]]),
+            temperature=temperature,
+            top_k=0,
+            top_p=1.0,
+            do_sample=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "logits",
+    [
+        [[1.0, float("nan"), 2.0]],
+        [[1.0, float("inf"), 2.0]],
+        # Every token masked: softmax of all -inf is NaN.
+        [[float("-inf"), float("-inf"), float("-inf")]],
+    ],
+)
+def test_logits_that_cannot_form_a_distribution_are_rejected_before_softmax(
+    logits,
+) -> None:
+    # multinomial would raise on CPU, and on CUDA a device-side assert
+    # poisons the whole process.
+    with pytest.raises(ValueError, match="logits"):
+        sample_logits(
+            torch.tensor(logits), temperature=1.0, top_k=0, top_p=1.0, do_sample=True
+        )
+
+
+def test_masked_tokens_alone_do_not_trip_the_logits_guard() -> None:
     token = sample_logits(
-        logits,
+        torch.tensor([[float("-inf"), 1.0, float("-inf")]]),
         temperature=1.0,
         top_k=0,
         top_p=1.0,
         do_sample=True,
-        token_history=history,
-        repetition_penalty=1e-40,
     )
-    assert token.tolist()[0] in (0, 1, 2, 3)
+
+    assert token.tolist() == [1]
 
 
-def test_nan_sampling_parameters_are_rejected() -> None:
-    logits = torch.tensor([[1.0, 2.0]])
-    with pytest.raises(ValueError, match="temperature"):
-        sample_logits(
-            logits, temperature=float("nan"), top_k=0, top_p=1.0, do_sample=True
-        )
-    with pytest.raises(ValueError, match="repetition_penalty"):
-        apply_repetition_penalty(logits, torch.tensor([0]), float("nan"))
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [
+        (1.0, True),
+        (np.float32(0.5), True),
+        (0.0, False),
+        (float("nan"), False),
+        (10**400, False),
+        (True, False),
+        ("1", False),
+    ],
+)
+def test_require_number_is_the_one_shared_check(value, valid) -> None:
+    rule = NumberRule(integer=False, minimum=0.0, minimum_inclusive=False)
+    if valid:
+        require_number("x", value, rule)
+    else:
+        with pytest.raises(ValueError, match="x must be"):
+            require_number("x", value, rule)
+
+
+def _depth_sampler(temperature: float):
+    """A DepthDecoderGraph with only the state its captured _cfg_sample reads."""
+    graph = object.__new__(DepthDecoderGraph)
+    graph.batch_size = 1
+    graph.half = 1
+    graph.codec_codebook_size = 4
+    graph.vocab_size = 4
+    graph.guidance_scale = torch.ones(1, 1)
+    graph.temperature_buf = torch.full((1, 1), temperature)
+    graph.top_k_buf = torch.zeros(1, 1, dtype=torch.long)
+    graph._max_k = 4
+    graph._topk_ranks = torch.arange(4)
+    graph.top_p_buf = torch.ones(1, 1)
+    graph.do_sample_buf = torch.ones(1, dtype=torch.long)
+    graph._debug_probs_slot = None
+    graph._tok_buf = torch.zeros(1, dtype=torch.long)
+    return graph
+
+
+@pytest.mark.parametrize("temperature", [1e-40, 5e-324])
+def test_depth_decoder_sampling_floors_a_tiny_temperature(temperature) -> None:
+    # FastStreamingConfig(temperature=1e-40) is valid (> 0) and reaches the
+    # depth decoder's temperature buffer too.
+    assert FastStreamingConfig(temperature=temperature).temperature == temperature
+    graph = _depth_sampler(temperature)
+
+    graph._cfg_sample(torch.tensor([[[30.0, -30.0, 29.0, 0.0]]]))
+
+    assert graph._tok_buf.tolist() == [0]
 
 
 def test_numpy_scalar_overrides_are_accepted(monkeypatch) -> None:
@@ -864,7 +1012,12 @@ _PROFILE_BUCKETS = {(1, n) for n in range(32, 513, 32)}
         # Unfrozen cache: a bucket past max_seq_len runs eagerly, not raises.
         (True, _FakePrefillCache(set(), frozen=False), 1000, 1030, (False, 2030)),
         (True, None, 1000, 1030, (False, 2030)),
-        (True, _FakePrefillCache(set(), frozen=False), 1000, 1024, (True, 2048)),
+        (True, _FakePrefillCache(set(), frozen=False), 1000, 900, (True, 1924)),
+        # A bucket that would leave fewer than MIN_SUFFIX_FRAMES frames runs
+        # eagerly at the exact length instead, which leaves more.
+        (True, _FakePrefillCache(set(), frozen=False), 1000, 1024, (False, 2024)),
+        (True, None, 10, 2004, (False, 2014)),
+        (True, None, 10, 2003, (True, 2035)),
     ],
 )
 def test_prefill_plan(fast, cache, seq_len, prefix_len, plan) -> None:
@@ -980,6 +1133,34 @@ def test_min_suffix_room_leaves_about_a_second_of_audio() -> None:
     # 12 frames at the codec's 12.5 Hz is about 1 s.
     assert MIN_SUFFIX_FRAMES == 12
     assert MIN_SUFFIX_ROOM > MIN_SUFFIX_FRAMES
+
+
+# The default-instruction suffix MIN_SUFFIX_ROOM is built from.
+_MIN_SUFFIX_TOKENS = MIN_SUFFIX_ROOM - MIN_SUFFIX_FRAMES
+
+
+@pytest.mark.parametrize("prefix_len", range(2004, _LONGEST_PREFIX + 1))
+def test_every_accepted_prefix_keeps_its_min_suffix_frames(prefix_len) -> None:
+    # 2004-2017 used to take the graph path: the 10-token suffix padded to 32
+    # left 2048 - prefix - 33 < 12 frames.
+    runtime = _room_runtime(fast_backbone_prefill=True)
+
+    room = runtime.max_new_tokens_room(
+        None, _prompt(_MIN_SUFFIX_TOKENS), prefix_len=prefix_len
+    )
+
+    assert room >= MIN_SUFFIX_FRAMES
+
+
+@pytest.mark.parametrize("prefix_len", [0, 1000, 1990, 2004])
+def test_room_never_grows_with_a_longer_prompt(prefix_len) -> None:
+    runtime = _room_runtime(fast_backbone_prefill=True)
+    rooms = [
+        runtime.max_new_tokens_room(1500, _prompt(length), prefix_len=prefix_len)
+        for length in range(1, 2048 - prefix_len)
+    ]
+
+    assert all(later <= earlier for earlier, later in itertools.pairwise(rooms))
 
 
 def test_reference_prefix_is_not_limited_by_the_max_new_tokens_ceiling() -> None:

@@ -36,6 +36,7 @@ from transformers import StaticCache
 from transformers.masking_utils import create_causal_mask
 
 from ..logits_process import mask_invalid_codec_token_logits
+from .sampling import MAX_TEMPERATURE, MIN_TEMPERATURE
 
 _log = logging.getLogger(__name__)
 
@@ -511,8 +512,13 @@ class DepthDecoderGraph:
             token_vocab_size=self.vocab_size,
         )
 
-        # temperature scaling (on raw logits, same as TemperatureLogitsWarper)
-        scaled = cfg / self.temperature_buf  # [half, vocab]
+        # temperature scaling (on raw logits, same as TemperatureLogitsWarper),
+        # clamped to the sampler's range as sample_logits does: a tiny
+        # temperature (1e-40) overflows the logits to inf and softmax to NaN,
+        # and a graph cannot raise, so the clamp is the guard here.
+        scaled = cfg / self.temperature_buf.clamp(
+            MIN_TEMPERATURE, MAX_TEMPERATURE
+        )  # [half, vocab]
 
         # top_k on raw logits (graph-safe: fixed _max_k workspace)
         effective_k = torch.where(
