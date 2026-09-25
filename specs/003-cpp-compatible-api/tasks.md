@@ -448,7 +448,7 @@ the GPU smoke test.
   Nothing reads `app.state`; everything is passed in. `tests/test_synthesis.py` uses `FakeRuntime`:
   seeds per piece, inline reference encoded once for every piece and both CFG rows, and ramp
   growth.
-- [ ] T039 [US1] *(Opus)* Create `breeze_infer/streaming.py` (R2, R3). `SpeechResponse`, a
+- [X] T039 [US1] *(Opus)* Create `breeze_infer/streaming.py` (R2, R3). `SpeechResponse`, a
   `StreamingResponse` subclass:
   - `__init__` takes the primed first chunk and an async body.
   - `stream_response` wraps each `send` in `asyncio.timeout(HTTP_SEND_TIMEOUT_SECONDS)` and
@@ -458,7 +458,7 @@ the GPU smoke test.
     emit `speech.completed`, `speech.aborted` or `speech.failed`.
   - An exception after headers propagates, so uvicorn closes without the terminator. **Never use
     `BaseHTTPMiddleware` anywhere in the app.**
-- [ ] T040 [US1] Create `tests/test_speech_abort.py`. It runs a **real uvicorn** on an ephemeral
+- [X] T040 [US1] Create `tests/test_speech_abort.py`. It runs a **real uvicorn** on an ephemeral
   port with `FakeRuntime`:
   - `test_bc_17_failure_after_streaming_starts_aborts_the_response`: httpx raises
     `RemoteProtocolError`, and curl-style checks confirm there is no `0\r\n\r\n` terminator;
