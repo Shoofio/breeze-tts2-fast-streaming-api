@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import logging
 import os
 import signal
 import socket
@@ -40,6 +41,7 @@ from breeze_infer.routes_health import Readiness, install_health
 from breeze_infer.routes_speech import install_speech
 from breeze_infer.runtime import get_dist_info
 from breeze_infer.settings import Settings, settings_from_args
+from breeze_infer.streaming import ClientAbortLogFilter
 from breeze_infer.version_header import VersionHeaderMiddleware
 
 
@@ -273,6 +275,9 @@ class ServeOutcome:
     hard_exit: bool = False
 
 
+_CLIENT_ABORT_LOG_FILTER = ClientAbortLogFilter()
+
+
 async def serve(
     components: Components,
     app: ASGIApp,
@@ -287,6 +292,9 @@ async def serve(
     Signals: the first stops uvicorn gracefully, a second forces it (`request_exit`); one
     arriving after uvicorn has returned, while the GPU drains, cuts the drain short.
     """
+    # Streams the client ended are already `speech.aborted` events; no traceback for each.
+    # One shared instance, so repeated calls don't stack filters (addFilter skips duplicates).
+    logging.getLogger("uvicorn.error").addFilter(_CLIENT_ABORT_LOG_FILTER)
     server = _Server(
         uvicorn.Config(
             app,
