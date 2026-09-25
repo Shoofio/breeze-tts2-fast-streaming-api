@@ -27,6 +27,7 @@ from starlette.types import ASGIApp
 
 from breeze_infer import __version__
 from breeze_infer.body_limit import BodyLimitMiddleware
+from breeze_infer.cors import CorsMiddleware, CorsPolicy
 from breeze_infer.errors import install_error_handlers
 from breeze_infer.events import Emitter
 from breeze_infer.gpu import GpuGate, GpuThread
@@ -51,16 +52,18 @@ class Components:
 
 def create_app(components: Components) -> ASGIApp:
     """Build the FastAPI app and wrap it in the pure-ASGI middleware, outermost first:
-    version header, (CORS, T028), body limit, app.
+    version header, CORS, body limit, app.
     """
     # No /docs, /redoc or /openapi.json: FR-001 allows exactly the contract's routes.
     app = FastAPI(title="Breeze TTS", docs_url=None, redoc_url=None, openapi_url=None)
     install_error_handlers(app, components.events)
     install_health(app, components.readiness, components.ws_port)
 
-    inner: ASGIApp = BodyLimitMiddleware(app)
-    # T028: CorsMiddleware wraps `inner` here, inside the version header, so that CORS's own
-    # preflight and 403 responses carry X-Breeze-Version too.
+    policy = CorsPolicy(origins=components.settings.cors)
+    inner: ASGIApp = CorsMiddleware(BodyLimitMiddleware(app), policy, app.router)
+    # CORS sits outside the body limit and the app, so even its 413s and 500s carry CORS
+    # headers; the version header stays outermost, so CORS's own preflight and 403 responses
+    # carry X-Breeze-Version too.
     return VersionHeaderMiddleware(inner, version=__version__)
 
 

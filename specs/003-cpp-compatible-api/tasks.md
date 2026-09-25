@@ -317,7 +317,7 @@ route (quickstart Scenario 1.3–1.4); the SillyTavern `health` live gate passes
 
 ### Tests (write first; they must fail)
 
-- [ ] T026 [P] [US5] `tests/test_cors.py`: port the parse tests from `A:tests/test_cors.py`
+- [X] T026 [P] [US5] `tests/test_cors.py`: port the parse tests from `A:tests/test_cors.py`
   (~39–100), then add the following (contracts/http-api.md "CORS"):
   - `test_bc_19_allowlist_entries_are_trimmed`;
   - `test_bc_20_vary_origin_on_every_response_in_allowlist_mode`, including no Origin and a
@@ -335,13 +335,13 @@ route (quickstart Scenario 1.3–1.4); the SillyTavern `health` live gate passes
 
 ### Implementation
 
-- [ ] T027 [US5] Create `breeze_infer/cors.py` (R8):
+- [X] T027 [US5] Create `breeze_infer/cors.py` (R8):
   - Pure functions: `origin_allowed(policy, origin)`, `preflight_headers(policy, route_methods,
     requested_headers)`, `response_headers(policy, origin)`.
   - A pure-ASGI `CorsMiddleware(app, policy, router)`. It finds a route's methods with
     `route.matches(scope)` and `route.methods`, and it rejects unsafe methods (`POST`/`DELETE`)
     with a disallowed `Origin` by returning the `403` envelope before calling the app.
-- [ ] T028 [US5] Wire it up in `breeze_infer/api.py`:
+- [X] T028 [US5] Wire it up in `breeze_infer/api.py`:
   `VersionHeaderMiddleware(CorsMiddleware(BodyLimitMiddleware(fastapi_app)))`, so CORS sits
   outside the body limit and the app, and even `413`s and `500`s carry its headers; the version
   header stays outermost (T025). Build the policy from `Settings`. With CORS off the policy allows no
