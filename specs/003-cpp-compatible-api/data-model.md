@@ -67,8 +67,8 @@ Rules that apply to every field:
 - An empty value counts as absent.
 - A field that appears more than once (within the query string, within the body, or in both)
   gets `400 duplicate_field`.
-- Numbers must match a strict decimal grammar (for example `^-?\d+$` for integers). Non-finite
-  values are rejected.
+- Numbers must match a strict decimal grammar (integers match `^[+-]?\d+$`, with ASCII digits
+  only, matching contracts/http-api.md). Non-finite values are rejected.
 
 ### ReferenceSpec
 

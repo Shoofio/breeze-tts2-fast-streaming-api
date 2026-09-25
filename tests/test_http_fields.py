@@ -1022,7 +1022,7 @@ def test_bc_46_control_characters_get_400(tmp_path: Path, bad: str) -> None:
     )
     assert text_response.status_code == 400
     assert text_response.json() == {
-        "error": "text must not contain control characters",
+        "error": "text must be free of control characters",
         "code": "invalid_field",
     }
 
@@ -1031,7 +1031,7 @@ def test_bc_46_control_characters_get_400(tmp_path: Path, bad: str) -> None:
     )
     assert instruction_response.status_code == 400
     assert instruction_response.json() == {
-        "error": "instruction must not contain control characters",
+        "error": "instruction must be free of control characters",
         "code": "invalid_field",
     }
 
@@ -1041,7 +1041,7 @@ def test_bc_46_control_characters_get_400(tmp_path: Path, bad: str) -> None:
     )
     assert ref_text_response.status_code == 400
     assert ref_text_response.json() == {
-        "error": "ref_text must not contain control characters",
+        "error": "ref_text must be free of control characters",
         "code": "invalid_field",
     }
 
@@ -1110,3 +1110,241 @@ def test_underflowing_nonzero_literal_is_400_not_default(
 
     assert response.status_code == 400
     assert response.json()["code"] == "invalid_field"
+
+
+# --- more malformed-corpus coverage (tasks.md T044/T048, Phase 5 checkpoint follow-ups) --
+
+
+def test_bc_01_integer_longer_than_20_digits_gets_400(tmp_path: Path) -> None:
+    """BC-01: an integer literal too long to ever be in range (over 20 digits) is rejected
+    with `400` naming the field's own range, not left to reach `int()` -- which, past
+    Python's 4,300-digit string-conversion ceiling, raises unhandled and would otherwise
+    surface as a `500`. The C++ server parsed a number with `atoi`/`strtod`-family
+    functions, which don't raise for an over-long digit string at all (they just saturate
+    or give undefined results); this server must never crash on one instead.
+    """
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "seed": "9" * 4400}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "seed must be an integer between 0 and 4294967295",
+        "code": "invalid_field",
+    }
+
+
+@pytest.mark.parametrize("bad", ["\x1c", "\x1d", "\x1e", "\x1f", "\x85"])
+def test_bc_46_control_character_that_python_calls_whitespace_is_rejected(
+    tmp_path: Path, bad: str
+) -> None:
+    """BC-46: `\\x1c`-`\\x1f` and `\\x85` (NEL) are control characters this contract
+    rejects, even though Python's own `str.strip()`/`str.isspace()` treat them as
+    whitespace -- a `text` or `instruction` consisting of *only* one of these must not be
+    mistaken for a blank field (`text_required`, or `instruction`'s default) instead of the
+    control-character violation it actually is. The C++ server accepted every control
+    character in these fields (and treated NUL as sentence-closing punctuation).
+    """
+    text_response = _client(tmp_path).post("/speech", data={"text": bad})
+    assert text_response.status_code == 400
+    assert text_response.json() == {
+        "error": "text must be free of control characters",
+        "code": "invalid_field",
+    }
+
+    instruction_response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "instruction": bad}
+    )
+    assert instruction_response.status_code == 400
+    assert instruction_response.json() == {
+        "error": "instruction must be free of control characters",
+        "code": "invalid_field",
+    }
+
+
+def test_bc_08_duplicate_ref_audio_file_parts_get_400(tmp_path: Path) -> None:
+    """BC-08: two `ref_audio` file parts under the same name -- both otherwise valid -- is
+    `400 duplicate_field`, not the last one silently winning. The C++ server (and a naive
+    `form.get`) would just use whichever file part it read last.
+    """
+    boundary = "xxxxBOUNDARYxxxx"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="text"\r\n\r\n'
+        "hi\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="ref_audio"; filename="a.wav"\r\n'
+        "Content-Type: audio/wav\r\n\r\n"
+        "first file bytes\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="ref_audio"; filename="b.wav"\r\n'
+        "Content-Type: audio/wav\r\n\r\n"
+        "second file bytes\r\n"
+        f"--{boundary}--\r\n"
+    ).encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio was given more than once",
+        "code": "duplicate_field",
+    }
+
+
+def test_bc_08_duplicate_detection_runs_before_other_field_errors(
+    tmp_path: Path,
+) -> None:
+    """BC-08: duplicate-field detection is one upfront pass over every key present, run
+    before any single field's own syntax is checked -- a too-long `text` (which would
+    otherwise be `400 text_too_long`) must not shadow an unrelated duplicated `seed`. The
+    C++ server resolved a duplicate field silently, using whichever value it parsed last,
+    and never checked one field's validity before another's.
+    """
+    body = ("text=" + "a" * (MAX_TEXT_CHARS + 1) + "&seed=1&seed=2").encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "seed was given more than once",
+        "code": "duplicate_field",
+    }
+
+
+def test_bc_08_duplicate_unknown_field_gets_400(tmp_path: Path) -> None:
+    """BC-08: "a field present more than once, anywhere, gets 400" applies to every key on
+    the wire, not just the ones `parse_speech` reads -- `foo` isn't a field this contract
+    defines at all, but repeating it is still rejected. The C++ server ignored unknown
+    fields entirely, duplicated or not.
+    """
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi"}, params=[("foo", "1"), ("foo", "2")]
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "foo was given more than once",
+        "code": "duplicate_field",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "raw"),
+    [
+        ("temperature", "10.0000000000000001"),
+        ("top_p", "1.00000000000000001"),
+        ("repetition_penalty", "0.00009999999999999999999"),
+    ],
+)
+def test_bc_03_decimal_range_bound_is_exact(
+    tmp_path: Path, field: str, raw: str
+) -> None:
+    """BC-03: a decimal literal just past a range boundary is rejected even when `float`'s
+    limited precision would otherwise round it into range (`float("10.0000000000000001")`
+    is exactly `10.0`) -- the bound comparison is exact, against the literal digits, not the
+    parsed float. The C++ server didn't range-check these fields at all.
+    """
+    response = _client(tmp_path).post("/speech", data={"text": "hi", field: raw})
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+
+
+# voice_id is validated here as a lookup key -- either a saved voice's name
+# ([A-Za-z0-9_-]{1,64}, contracts/http-api.md POST /v1/voices, which can never itself start
+# with v_ per BC-26) or an unnamed voice's v_ + 16 lowercase hex id. Whether the id actually
+# names a registered voice is Phase 7's concern (the stub 404 lookup); these only check its
+# shape, which the C++ server never validated at all (any string reached its lookup as-is).
+
+
+def test_voice_id_with_invalid_characters_gets_400(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "voice_id": "not a valid name!"}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "voice_id must be a voice name or v_ id",
+        "code": "invalid_field",
+    }
+
+
+def test_voice_id_saved_name_is_accepted(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "voice_id": "alice-1_2"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reference"]["voice_id"] == "alice-1_2"
+
+
+def test_voice_id_v_id_is_accepted(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "voice_id": "v_" + "a1b2c3d4e5f60789"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reference"]["voice_id"] == "v_a1b2c3d4e5f60789"
+
+
+def test_voice_id_v_prefixed_but_not_valid_hex_gets_400(tmp_path: Path) -> None:
+    """A `v_`-prefixed string that isn't 16 lowercase hex characters can't be a real
+    unnamed-voice id, and structurally can't be a saved name either (BC-26: a saved name
+    can never start with `v_`) -- so it's rejected, even though its characters alone would
+    otherwise fit the general name pattern."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "voice_id": "v_not-a-real-id"}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "voice_id must be a voice name or v_ id",
+        "code": "invalid_field",
+    }
+
+
+def test_blank_ref_text_counts_as_absent_with_voice_id(tmp_path: Path) -> None:
+    """A whitespace-only `ref_text` counts as absent (BC-02's general rule, extended to
+    "blank" the same way `instruction`'s own default check works), decided only after the
+    control-character check -- so a `ref_text` that's genuinely a control character is
+    still rejected, never silently treated as blank. Paired with `voice_id`, a blank
+    `ref_text` means no override of the voice's stored transcript.
+    """
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "voice_id": "alice", "ref_text": "   "}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reference"] == {
+        "kind": "voice",
+        "voice_id": "alice",
+        "ref_text_override": None,
+    }
+
+
+def test_blank_ref_text_counts_as_absent_needing_ref_text_required_with_ref_audio(
+    tmp_path: Path,
+) -> None:
+    """A whitespace-only `ref_text` counts as absent -- paired with `ref_audio`, that means
+    `ref_text` is missing, so this is `400 ref_text_required`, the same as omitting it
+    outright."""
+    response = _client(tmp_path).post(
+        "/speech",
+        data={"text": "hi", "ref_text": "   "},
+        files={"ref_audio": ("ref.wav", b"anything", "audio/wav")},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_text is required with ref_audio",
+        "code": "ref_text_required",
+    }

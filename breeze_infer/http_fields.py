@@ -60,6 +60,7 @@ import math
 import re
 import unicodedata
 from dataclasses import dataclass
+from decimal import Decimal
 from urllib.parse import parse_qsl
 
 from fastapi import Request
@@ -83,8 +84,12 @@ DEFAULT_CFG_SCALE = 1.0
 DEFAULT_SEED = 42
 
 # The limits passed to the multipart parser, and to _urlencoded_pairs_sync by hand
-# (research.md R6).
-FORM_MAX_FILES = 1
+# (research.md R6). review-agent pass 1 finding #4: 2, not 1 -- letting Starlette's own
+# parser accept a *second* file part at all is what lets `_split_multipart_fields` below
+# tell "a second ref_audio file" (400 duplicate_field) apart from "too many files"
+# (Starlette's own generic MultiPartException); with max_files still 1, the second file
+# would never reach this module's own code to be told apart from anything.
+FORM_MAX_FILES = 2
 FORM_MAX_FIELDS = 32
 # T037 review 1 finding #3, review 2 finding #4: a 4-byte UTF-8 code point (an emoji, or a
 # CJK Extension-B character) percent-encodes to 12 ASCII bytes ("%XX" x 4), so a urlencoded
@@ -337,6 +342,11 @@ def _split_multipart_fields(form: FormData) -> tuple[list[tuple[str, str]], Uplo
     `form.get("ref_audio")` alone would miss an earlier, invalid text `ref_audio` sent
     before a later, valid file part under the same name. Every other field must be text
     (review 1 finding #1): a file part sent under any other field name is rejected outright.
+
+    review-agent pass 1 finding #4: a *second* valid `ref_audio` file part is
+    `400 duplicate_field`, not silently the last-one-wins `form.get` would give -- `FORM_MAX_FILES`
+    is 2 specifically so this loop gets the chance to see that second part and say so, rather
+    than Starlette's own parser rejecting it first with its own generic "too many files" error.
     """
     pairs: list[tuple[str, str]] = []
     ref_audio_part: UploadFile | None = None
@@ -344,6 +354,8 @@ def _split_multipart_fields(form: FormData) -> tuple[list[tuple[str, str]], Uplo
         if name == "ref_audio":
             if not isinstance(value, UploadFile):
                 raise ApiError(400, "invalid_field", "ref_audio must be a file part")
+            if ref_audio_part is not None:
+                raise ApiError(400, "duplicate_field", "ref_audio was given more than once")
             ref_audio_part = value
             continue
         if isinstance(value, UploadFile):
@@ -361,20 +373,38 @@ async def _read_ref_audio_bytes(part: UploadFile | None) -> bytes | None:
     return await part.read(MAX_AUDIO_BYTES + 1)
 
 
+def _check_no_duplicate_fields(fields: Fields) -> None:
+    """BC-08, review-agent pass 1 finding #5: one upfront pass over every key actually
+    present in the form or the query string -- known to this contract or not (`foo=1&foo=2`
+    is `400 duplicate_field` even though `foo` isn't a field `parse_speech` ever reads) --
+    run before any other field-level check.
+
+    This has to run first, not lazily inside `_first`: a request whose `text` happens to be
+    too long but whose unrelated `seed` is duplicated must still get `duplicate_field`, not
+    `text_too_long` -- which only holds if every key is checked before any single field's
+    own syntax is.
+
+    `ref_audio` is a separate concern, handled where it's actually read
+    (`_split_multipart_fields`'s own duplicate check): it's a file part, never a member of
+    `fields.form`/`fields.query`, so it can't be seen from here.
+    """
+    names = dict.fromkeys([*fields.form.keys(), *fields.query.keys()])
+    for name in names:
+        form_count = len(fields.form.getlist(name))
+        query_count = len(fields.query.getlist(name))
+        if form_count > 1 or query_count > 1 or (form_count and query_count):
+            raise ApiError(400, "duplicate_field", f"{_label(name)} was given more than once")
+
+
 def _first(fields: Fields, name: str) -> str | None:
     """The field's value, or `None` when it's absent or empty (BC-02).
 
-    BC-08: a field given more than once -- twice in the form, twice in the query string, or
-    once in each -- is `400 duplicate_field` before anything else is checked about it.
-    Reading `form.getlist`/`query.getlist` separately (rather than a single merged list) is
-    what lets this tell those cases apart, which the message needs in order to stay
-    accurate regardless of which source doubled up.
+    Duplicate detection (BC-08) already ran once, upfront, over every key present
+    (`_check_no_duplicate_fields`, called first thing in `parse_speech`) -- by the time this
+    runs, `name` is already known to have at most one value between the form and the query
+    string, so this is purely "the one value, empty means absent".
     """
-    form_values = fields.form.getlist(name)
-    query_values = fields.query.getlist(name)
-    if len(form_values) > 1 or len(query_values) > 1 or (form_values and query_values):
-        raise ApiError(400, "duplicate_field", f"{_label(name)} was given more than once")
-    values = [*form_values, *query_values]
+    values = [*fields.form.getlist(name), *fields.query.getlist(name)]
     if not values or values[0] == "":
         return None
     return values[0]
@@ -390,14 +420,31 @@ def _first(fields: Fields, name: str) -> str | None:
 _INT_LITERAL = re.compile(r"[+-]?\d+", re.ASCII)
 _DECIMAL_LITERAL = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", re.ASCII)
 
+# review-agent pass 1 finding #1 (HIGH): Python 3.11+ refuses to convert a digit string
+# longer than `sys.get_int_max_str_digits()` (4,300 by default) to `int` at all -- it
+# raises `ValueError`, uncaught, which reached the client as a bare `500`. No field this
+# contract validates ever needs more than 10 digits (the widest range, seed, tops out at
+# 4294967295); 20 is a generous margin that's still nowhere near the CPython limit, so a
+# literal this long is rejected as out-of-range before `int()` is ever called on it, rather
+# than relying on a limit that exists for a different reason and could itself change.
+_MAX_INT_LITERAL_DIGITS = 20
 
-def _parse_int(value: str, field: str) -> int:
+
+def _parse_int(value: str, field: str, rule: str) -> int:
     """The strict integer grammar (BC-01): reject anything `int()` itself is more lenient
     about than the contract is -- surrounding whitespace, a non-ASCII digit, underscore
     digit separators -- before ever calling `int()`, so only a string already known to
-    match `^[+-]?\\d+$` reaches it."""
+    match `^[+-]?\\d+$` reaches it.
+
+    `rule` is the field's own range wording, used only for the digit-count guard above: a
+    literal that grammar-matched (it *is* all digits) but is absurdly long is out of range,
+    not malformed, so it gets that field's `"<field> must be <rule>"` message, not the
+    generic "must be an integer" one.
+    """
     if _INT_LITERAL.fullmatch(value) is None:
         raise ApiError(400, "invalid_field", f"{field} must be an integer")
+    if len(value.lstrip("+-")) > _MAX_INT_LITERAL_DIGITS:
+        raise ApiError(400, "invalid_field", f"{field} must be {rule}")
     return int(value)
 
 
@@ -438,14 +485,49 @@ def _check_int_range(value: int, field: str, low: int, high: int, rule: str) -> 
 
 
 def _check_decimal_range(
-    value: float, field: str, low: float, high: float, *, low_inclusive: bool, rule: str
+    literal: str,
+    value: float,
+    field: str,
+    low: str,
+    high: str,
+    *,
+    low_inclusive: bool,
+    rule: str,
 ) -> None:
-    """`math.isfinite` guards an overflowed literal (e.g. `cfg_scale=1e400`, which parses to
-    `inf`): every field this module validates has a finite `high`, so `inf` would otherwise
-    fail the ordinary `value <= high` comparison anyway, but checking it explicitly doesn't
-    depend on that staying true for every future caller."""
-    in_range = (value >= low) if low_inclusive else (value > low)
-    if not (math.isfinite(value) and in_range and value <= high):
+    """review-agent pass 1 finding #6: the bound comparison also checks `literal`, via
+    `decimal.Decimal`, not just the parsed `float`. `float`'s limited (~15-17 significant
+    digit) precision can round a genuinely out-of-range literal into range --
+    `float("10.0000000000000001") == 10.0` exactly, so a naive `value <= 10` would wrongly
+    accept it. `decimal.Decimal` parses the literal exactly, so that comparison is exact.
+
+    `low`/`high` are strings, not `float`/`int`, for the same reason: `Decimal(0.0001)`
+    (from the *float* `0.0001`, which itself can't be represented exactly in binary) would
+    reintroduce the very imprecision this function exists to avoid, where `Decimal("0.0001")`
+    (from the literal digits) doesn't.
+
+    The `Decimal` check alone isn't sufficient, though: `value` (`float(literal)`) is what
+    every caller actually keeps and returns downstream, and `float` underflow means the two
+    can disagree about which side of the boundary a tiny literal is on. `temperature=1e-400`
+    is a genuinely positive `Decimal` -- `Decimal` comparison alone would call it in-range
+    for `(0, 10]` -- but `float("1e-400")` underflows to exactly `0.0`, which is *not* in
+    `(0, 10]`, and `0.0` is what this field would actually carry from here on (the runtime's
+    own range check, aligned to this same table, would then raise on that stored `0.0` after
+    the busy check -- a `500` this validation exists to prevent). So both the exact `Decimal`
+    check and the ordinary `float` check must pass; either one failing is out of range.
+    """
+    decimal_value = Decimal(literal)
+    low_bound = Decimal(low)
+    high_bound = Decimal(high)
+    decimal_in_range = (
+        decimal_value >= low_bound if low_inclusive else decimal_value > low_bound
+    ) and decimal_value <= high_bound
+
+    float_low, float_high = float(low), float(high)
+    float_in_range = (
+        value >= float_low if low_inclusive else value > float_low
+    ) and value <= float_high
+
+    if not (math.isfinite(value) and decimal_in_range and float_in_range):
         raise ApiError(400, "invalid_field", f"{field} must be {rule}")
 
 
@@ -457,7 +539,7 @@ def _optional_int(fields: Fields, name: str, low: int, high: int, rule: str) -> 
     raw = _first(fields, name)
     if raw is None:
         return None
-    value = _parse_int(raw, name)
+    value = _parse_int(raw, name, rule)
     if value == 0:
         return None
     _check_int_range(value, name, low, high, rule)
@@ -465,7 +547,7 @@ def _optional_int(fields: Fields, name: str, low: int, high: int, rule: str) -> 
 
 
 def _optional_decimal(
-    fields: Fields, name: str, low: float, high: float, *, low_inclusive: bool, rule: str
+    fields: Fields, name: str, low: str, high: str, *, low_inclusive: bool, rule: str
 ) -> float | None:
     """FR-006: `0` (or an absent field) means the model default (`None`); otherwise the
     value must fall in the given range. The sentinel is decided from the literal text
@@ -478,7 +560,7 @@ def _optional_decimal(
     value = _parse_decimal(raw, name)
     if _is_zero_literal(raw):
         return None
-    _check_decimal_range(value, name, low, high, low_inclusive=low_inclusive, rule=rule)
+    _check_decimal_range(raw, value, name, low, high, low_inclusive=low_inclusive, rule=rule)
     return value
 
 
@@ -491,24 +573,35 @@ def _check_no_control_characters(value: str, field: str) -> None:
     """
     for ch in value:
         if ch not in "\t\r\n" and unicodedata.category(ch) == "Cc":
-            raise ApiError(
-                400, "invalid_field", f"{field} must not contain control characters"
-            )
+            # review-agent pass 1 finding #8: contract wording, "<field> must be <rule>".
+            raise ApiError(400, "invalid_field", f"{field} must be free of control characters")
 
 
 def _validated_text_field(fields: Fields, name: str, max_chars: int) -> str | None:
     """A text field's value (`None` when absent, BC-02), length- and control-character-
-    checked (BC-05/BC-46) -- shared by `instruction` and `ref_text`, whose only difference
-    from each other is their max length and (for `instruction`) the blank-means-default
-    rule the caller applies around this. `text` doesn't use this: it has its own
-    `text_required`/`text_too_long` codes instead of `invalid_field`.
+    checked (BC-05/BC-46) -- shared by `ref_text`, and (via its own inline copy of this
+    ordering) `text`/`instruction` in `parse_speech`, whose only differences are their max
+    length and their own blank-handling.
+
+    review-agent pass 1 findings #2/#3/#9: the control-character check runs *before* the
+    blank check, in that order, not after. `str.strip()` (and `str.isspace()`) treats
+    several `Cc` control characters -- `\\x1c`-`\\x1f`, `\\x85` NEL -- as whitespace, even
+    though they're exactly the characters BC-46 rejects; checking blank-ness first would let
+    a value that is *only* one of those slip through as "blank" instead of being caught as
+    the control-character violation it actually is. Once that's ruled out, a value that
+    really is blank (finding #9: e.g. all spaces, or empty) counts as absent here, the same
+    as `ref_text`'s general BC-02 "empty means absent" -- `text` and `instruction` apply
+    their own, different meaning of "blank" (`text_required`, or `instruction`'s default)
+    around their own copy of this ordering instead.
     """
     raw = _first(fields, name)
     if raw is None:
         return None
+    _check_no_control_characters(raw, name)
+    if not raw.strip():
+        return None
     if len(raw) > max_chars:
         raise ApiError(400, "invalid_field", f"{name} must be at most {max_chars} characters")
-    _check_no_control_characters(raw, name)
     return raw
 
 
@@ -540,6 +633,25 @@ class InlineRef:
 # annotation) builds a real `types.UnionType`, usable both as a runtime value and as a type.
 ReferenceSpec = NoReference | VoiceRef | InlineRef
 
+# review-agent pass 1 finding #7: `voice_id` is a *lookup* key, so it must accept either
+# shape a real voice id can have: a saved voice's name (contracts/http-api.md POST
+# /v1/voices `name` field, which BC-26 forbids from ever starting with `v_`), or an
+# unnamed voice's auto-generated `v_` + 16-lowercase-hex id (data-model.md). Whether the id
+# actually exists is Phase 7's concern (the stub 404 lookup); this only checks its shape.
+_VOICE_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}", re.ASCII)
+_VOICE_UNNAMED_ID_PATTERN = re.compile(r"v_[0-9a-f]{16}", re.ASCII)
+
+
+def _is_valid_voice_id(value: str) -> bool:
+    """Branches on the `v_` prefix rather than just matching `_VOICE_NAME_PATTERN` alone:
+    that pattern's character class would also accept a `v_`-prefixed string that isn't a
+    real 16-hex id (e.g. `v_not-a-real-id`) as if it were a plausible saved name -- which it
+    structurally can't be, since BC-26 forbids a saved name from ever starting with `v_`.
+    """
+    if value.startswith("v_"):
+        return _VOICE_UNNAMED_ID_PATTERN.fullmatch(value) is not None
+    return _VOICE_NAME_PATTERN.fullmatch(value) is not None
+
 
 def _build_reference(fields: Fields) -> ReferenceSpec:
     """data-model.md "ReferenceSpec": build the variant these fields describe.
@@ -556,6 +668,10 @@ def _build_reference(fields: Fields) -> ReferenceSpec:
     turns an empty blob into `400 invalid_audio` (data-model.md "DecodedAudio").
     """
     voice_id = _first(fields, "voice_id")
+    if voice_id is not None and not _is_valid_voice_id(voice_id):
+        # A field-syntax check (FR-007 order), so it runs before the reference-consistency
+        # checks below, same as ref_text's own length/control-character check does.
+        raise ApiError(400, "invalid_field", "voice_id must be a voice name or v_ id")
     ref_audio = fields.ref_audio
     # ref_text's own syntax (length, control characters) is checked here, before the
     # reference-consistency checks below, per FR-007's order: field syntax and ranges
@@ -603,18 +719,32 @@ def parse_speech(fields: Fields, settings: Settings) -> SpeechRequest:
     """data-model.md "SpeechRequest": defaults, ranges, length limits, the control-
     character rule and FR-006's `0` -> `None` all applied, in the field's table order.
     """
+    # review-agent pass 1 finding #5: duplicate detection is one upfront pass over every
+    # key present, run before any other field is even read -- so it beats, rather than
+    # loses to, a field's own syntax error (e.g. a too-long `text` alongside a duplicated,
+    # unrelated `seed` is `duplicate_field`, not `text_too_long`).
+    _check_no_duplicate_fields(fields)
+
     text = _first(fields, "text")
+    # review-agent pass 1 findings #2/#3: control characters are checked before the blank
+    # check, not after -- str.strip() treats several Cc control characters (\x1c-\x1f,
+    # \x85 NEL) as whitespace, so checking blank-ness first would let a `text` that is
+    # *only* one of those silently become "blank" (text_required) instead of the BC-46
+    # violation it actually is.
+    if text is not None:
+        _check_no_control_characters(text, "text")  # BC-46
     if text is None or not text.strip():
         raise ApiError(400, "text_required", "text is required")  # BC-10
     if len(text) > MAX_TEXT_CHARS:  # BC-05
         raise ApiError(400, "text_too_long", "text is too long")
-    _check_no_control_characters(text, "text")  # BC-46
 
     # BC-09: a blank (or absent) instruction uses the default; a non-blank one is kept
-    # exactly as given, not stripped -- its length and control characters are only
-    # checked once it's known not to be blank, since a huge whitespace-only string is
-    # still "blank" (BC-09), not "too long".
+    # exactly as given, not stripped -- its length is only checked once it's known not to
+    # be blank, since a huge whitespace-only string is still "blank" (BC-09), not "too
+    # long". Control characters, same as `text` above, are checked before that blank check.
     instruction_raw = _first(fields, "instruction")
+    if instruction_raw is not None:
+        _check_no_control_characters(instruction_raw, "instruction")
     if instruction_raw is None or not instruction_raw.strip():
         instruction = DEFAULT_INSTRUCTION
     else:
@@ -624,7 +754,6 @@ def parse_speech(fields: Fields, settings: Settings) -> SpeechRequest:
                 "invalid_field",
                 f"instruction must be at most {MAX_INSTRUCTION_CHARS} characters",
             )
-        _check_no_control_characters(instruction_raw, "instruction")
         instruction = instruction_raw
 
     cfg_scale_raw = _first(fields, "cfg_scale")
@@ -633,10 +762,11 @@ def parse_speech(fields: Fields, settings: Settings) -> SpeechRequest:
     else:
         cfg_scale = _parse_decimal(cfg_scale_raw, "cfg_scale")
         _check_decimal_range(
+            cfg_scale_raw,
             cfg_scale,
             "cfg_scale",
-            0,
-            100,
+            "0",
+            "100",
             low_inclusive=True,
             rule="finite and between 0 and 100",
         )
@@ -645,19 +775,20 @@ def parse_speech(fields: Fields, settings: Settings) -> SpeechRequest:
     if seed_raw is None:
         seed = DEFAULT_SEED
     else:
-        seed = _parse_int(seed_raw, "seed")
-        _check_int_range(seed, "seed", 0, 4_294_967_295, "an integer between 0 and 4294967295")
+        seed_rule = "an integer between 0 and 4294967295"
+        seed = _parse_int(seed_raw, "seed", seed_rule)
+        _check_int_range(seed, "seed", 0, 4_294_967_295, seed_rule)
 
     temperature = _optional_decimal(
-        fields, "temperature", 0, 10, low_inclusive=False,
+        fields, "temperature", "0", "10", low_inclusive=False,
         rule="0, or greater than 0 and at most 10",
     )
     top_k = _optional_int(fields, "top_k", 1, 10_000, "0, or an integer between 1 and 10000")
     top_p = _optional_decimal(
-        fields, "top_p", 0, 1, low_inclusive=False, rule="0, or greater than 0 and at most 1"
+        fields, "top_p", "0", "1", low_inclusive=False, rule="0, or greater than 0 and at most 1"
     )
     repetition_penalty = _optional_decimal(
-        fields, "repetition_penalty", 0.0001, 10, low_inclusive=True,
+        fields, "repetition_penalty", "0.0001", "10", low_inclusive=True,
         rule="0, or between 0.0001 and 10",
     )
     max_new_tokens = _optional_int(
@@ -672,8 +803,9 @@ def parse_speech(fields: Fields, settings: Settings) -> SpeechRequest:
     if split_chars_raw is None:
         split_chars = settings.split_chars
     else:
-        split_chars = _parse_int(split_chars_raw, "split_chars")
-        _check_int_range(split_chars, "split_chars", 0, 10_000, "an integer between 0 and 10000")
+        split_chars_rule = "an integer between 0 and 10000"
+        split_chars = _parse_int(split_chars_raw, "split_chars", split_chars_rule)
+        _check_int_range(split_chars, "split_chars", 0, 10_000, split_chars_rule)
 
     return SpeechRequest(
         text=text,
