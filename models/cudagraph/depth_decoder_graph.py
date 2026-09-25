@@ -115,6 +115,12 @@ class DepthDecoderGraph:
         self.device = device
         self.dtype = dtype
         self.config = config
+        # Set on the device by _cfg_sample when a row had no finite logit (it
+        # then samples a fixed code instead). One tensor shared by every
+        # bucket's graph and the eager path, cleared before each run, and read
+        # by the caller at its existing per-frame host sync. A captured graph
+        # cannot raise, so this flag is how its guard reports.
+        self.nonfinite_logits = torch.zeros(1, dtype=torch.bool, device=device)
         self.debug = debug
         self.no_graph = (
             False  # runtime flag: True = skip graph replay (for layer-diff hooks)
@@ -512,6 +518,18 @@ class DepthDecoderGraph:
             token_vocab_size=self.vocab_size,
         )
 
+        # Capture-safe guard (no host sync). NaN and +inf entries become -inf,
+        # so sampling skips them. A row left with no finite logit cannot be
+        # sampled at all: multinomial on it is a CUDA device assert that
+        # poisons the process. Such a row samples from zeros, gets the fixed
+        # code 0 below, and sets nonfinite_logits for the caller to raise on.
+        cfg = torch.where(
+            torch.isfinite(cfg), cfg, torch.full_like(cfg, float("-inf"))
+        )
+        row_ok = torch.isfinite(cfg.amax(dim=-1))  # [half]
+        self.nonfinite_logits.logical_or_(~row_ok.all())
+        cfg = torch.where(row_ok.unsqueeze(-1), cfg, torch.zeros_like(cfg))
+
         # temperature scaling (on raw logits, same as TemperatureLogitsWarper),
         # clamped to the sampler's range as sample_logits does: a tiny
         # temperature (1e-40) overflows the logits to inf and softmax to NaN,
@@ -560,6 +578,7 @@ class DepthDecoderGraph:
         toks = torch.where(
             self.do_sample_buf.bool(), sampled_toks, greedy_toks
         )  # [half] per-sample
+        toks = torch.where(row_ok, toks, torch.zeros_like(toks))
 
         # Write to the active slots; duplicate for paired cond/uncond mode.
         self._tok_buf[: self.half] = toks
@@ -883,6 +902,7 @@ class DepthDecoderGraph:
             self.set_guidance_scale(guidance_scale)
 
         self.static_cache.reset()
+        self.nonfinite_logits.zero_()
         self._full_loop()
         return self.output_tokens[: self.half].clone()
 
@@ -985,6 +1005,7 @@ class DepthDecoderGraph:
 
         # Replay graph
         self.static_cache.reset()
+        self.nonfinite_logits.zero_()
         state.graph.replay()
 
         if self.debug and self._debug_head_input is not None:

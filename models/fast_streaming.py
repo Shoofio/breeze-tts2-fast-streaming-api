@@ -21,6 +21,7 @@ from .cudagraph.depth_decoder_graph import DepthDecoderGraph
 from .cudagraph.sampling import (
     MAX_TEMPERATURE,
     REPETITION_PENALTY_RULE,
+    UNSAMPLEABLE_TOKEN,
     NumberRule,
     require_number,
     sample_logits,
@@ -42,11 +43,10 @@ _DUAL_CFG_KEYS = (
 _PREFILL_TOKEN_GRANULARITY = 32
 
 # Per-request overrides. Counts must be integers (a fraction is a caller bug,
-# not something to truncate). The upper bounds on the logit-scaling floats are
-# far past any useful setting (the API allows much less) and keep absurd values
-# a caller error rather than a numerics question; top_p needs none, since above
-# 1 it filters nothing. The penalty's range is the sampler's own
-# (REPETITION_PENALTY_RULE: its floor keeps a divided positive logit finite).
+# not something to truncate). temperature and repetition_penalty take the HTTP
+# contract's ranges, which are also the sampler's own (MAX_TEMPERATURE,
+# REPETITION_PENALTY_RULE, whose floor keeps a divided positive logit finite);
+# top_p needs no upper bound here, since above 1 it filters nothing.
 _OVERRIDE_RULES = {
     "temperature": NumberRule(False, 0.0, False, MAX_TEMPERATURE),
     "top_k": NumberRule(True, 0, False),
@@ -195,16 +195,47 @@ def select_fast_cfg(inputs: dict[str, Any]) -> FastCfgSelection:
 
 
 def is_backbone_eos_token(token: torch.Tensor | int, config: Any) -> bool:
+    """Whether ``token`` ends generation; raises on ``UNSAMPLEABLE_TOKEN``.
+
+    This is the decode loop's per-step host read of the backbone token, so it
+    is also where the sampler's sync-free guard is checked: a token that could
+    not be sampled fails the request here, before it reaches the depth decoder
+    or the codec.
+    """
     token_id = int(token.item() if isinstance(token, torch.Tensor) else token)
+    if token_id == UNSAMPLEABLE_TOKEN:
+        raise ValueError(
+            "backbone logits contain NaN or +inf, or no finite value; cannot sample"
+        )
     return token_id == int(config.vocab_size)
 
 
-def is_terminal_pad_frame(frame: torch.Tensor, config: Any) -> bool:
-    return bool((frame == int(config.codebook_pad_token_id)).all().item())
+def _frame_flags(
+    frame: torch.Tensor, depth_nonfinite: torch.Tensor, config: Any
+) -> tuple[bool, bool]:
+    """``(is_terminal_pad, depth_logits_nonfinite)`` for one frame, in one host read.
+
+    The loop already read the pad check on the host once per frame; the depth
+    decoder's captured guard (``DepthDecoderGraph.nonfinite_logits``) rides on
+    that same read instead of adding a sync.
+    """
+    is_pad = (frame == int(config.codebook_pad_token_id)).all()
+    flags = torch.stack([is_pad, depth_nonfinite.reshape(()).to(is_pad.device)])
+    is_pad_value, nonfinite_value = flags.tolist()
+    return bool(is_pad_value), bool(nonfinite_value)
 
 
-def should_decode_codec_frame(frame: torch.Tensor, config: Any) -> bool:
-    return not is_terminal_pad_frame(frame, config)
+class NoRoomError(ValueError):
+    """A prompt (plus any reference prefix, CFG and graph-bucket padding) already fills
+    the context, so no frame at all can be generated -- the same condition as
+    ``max_new_tokens_room(...) <= 0``, raised instead of returned when it's only
+    discovered once ``iter_audio_chunks`` actually starts (T046 review: a bare
+    ``ValueError`` here used to be indistinguishable from every other invalid-input or
+    server-bug ``ValueError`` this class raises, so a caller mapping it to a `400` was
+    mapping *every* priming failure to one, including real bugs. Only this specific
+    condition means "the request has no room"; every other ``ValueError`` this module
+    raises is a caller/programming error and must stay a `500`.
+    """
 
 
 def _require_valid_overrides(**overrides: Any) -> None:
@@ -1242,7 +1273,7 @@ class FastBreezeStreamingRuntime:
         shape = _branch_shape(inputs)
         prefix_len = 0 if prefix is None else int(prefix.prefix_len)
         if self._context_room(shape, prefix_len) <= 0:
-            raise ValueError(
+            raise NoRoomError(
                 "prompt leaves no room to generate in the "
                 f"{self.config.max_seq_len}-token context"
             )
@@ -1353,9 +1384,18 @@ class FastBreezeStreamingRuntime:
                     **depth_params,
                 )
                 frame = torch.cat([token.view(1), depth_tokens[0]], dim=0)
+                is_pad, depth_nonfinite = _frame_flags(
+                    frame, self._depth_decoder_graph.nonfinite_logits, self.model.config
+                )
+                if depth_nonfinite:
+                    # Checked before the frame is observed or decoded; its
+                    # codes are the guard's fixed stand-ins, not the model's.
+                    raise ValueError(
+                        "depth decoder logits had no finite value; cannot sample"
+                    )
                 if token_observer is not None:
                     token_observer(frame)
-                if should_decode_codec_frame(frame, self.model.config):
+                if not is_pad:
                     chunk_buffer.append(frame.detach())
 
                 # A complete codec frame can be decoded immediately. Emit it

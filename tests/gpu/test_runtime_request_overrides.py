@@ -19,7 +19,13 @@ from breeze_infer.templates import (
     prepare_prefix_inputs,
     prepare_suffix_inputs,
 )
-from models.cudagraph.sampling import MIN_REPETITION_PENALTY
+from models.cudagraph.sampling import (
+    MAX_REPETITION_PENALTY,
+    MAX_TEMPERATURE,
+    MIN_REPETITION_PENALTY,
+    UNSAMPLEABLE_TOKEN,
+    sample_logits,
+)
 from models.fast_streaming import MIN_SUFFIX_FRAMES, MIN_SUFFIX_ROOM
 
 pytestmark = pytest.mark.gpu
@@ -106,9 +112,9 @@ def test_sampling_overrides_change_the_backbone_trace_for_the_same_seed(
     _, flat_frames = _run(
         gpu_env,
         inputs,
-        # A near-uniform distribution over every codebook entry: with the same
-        # seed, matching the default trace would be a ~1-in-2048-per-step fluke.
-        temperature=50.0,
+        # The flattest distribution the contract allows, over every codebook
+        # entry: with the same seed, matching the default trace would be a fluke.
+        temperature=MAX_TEMPERATURE,
         top_k=2048,
         top_p=1.0,
         repetition_penalty=1.3,
@@ -188,16 +194,53 @@ def test_reference_prefix_longer_than_every_prefill_bucket_builds_eagerly(
 
 
 def test_largest_allowed_temperature_and_penalty_still_sample(gpu_env) -> None:
-    # 1e4 is the override ceiling; the logits shrink toward uniform but stay
-    # finite, so every step samples a valid token.
+    # The contract's ceilings (10); the logits flatten but stay finite, so
+    # every step samples a valid token.
     inputs = _inputs(gpu_env, "The cat sat on the mat.")
 
     chunks, frames = _run(
-        gpu_env, inputs, temperature=1e4, repetition_penalty=1e4, max_new_tokens=4
+        gpu_env,
+        inputs,
+        temperature=MAX_TEMPERATURE,
+        repetition_penalty=MAX_REPETITION_PENALTY,
+        max_new_tokens=4,
     )
 
     assert 0 < len(frames) <= 4
     assert sum(chunk.audio.size for chunk in chunks) > 0
+
+
+@torch.inference_mode()
+def test_captured_depth_decoder_flags_nan_logits_instead_of_asserting(
+    gpu_env,
+) -> None:
+    # A NaN backbone hidden state makes every depth logit NaN. Before the
+    # guard, multinomial on it was a device-side assert that poisoned the
+    # process; now the graph samples fixed codes and raises its flag.
+    graph = gpu_env.runtime._depth_decoder_graph
+    hidden_size = graph.backbone_hidden_size
+    hidden = torch.full(
+        (1, hidden_size), float("nan"), dtype=graph.dtype, device=graph.device
+    )
+    first = torch.zeros(1, dtype=torch.long, device=graph.device)
+
+    tokens = graph.run(hidden, first)
+
+    assert bool(graph.nonfinite_logits.item())
+    assert tokens.cpu().tolist() == [[0] * graph.num_decode_codebooks]
+    # The next run clears the flag, and the CUDA context is still usable.
+    graph.run(torch.zeros_like(hidden), first)
+    assert not bool(graph.nonfinite_logits.item())
+    _, frames = _run(gpu_env, _inputs(gpu_env, "Hello."), max_new_tokens=2)
+    assert frames
+
+
+def test_backbone_sampler_returns_the_sentinel_for_nan_logits_on_cuda(gpu_env) -> None:
+    logits = torch.full((1, 2049), float("nan"), device="cuda")
+
+    token = sample_logits(logits, temperature=0.9, top_k=50, top_p=1.0, do_sample=True)
+
+    assert token.cpu().tolist() == [UNSAMPLEABLE_TOKEN]
 
 
 def test_smallest_allowed_repetition_penalty_still_samples(gpu_env) -> None:

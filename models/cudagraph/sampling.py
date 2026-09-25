@@ -13,23 +13,26 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# The temperature range sample_logits divides by. Below 1e-5, logits / t
-# overflows float32 to inf and softmax turns it into NaN; sampling there is
-# already effectively greedy, so the floor changes nothing observable. Above
-# float32 max, t itself becomes inf once it meets the float32 logits, and a
-# suppressed token's -inf / inf is NaN. Either NaN makes torch.multinomial
-# raise. The cap is 1e4, the same as the runtime's override limit, far below
-# that overflow and already a near-uniform distribution.
+# Temperatures. MAX_TEMPERATURE is the HTTP contract's limit (0, 10], which
+# the runtime's overrides and sample_logits both enforce. MIN_TEMPERATURE is a
+# numeric floor, not a limit: below 1e-5, logits / t overflows float32 to inf
+# and softmax turns it into NaN, while sampling there is already effectively
+# greedy, so any smaller positive temperature is raised to it.
 MIN_TEMPERATURE = 1e-5
-MAX_TEMPERATURE = 1e4
+MAX_TEMPERATURE = 10.0
 
-# The repetition penalties apply_repetition_penalty accepts. A positive logit
-# is divided by the penalty, so 1e-40 overflows it to inf (then NaN); at 1e-4 a
-# logit of 30 becomes 3e5, still finite. The upper bound is far past any useful
-# setting and keeps absurd values a caller error rather than a numerics
-# question. The runtime's override limits are these same constants.
+# The repetition penalties apply_repetition_penalty accepts, the HTTP
+# contract's [1e-4, 10]. A positive logit is divided by the penalty, so 1e-40
+# overflows it to inf (then NaN); at 1e-4 a logit of 30 becomes 3e5, still
+# finite. The runtime's override limits are these same constants.
 MIN_REPETITION_PENALTY = 1e-4
-MAX_REPETITION_PENALTY = 1e4
+MAX_REPETITION_PENALTY = 10.0
+
+# What sample_logits returns for a row whose logits cannot form a distribution
+# (NaN, +inf, or no finite value). It is not a valid token id, so a caller
+# must check for it at the host read it already makes (the runtime's EOS check)
+# and fail the request there.
+UNSAMPLEABLE_TOKEN = -1
 
 
 class NumberRule(NamedTuple):
@@ -80,9 +83,9 @@ def require_number(name: str, value: Any, rule: NumberRule, *, suffix: str = "")
         raise ValueError(f"{name} must be {rule.describe()}{suffix}, got {value!r}")
 
 
-# sample_logits takes any finite positive temperature and clamps it; the
-# runtime's per-request override rule is the stricter (0, MAX_TEMPERATURE].
-_SAMPLING_TEMPERATURE_RULE = NumberRule(False, 0.0, False)
+# sample_logits takes the contract's temperature range and floors it at
+# MIN_TEMPERATURE.
+_SAMPLING_TEMPERATURE_RULE = NumberRule(False, 0.0, False, MAX_TEMPERATURE)
 REPETITION_PENALTY_RULE = NumberRule(
     False, MIN_REPETITION_PENALTY, True, MAX_REPETITION_PENALTY
 )
@@ -137,9 +140,12 @@ def sample_logits(
     HF-compatible order: suppress -> temperature -> top_k -> top_p -> softmax -> sample.
     Matches transformers logits_processor (TemperatureLogitsWarper, TopKLogitsWarper,
     TopPLogitsWarper) followed by softmax + multinomial. The temperature must be
-    finite and > 0 (``ValueError`` otherwise) and is clamped to
-    ``[MIN_TEMPERATURE, MAX_TEMPERATURE]``. Logits that cannot form a
-    distribution raise ``ValueError`` before softmax (see the guard below).
+    in ``(0, MAX_TEMPERATURE]`` (``ValueError`` otherwise) and is floored at
+    ``MIN_TEMPERATURE``.
+
+    A row whose logits cannot form a distribution gets ``UNSAMPLEABLE_TOKEN``
+    instead of a token, on the device and without a host sync; the caller must
+    check for it (see the guard below).
     """
     require_number("temperature", temperature, _SAMPLING_TEMPERATURE_RULE)
     logits = logits.clone().float()
@@ -149,11 +155,32 @@ def sample_logits(
         logits[..., suppress_mask] = float("-inf")
     if suppress_tokens:
         logits[..., list(suppress_tokens)] = float("-inf")
-    if not do_sample:
-        return torch.argmax(logits, dim=-1)
+    # The guard, for the greedy and the sampling path alike. NaN or +inf in a
+    # row (a model NaN, a CFG overflow), or a row with no finite logit, would
+    # make softmax produce NaN and multinomial fail: on CUDA as a device-side
+    # assert that poisons the whole process. A row's max is NaN if any logit
+    # is (amax propagates NaN), +inf if any is +inf, and -inf if none is
+    # finite, so one reduction finds all three. Such a row is replaced by
+    # zeros so everything below stays well defined, and its token by
+    # UNSAMPLEABLE_TOKEN. Nothing here reads a tensor on the host: the caller
+    # checks the token at the read it already makes. -inf alone is fine; it is
+    # how tokens are masked.
+    sampleable = torch.isfinite(logits.amax(dim=-1))
+    logits = torch.where(sampleable.unsqueeze(-1), logits, torch.zeros_like(logits))
+    if do_sample:
+        token = _draw(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+    else:
+        token = torch.argmax(logits, dim=-1)
+    return torch.where(sampleable, token, UNSAMPLEABLE_TOKEN)
+
+
+def _draw(
+    logits: torch.Tensor, *, temperature: float, top_k: int, top_p: float
+) -> torch.Tensor:
+    """Temperature, top-k and top-p on finite-max logits, then softmax + multinomial."""
     # temperature scaling (on raw logits, same as TemperatureLogitsWarper),
-    # clamped so no caller can turn the distribution into NaN
-    logits = logits / min(max(temperature, MIN_TEMPERATURE), MAX_TEMPERATURE)
+    # floored so a tiny temperature cannot overflow the logits
+    logits = logits / max(temperature, MIN_TEMPERATURE)
     # top_k filtering (on raw logits, same as TopKLogitsWarper)
     if top_k > 0:
         k = min(top_k, logits.size(-1))
@@ -172,18 +199,6 @@ def sample_logits(
         sorted_logits[sorted_indices_to_remove] = float("-inf")
         logits = torch.full_like(logits, float("-inf")).scatter_(
             -1, sorted_indices, sorted_logits
-        )
-    # The one guard before softmax. NaN or +inf anywhere (a model NaN, a CFG
-    # overflow), or a row with no finite logit, makes softmax produce NaN, and
-    # multinomial then fails: on CUDA as a device-side assert that poisons the
-    # whole process. Raising ValueError instead fails only this request, and
-    # the caller's stream error path handles it. -inf is fine: it is how
-    # tokens are masked. A row's max is NaN if any logit is (amax propagates
-    # NaN), +inf if any is +inf, and -inf if none is finite, so one reduction
-    # covers all three; the check costs one host sync per call.
-    if not bool(torch.isfinite(logits.amax(dim=-1)).all()):
-        raise ValueError(
-            "logits contain NaN or +inf, or no finite value; cannot sample"
         )
     # softmax -> multinomial (same as HF _sample)
     probs = F.softmax(logits, dim=-1)
