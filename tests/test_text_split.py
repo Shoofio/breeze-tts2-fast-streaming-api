@@ -11,12 +11,19 @@ from __future__ import annotations
 
 import json
 import random
+import time
 import unicodedata
 from pathlib import Path
 
 import pytest
 
-from breeze_infer.text_split import segment, split_text, weigh
+from breeze_infer.text_split import (
+    _MAX_JOINED,
+    _joins_previous,
+    segment,
+    split_text,
+    weigh,
+)
 
 GOLDEN = json.loads(
     (Path(__file__).parent / "cpp_golden" / "golden.json").read_text(encoding="utf-8")
@@ -215,6 +222,26 @@ def test_bc_39_only_plain_whitespace_ends_a_sentence() -> None:
         assert segment(f"Hi.{gap}there", budget=100, final=False) == (["Hi."], f"{gap}there")
 
 
+def test_bc_39_fullwidth_period_between_digits_is_a_decimal_point() -> None:
+    """`．` is a CJK stop, but between two digits it is a decimal point: `３．１４`."""
+    for number in ("３．１４", "3．14", "３．14"):
+        text = f"圆周率是{number}吗"
+        assert segment(text, budget=100, final=False) == ([], text)
+        assert segment(text + "。好", budget=100, final=False) == ([text + "。"], "好")
+    assert segment("好．然后", budget=100, final=False) == (["好．"], "然后")
+
+
+def test_bc_39_exotic_spaces_break_clauses_but_do_not_end_sentences() -> None:
+    """No-break, narrow no-break, fixed-width and medium mathematical spaces are word breaks,
+    so long text using them still gets cut, but they don't end a sentence after `.`."""
+    for gap in ("\u00a0", "\u202f", "\u2002", "\u2009", "\u200a", "\u205f"):
+        assert split_text(f"aaaaaaaa{gap}bbbb", budget=9) == ["aaaaaaaa", "bbbb"]
+        assert segment(f"Dr.{gap}Smith and", budget=100, final=False) == (
+            [],
+            f"Dr.{gap}Smith and",
+        )
+
+
 def test_bc_39_newline_cuts_on_the_websocket_too() -> None:
     """C++ drain's sentence_end ignored `\\n`, so line-separated text waited for the budget."""
     assert segment("first line\nsecond", budget=30, final=False) == (["first line"], "second")
@@ -294,6 +321,22 @@ def test_bc_39_opening_budget_bounds_unpunctuated_opening_text() -> None:
     assert buffer == ""
 
 
+def test_bc_39_opening_budget_applies_to_the_first_streamed_clause_only() -> None:
+    """The opening budget cut every clause of the opening drain short, as C++'s 200 budget did
+    for the whole drain; it now shapes only the first piece."""
+    pieces, rest = segment("word " * 60, budget=100, first_budget=20, final=False)
+    twenty = " ".join(["word"] * 20)
+    assert pieces == ["word word word word", twenty, twenty]
+    assert rest == "word " * 16
+
+    text = "中" * 1000
+    pieces, rest = segment(text, budget=600, first_budget=200, final=False)
+    assert 150 < weigh(pieces[0]) <= 200
+    assert [weigh(p) for p in pieces[1:]] == [600] * (len(pieces) - 1)
+    assert len(pieces) > 1
+    assert "".join(pieces) + rest == text
+
+
 def test_bc_38_budget_zero_means_no_length_limit() -> None:
     """C++ turned split_chars 0 into 600 on the WebSocket; 0 now means no length limit on both
     interfaces, so all the text that is ready is one piece."""
@@ -365,28 +408,73 @@ def test_bc_39_pieces_without_a_letter_or_digit_are_dropped() -> None:
     assert split_text("Hi 😀", budget=20) == ["Hi 😀"]
 
 
-def _joins_previous(ch: str) -> bool:
-    return (
-        unicodedata.category(ch).startswith("M")
-        or ch == "‍"
-        or "︀" <= ch <= "️"
-        or "\U000e0100" <= ch <= "\U000e01ef"
-    )
+def _regional(ch: str) -> bool:
+    return "\U0001f1e6" <= ch <= "\U0001f1ff"
+
+
+def _assert_cuts_keep_clusters(text: str, pieces: list[str]) -> None:
+    """Every piece boundary falls between two grapheme clusters: nothing joins across it and a
+    flag's two regional indicators stay together."""
+    pos = 0
+    for piece in pieces:
+        start = text.index(piece, pos)
+        pos = start + len(piece)
+        for cut in (start, pos):
+            if 0 < cut < len(text):
+                assert not _joins_previous(text[cut - 1], text[cut]), (text, piece)
+                regional_before = 0
+                while cut - regional_before > 0 and _regional(text[cut - regional_before - 1]):
+                    regional_before += 1
+                assert regional_before % 2 == 0, (text, piece)
 
 
 @pytest.mark.parametrize(
     "run",
-    ["é" * 40, "a👨‍👩‍👧" * 10, "中️" * 30],
-    ids=["combining_accent", "zwj_family", "variation_selector"],
+    [
+        "e\u0301" * 40,
+        "a👨\u200d👩\u200d👧" * 10,
+        "中\ufe0f" * 30,
+        "\u1100\u1161\u11a8" * 20,
+        "a🇺🇸🇯🇵" * 15,
+        "क्ष" * 30,
+    ],
+    ids=["combining_accent", "zwj_family", "variation_selector", "hangul_jamo", "flags", "virama"],
 )
-def test_bc_39_hard_cut_keeps_combining_sequences_whole(run) -> None:
-    """A hard cut never separates a character from a combining mark, ZWJ or variation selector
-    that belongs to it."""
+def test_bc_39_hard_cut_keeps_grapheme_clusters_whole(run) -> None:
+    """A hard cut never separates a character from its combining mark, ZWJ or variation
+    selector, a Hangul syllable's jamo, a flag's two regional indicators, or a virama from
+    the consonant it joins."""
     for pieces in (split_text(run, budget=5), segment(run, budget=5, final=False)[0]):
         assert len(pieces) > 1
-        for piece in pieces:
-            assert not _joins_previous(piece[0])
-            assert piece[-1] != "‍"
+        _assert_cuts_keep_clusters(run, pieces)
+
+
+def test_bc_39_zwj_joins_only_a_pictograph() -> None:
+    """After a ZWJ only an emoji continues the cluster; a letter starts a new one."""
+    assert _joins_previous("\u200d", "👩")
+    assert not _joins_previous("\u200d", "b")
+    assert not _joins_previous(" ", "\u0301")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a" + "\u0301" * 10_000,
+        "a\u200d" * 5_000,
+        "\u1100" * 10_000,
+        "🇺🇸" * 5_000,
+        "a" + "\ufe0f" * 10_000,
+    ],
+    ids=["combining_marks", "zwj_letters", "hangul_leading_jamo", "flags", "variation_selectors"],
+)
+def test_bc_39_long_joined_runs_are_cut_in_linear_time(text) -> None:
+    """A run of 10,000 combining marks took 12-14 s (quadratic). A joined run is now force-cut
+    after 30 joined code points, the UAX #15 stream-safe limit, and scanning is linear."""
+    began = time.perf_counter()
+    whole = split_text(text, budget=20)
+    streamed = segment(text, budget=20, final=False)
+    assert time.perf_counter() - began < 0.5
+    assert whole or streamed[0] or weigh(streamed[1]) <= 3 * (_MAX_JOINED + 1)
 
 
 # --- behaviour the port keeps ---
@@ -415,14 +503,15 @@ _TOKENS = (
     + list(".,!?;:\"')") + ["1,000", "10:30", "http://x.io"]
     + list("中文好。，、…．！？") + ["é", "é", "👨‍👩‍👧", "❤️"]
     + list("”’」』）》】〉")
+    + ["\u202f", "\u2009", "한", "\u1100\u1161", "🇺🇸", "क्ष", "３．１４"]
 )
 # Tokens without a sentence stop, for the chunking property.
 _UNSTOPPED_TOKENS = [t for t in _TOKENS if not any(ch in t for ch in "\n.!?;。！？…．")] + [
     "x.io"
 ]
-# The heaviest token: the open piece may exceed its bound by one token when the only cut point
-# would split a combining sequence that is still arriving.
-_CLUSTER_SLACK = max(weigh(t) for t in _TOKENS)
+# The heaviest possible grapheme cluster: a base and _MAX_JOINED joined code points, all
+# non-ASCII. The open tail can be one such cluster with nowhere safe to cut.
+_MAX_CLUSTER_WEIGHT = 3 * (_MAX_JOINED + 1)
 
 
 def _random_text(rng: random.Random, tokens: list[str], max_tokens: int = 200) -> str:
@@ -458,19 +547,19 @@ def _speakable(text: str) -> str:
 
 def test_bc_39_streaming_leftover_stays_bounded() -> None:
     """C++ could hold an arbitrarily long unpunctuated buffer. Streamed in random chunks, a
-    non-final leftover now weighs at most max(first_budget, 2 x budget); pieces are stripped,
-    speakable and never start inside a combining sequence; and every letter and digit comes
-    out once, in order."""
+    non-final leftover now weighs at most max(2 x budget, one grapheme cluster), whatever the
+    opening budget; pieces are stripped, speakable and never cut inside a grapheme cluster; and
+    every letter and digit comes out once, in order."""
     rng = random.Random(20260924)
     for _ in range(500):
         budget = rng.randint(1, 40)
         first_budget = rng.choice([0, rng.randint(1, 80)])
-        bound = max(first_budget, 2 * budget) + _CLUSTER_SLACK
+        bound = max(2 * budget, _MAX_CLUSTER_WEIGHT)
         text = _random_text(rng, _TOKENS)
         spoken = _stream(text, rng, budget, first_budget, bound)
 
         assert all(p == p.strip() and _speakable(p) for p in spoken)
-        assert not any(_joins_previous(p[0]) for p in spoken)
+        _assert_cuts_keep_clusters(text, spoken)
         assert _speakable("".join(spoken)) == _speakable(text)
 
 
