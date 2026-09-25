@@ -29,13 +29,16 @@
     CORS mode for browser clients (e.g. SillyTavern). Empty (the default)
     leaves CORS off, so no browser origin is allowed. Pass '*' to allow every
     origin -- this is how to send the API's bare `--cors` flag from
-    PowerShell, since a string parameter can't be given with no value -- or a
-    comma-separated allowlist, e.g.
-    -Cors 'http://127.0.0.1:8000,http://localhost:8000'.
+    PowerShell, since a string parameter can't be given with no value -- or
+    an allowlist. This is a string array, so an unquoted comma-separated list
+    works directly, e.g.
+    -Cors http://127.0.0.1:8000,http://localhost:8000
+    (PowerShell splits that on the commas itself); a single quoted string
+    with commas also works.
 
 .PARAMETER WsPort
     WebSocket port. Defaults to the HTTP port + 1. Pass 'disabled' to turn
-    the WebSocket endpoint off.
+    the WebSocket endpoint off. Must be a plain digit string or 'disabled'.
 
 .PARAMETER ModelPath
     Override the checkpoint path. By default the current HuggingFace snapshot
@@ -72,7 +75,8 @@
 param(
     [string]$BindHost = '0.0.0.0',
     [int]$Port = 8080,
-    [string]$Cors = '',
+    [string[]]$Cors,
+    [ValidatePattern('^(\d+|disabled)$')]
     [string]$WsPort,
     [string]$ModelPath,
     [switch]$NoFastAll,
@@ -226,11 +230,14 @@ try {
         $fastFlag,
         '--attn-implementation', $AttnImplementation
     )
-    if ($Cors) { $argList += @('--cors', $Cors) }
+    $corsJoined = if ($Cors) { $Cors -join ',' } else { $null }
+    if ($corsJoined) { $argList += @('--cors', $corsJoined) }
     if ($WsPort) { $argList += @('--ws-port', $WsPort) }
     if ($ExtraArgs) { $argList += $ExtraArgs }
 
-    Write-Host "==> Serving $ModelPath on http://${BindHost}:$Port ($fastFlag, attn $AttnImplementation)" -ForegroundColor Green
+    $corsDisplay = if (-not $corsJoined) { 'off' } else { $corsJoined }
+    $wsPortDisplay = if ($WsPort) { $WsPort } else { "$($Port + 1) (derived)" }
+    Write-Host "==> Serving $ModelPath on http://${BindHost}:$Port (cors: $corsDisplay, ws-port: $wsPortDisplay, $fastFlag, attn $AttnImplementation)" -ForegroundColor Green
     & $VenvPy @argList
     exit $LASTEXITCODE
 }
