@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import threading
+import time
 from collections import deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
@@ -125,6 +128,21 @@ def _next_or_done(gen: Generator[T, None, None]) -> T | Done:
         return DONE
 
 
+class GpuCloseTimeout(Exception):
+    """`gen.close()` did not finish within `GPU_CLOSE_TIMEOUT_SECONDS`.
+
+    The close is still queued or running on the GPU thread. A `GpuSession` keeps holding the
+    gate until it finishes (for good, if the GPU is hung), so later requests answer `busy`
+    instead of running on a GPU that is still occupied. The caller logs it.
+    """
+
+
+# How long a caller waits for `gen.close()`. A close normally waits behind at most one
+# in-flight step and then takes milliseconds; 30 s is far past that, so past it the GPU is
+# presumably hung. Waiting for ever would hold a request task, and with it shutdown, hostage.
+GPU_CLOSE_TIMEOUT_SECONDS = 30.0
+
+
 class GpuThread:
     """Runs all GPU work on one dedicated thread, awaited from the event loop.
 
@@ -134,9 +152,17 @@ class GpuThread:
     must `close()` it anyway, whatever happened to the step. `close()` itself is the exception:
     it always runs, because a skipped close would leave the generator to be closed by the
     garbage collector on whatever thread happens to drop it.
+
+    `on_close_error` receives a `gen.close()` error that no caller will see: the caller was
+    cancelled, closed, or timed out before the close finished. It is called on the event loop.
     """
 
-    def __init__(self, device: Any, set_device: Callable[[Any], None]) -> None:
+    def __init__(
+        self,
+        device: Any,
+        set_device: Callable[[Any], None],
+        on_close_error: Callable[[BaseException], None] | None = None,
+    ) -> None:
         # max_workers=1 gives exactly one long-lived thread, and FIFO order for everything
         # submitted to it.
         self._executor = ThreadPoolExecutor(
@@ -145,50 +171,132 @@ class GpuThread:
         # Submitted first, so it runs before any other work. Not the executor's `initializer`:
         # a failing initializer only surfaces as `BrokenThreadPool`, hiding the real error.
         self._device_set = self._executor.submit(set_device, device)
+        self._on_close_error = on_close_error
+        # `shutdown()` stops new run/step calls at once but keeps taking closes until the
+        # queue is empty, so a request cancelled during shutdown still gets its close. The lock
+        # makes "queue empty, stop taking closes" one step against a close being submitted.
+        self._lock = threading.Lock()
+        self._accepting = True  # run() and step() allowed
+        self._drained = False  # nothing allowed, not even close()
+        self._pending: set[Future[Any]] = set()
 
     def _call(self, fn: Callable[..., T], *args: Any) -> T:
-        # FIFO means set_device has already finished; this re-raises its error, if any.
-        self._device_set.result()
+        # FIFO means set_device has already finished. A fresh error each time, so callers
+        # don't share (and keep extending the traceback of) one exception object.
+        error = self._device_set.exception()
+        if error is not None:
+            raise RuntimeError("set_device failed") from error
         return fn(*args)
 
-    def _submit(self, fn: Callable[..., T], *args: Any) -> Future[T]:
-        return self._executor.submit(self._call, fn, *args)
+    def _submit(
+        self, fn: Callable[..., T], *args: Any, is_close: bool = False
+    ) -> Future[T]:
+        with self._lock:
+            if self._drained or not (self._accepting or is_close):
+                raise RuntimeError("GpuThread is shut down")
+            future = self._executor.submit(fn, *args)
+            self._pending.add(future)
+        # Outside the lock: a future that is already done runs the callback right here.
+        future.add_done_callback(self._forget)
+        return future
+
+    def _forget(self, future: Future[Any]) -> None:
+        with self._lock:
+            self._pending.discard(future)
 
     async def run(self, fn: Callable[..., T], *args: Any) -> T:
         """Run `fn(*args)` on the GPU thread. Its exception, if any, is raised here."""
-        return await asyncio.wrap_future(self._submit(fn, *args))
+        return await asyncio.wrap_future(self._submit(self._call, fn, *args))
 
     async def step(self, gen: Generator[T, None, None]) -> T | Done:
         """Advance `gen` once on the GPU thread; return its next item, or `DONE`."""
         return await self.run(_next_or_done, gen)
 
-    async def close(self, gen: Generator[Any, None, None]) -> None:
-        """Close `gen` on the GPU thread, after any step already queued or running.
+    def submit_close(self, gen: Generator[Any, None, None]) -> asyncio.Future[None]:
+        """Queue `gen.close()` on the GPU thread, after any step already queued or running.
+        The returned future completes when the close has run. Call on the event loop.
 
-        The close is never skipped. If the caller is cancelled meanwhile, this still waits for
-        the close to finish and only then re-raises the cancellation.
+        Runs even if `set_device` failed (a close touches no new device state) and even after
+        `shutdown()` has started, until the thread has drained. After that, the future fails
+        with `RuntimeError` instead.
         """
-        done = asyncio.wrap_future(self._submit(gen.close))
+        try:
+            future = self._submit(gen.close, is_close=True)
+        except RuntimeError as error:
+            future = Future()
+            future.set_exception(error)
+        return asyncio.wrap_future(future)
+
+    async def wait_closed(self, closing: asyncio.Future[None]) -> None:
+        """Wait for a close from `submit_close`, for at most `GPU_CLOSE_TIMEOUT_SECONDS`.
+
+        - Cancelled meanwhile: keeps waiting, and re-raises the cancellation once the close
+          has finished. A close error then goes to `on_close_error`, not to the caller: the
+          cancellation must win, because timeouts and task groups depend on seeing it.
+        - Interrupted by anything else (`GeneratorExit` when this coroutine is closed, which
+          forbids waiting any longer): re-raises at once; the close keeps running.
+        - Timed out: raises `GpuCloseTimeout`, even if also cancelled, so the caller learns
+          the GPU is still busy. The close keeps running.
+
+        When the caller stops waiting early, a later close error goes to `on_close_error`.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + GPU_CLOSE_TIMEOUT_SECONDS
         cancelled: asyncio.CancelledError | None = None
-        while not done.done():
+        while not closing.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                closing.add_done_callback(self._report_close_error)
+                raise GpuCloseTimeout(
+                    f"gen.close() still running after {GPU_CLOSE_TIMEOUT_SECONDS:g} s"
+                ) from cancelled
             try:
-                # Unlike awaiting `done` directly, `wait` doesn't cancel it when we are.
-                await asyncio.wait([done])
+                # Unlike awaiting `closing` directly, `wait` doesn't cancel it when we are.
+                await asyncio.wait([closing], timeout=remaining)
             except asyncio.CancelledError as error:
                 cancelled = error
+            except BaseException:
+                closing.add_done_callback(self._report_close_error)
+                raise
         if cancelled is not None:
-            # Retrieve any close error so it isn't lost as "never retrieved", but let the
-            # cancellation win: timeouts and task groups depend on seeing it.
-            raise cancelled from done.exception()
-        done.result()
+            self._report_close_error(closing)
+            raise cancelled
+        closing.result()
 
-    def shutdown(self, wait: bool = True) -> None:
-        """Stop accepting work. Queued work always still runs, because it may include the
-        `gen.close()` calls that release GPU state; `wait` only chooses whether to block the
-        calling thread until it has. Blocking, so don't call it with `wait=True` on the event
-        loop while GPU work may still be queued.
+    async def close(self, gen: Generator[Any, None, None]) -> None:
+        """Close `gen` on the GPU thread: `submit_close` then `wait_closed`."""
+        await self.wait_closed(self.submit_close(gen))
+
+    def _report_close_error(self, closing: asyncio.Future[None]) -> None:
+        # Reading the exception also marks it retrieved, so asyncio doesn't log it as lost.
+        error = None if closing.cancelled() else closing.exception()
+        if error is not None and self._on_close_error is not None:
+            self._on_close_error(error)
+
+    def shutdown(self, timeout: float | None = None) -> bool:
+        """Stop the GPU thread once everything queued has run. Returns whether it did within
+        `timeout` seconds (None: no limit).
+
+        New `run()`/`step()` calls are refused at once. `close()` is still accepted until the
+        queue is empty, so a generation cancelled during shutdown still gets closed on this
+        thread. Blocking: don't call it on the event loop while GPU work may be queued. After
+        a `False`, the thread is still busy and a later call can wait again.
         """
-        self._executor.shutdown(wait=wait)
+        with self._lock:
+            self._accepting = False
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            with self._lock:
+                pending = {future for future in self._pending if not future.done()}
+                if not pending:
+                    self._drained = True
+                    break
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            wait_futures(pending, timeout=remaining)
+        self._executor.shutdown(wait=True)
+        return True
 
 
 class GpuSession(Generic[T]):
@@ -207,27 +315,33 @@ class GpuSession(Generic[T]):
         self._lease = lease
         self._gpu = gpu
         self._gen = gen
-        self._closed = False
+        self._closing: asyncio.Future[None] | None = None
 
     async def step(self) -> T | Done:
         """The next item, or `DONE`. Raises `RuntimeError` after `aclose()`: the gate is gone."""
-        if self._closed:
+        if self._closing is not None:
             raise RuntimeError("GpuSession.step() after aclose()")
         return await self._gpu.step(self._gen)
 
     async def aclose(self) -> None:
-        """Close the generator on the GPU thread, then release the gate. Safe to call twice.
+        """Close the generator on the GPU thread, then release the gate.
 
-        If the caller is cancelled, this still finishes both before re-raising (see
-        `GpuThread.close`). If the close raises, the gate is released anyway.
+        The release is a callback on the close itself, not a step of this coroutine, so it
+        happens exactly when `gen.close()` has finished, however the caller ended: cancelled,
+        closed (`GeneratorExit`) or timed out. Repeated and concurrent calls all wait for the
+        same close. Raises what the close raised (the gate is released anyway), and
+        `GpuCloseTimeout` if it hasn't finished in time; the gate then stays held until it does.
+        Cancellation behaves as in `GpuThread.wait_closed`.
         """
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            await self._gpu.close(self._gen)
-        finally:
-            self._lease.release()
+        if self._closing is None:
+            self._closing = self._gpu.submit_close(self._gen)
+            # Added before anyone waits, so it runs before any waiter resumes: the gate is
+            # already free when `aclose()` returns.
+            self._closing.add_done_callback(self._release)
+        await self._gpu.wait_closed(self._closing)
+
+    def _release(self, _closing: asyncio.Future[None]) -> None:
+        self._lease.release()
 
     async def __aenter__(self) -> GpuSession[T]:
         return self

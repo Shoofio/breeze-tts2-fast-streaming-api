@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 
 import pytest
 
-from breeze_infer.gpu import DONE, GpuGate, GpuLease, GpuSession, GpuThread
+from breeze_infer import gpu as gpu_module
+from breeze_infer.gpu import (
+    DONE,
+    GpuCloseTimeout,
+    GpuGate,
+    GpuLease,
+    GpuSession,
+    GpuThread,
+)
 
 # Long enough never to fire on a healthy run; only there so a bug hangs a test, not the suite.
 TIMEOUT = 5.0
@@ -192,21 +200,46 @@ def test_shutdown_waits_for_queued_work_then_refuses_more() -> None:
     asyncio.run(main())
 
 
-def test_a_failing_set_device_surfaces_its_own_error_on_every_call() -> None:
+def test_a_failing_set_device_surfaces_as_a_fresh_error_on_every_call() -> None:
     def no_such_device(device: object) -> None:
         raise ValueError(f"invalid device {device}")
 
     gpu = GpuThread("cuda:9", no_such_device)
 
-    async def main() -> None:
+    async def main() -> list[BaseException]:
+        errors = []
         for _ in range(2):
-            with pytest.raises(ValueError, match="invalid device cuda:9"):
+            with pytest.raises(RuntimeError, match="set_device failed") as raised:
                 await gpu.run(lambda: None)
+            assert isinstance(raised.value.__cause__, ValueError)
+            assert "invalid device cuda:9" in str(raised.value.__cause__)
+            errors.append(raised.value)
+        return errors
 
     try:
-        asyncio.run(main())
+        first, second = asyncio.run(main())
     finally:
         gpu.shutdown()
+    # Not one shared object whose traceback grows with every re-raise.
+    assert first is not second
+    assert first.__cause__ is second.__cause__
+
+
+def test_close_still_runs_when_set_device_failed() -> None:
+    def no_such_device(_device: object) -> None:
+        raise ValueError("invalid device")
+
+    gpu = GpuThread("cuda:9", no_such_device)
+    closed_on: list[int] = []
+    gen = _recording_close(closed_on)
+    assert next(gen) == 1  # suspended inside `try`, so closing it has work to do
+
+    try:
+        asyncio.run(gpu.close(gen))
+    finally:
+        gpu.shutdown()
+    assert len(closed_on) == 1
+    assert closed_on[0] != threading.get_ident()
 
 
 def _recording_close(closed_on: list[int]) -> Generator[int, None, None]:
@@ -356,3 +389,200 @@ def test_session_aclose_is_idempotent_and_step_after_close_is_rejected() -> None
         asyncio.run(asyncio.wait_for(main(), TIMEOUT))
     finally:
         gpu.shutdown()
+
+
+# --- shutdown -----------------------------------------------------------------------------
+
+
+def _blocker(started: threading.Event, proceed: threading.Event) -> Callable[[], None]:
+    def hold() -> None:
+        started.set()
+        assert proceed.wait(TIMEOUT)
+
+    return hold
+
+
+def test_close_is_still_accepted_while_shutdown_drains() -> None:
+    gpu = GpuThread(0, _DeviceStub())
+    started, proceed = threading.Event(), threading.Event()
+    closed_on: list[int] = []
+    gen = _recording_close(closed_on)
+
+    async def main() -> None:
+        assert await gpu.step(gen) == 1
+        blocker = asyncio.create_task(gpu.run(_blocker(started, proceed)))
+        assert await asyncio.to_thread(started.wait, TIMEOUT)
+        stopping = asyncio.create_task(asyncio.to_thread(gpu.shutdown))
+        await asyncio.sleep(0.05)
+
+        with pytest.raises(RuntimeError, match="shut down"):
+            await gpu.run(lambda: None)  # new work is refused at once...
+        close = asyncio.create_task(gpu.close(gen))  # ...but a close is still taken
+        await asyncio.sleep(0.05)
+        proceed.set()
+        await close
+        assert await stopping is True
+        await blocker
+
+    asyncio.run(asyncio.wait_for(main(), TIMEOUT))
+    assert len(closed_on) == 1
+
+
+def test_after_the_drain_a_session_close_fails_but_still_releases_the_gate() -> None:
+    gpu = GpuThread(0, _DeviceStub())
+    gate = GpuGate()
+    gpu.shutdown()
+
+    async def main() -> None:
+        session = GpuSession(_lease(gate), gpu, _counting(1, []))
+        with pytest.raises(RuntimeError, match="shut down"):
+            await session.aclose()
+        assert gate.try_acquire() is not None
+
+    asyncio.run(asyncio.wait_for(main(), TIMEOUT))
+
+
+def test_shutdown_with_a_timeout_reports_a_busy_thread() -> None:
+    gpu = GpuThread(0, _DeviceStub())
+    started, proceed = threading.Event(), threading.Event()
+
+    async def main() -> None:
+        blocker = asyncio.create_task(gpu.run(_blocker(started, proceed)))
+        assert await asyncio.to_thread(started.wait, TIMEOUT)
+        assert await asyncio.to_thread(gpu.shutdown, 0.05) is False
+        proceed.set()
+        assert await asyncio.to_thread(gpu.shutdown, TIMEOUT) is True
+        await blocker
+
+    asyncio.run(asyncio.wait_for(main(), TIMEOUT))
+
+
+# --- close: timeout, lost errors, interruption, concurrency --------------------------------
+
+
+def _bad_cleanup() -> Generator[int, None, None]:
+    try:
+        yield 1
+    finally:
+        raise OSError("cleanup failed")
+
+
+def test_a_close_error_after_the_caller_was_cancelled_goes_to_on_close_error() -> None:
+    reported: list[BaseException] = []
+    gpu = GpuThread(0, _DeviceStub(), on_close_error=reported.append)
+    started, proceed = threading.Event(), threading.Event()
+    gen = _bad_cleanup()
+
+    async def main() -> None:
+        assert await gpu.step(gen) == 1
+        blocker = asyncio.create_task(gpu.run(_blocker(started, proceed)))
+        assert await asyncio.to_thread(started.wait, TIMEOUT)
+        close = asyncio.create_task(gpu.close(gen))
+        await asyncio.sleep(0.05)
+        close.cancel()
+        proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close
+        await blocker
+
+    try:
+        asyncio.run(asyncio.wait_for(main(), TIMEOUT))
+    finally:
+        gpu.shutdown()
+    assert [str(error) for error in reported] == ["cleanup failed"]
+
+
+def test_a_close_past_the_timeout_raises_and_keeps_the_gate_until_it_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gpu_module, "GPU_CLOSE_TIMEOUT_SECONDS", 0.1)
+    reported: list[BaseException] = []
+    gpu = GpuThread(0, _DeviceStub(), on_close_error=reported.append)
+    gate = GpuGate()
+    started, proceed = threading.Event(), threading.Event()
+
+    async def main() -> None:
+        session = GpuSession(_lease(gate), gpu, _bad_cleanup())
+        assert await session.step() == 1
+        blocker = asyncio.create_task(gpu.run(_blocker(started, proceed)))
+        assert await asyncio.to_thread(started.wait, TIMEOUT)
+
+        with pytest.raises(GpuCloseTimeout):
+            await session.aclose()  # queued behind `hold`, which outlasts the timeout
+        assert gate.try_acquire() is None  # the GPU is still busy: the gate stays held
+
+        proceed.set()
+        await blocker
+        while gate.try_acquire() is None:  # released once the close has really run
+            await asyncio.sleep(0.01)
+
+    try:
+        asyncio.run(asyncio.wait_for(main(), TIMEOUT))
+    finally:
+        gpu.shutdown()
+    # Nobody was waiting any more when it failed, so the error went to the callback.
+    assert [str(error) for error in reported] == ["cleanup failed"]
+
+
+def test_a_session_closed_mid_wait_keeps_the_gate_until_the_close_runs() -> None:
+    """GeneratorExit (the awaiting coroutine being closed) must not release the gate early."""
+    gpu = GpuThread(0, _DeviceStub())
+    gate = GpuGate()
+    started, proceed = threading.Event(), threading.Event()
+    closed_on: list[int] = []
+
+    async def main() -> None:
+        session = GpuSession(_lease(gate), gpu, _recording_close(closed_on))
+        assert await session.step() == 1
+        blocker = asyncio.create_task(gpu.run(_blocker(started, proceed)))
+        assert await asyncio.to_thread(started.wait, TIMEOUT)
+
+        # Drive aclose() by hand to its first suspension, then close it: that throws
+        # GeneratorExit in at the wait, as when an abandoned coroutine is closed.
+        closing = session.aclose()
+        closing.send(None)
+        closing.close()
+        assert gate.try_acquire() is None
+        assert closed_on == []
+
+        proceed.set()
+        await blocker
+        while gate.try_acquire() is None:
+            await asyncio.sleep(0.01)
+
+    try:
+        asyncio.run(asyncio.wait_for(main(), TIMEOUT))
+    finally:
+        gpu.shutdown()
+    assert len(closed_on) == 1
+
+
+def test_concurrent_session_closes_wait_for_the_same_close() -> None:
+    gpu = GpuThread(0, _DeviceStub())
+    gate = GpuGate()
+    started, proceed = threading.Event(), threading.Event()
+    closed_on: list[int] = []
+
+    async def main() -> None:
+        session = GpuSession(_lease(gate), gpu, _recording_close(closed_on))
+        assert await session.step() == 1
+        blocker = asyncio.create_task(gpu.run(_blocker(started, proceed)))
+        assert await asyncio.to_thread(started.wait, TIMEOUT)
+
+        first = asyncio.create_task(session.aclose())
+        second = asyncio.create_task(session.aclose())
+        await asyncio.sleep(0.05)
+        # The second caller must not return before the generator is closed.
+        assert not first.done()
+        assert not second.done()
+
+        proceed.set()
+        await asyncio.gather(first, second, blocker)
+        assert closed_on != []
+        assert gate.try_acquire() is not None  # released exactly once
+
+    try:
+        asyncio.run(asyncio.wait_for(main(), TIMEOUT))
+    finally:
+        gpu.shutdown()
+    assert len(closed_on) == 1

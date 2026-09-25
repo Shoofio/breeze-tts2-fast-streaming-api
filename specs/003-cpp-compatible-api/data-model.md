@@ -242,8 +242,10 @@ offending record's field names), so one bad field never breaks the request emitt
 - Every request event carries `request_id`; WebSocket events also carry `session_id` and
   `piece_index`.
 - Event names:
-  - server: `server.started`, `server.bind_failed`, `ws.bind_failed`, `model.loaded`,
-    `model.load_failed` (the process then exits non-zero);
+  - server: `server.started` (with every bound `addresses`), `server.bind_failed`,
+    `server.stopping` (a hard exit: a load still in progress, or the GPU drain timed out),
+    `ws.bind_failed`, `model.loaded`, `model.load_failed` (the process then exits non-zero),
+    `gpu.close_failed`;
   - voices: `voices.loaded`, `voice.skipped`, `voice.created`, `voice.deleted`;
   - speech: `speech.accepted`, `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`,
     `speech.completed` (`rtf`), `speech.failed`, `speech.aborted`;

@@ -1,7 +1,8 @@
 """The composition root in `breeze_infer.api` (T022; research R3, R5, R14).
 
 No GPU and no model: the `GpuThread` gets a stub `set_device`, and the model loader is a stub
-returning `FakeRuntime`. `serve()` runs a real uvicorn on an ephemeral port.
+returning `FakeRuntime`. `serve()` runs a real uvicorn on an ephemeral port, and the shutdown
+tests send the process real signals.
 """
 
 from __future__ import annotations
@@ -12,6 +13,9 @@ import json
 import os
 import signal
 import socket
+import threading
+import time
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 
@@ -21,13 +25,14 @@ import uvicorn
 from breeze_infer import __version__, api
 from breeze_infer.api import (
     Components,
-    bind_http_socket,
+    ServeOutcome,
+    bind_http_sockets,
     create_app,
     request_exit,
     serve,
 )
 from breeze_infer.events import Emitter
-from breeze_infer.gpu import GpuGate, GpuThread
+from breeze_infer.gpu import GpuGate, GpuSession, GpuThread
 from breeze_infer.limits import MAX_BODY_BYTES, TCP_USER_TIMEOUT_MS
 from breeze_infer.model_loading import LoadedModel
 from breeze_infer.routes_health import Readiness
@@ -38,11 +43,14 @@ MODEL_DIR = str(Path(__file__).parent)  # any existing directory; nothing loads 
 
 
 def _components(sink: io.StringIO) -> Components:
+    events = Emitter(sink, lambda: 0.0)
     return Components(
         settings=settings_from_args([MODEL_DIR]),
-        events=Emitter(sink, lambda: 0.0),
+        events=events,
         gate=GpuGate(),
-        gpu=GpuThread("cpu", lambda _device: None),
+        gpu=GpuThread(
+            "cpu", lambda _device: None, lambda error: api._report_close_failed(events, error)
+        ),
         readiness=Readiness(),
         ws_port=lambda: 0,
     )
@@ -55,11 +63,16 @@ def _events(sink: io.StringIO) -> list[dict[str, Any]]:
 # --- the socket pre-bind ---------------------------------------------------------------
 
 
+def _bind_one(host: str, port: int) -> socket.socket:
+    [sock] = bind_http_sockets(host, port)
+    return sock
+
+
 @pytest.mark.skipif(
     not hasattr(socket, "TCP_USER_TIMEOUT"), reason="TCP_USER_TIMEOUT is Linux-only"
 )
 def test_bound_socket_has_tcp_user_timeout() -> None:
-    with bind_http_socket("127.0.0.1", 0) as sock:
+    with _bind_one("127.0.0.1", 0) as sock:
         value = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT)
 
     assert value == TCP_USER_TIMEOUT_MS
@@ -67,7 +80,7 @@ def test_bound_socket_has_tcp_user_timeout() -> None:
 
 @pytest.mark.skipif(os.name != "posix", reason="SO_REUSEADDR is set on POSIX only")
 def test_bound_socket_has_reuseaddr_and_is_listening() -> None:
-    with bind_http_socket("127.0.0.1", 0) as sock:
+    with _bind_one("127.0.0.1", 0) as sock:
         assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 1
         # Listening already: a client can connect before uvicorn starts accepting.
         with socket.create_connection(sock.getsockname(), timeout=2):
@@ -79,8 +92,104 @@ def test_bind_works_where_the_platform_has_no_tcp_user_timeout(
 ) -> None:
     monkeypatch.delattr(socket, "TCP_USER_TIMEOUT", raising=False)
 
-    with bind_http_socket("127.0.0.1", 0) as sock:
+    with _bind_one("127.0.0.1", 0) as sock:
         assert sock.getsockname()[1] > 0
+
+
+def _has_ipv6_loopback() -> bool:
+    try:
+        with socket.socket(socket.AF_INET6) as probe:
+            probe.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _resolving_to(
+    monkeypatch: pytest.MonkeyPatch, *addresses: tuple[socket.AddressFamily, tuple]
+) -> None:
+    """Make every getaddrinfo() return `addresses`, as a dual-stack or odd host would."""
+    infos = [
+        (family, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", address)
+        for family, address in addresses
+    ]
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kw: infos)
+
+
+@pytest.mark.skipif(not _has_ipv6_loopback(), reason="no IPv6 loopback here")
+def test_every_resolved_address_is_bound_with_ipv6_kept_off_the_ipv4_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _free_port()
+    _resolving_to(
+        monkeypatch,
+        (socket.AF_INET, ("127.0.0.1", port)),
+        (socket.AF_INET6, ("::1", port, 0, 0)),
+    )
+
+    sockets = bind_http_sockets("localhost", port)
+    try:
+        assert [sock.family for sock in sockets] == [socket.AF_INET, socket.AF_INET6]
+        assert {sock.getsockname()[1] for sock in sockets} == {port}
+        # Without V6ONLY a wildcard IPv6 bind also claims the IPv4 port, and the two clash.
+        assert sockets[1].getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
+        assert [api._address(sock) for sock in sockets] == [
+            f"127.0.0.1:{port}",
+            f"[::1]:{port}",
+        ]
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
+def test_an_address_the_host_does_not_have_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 192.0.2.1 is TEST-NET-1: never a local address, so bind() fails with EADDRNOTAVAIL.
+    _resolving_to(
+        monkeypatch,
+        (socket.AF_INET, ("192.0.2.1", 0)),
+        (socket.AF_INET, ("127.0.0.1", 0)),
+    )
+
+    [sock] = bind_http_sockets("somehost", 0)
+    with sock:
+        assert sock.getsockname()[0] == "127.0.0.1"
+
+
+def test_a_taken_port_on_one_address_closes_the_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: list[socket.socket] = []
+    real_socket = socket.socket
+
+    def recording_socket(*args: Any) -> socket.socket:
+        sock = real_socket(*args)
+        opened.append(sock)
+        return sock
+
+    with real_socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        port = taken.getsockname()[1]
+        _resolving_to(
+            monkeypatch,
+            (socket.AF_INET, ("127.0.0.2", port)),
+            (socket.AF_INET, ("127.0.0.1", port)),
+        )
+        monkeypatch.setattr(socket, "socket", recording_socket)
+
+        with pytest.raises(OSError):
+            bind_http_sockets("somehost", port)
+
+    assert len(opened) == 2
+    assert all(sock.fileno() == -1 for sock in opened)
 
 
 def test_main_exits_non_zero_with_a_message_when_the_port_is_taken(
@@ -155,7 +264,9 @@ def test_version_header_is_outside_the_body_limit() -> None:
 # --- device and signals -------------------------------------------------------------------
 
 
-def test_cuda_device_follows_local_rank_then_rank(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cuda_device_follows_local_rank_then_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setattr(api.torch.cuda, "is_available", lambda: True)
 
     assert api._cuda_device({}) == "cuda:0"
@@ -194,46 +305,59 @@ async def _wait_until(condition: Any, timeout: float = 10.0) -> None:
             await asyncio.sleep(0.01)
 
 
-@pytest.mark.skipif(os.name != "posix", reason="loop.add_signal_handler is POSIX-only")
+posix_only = pytest.mark.skipif(
+    os.name != "posix", reason="sends the process POSIX signals with os.kill"
+)
+
+
+def _loaded() -> LoadedModel:
+    return LoadedModel(runtime=FakeRuntime(), report={"device": "cpu"})
+
+
+def _serving(
+    components: Components, load: Any, app: Any = None
+) -> tuple[asyncio.Task[ServeOutcome], int]:
+    sock = _bind_one("127.0.0.1", 0)
+    app = create_app(components) if app is None else app
+    return asyncio.create_task(serve(components, app, [sock], load)), sock.getsockname()[1]
+
+
+@posix_only
 def test_serve_loads_in_the_background_then_stops_cleanly_on_sigterm() -> None:
     sink = io.StringIO()
     components = _components(sink)
-    sock = bind_http_socket("127.0.0.1", 0)
-    port = sock.getsockname()[1]
 
-    def load() -> LoadedModel:
-        return LoadedModel(runtime=FakeRuntime(), report={"device": "cpu"})
-
-    async def scenario() -> tuple[int, tuple, tuple]:
-        serving = asyncio.create_task(serve(components, create_app(components), sock, load))
+    async def scenario() -> tuple[ServeOutcome, int, tuple, tuple]:
+        serving, port = _serving(components, _loaded)
         await _wait_until(lambda: components.readiness.runtime is not None)
         ready = await _get(port, "/health")
         missing = await _get(port, "/nope")
         # If uvicorn's own handler were still installed, its re-raise after serve() would
         # kill the test process with the default SIGTERM action.
         os.kill(os.getpid(), signal.SIGTERM)
-        return await asyncio.wait_for(serving, 10), ready, missing
+        return await asyncio.wait_for(serving, 10), port, ready, missing
 
-    exit_code, ready, missing = asyncio.run(scenario())
+    outcome, port, ready, missing = asyncio.run(scenario())
 
-    assert exit_code == 0
+    assert outcome == ServeOutcome(0)
     assert ready == (200, {"status": "ok", "sample_rate": 24000, "ws_port": 0})
     assert missing[0] == 404
     names = [event["event"] for event in _events(sink)]
     assert names == ["server.started", "model.loaded"]
     started, loaded = _events(sink)
     assert started["port"] == port
+    assert started["addresses"] == [f"127.0.0.1:{port}"]
     assert loaded["sample_rate"] == 24000
     assert loaded["device"] == "cpu"
+    with pytest.raises(RuntimeError):  # serve() shut the GPU thread down
+        asyncio.run(components.gpu.run(lambda: None))
 
 
 def test_serve_answers_loading_while_the_model_loads() -> None:
     sink = io.StringIO()
     components = _components(sink)
-    sock = bind_http_socket("127.0.0.1", 0)
-    port = sock.getsockname()[1]
 
-    async def scenario() -> tuple[int, tuple]:
+    async def scenario() -> tuple[ServeOutcome, tuple]:
         unblock = asyncio.get_running_loop().create_future()
         loop = asyncio.get_running_loop()
 
@@ -242,34 +366,245 @@ def test_serve_answers_loading_while_the_model_loads() -> None:
             asyncio.run_coroutine_threadsafe(asyncio.wait_for(unblock, 10), loop).result()
             raise RuntimeError("stop here")
 
-        serving = asyncio.create_task(serve(components, create_app(components), sock, load))
+        serving, port = _serving(components, load)
         loading = await _get(port, "/health")
         unblock.set_result(None)
         return await asyncio.wait_for(serving, 10), loading
 
-    exit_code, loading = asyncio.run(scenario())
+    outcome, loading = asyncio.run(scenario())
 
     assert loading == (
         503,
         {"status": "loading", "error": "model is loading", "code": "loading"},
     )
-    assert exit_code == 1
+    assert outcome == ServeOutcome(1)
 
 
 def test_a_failed_load_is_reported_and_the_server_exits_non_zero() -> None:
     sink = io.StringIO()
     components = _components(sink)
-    sock = bind_http_socket("127.0.0.1", 0)
 
     def load() -> LoadedModel:
         raise FileNotFoundError("no checkpoint here")
 
-    exit_code = asyncio.run(serve(components, create_app(components), sock, load))
+    async def scenario() -> ServeOutcome:
+        serving, _ = _serving(components, load)
+        return await serving
 
-    assert exit_code == 1
+    outcome = asyncio.run(scenario())
+
+    assert outcome == ServeOutcome(1)
     failed = _events(sink)[-1]
     assert failed["event"] == "model.load_failed"
     assert failed["level"] == "error"
     assert "no checkpoint here" in failed["error"]
     assert "FileNotFoundError" in failed["traceback"]
     assert components.readiness.runtime is None
+
+
+@pytest.mark.parametrize(
+    "load",
+    [
+        # A BaseException from the loader (sys.exit in a library, say).
+        pytest.param(lambda: (_ for _ in ()).throw(SystemExit(3)), id="system-exit"),
+        # A loader result that breaks marking ready / reporting it.
+        pytest.param(lambda: LoadedModel(runtime=object(), report={}), id="bad-result"),
+    ],
+)
+def test_any_failure_in_the_load_task_ends_the_server(load: Any) -> None:
+    sink = io.StringIO()
+    components = _components(sink)
+
+    async def scenario() -> ServeOutcome:
+        serving, _ = _serving(components, load)
+        return await asyncio.wait_for(serving, 10)
+
+    assert asyncio.run(scenario()) == ServeOutcome(1)
+    assert _events(sink)[-1]["event"] == "model.load_failed"
+
+
+# --- shutdown: graceful, forced, during the load -------------------------------------------
+
+
+async def _slow_stream(scope: dict, receive: Any, send: Any) -> None:
+    """A 5 s streaming response, the reviewer's case for the forced exit."""
+    await send({"type": "http.response.start", "status": 200, "headers": []})
+    for _ in range(50):
+        await send({"type": "http.response.body", "body": b"x", "more_body": True})
+        await asyncio.sleep(0.1)
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
+async def _start_request(port: int) -> asyncio.StreamWriter:
+    """Open a streaming GET and return once the response has started."""
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+    await reader.readuntil(b"\r\n\r\n")
+    return writer
+
+
+@posix_only
+def test_a_second_signal_stops_at_once_despite_an_open_stream() -> None:
+    sink = io.StringIO()
+    components = _components(sink)
+
+    async def scenario() -> tuple[ServeOutcome, float]:
+        serving, port = _serving(components, _loaded, app=_slow_stream)
+        await _wait_until(lambda: components.readiness.runtime is not None)
+        writer = await _start_request(port)
+
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(0.3)
+        assert not serving.done()  # graceful: the open response is allowed to finish
+
+        os.kill(os.getpid(), signal.SIGTERM)
+        forced_at = time.monotonic()
+        outcome = await asyncio.wait_for(serving, 10)
+        writer.close()
+        return outcome, time.monotonic() - forced_at
+
+    outcome, after_second = asyncio.run(scenario())
+
+    assert outcome == ServeOutcome(0)
+    assert after_second < 1.0
+
+
+def _frames(closed: list[str]) -> Generator[bytes, None, None]:
+    try:
+        while True:
+            time.sleep(0.01)  # a "GPU step", on the GPU thread
+            yield b"x"
+    finally:
+        closed.append(threading.current_thread().name)
+
+
+@posix_only
+@pytest.mark.parametrize("signals", [1, 2], ids=["graceful-timeout", "forced"])
+def test_each_open_generation_is_closed_on_the_gpu_thread_before_it_stops(
+    monkeypatch: pytest.MonkeyPatch, signals: int
+) -> None:
+    """After the graceful timeout uvicorn cancels the request without waiting for it; on a
+    forced exit it doesn't cancel it at all. Either way serve() must see the close through."""
+    monkeypatch.setattr(api, "GRACEFUL_SHUTDOWN_SECONDS", 0.3)
+    sink = io.StringIO()
+    components = _components(sink)
+    closed: list[str] = []
+
+    async def generating(scope: dict, receive: Any, send: Any) -> None:
+        lease = components.gate.try_acquire()
+        assert lease is not None
+        session = GpuSession(lease, components.gpu, _frames(closed))
+        try:
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            while True:
+                chunk = await session.step()
+                await send({"type": "http.response.body", "body": chunk, "more_body": True})
+        finally:
+            await session.aclose()
+
+    async def scenario() -> ServeOutcome:
+        serving, port = _serving(components, _loaded, app=generating)
+        await _wait_until(lambda: components.readiness.runtime is not None)
+        writer = await _start_request(port)
+        for _ in range(signals):  # the stream never ends on its own
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(0.05)
+        outcome = await asyncio.wait_for(serving, 10)
+        writer.close()
+        return outcome
+
+    outcome = asyncio.run(scenario())
+
+    assert outcome == ServeOutcome(0)
+    assert len(closed) == 1 and closed[0].startswith("breeze-gpu")
+    assert components.gate.try_acquire() is not None
+    assert "gpu.close_failed" not in [event["event"] for event in _events(sink)]
+
+
+@posix_only
+def test_a_signal_during_the_load_asks_main_for_a_hard_exit() -> None:
+    sink = io.StringIO()
+    components = _components(sink)
+    started, release = threading.Event(), threading.Event()
+
+    def load() -> LoadedModel:
+        started.set()
+        assert release.wait(10)  # a load the signal can't interrupt
+        return _loaded()
+
+    async def scenario() -> ServeOutcome:
+        serving, _ = _serving(components, load)
+        assert await asyncio.to_thread(started.wait, 10)
+        os.kill(os.getpid(), signal.SIGTERM)
+        return await asyncio.wait_for(serving, 5)
+
+    try:
+        outcome = asyncio.run(scenario())
+    finally:
+        release.set()
+        components.gpu.shutdown()
+
+    assert outcome == ServeOutcome(0, hard_exit=True)
+    stopping = _events(sink)[-1]
+    assert stopping["event"] == "server.stopping"
+    assert stopping["level"] == "warning"
+    assert stopping["reason"] == "load in progress"
+
+
+# --- signal handler installation -----------------------------------------------------------
+
+
+def test_uvicorn_never_captures_signals_itself() -> None:
+    server = api._Server(uvicorn.Config(lambda *_: None))
+    before = signal.getsignal(signal.SIGTERM)
+
+    with server.capture_signals():
+        assert signal.getsignal(signal.SIGTERM) is before
+
+
+@posix_only
+@pytest.mark.parametrize("refusal", [NotImplementedError, RuntimeError])
+def test_without_loop_signal_handlers_signal_signal_still_stops_the_server(
+    refusal: type[Exception],
+) -> None:
+    """Windows loops raise NotImplementedError; a loop off the main thread, RuntimeError."""
+    sink = io.StringIO()
+    components = _components(sink)
+    before = signal.getsignal(signal.SIGTERM)
+
+    def refuse(*_args: Any) -> None:
+        raise refusal("no add_signal_handler here")
+
+    async def scenario() -> ServeOutcome:
+        asyncio.get_running_loop().add_signal_handler = refuse  # type: ignore[method-assign]
+        serving, _ = _serving(components, _loaded)
+        await _wait_until(lambda: components.readiness.runtime is not None)
+        assert signal.getsignal(signal.SIGTERM) is not before  # the fallback is in place
+        os.kill(os.getpid(), signal.SIGTERM)
+        return await asyncio.wait_for(serving, 10)
+
+    assert asyncio.run(scenario()) == ServeOutcome(0)
+    assert signal.getsignal(signal.SIGTERM) is before  # and removed again
+
+
+def test_off_the_main_thread_no_handlers_are_installed() -> None:
+    server = uvicorn.Server(uvicorn.Config(lambda *_: None))
+    before = signal.getsignal(signal.SIGTERM)
+    results: list[BaseException | None] = []
+
+    def in_thread() -> None:
+        loop = asyncio.new_event_loop()
+        try:
+            api._install_signal_handlers(loop, server)()  # install, then undo
+            results.append(None)
+        except BaseException as exc:  # noqa: BLE001 - reported to the main thread
+            results.append(exc)
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=in_thread)
+    thread.start()
+    thread.join(5)
+
+    assert results == [None]
+    assert signal.getsignal(signal.SIGTERM) is before

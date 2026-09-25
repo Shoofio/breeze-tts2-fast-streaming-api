@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -12,10 +13,14 @@ from transformers import AutoTokenizer
 from models.breeze import BreezeForConditionalGeneration
 
 
-def get_dist_info() -> tuple[int, int, int]:
-    rank = int(os.environ.get("RANK", "0"))
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+def get_dist_info(environ: Mapping[str, str] | None = None) -> tuple[int, int, int]:
+    """(rank, world_size, local_rank) from `environ`, the process environment by default.
+    The server's composition root passes the mapping it read once (Constitution III)."""
+    if environ is None:
+        environ = os.environ
+    rank = int(environ.get("RANK", "0"))
+    world_size = int(environ.get("WORLD_SIZE", "1"))
+    local_rank = int(environ.get("LOCAL_RANK", str(rank)))
     return rank, world_size, local_rank
 
 
