@@ -585,12 +585,13 @@ def _serve_with(
     components: Components,
     load: Any,
     main_loop_raises: BaseException | None,
-    stop_gpu_raises: BaseException | None = None,
+    drain_raises: BaseException | None = None,
     wait_until: Any = None,
-) -> tuple[ServeOutcome, BaseException | None]:
+) -> tuple[ServeOutcome, BaseException | None, list[asyncio.Task[Any]]]:
     """Run serve() with uvicorn's main loop (once `wait_until()` holds) returning or raising
-    `main_loop_raises`, and `_stop_gpu` optionally raising. Returns the outcome and whatever
-    serve() raised."""
+    `main_loop_raises`, and the GPU drain optionally raising `drain_raises` (the real
+    `_stop_gpu` still runs around it). Returns the outcome, whatever serve() raised, and the
+    tasks still pending once it had."""
 
     async def main_loop(self: Any) -> None:
         if wait_until is not None:
@@ -599,23 +600,47 @@ def _serve_with(
             raise main_loop_raises
 
     monkeypatch.setattr(api._Server, "main_loop", main_loop)
-    if stop_gpu_raises is not None:
+    if drain_raises is not None:
 
-        async def broken_stop_gpu(*_args: Any) -> None:
-            raise stop_gpu_raises
+        async def broken_drain(*_args: Any) -> bool:
+            raise drain_raises
 
-        monkeypatch.setattr(api, "_stop_gpu", broken_stop_gpu)
+        monkeypatch.setattr(api, "_drain_gpu", broken_drain)
     outcome = ServeOutcome()
+    raised: list[BaseException] = []
+    pending: list[asyncio.Task[Any]] = []
 
     async def scenario() -> None:
         app = create_app(components)
-        await serve(components, app, [_bind_one("127.0.0.1", 0)], load, outcome)
+        try:
+            await serve(components, app, [_bind_one("127.0.0.1", 0)], load, outcome)
+        except BaseException as exc:  # noqa: BLE001 - returned for the test to inspect
+            raised.append(exc)
+        current = asyncio.current_task()
+        pending.extend(t for t in asyncio.all_tasks() if t is not current and not t.done())
 
-    try:
-        asyncio.run(scenario())
-    except BaseException as exc:  # noqa: BLE001 - returned for the test to inspect
-        return outcome, exc
-    return outcome, None
+    asyncio.run(scenario())
+    return outcome, (raised[0] if raised else None), pending
+
+
+def _loaded_in(components: Components) -> Any:
+    """For `wait_until`: the load has finished, so `_stop_gpu` goes on to drain the GPU."""
+    return lambda: components.readiness.runtime is not None
+
+
+@pytest.mark.parametrize(
+    ("crash", "exit_code"),
+    [
+        (RuntimeError("boom"), 1),
+        (SystemExit(3), 3),
+        (SystemExit(None), 0),
+        (SystemExit("bye"), 1),  # Python prints a non-int code and exits 1
+        (KeyboardInterrupt(), 130),
+    ],
+    ids=["exception", "system-exit-3", "system-exit-none", "system-exit-str", "sigint"],
+)
+def test_crash_exit_codes_follow_python(crash: BaseException, exit_code: int) -> None:
+    assert api._crash_exit_code(crash) == exit_code
 
 
 @pytest.mark.usefixtures("keep_sigint")
@@ -645,7 +670,7 @@ def test_a_crash_during_the_load_hard_exits_with_its_code_and_one_error_event(
         return _loaded()
 
     try:
-        outcome, raised = _serve_with(monkeypatch, components, load, crash, wait_until=started.is_set)
+        outcome, raised, _ = _serve_with(monkeypatch, components, load, crash, wait_until=started.is_set)
     finally:
         release.set()
         components.gpu.shutdown()
@@ -673,7 +698,7 @@ def test_a_cancelled_serve_during_the_load_is_not_a_crash(
         return _loaded()
 
     try:
-        outcome, raised = _serve_with(
+        outcome, raised, _ = _serve_with(
             monkeypatch, components, load, asyncio.CancelledError(), wait_until=started.is_set
         )
     finally:
@@ -698,7 +723,7 @@ def test_a_crash_without_a_hard_exit_is_reported_and_propagates(
     def loaded() -> bool:  # the load is over, so the GPU drains normally
         return components.readiness.runtime is not None
 
-    outcome, raised = _serve_with(monkeypatch, components, _loaded, crash, wait_until=loaded)
+    outcome, raised, _ = _serve_with(monkeypatch, components, _loaded, crash, wait_until=loaded)
 
     assert raised is crash
     # No hard exit: the exception reaches main() and Python prints it and exits non-zero.
@@ -719,13 +744,19 @@ def test_a_failing_gpu_stop_hard_exits_with_ex_software(
     stop_error = OSError("stop broke")
 
     try:
-        outcome, raised = _serve_with(
-            monkeypatch, components, _loaded, None, stop_gpu_raises=stop_error
+        outcome, raised, pending = _serve_with(
+            monkeypatch,
+            components,
+            _loaded,
+            None,
+            drain_raises=stop_error,
+            wait_until=_loaded_in(components),
         )
     finally:
         components.gpu.shutdown()
 
     assert raised is stop_error
+    assert pending == []
     assert outcome == ServeOutcome(70, hard_exit=True)
     assert "OSError: stop broke" in capsys.readouterr().err
     [stopping] = _stopping_events(sink)
@@ -735,29 +766,121 @@ def test_a_failing_gpu_stop_hard_exits_with_ex_software(
 
 
 @pytest.mark.usefixtures("keep_sigint")
-def test_a_crash_and_a_failing_gpu_stop_re_raise_the_crash_and_report_both(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("crash", "exit_code"),
+    [(RuntimeError("uvicorn broke"), 1), (KeyboardInterrupt(), 130), (SystemExit(4), 4)],
+    ids=["exception", "sigint", "system-exit"],
+)
+def test_a_crash_and_a_failing_gpu_stop_keep_the_crash_code_and_report_both(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    crash: BaseException,
+    exit_code: int,
 ) -> None:
     sink = io.StringIO()
     components = _components(sink)
-    crash, stop_error = RuntimeError("uvicorn broke"), OSError("stop broke")
+    stop_error = OSError("stop broke")
 
     try:
-        outcome, raised = _serve_with(
-            monkeypatch, components, _loaded, crash, stop_gpu_raises=stop_error
+        outcome, raised, pending = _serve_with(
+            monkeypatch,
+            components,
+            _loaded,
+            crash,
+            drain_raises=stop_error,
+            wait_until=_loaded_in(components),
         )
     finally:
         components.gpu.shutdown()
 
     assert raised is crash
-    assert outcome == ServeOutcome(70, hard_exit=True)
+    assert pending == []
+    assert outcome == ServeOutcome(exit_code, hard_exit=True)
     stderr = capsys.readouterr().err
-    assert "RuntimeError: uvicorn broke" in stderr
+    assert type(crash).__name__ in stderr
     assert "OSError: stop broke" in stderr
     [stopping] = _stopping_events(sink)
     assert (stopping["level"], stopping["reason"]) == ("error", "gpu stop failed")
-    assert "uvicorn broke" in stopping["crash"]
+    assert type(crash).__name__ in stopping["crash"]
     assert "stop broke" in stopping["stop_error"]
+
+
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_cancelled_serve_with_a_failing_gpu_stop_re_raises_the_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation always propagates; the stop failure is still reported and exits 70."""
+    sink = io.StringIO()
+    components = _components(sink)
+
+    try:
+        outcome, raised, pending = _serve_with(
+            monkeypatch,
+            components,
+            _loaded,
+            asyncio.CancelledError(),
+            drain_raises=OSError("stop broke"),
+            wait_until=_loaded_in(components),
+        )
+    finally:
+        components.gpu.shutdown()
+
+    assert isinstance(raised, asyncio.CancelledError)
+    assert pending == []
+    assert outcome == ServeOutcome(70, hard_exit=True)
+    [stopping] = _stopping_events(sink)
+    assert (stopping["level"], stopping["reason"]) == ("error", "gpu stop failed")
+    assert "crash" not in stopping
+
+
+@pytest.mark.usefixtures("keep_sigint")
+def test_cancelling_serve_while_the_gpu_drains_is_a_cancel_not_a_stop_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sink = io.StringIO()
+    components = _components(sink)
+    draining = threading.Event()
+
+    async def stuck_drain(*_args: Any) -> bool:
+        draining.set()
+        await asyncio.Event().wait()  # never finishes on its own
+        return True
+
+    monkeypatch.setattr(api._Server, "main_loop", _returns_once(_loaded_in(components)))
+    monkeypatch.setattr(api, "_drain_gpu", stuck_drain)
+    outcome = ServeOutcome()
+
+    async def scenario() -> list[asyncio.Task[Any]]:
+        app = create_app(components)
+        serving = asyncio.create_task(
+            serve(components, app, [_bind_one("127.0.0.1", 0)], _loaded, outcome)
+        )
+        await _wait_until(draining.is_set)
+        serving.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await serving
+        current = asyncio.current_task()
+        return [t for t in asyncio.all_tasks() if t is not current and not t.done()]
+
+    try:
+        pending = asyncio.run(scenario())
+    finally:
+        components.gpu.shutdown()
+
+    assert pending == []
+    # The GPU may still be busy, so still a hard exit, but with the normal code.
+    assert outcome == ServeOutcome(0, hard_exit=True)
+    assert capsys.readouterr().err == ""
+    [stopping] = _stopping_events(sink)
+    assert (stopping["level"], stopping["reason"]) == ("warning", "gpu stop cancelled")
+    assert "stop_error" not in stopping
+
+
+def _returns_once(condition: Any) -> Any:
+    async def main_loop(self: Any) -> None:
+        await _wait_until(condition)
+
+    return main_loop
 
 
 @posix_only

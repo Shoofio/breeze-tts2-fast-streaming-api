@@ -342,7 +342,7 @@ async def serve(
                 stop_error = exc
             _conclude(components.events, outcome, crash, hard_exit_reason, stop_error)
             if stop_error is not None and crash is None:
-                raise stop_error  # with a crash, the crash propagates (see _conclude)
+                raise stop_error  # otherwise uvicorn's exception propagates (see _conclude)
     finally:
         # Only now that the hard-exit decision is made: until then a signal must still reach
         # `on_signal`.
@@ -352,8 +352,11 @@ async def serve(
 
 
 def _crash_exit_code(crash: BaseException) -> int:
-    if isinstance(crash, SystemExit) and isinstance(crash.code, int):
-        return crash.code
+    """The code Python itself would exit with, had the exception gone uncaught."""
+    if isinstance(crash, SystemExit):
+        if crash.code is None:
+            return 0
+        return crash.code if isinstance(crash.code, int) else 1
     if isinstance(crash, KeyboardInterrupt):
         return 130  # the shell convention for "killed by SIGINT"
     return 1
@@ -368,36 +371,42 @@ def _conclude(
 ) -> None:
     """Settle how serve() ends and report it in exactly one `server.stopping` (or none, for a
     clean stop). `crash` is what uvicorn's serve() raised, `stop_error` what `_stop_gpu`
-    raised. A CancelledError is not a crash: it is someone stopping us.
+    raised. A CancelledError in either is a cancel, not a failure: it is someone stopping us.
 
-    | case                           | hard exit | exit code             | reason              | level   |
-    |--------------------------------|-----------|-----------------------|---------------------|---------|
-    | clean stop                     | no        | 0 / 1 (load failed)   | (no event)          |         |
-    | hard exit (load, signal, 70)   | yes       | from `_stop_gpu`      | hard-exit reason    | warning |
-    | crash, no hard exit            | no        | Python's, as it raises| "serve raised"      | error   |
-    | crash + hard exit              | yes       | the crash's (1, SystemExit's int, 130); 70 kept | hard-exit reason | error |
-    | `_stop_gpu` raised (± a crash) | yes       | 70                    | "gpu stop failed"   | error   |
+    | case                              | hard exit | exit code                  | reason               | level   |
+    |-----------------------------------|-----------|----------------------------|----------------------|---------|
+    | clean stop                        | no        | 0 / 1 (load failed)        | (no event)           |         |
+    | hard exit from `_stop_gpu`        | yes       | from `_stop_gpu` (70: drain timed out) | its reason | warning |
+    | `_stop_gpu` cancelled             | yes       | unchanged                  | "gpu stop cancelled" | warning |
+    | `_stop_gpu` failed                | yes       | 70                         | "gpu stop failed"    | error   |
+    | crash, no hard exit               | no        | Python's, as it propagates | "serve raised"       | error   |
+    | crash + any hard exit above       | yes       | the crash's (`_crash_exit_code`), but 70 after a drain timeout | as above | error |
 
-    A failed `_stop_gpu` is a hard exit because the GPU thread may still be busy, and a normal
-    exit would join it. The event carries `crash` and `stop_error` (formatted tracebacks)
-    when present; on a hard exit they also go to stderr, since `os._exit` would swallow them.
-    serve() then re-raises the crash if there was one, else the stop error.
+    `_stop_gpu` ending early (failed or cancelled) is a hard exit because the GPU thread may
+    still be busy, and a normal exit would join it. The event carries `crash` and
+    `stop_error` (formatted tracebacks) for failures, never for a cancel; on a hard exit they
+    also go to stderr, since `os._exit` would swallow them. serve() then re-raises what
+    uvicorn's serve() raised (a crash or a cancellation), else what `_stop_gpu` raised.
     """
     if isinstance(crash, asyncio.CancelledError):
         crash = None
+    stop_cancelled = isinstance(stop_error, asyncio.CancelledError)
+    stop_failure = None if stop_cancelled else stop_error
+    drain_timed_out = outcome.exit_code == EXIT_GPU_STUCK  # only `_stop_gpu` sets it
     # Exit code first, so a failure while reporting can't leave a crash exiting 0.
     if stop_error is not None:
         outcome.hard_exit = True
-        hard_exit_reason = "gpu stop failed"
+        hard_exit_reason = "gpu stop cancelled" if stop_cancelled else "gpu stop failed"
+    if crash is not None and outcome.hard_exit:
+        outcome.exit_code = EXIT_GPU_STUCK if drain_timed_out else _crash_exit_code(crash)
+    elif stop_failure is not None:
         outcome.exit_code = EXIT_GPU_STUCK
-    elif crash is not None and outcome.hard_exit and outcome.exit_code != EXIT_GPU_STUCK:
-        outcome.exit_code = _crash_exit_code(crash)
     if crash is None and not outcome.hard_exit:
         return
     try:
         failures = {
             name: "".join(traceback.format_exception(error))
-            for name, error in (("crash", crash), ("stop_error", stop_error))
+            for name, error in (("crash", crash), ("stop_error", stop_failure))
             if error is not None
         }
         events.emit(
@@ -436,11 +445,17 @@ async def _stop_gpu(
 
     drain = asyncio.create_task(_drain_gpu(components, server))
     interrupted = asyncio.create_task(drain_interrupted.wait())
-    await asyncio.wait([drain, interrupted], return_when=asyncio.FIRST_COMPLETED)
-    interrupted.cancel()
-    if not drain.done():
-        # The drain is abandoned, not awaited: the process is about to end.
+    try:
+        await asyncio.wait([drain, interrupted], return_when=asyncio.FIRST_COMPLETED)
+        signalled = not drain.done()
+    finally:
+        # Neither task outlives this call, however it ends (a signal, a failure, a cancel).
+        # Waiting for a cancelled drain is quick: it only stops waiting; any GPU work it had
+        # started carries on, which is why the caller then hard-exits.
         drain.cancel()
+        interrupted.cancel()
+        await asyncio.gather(drain, interrupted, return_exceptions=True)
+    if signalled:
         outcome.hard_exit = True
         return "signal during drain"
     if not drain.result():
