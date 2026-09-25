@@ -61,6 +61,17 @@ read it); forcing a TCP reset (plain ASGI can't reach the transport, and it isn'
 - `A:`'s `_SpeechResponse` (`api.py:1215-1242`) already had the right shape: the response's
   `finally` owns cleanup. The fixes are listed in R10.
 
+**Minimum delivery rate**: the send timeout only catches a client that stops reading entirely.
+A client that trickles (draining a few bytes just before each timeout) would keep every send
+under 30 s and hold the single GPU for hours. So after a 30 s grace period, the stream must have
+delivered audio at an average of at least half of real time since its first byte:
+`bytes_sent / (2 × sample_rate) ≥ 0.5 × (elapsed − 30 s)`. A stream below that is aborted like a
+send timeout, as `speech.aborted` with reason `too_slow`. Each send's timeout is the shorter of
+the send timeout and the time left before the rate would be breached, so a trickle is caught
+mid-send too. The grace period absorbs slow starts and hiccups, and any client that plays the
+audio reads at least at real time. Note that the elapsed time includes waiting for generation,
+so a GPU generating below 0.5× real time would trip the rule on its own.
+
 **Alternatives considered**: releasing the gate in the generator's `finally` (skipped when the
 body never starts); polling `request.is_disconnected()` (redundant under spec 2.3).
 
@@ -338,8 +349,16 @@ BC-47 documents the limit.
 - **`.breeze` files:** counted in `voices.loaded`.
 - **Unnamed ids:** `v_` followed by 16 hex characters of `blake2b(len(wav) ‖ wav ‖ text,
   digest_size=8)`.
-- **Codec fingerprint:** sha256 of `config.json`, the codebook count, the codebook size and the
-  sample rate, with no path.
+- **Codec fingerprint:** sha256 of (a) the canonical JSON of `config.json`'s required identity
+  fields -- input/output sample rates, `encoder_valid_num_quantizers`, encode/decode
+  frame/upsample rates at the top level; codebook size/dim and quantizer count from both
+  `encoder_config` and `decoder_config` (which differ between the two); plus `decoder_config`'s
+  semantic-codebook fields and upsample schedule -- every field required, none defaulted; and
+  (b) the tensor name/dtype/shape map (not the trained values) of the safetensors header of the
+  one weight file (or, sharded, every shard the loader's own index lists) the codec loader
+  actually reads. No path is hashed. This detects an architecture, shape or dtype change, not a
+  retrain of weights with identical shapes -- an accepted limit of a fingerprint cheap enough to
+  compute at every startup.
 
 **Rationale**: FR-017–FR-022 and BC-25–BC-29/48.
 - All saved codes live in memory (about 12 KB per 30 s voice), which removes 001's lazy-load and

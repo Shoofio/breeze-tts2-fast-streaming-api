@@ -10,26 +10,42 @@ What this relies on, in Starlette 1.6.0 and uvicorn 0.52.4 (h11, ASGI spec 2.3):
 - uvicorn announces spec 2.3 (`uvicorn/protocols/http/h11_impl.py:207`), so
   `StreamingResponse.__call__` runs `stream_response` in a task group next to
   `listen_for_disconnect` (`starlette/responses.py:273-280`). An `http.disconnect` cancels
-  `stream_response`, and `__call__` then *returns normally*: a disconnect is recognised here
-  by the stream not having finished.
+  `stream_response`, and `__call__` then *returns normally*. The listener is overridden here
+  to set a flag, so a disconnect is never mistaken for a completed stream.
 - An exception in `stream_response` cancels the listener and is re-raised on its own
-  (`create_collapsing_task_group`, `starlette/_utils.py:83-93`). Starlette's exception wrapper
-  can't answer once the response has started and raises instead
-  (`starlette/_exception_handler.py:55-56`), so it reaches uvicorn, which closes the transport
-  without the `0\\r\\n\\r\\n` chunked terminator (`h11_impl.py:413-425`). That is the abort.
+  (`create_collapsing_task_group`, `starlette/_utils.py:83-93`). `SpeechResponse` turns it into
+  `StreamAborted`. No handler matches that in the exception wrapper, which re-raises it
+  (`starlette/_exception_handler.py:52-53`); `ServerErrorMiddleware` then calls the app's
+  `Exception` handler but can't send its response, since ours has started, and re-raises
+  (`starlette/middleware/errors.py:163-186`). That handler recognises `StreamAborted` and
+  stays quiet: the outcome event was already emitted here. uvicorn finally closes the
+  transport without the `0\\r\\n\\r\\n` chunked terminator (`h11_impl.py:414-425`). That is
+  the abort.
 - A client that stays connected but stops reading parks `send()` in `flow.drain()` for ever
-  (`h11_impl.py:460-461`); the per-send timeout bounds it. After a disconnect, `send()` returns
-  without writing (`h11_impl.py:463-464`), so a disconnect never looks like a send failure.
+  (`h11_impl.py:461-462`); the send timeout and the minimum delivery rate bound it. After a
+  disconnect, `send()` returns without writing (`h11_impl.py:464-465`), so a disconnect never
+  looks like a send failure.
 - On spec 2.4 servers Starlette reports a disconnect as `ClientDisconnect` instead
   (`starlette/responses.py:267-271`); that is handled too, although uvicorn doesn't use it.
 
+Limit: after a send timeout the connection is *closed*, not aborted. ASGI gives no way to
+reach the transport, so uvicorn's `transport.close()` keeps the socket until its write buffer
+drains, which a stalled reader never does. The GPU is already released by then; the socket is
+evicted by the kernel through `TCP_USER_TIMEOUT` (30 s, set on the listening socket in
+`api.bind_http_sockets`), and at shutdown by uvicorn's bounded graceful timeout.
+
 Never wrap the app in `BaseHTTPMiddleware`: it runs the response in its own task and would
-change all of the above.
+change all of the above. Routes returning a `SpeechResponse` must not use FastAPI `yield`
+dependencies either: their exit code runs between building the response and calling it, and
+a failure there means `__call__` never runs (the `weakref.finalize` fallback below then
+releases the GPU, but only when the response is garbage-collected).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import weakref
 from collections.abc import AsyncGenerator, Callable, Mapping
 from typing import Any, Protocol
 
@@ -37,10 +53,19 @@ from starlette.requests import ClientDisconnect
 from starlette.responses import StreamingResponse
 from starlette.types import Message, Receive, Scope, Send
 
+from breeze_infer.errors import StreamAborted
 from breeze_infer.gpu import GpuCloseTimeout, GpuSession
 from breeze_infer.limits import HTTP_SEND_TIMEOUT_SECONDS
 
 BYTES_PER_SAMPLE = 2  # s16le mono
+
+# Minimum delivery rate (research.md R3). The send timeout alone only catches a reader that
+# stops completely; one that trickles (a few bytes before each timeout) could hold the only
+# GPU for hours. So after a grace period, the audio delivered since the first byte must keep
+# up with at least half of real time. The grace period covers slow starts and short hiccups;
+# half of real time is far below what any client that plays the audio has to read.
+MIN_RATE_GRACE_SECONDS = 30.0
+MIN_RATE_REAL_TIME = 0.5
 
 
 class Events(Protocol):
@@ -48,13 +73,57 @@ class Events(Protocol):
 
 
 class SendTimeout(Exception):
-    """One `send()` took longer than the send timeout: the client stopped reading."""
+    """The client isn't reading fast enough. `reason` is `send_timeout` (one send blocked for
+    too long) or `too_slow` (below the minimum delivery rate)."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
-# Cleanup tasks still running after the request task that started them was cancelled. The
-# event loop only keeps weak references to tasks, so without this one could be collected
-# half-way through closing the generator.
+# Cleanup tasks that must finish even if nobody awaits them any more (a cancelled request, or
+# a response that was never sent). The event loop only keeps weak references to tasks, so
+# without this one could be collected half-way through closing the generator.
 _cleanups: set[asyncio.Task[None]] = set()
+
+
+def _keep_running(task: asyncio.Task[None]) -> asyncio.Task[None]:
+    _cleanups.add(task)
+    task.add_done_callback(_cleanups.discard)
+    return task
+
+
+async def _close_session(session: GpuSession[Any]) -> dict[str, str] | None:
+    """Close the session (generator on the GPU thread, then release). If that failed, return
+    the `speech.failed` fields to report instead of the stream's own outcome."""
+    try:
+        await session.aclose()
+    except GpuCloseTimeout as error:
+        # The close is still running on the GPU thread, so the gate stays held; see gpu.py.
+        return {"reason": "gpu_close_timeout", "error": repr(error)}
+    except Exception as error:  # noqa: BLE001 - reported as an event, never raised
+        # The generator raised while closing; `aclose()` released the gate anyway.
+        return {"reason": "gpu_close_error", "error": repr(error)}
+    return None
+
+
+async def _close_unsent(session: GpuSession[Any], events: Events, request_id: str) -> None:
+    failure = await _close_session(session)
+    if failure is not None:
+        events.emit("speech.failed", level="error", request_id=request_id, **failure)
+    else:
+        events.emit("speech.aborted", request_id=request_id, reason="not_sent", audio_seconds=0.0)
+
+
+def _schedule_close_unsent(
+    loop: asyncio.AbstractEventLoop, session: GpuSession[Any], events: Events, request_id: str
+) -> None:
+    """`weakref.finalize` callback for a response dropped without being called. It can run on
+    any thread (wherever the last reference went), so it only schedules the close."""
+    with contextlib.suppress(RuntimeError):  # the loop is closed: nothing can run it any more
+        loop.call_soon_threadsafe(
+            lambda: _keep_running(loop.create_task(_close_unsent(session, events, request_id)))
+        )
 
 
 class SpeechResponse(StreamingResponse):
@@ -64,12 +133,15 @@ class SpeechResponse(StreamingResponse):
     - `body`: an async generator of the remaining PCM chunks. It is closed with `aclose()`
       when streaming stops for any reason; Starlette itself never closes it.
     - `session`: the `GpuSession` feeding `body`. `__call__` closes it (generator closed on
-      the GPU thread, then the gate released) whatever happens, even when cancelled.
+      the GPU thread, then the gate released) whatever happens, even when cancelled. If the
+      response is dropped without ever being called, a finalizer closes it instead.
+    - `sample_rate`: sets the contract headers and turns bytes into audio seconds. `headers`
+      adds to the contract headers; it can't replace them.
     - `clock` and `started_at`: a monotonic clock and its reading when generation started,
-      for the real-time factor in `speech.completed`.
+      for the real-time factor in `speech.completed` and the minimum delivery rate.
 
     Exactly one of `speech.completed`, `speech.aborted` or `speech.failed` is emitted, after
-    the session is closed.
+    the session is closed. Build it on the event loop that will serve it.
     """
 
     media_type = "audio/pcm"
@@ -87,8 +159,16 @@ class SpeechResponse(StreamingResponse):
         started_at: float,
         headers: Mapping[str, str] | None = None,
         send_timeout: float = HTTP_SEND_TIMEOUT_SECONDS,
+        min_rate_grace: float = MIN_RATE_GRACE_SECONDS,
+        min_rate: float = MIN_RATE_REAL_TIME,
     ) -> None:
-        super().__init__(body, headers=headers)
+        contract = {
+            "x-sample-rate": str(sample_rate),
+            "x-sample-format": "s16le",
+            "cache-control": "no-store",
+        }
+        extra = {name.lower(): value for name, value in (headers or {}).items()}
+        super().__init__(body, headers={**extra, **contract})
         self._first_chunk = first_chunk
         self._body = body
         self._session = session
@@ -98,8 +178,19 @@ class SpeechResponse(StreamingResponse):
         self._clock = clock
         self._started_at = started_at
         self._send_timeout = send_timeout
+        self._min_rate_grace = min_rate_grace
+        self._min_rate = min_rate
         self._bytes_sent = 0
-        self._finished = False  # set once the final, terminating send went out
+        self._first_byte_at: float | None = None
+        self._disconnected = False
+        self._finished = False  # the terminator went out to a client still connected
+        self._unsent = weakref.finalize(
+            self, _schedule_close_unsent, asyncio.get_running_loop(), session, events, request_id
+        )
+
+    async def listen_for_disconnect(self, receive: Receive) -> None:
+        await super().listen_for_disconnect(receive)
+        self._disconnected = True
 
     async def stream_response(self, send: Send) -> None:
         try:
@@ -111,26 +202,47 @@ class SpeechResponse(StreamingResponse):
                     "headers": self.raw_headers,
                 },
             )
+            self._first_byte_at = self._clock()
             await self._send_chunk(send, self._first_chunk)
             async for chunk in self._body:
                 await self._send_chunk(send, chunk)
             await self._send(send, {"type": "http.response.body", "body": b"", "more_body": False})
-            self._finished = True
+            # Checked here, not after `__call__`'s task group: once the terminator is sent,
+            # uvicorn answers the listener with `http.disconnect` too, so a flag set later
+            # means nothing.
+            self._finished = not self._disconnected
         finally:
-            await self._body.aclose()
+            # The body is suspended at a `yield` or already finished, so this can't normally
+            # fail; if it did, it must not replace the exception that decides the outcome.
+            with contextlib.suppress(Exception):
+                await self._body.aclose()
 
     async def _send_chunk(self, send: Send, chunk: bytes) -> None:
         await self._send(send, {"type": "http.response.body", "body": chunk, "more_body": True})
-        self._bytes_sent += len(chunk)
+        # After a disconnect uvicorn drops sends without a word: those bytes never left.
+        if not self._disconnected:
+            self._bytes_sent += len(chunk)
 
     async def _send(self, send: Send, message: Message) -> None:
+        timeout, reason = self._send_timeout, "send_timeout"
+        if self._first_byte_at is not None:
+            # Past this moment the delivered audio is below `min_rate` x real time.
+            too_slow_at = (
+                self._first_byte_at + self._min_rate_grace + self._audio_seconds() / self._min_rate
+            )
+            left = too_slow_at - self._clock()
+            if left <= 0:
+                raise SendTimeout("too_slow", "delivery fell below the minimum rate")
+            if left < timeout:
+                timeout, reason = left, "too_slow"
         try:
-            async with asyncio.timeout(self._send_timeout):
+            async with asyncio.timeout(timeout):
                 await send(message)
         except TimeoutError as error:
-            raise SendTimeout(f"send() blocked for over {self._send_timeout:g} s") from error
+            raise SendTimeout(reason, f"send() blocked for {timeout:g} s ({reason})") from error
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        self._unsent.detach()  # from here on, the `finally` below owns the close
         # The outcome if nothing below says otherwise: a disconnect cancels the stream inside
         # Starlette's task group, and `super().__call__` then returns normally.
         outcome, fields = "speech.aborted", {"reason": "client_disconnect"}
@@ -141,42 +253,30 @@ class SpeechResponse(StreamingResponse):
         except asyncio.CancelledError:
             outcome, fields = "speech.aborted", {"reason": "cancelled"}
             raise
-        except ClientDisconnect:
-            raise
-        except SendTimeout:
-            outcome, fields = "speech.aborted", {"reason": "send_timeout"}
-            raise
+        except SendTimeout as error:
+            outcome, fields = "speech.aborted", {"reason": error.reason}
+            raise StreamAborted(error.reason) from error
+        except ClientDisconnect as error:
+            raise StreamAborted("client_disconnect") from error
         except Exception as error:
-            # Re-raised so uvicorn drops the connection without the chunked terminator.
             outcome = "speech.failed"
             fields = {"reason": "generation_error", "error": repr(error)}
-            raise
+            raise StreamAborted("generation_error") from error
         finally:
             # In its own task, so a cancellation of this one can't interrupt it: the gate must
             # be released, and the event emitted, however the request ended.
-            cleanup = asyncio.ensure_future(self._close(outcome, fields))
-            _cleanups.add(cleanup)
-            cleanup.add_done_callback(_cleanups.discard)
-            await asyncio.shield(cleanup)
+            await asyncio.shield(_keep_running(asyncio.ensure_future(self._close(outcome, fields))))
 
     async def _close(self, outcome: str, fields: dict[str, str]) -> None:
-        try:
-            await self._session.aclose()
-        except GpuCloseTimeout as error:
-            # The close is still running on the GPU thread and the gate stays held until it
-            # finishes: later requests get `busy` rather than a GPU that is still occupied.
-            outcome = "speech.failed"
-            fields = {"reason": "gpu_close_timeout", "error": repr(error)}
-        except Exception as error:  # noqa: BLE001 - reported as an event, never raised
-            # The generator raised while closing; `aclose()` released the gate anyway.
-            outcome = "speech.failed"
-            fields = {"reason": "gpu_close_error", "error": repr(error)}
-        self._emit(outcome, fields)
-
-    def _emit(self, outcome: str, fields: dict[str, str]) -> None:
-        audio_seconds = self._bytes_sent / BYTES_PER_SAMPLE / self._sample_rate
+        failure = await _close_session(self._session)
+        if failure is not None:
+            outcome, fields = "speech.failed", failure
+        audio_seconds = self._audio_seconds()
         extra: dict[str, Any] = {"audio_seconds": audio_seconds, **fields}
         if outcome == "speech.completed" and audio_seconds > 0:
             extra["rtf"] = (self._clock() - self._started_at) / audio_seconds
         level = "error" if outcome == "speech.failed" else "info"
         self._events.emit(outcome, level=level, request_id=self._request_id, **extra)
+
+    def _audio_seconds(self) -> float:
+        return self._bytes_sent / BYTES_PER_SAMPLE / self._sample_rate

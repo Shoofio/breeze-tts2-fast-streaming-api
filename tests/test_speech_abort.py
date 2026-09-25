@@ -10,6 +10,7 @@ is noticed, and what a blocked `send()` does. The route is a minimal stand-in fo
 from __future__ import annotations
 
 import asyncio
+import gc
 import socket
 import threading
 import time
@@ -23,9 +24,9 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 
 from breeze_infer.audio import pcm16
-from breeze_infer.errors import install_error_handlers
+from breeze_infer.errors import StreamAborted, install_error_handlers
 from breeze_infer.gpu import DONE, GpuGate, GpuSession, GpuThread
-from breeze_infer.streaming import SpeechResponse
+from breeze_infer.streaming import SendTimeout, SpeechResponse
 
 # FakeRuntime imports this lazily on the first step, i.e. on the GPU thread in the middle of a
 # request; on a slow mount that takes tens of seconds and would blow every bound below.
@@ -46,6 +47,20 @@ def wait_until(condition: Callable[[], bool], timeout: float = 5.0) -> None:
         if time.monotonic() > deadline:
             raise AssertionError(f"condition not met within {timeout} s")
         time.sleep(0.01)
+
+
+def wait_for_events(rig: Rig, count: int = 1) -> None:
+    """Wait for `count` outcome events: each is emitted after the gate is released."""
+    wait_until(lambda: len(rig.terminal_events()) >= count)
+
+
+async def eventually(condition: Callable[[], bool], timeout: float = 5.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not condition():
+        if loop.time() > deadline:
+            raise AssertionError(f"condition not met within {timeout} s")
+        await asyncio.sleep(0.01)
 
 
 class TrackedGeneration:
@@ -123,6 +138,7 @@ class Rig:
                 sample_rate=self.runtime.sample_rate,
                 clock=time.monotonic,
                 started_at=time.monotonic(),
+                headers={"X-Request-Id": "req-test"},
                 send_timeout=self.send_timeout,
             )
 
@@ -158,7 +174,14 @@ class LiveServer:
             daemon=True,
         )
         self._thread.start()
-        wait_until(lambda: self.server.started)
+        try:
+            wait_until(lambda: self.server.started or not self._thread.is_alive())
+            if not self.server.started:
+                raise AssertionError("uvicorn exited without starting")
+        except BaseException:
+            self.stop()
+            sock.close()  # uvicorn closes it once serving; not if it never got that far
+            raise
 
     def call(self, fn: Callable[[], T]) -> T:
         """Run `fn` on the server's event loop, where the gate lives."""
@@ -171,6 +194,9 @@ class LiveServer:
     def stop(self) -> None:
         self.server.should_exit = True
         self._thread.join(timeout=10)
+        if self._thread.is_alive():
+            # The loop is still running: closing it now would fail and hide this error.
+            raise AssertionError("uvicorn did not stop within 10 s")
         self.loop.close()
 
 
@@ -198,8 +224,12 @@ def serve() -> Iterator[Callable[[Rig], LiveServer]]:
     for rig, server in started:
         if rig.runtime.gate is not None:
             rig.runtime.gate.set()  # never leave the GPU thread parked on a failed test
-        server.stop()
-        assert rig.gpu.shutdown(timeout=5)
+        try:
+            server.stop()
+        finally:
+            assert rig.gpu.shutdown(timeout=5)
+
+
 
 
 def read_until_closed(sock: socket.socket) -> bytes:
@@ -207,6 +237,29 @@ def read_until_closed(sock: socket.socket) -> bytes:
     while data := sock.recv(65536):
         received += data
     return bytes(received)
+
+
+def test_a_finished_stream_completes_with_the_contract_headers(
+    serve: Callable[[Rig], LiveServer],
+) -> None:
+    rig = Rig(FakeRuntime(chunks=4))
+    server = serve(rig)
+
+    response = httpx.post(server.url, timeout=10)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/pcm"
+    assert response.headers["x-sample-rate"] == "24000"
+    assert response.headers["x-sample-format"] == "s16le"
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["x-request-id"] == "req-test"  # extra headers still pass through
+    assert len(response.content) == 4 * CHUNK_BYTES
+    wait_for_events(rig)
+    [(name, fields)] = rig.events.calls
+    assert name == "speech.completed"
+    assert fields["audio_seconds"] == 4 * CODEC_SAMPLES_PER_FRAME / 24000
+    assert isinstance(fields["rtf"], float) and fields["rtf"] > 0
+    assert gate_is_free(rig, server)
 
 
 def test_bc_17_failure_after_streaming_starts_aborts_the_response(
@@ -225,7 +278,7 @@ def test_bc_17_failure_after_streaming_starts_aborts_the_response(
             for data in response.iter_raw():
                 received += data
     assert len(received) == 3 * CHUNK_BYTES  # everything produced before the failure
-    wait_until(lambda: gate_is_free(rig, server))
+    wait_for_events(rig, 1)
 
     # The same failure seen on the wire, as curl would: headers, some body, then EOF with
     # no terminating zero-length chunk.
@@ -235,14 +288,17 @@ def test_bc_17_failure_after_streaming_starts_aborts_the_response(
     assert raw.startswith(b"HTTP/1.1 200 ")
     assert b"transfer-encoding: chunked" in raw.lower()
     assert not raw.endswith(TERMINATOR)
-    wait_until(lambda: gate_is_free(rig, server))
+    wait_for_events(rig, 2)
 
-    assert [name for name, _ in rig.terminal_events()] == ["speech.failed", "speech.failed"]
-    for _, fields in rig.terminal_events():
+    # One outcome event per request, and nothing else: no second `request.failed` from the
+    # app's catch-all handler for an error the response already reported.
+    assert [name for name, _ in rig.events.calls] == ["speech.failed", "speech.failed"]
+    for _, fields in rig.events.calls:
         assert fields["level"] == "error"
         assert fields["reason"] == "generation_error"
         assert "RuntimeError" in str(fields["error"])
     assert all(generation.ended_on.startswith("breeze-gpu") for generation in rig.generations)
+    assert gate_is_free(rig, server)
 
 
 def test_bc_17_failure_before_first_chunk_returns_an_error_status(
@@ -257,10 +313,9 @@ def test_bc_17_failure_before_first_chunk_returns_an_error_status(
 
     assert response.status_code == 500
     assert response.json() == {"error": "internal error", "code": "internal_error"}
+    assert [name for name, _ in rig.events.calls] == ["request.failed"]  # no response built
     assert gate_is_free(rig, server)
     assert rig.runtime.closed == 1
-    assert rig.terminal_events() == []  # no response was ever built
-    assert [name for name, _ in rig.events.calls] == ["request.failed"]
 
 
 def test_client_disconnect_releases_the_gate_within_one_chunk(
@@ -286,84 +341,24 @@ def test_client_disconnect_releases_the_gate_within_one_chunk(
     # the gate released: the next request must not overlap a step that is still running.
     assert not gate_is_free(rig, server)
     hold.set()
-    wait_until(lambda: gate_is_free(rig, server))
+    wait_for_events(rig)
 
+    assert rig.events.calls == [
+        (
+            "speech.aborted",
+            {
+                "level": "info",
+                "request_id": "req-test",
+                "audio_seconds": 2 * CODEC_SAMPLES_PER_FRAME / 24000,
+                "reason": "client_disconnect",
+            },
+        )
+    ]
     [generation] = rig.generations
     assert generation.yielded == 3  # the two sent, plus the one in flight at the disconnect
     assert generation.ended_on is not None and generation.ended_on.startswith("breeze-gpu")
     assert rig.runtime.closed == 1
-    assert rig.terminal_events() == [
-        ("speech.aborted", {"level": "info", "request_id": "req-test",
-                            "audio_seconds": 2 * CODEC_SAMPLES_PER_FRAME / 24000,
-                            "reason": "client_disconnect"})
-    ]
-
-
-def test_gate_released_if_body_never_starts() -> None:
-    """Cleanup in the body generator's `finally` would never run here: the request is
-    cancelled while the headers are still being sent, before the body is first iterated."""
-    runtime = FakeRuntime(chunks=4)
-    events = RecordingEvents()
-    body_started = False
-
-    async def scenario() -> None:
-        nonlocal body_started
-        gate = GpuGate()
-        gpu = GpuThread("cpu", lambda _device: None)
-        lease = gate.try_acquire()
-        assert lease is not None
-        generation = TrackedGeneration(runtime.iter_audio_chunks({}))
-        session = GpuSession(lease, gpu, generation.run())
-        first = await session.step()
-        assert first is not DONE
-
-        async def body() -> AsyncGenerator[bytes, None]:
-            nonlocal body_started
-            body_started = True
-            async for chunk in rest_of_audio(session):
-                yield chunk
-
-        response = SpeechResponse(
-            first_chunk=pcm16(first.audio),
-            body=body(),
-            session=session,
-            events=events,
-            request_id="req-test",
-            sample_rate=runtime.sample_rate,
-            clock=time.monotonic,
-            started_at=time.monotonic(),
-        )
-        headers_sending = asyncio.Event()
-
-        async def receive() -> dict[str, Any]:
-            await asyncio.Event().wait()  # the client never sends or disconnects
-            raise AssertionError("unreachable")
-
-        async def send(message: dict[str, Any]) -> None:
-            headers_sending.set()
-            await asyncio.Event().wait()  # a peer that never accepts the headers
-
-        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}}
-        call = asyncio.create_task(response(scope, receive, send))
-        await asyncio.wait_for(headers_sending.wait(), timeout=5)
-        call.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(call, timeout=5)
-
-        # aclose() has run (not just been started): the gate is free right away.
-        free = gate.try_acquire()
-        assert free is not None
-        free.release()
-        assert generation.ended_on is not None and generation.ended_on.startswith("breeze-gpu")
-        assert await asyncio.to_thread(gpu.shutdown, 5)
-
-    asyncio.run(scenario())
-
-    assert not body_started
-    assert runtime.closed == 1
-    assert [(name, fields["reason"]) for name, fields in events.calls] == [
-        ("speech.aborted", "cancelled")
-    ]
+    assert gate_is_free(rig, server)
 
 
 def test_stalled_reader_hits_send_timeout(serve: Callable[[Rig], LiveServer]) -> None:
@@ -380,12 +375,263 @@ def test_stalled_reader_hits_send_timeout(serve: Callable[[Rig], LiveServer]) ->
         assert sock.recv(4096).startswith(b"HTTP/1.1 200 ")
         # ...and never read again. The connection stays open, so this isn't a disconnect.
 
-        wait_until(lambda: gate_is_free(rig, server), timeout=10)
+        wait_for_events(rig)
 
-        [(name, fields)] = rig.terminal_events()
+        [(name, fields)] = rig.events.calls  # and no `request.failed` on top
         assert name == "speech.aborted"
         assert fields["reason"] == "send_timeout"
+        assert gate_is_free(rig, server)
         [generation] = rig.generations
         assert generation.yielded < rig.runtime.chunks  # stopped early, not run to the end
         assert generation.ended_on is not None and generation.ended_on.startswith("breeze-gpu")
         assert rig.runtime.closed == 1
+
+
+# --- Direct ASGI calls, for orderings a real client can't produce on demand --------------
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@dataclass
+class Direct:
+    """A primed generation holding the gate, as the route leaves it just before responding."""
+
+    runtime: FakeRuntime
+    events: RecordingEvents
+    gate: GpuGate
+    gpu: GpuThread
+    generation: TrackedGeneration
+    session: GpuSession[Any]
+    first_chunk: bytes
+
+    @classmethod
+    async def open(cls, runtime: FakeRuntime) -> Direct:
+        gate = GpuGate()
+        gpu = GpuThread("cpu", lambda _device: None)
+        lease = gate.try_acquire()
+        assert lease is not None
+        generation = TrackedGeneration(runtime.iter_audio_chunks({}))
+        session = GpuSession(lease, gpu, generation.run())
+        first = await session.step()
+        assert first is not DONE
+        return cls(runtime, RecordingEvents(), gate, gpu, generation, session, pcm16(first.audio))
+
+    def response(self, **kwargs: Any) -> SpeechResponse:
+        options: dict[str, Any] = {
+            "body": rest_of_audio(self.session),
+            "clock": time.monotonic,
+            "started_at": time.monotonic(),
+        }
+        options.update(kwargs)
+        return SpeechResponse(
+            first_chunk=self.first_chunk,
+            session=self.session,
+            events=self.events,
+            request_id="req-test",
+            sample_rate=self.runtime.sample_rate,
+            **options,
+        )
+
+    def gate_is_free(self) -> bool:
+        lease = self.gate.try_acquire()
+        if lease is None:
+            return False
+        lease.release()
+        return True
+
+    async def shut_down(self) -> None:
+        assert await asyncio.to_thread(self.gpu.shutdown, 5)
+
+
+SCOPE = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}}
+
+
+async def never_disconnects() -> dict[str, Any]:
+    await asyncio.Event().wait()
+    raise AssertionError("unreachable")
+
+
+def test_gate_released_if_body_never_starts() -> None:
+    """Cleanup in the body generator's `finally` would never run here: the request is
+    cancelled while the headers are still being sent, before the body is first iterated."""
+    body_started = False
+
+    async def scenario() -> Direct:
+        direct = await Direct.open(FakeRuntime(chunks=4))
+
+        async def body() -> AsyncGenerator[bytes, None]:
+            nonlocal body_started
+            body_started = True
+            async for chunk in rest_of_audio(direct.session):
+                yield chunk
+
+        headers_sending = asyncio.Event()
+
+        async def send(message: dict[str, Any]) -> None:
+            headers_sending.set()
+            await asyncio.Event().wait()  # a peer that never accepts the headers
+
+        call = asyncio.create_task(direct.response(body=body())(SCOPE, never_disconnects, send))
+        await asyncio.wait_for(headers_sending.wait(), timeout=5)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(call, timeout=5)
+
+        # The cancelled call waited for the close: the gate is free right away.
+        assert direct.gate_is_free()
+        await direct.shut_down()
+        return direct
+
+    direct = asyncio.run(scenario())
+
+    assert not body_started
+    assert direct.generation.ended_on is not None
+    assert direct.generation.ended_on.startswith("breeze-gpu")
+    assert direct.runtime.closed == 1
+    assert [(name, fields["reason"]) for name, fields in direct.events.calls] == [
+        ("speech.aborted", "cancelled")
+    ]
+
+
+def test_a_response_that_is_never_called_still_releases_the_gate() -> None:
+    async def scenario() -> Direct:
+        direct = await Direct.open(FakeRuntime(chunks=4))
+        response = direct.response()
+        del response
+        gc.collect()
+
+        await eventually(lambda: bool(direct.events.calls))
+        assert direct.gate_is_free()
+        await direct.shut_down()
+        return direct
+
+    direct = asyncio.run(scenario())
+
+    assert direct.runtime.closed == 1
+    assert direct.generation.ended_on is not None
+    assert direct.generation.ended_on.startswith("breeze-gpu")
+    assert [(name, fields["reason"]) for name, fields in direct.events.calls] == [
+        ("speech.aborted", "not_sent")
+    ]
+
+
+def test_a_trickling_reader_is_aborted_as_too_slow() -> None:
+    # Each send "takes" 1 s of the injected clock for 0.08 s of audio: 0.08x real time.
+    clock = FakeClock()
+
+    async def send(message: dict[str, Any]) -> None:
+        clock.now += 1.0
+
+    async def scenario() -> Direct:
+        direct = await Direct.open(FakeRuntime(chunks=20))
+        response = direct.response(clock=clock, started_at=0.0, min_rate_grace=2.0)
+        with pytest.raises(StreamAborted) as aborted:
+            await response(SCOPE, never_disconnects, send)
+        assert isinstance(aborted.value.__cause__, SendTimeout)
+        assert direct.gate_is_free()
+        await direct.shut_down()
+        return direct
+
+    direct = asyncio.run(scenario())
+
+    # First byte at t=1. Breached once t > 1 + 2 + audio / 0.5: after 3 chunks, t=4 > 3.48.
+    [(name, fields)] = direct.events.calls
+    assert name == "speech.aborted"
+    assert fields["reason"] == "too_slow"
+    assert fields["audio_seconds"] == 3 * CODEC_SAMPLES_PER_FRAME / 24000
+    assert direct.generation.yielded < direct.runtime.chunks
+    assert direct.runtime.closed == 1
+
+
+def test_a_reader_above_the_minimum_rate_completes() -> None:
+    # 0.05 s of the injected clock per 0.08 s of audio: 1.6x real time.
+    clock = FakeClock()
+
+    async def send(message: dict[str, Any]) -> None:
+        clock.now += 0.05
+
+    async def scenario() -> Direct:
+        direct = await Direct.open(FakeRuntime(chunks=20))
+        response = direct.response(clock=clock, started_at=0.0, min_rate_grace=0.1)
+        await response(SCOPE, never_disconnects, send)
+        await direct.shut_down()
+        return direct
+
+    direct = asyncio.run(scenario())
+
+    [(name, fields)] = direct.events.calls
+    assert name == "speech.completed"
+    assert fields["audio_seconds"] == 20 * CODEC_SAMPLES_PER_FRAME / 24000
+
+
+def test_a_send_blocked_past_the_minimum_rate_is_aborted_as_too_slow() -> None:
+    """The rate also bounds a send in progress, well before the (here 30 s) send timeout."""
+
+    async def send(message: dict[str, Any]) -> None:
+        if message["type"] == "http.response.body":
+            await asyncio.Event().wait()  # the first chunk never drains
+
+    async def scenario() -> tuple[Direct, float]:
+        direct = await Direct.open(FakeRuntime(chunks=4))
+        response = direct.response(min_rate_grace=0.2)
+        started = time.monotonic()
+        with pytest.raises(StreamAborted):
+            await asyncio.wait_for(response(SCOPE, never_disconnects, send), timeout=10)
+        elapsed = time.monotonic() - started
+        await direct.shut_down()
+        return direct, elapsed
+
+    direct, elapsed = asyncio.run(scenario())
+
+    assert elapsed < 5
+    assert [(name, fields["reason"]) for name, fields in direct.events.calls] == [
+        ("speech.aborted", "too_slow")
+    ]
+
+
+def test_a_disconnect_seen_before_the_stream_finishes_is_not_a_completion() -> None:
+    """uvicorn drops sends after a disconnect without an error. Here the last chunk and the
+    terminator go out after the listener has seen the disconnect: Starlette can't cancel the
+    stream in time (anyio skips a task whose awaited future is already done), so only the
+    flag keeps this from being reported as completed, with bytes the client never got."""
+    client_gone = False
+
+    async def scenario() -> Direct:
+        nonlocal client_gone
+        direct = await Direct.open(FakeRuntime(chunks=1))
+        body_waiting = asyncio.Event()
+        last_chunk: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+        async def body() -> AsyncGenerator[bytes, None]:
+            body_waiting.set()
+            await last_chunk
+            yield b"\0\0" * CODEC_SAMPLES_PER_FRAME
+
+        async def receive() -> dict[str, Any]:
+            nonlocal client_gone
+            await body_waiting.wait()
+            # The body's wait ends in the same step as the disconnect is reported.
+            last_chunk.set_result(None)
+            client_gone = True
+            return {"type": "http.disconnect"}
+
+        async def send(message: dict[str, Any]) -> None:
+            if client_gone:
+                return  # uvicorn: `if self.disconnected: return`
+
+        await direct.response(body=body())(SCOPE, receive, send)
+        await direct.shut_down()
+        return direct
+
+    direct = asyncio.run(scenario())
+
+    [(name, fields)] = direct.events.calls
+    assert name == "speech.aborted"
+    assert fields["reason"] == "client_disconnect"
+    assert fields["audio_seconds"] == CODEC_SAMPLES_PER_FRAME / 24000  # the primed chunk only
