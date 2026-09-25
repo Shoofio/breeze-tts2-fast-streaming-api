@@ -446,7 +446,7 @@ the GPU smoke test.
   - `resolve_reference(spec, …)`: an inline reference is encoded once on the `GpuThread` into
     codes;
   - `piece_seed(s, i) = (s + i) & 0xFFFFFFFF`;
-  - `prepare_piece(runtime, reference, text, instruction, cfg)`;
+  - `prepare_piece(tokenizer, model, reference, text, instruction, cfg_scale)`;
   - `ramp_pcm(chunks, chunk_first, chunk_max)`, ported from `A:api.py` ~199–238;
   - `generate_piece(...)`, a sync generator of PCM bytes for the `GpuThread`.
 

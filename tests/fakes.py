@@ -94,6 +94,20 @@ def fake_model():
     )
 
 
+def model_with_codec_facts():
+    """``fake_model()`` plus the codec facts ``templates._codec_facts`` requires
+    (``codec_config.codebook_size``, cross-checked against ``codebook_pad_token_id``).
+    ``fake_model()`` deliberately leaves this out (``tests/test_templates.py``'s own
+    ``_model_with_codec_facts`` tests that omission on purpose), so this augments the
+    ``SimpleNamespace`` here instead -- shared by every other caller that needs a model
+    ``prepare_piece``/``prepare_inputs`` can actually use (review-agent pass 1, finding 9:
+    previously duplicated in ``tests/test_synthesis.py`` and ``tests/test_routes_speech.py``).
+    """
+    model = fake_model()
+    model.config.codec_config.codebook_size = 2048
+    return model
+
+
 # --- FakeCodec: the 12 Hz audio tokenizer at the reference-encode edge -------------
 
 # The real tokenizer is qwen-tts's ``tokenizer_12hz`` (its class name is literally the
@@ -269,8 +283,9 @@ class FakeCodec:
 @dataclass(frozen=True)
 class FakeStreamingConfig:
     """The subset of ``models.fast_streaming.FastStreamingConfig`` that
-    ``FakeRuntime.max_new_tokens_room``/``_frame_cap`` read (``max_new_tokens``, the
-    per-request ceiling, and ``max_seq_len``, the context length). A plain local
+    ``FakeRuntime.max_new_tokens_room``/``_frame_cap``/``_context_room`` read
+    (``max_new_tokens``, the per-request ceiling; ``max_seq_len``, the context length;
+    ``fast_backbone_prefill``, whether the prefill bucket-pads). A plain local
     dataclass, not the real one: constructing a `FakeRuntime` must never import
     ``models.fast_streaming`` just to build its default ``config`` (the module-import
     cost this file's docstring and finding #8 already avoid). Field defaults match
@@ -279,6 +294,10 @@ class FakeStreamingConfig:
 
     max_new_tokens: int = 1500
     max_seq_len: int = 1024
+    # Real default is False (``_prefill_plan``): the prefill runs at the exact prompt
+    # length until the fast backbone-prefill path is turned on, which is what pads it
+    # up to the nearest ``_PREFILL_TOKEN_GRANULARITY`` bucket. See ``_context_room``.
+    fast_backbone_prefill: bool = False
 
 
 class FakeRuntime:
@@ -349,12 +368,21 @@ class FakeRuntime:
       existing parameters: baked into ``inputs`` as ``ref_audio_codes`` (by
       `breeze_infer.templates.prepare_inputs`, for the "codes" `Reference` variant), or
       as a cached-KV ``prefix`` (the "prefix" variant, `build_reference_prefix`'s
-      result). `synthesis.py`'s `resolve_reference`/`prepare_piece` build one of those
+      result, or a stand-in with the same ``prefix_len`` attribute -- see the next
+      bullet). `synthesis.py`'s `resolve_reference`/`prepare_piece` build one of those
       two shapes; a test asserting "the inline reference is encoded once and reused for
       every piece and both CFG rows" (T038) does so by asserting `FakeCodec.encode_calls`
-      stays 1 while every recorded call's ``inputs["input_values"]`` (or, once a saved
-      voice's prefix path exists, ``prefix``) is the same object, not by inspecting a
-      ``reference`` field on these calls -- there is none.
+      stays 1 while the same encoded codes turn up, value-equal, in every recorded call's
+      ``inputs["input_values"]`` (a fresh tensor each time -- `templates.py`'s
+      ``_resolve_segment_audio_codes``/``_collate_inputs`` copy it via ``.to()``/
+      ``.contiguous()`` on every `prepare_piece` call, so it is never literally the same
+      object -- see `tests/test_synthesis.py`), not by inspecting a ``reference`` field
+      on these calls -- there is none.
+    - ``prefix`` is read strictly, like the real runtime's own ``prefix.prefix_len``: a
+      caller passing a reference prefix must give a real-shaped object (the real
+      ``ReferencePrefix``, or any stand-in with a ``prefix_len`` attribute, e.g.
+      ``SimpleNamespace(prefix_len=64)``) -- not an arbitrary value that happens not to
+      crash a lenient lookup.
     - The five overrides are validated exactly as the real ``_require_valid_overrides``
       does, by calling that same function (imported lazily, like ``FastStreamingChunk``
       below, so constructing or draining a `FakeRuntime` that never overrides anything
@@ -363,20 +391,34 @@ class FakeRuntime:
       range, and an integer for ``top_k``/``max_new_tokens``, never a bool). Since ``iter_audio_chunks`` is a generator function, validation
       -- here and on the real runtime -- runs on the first ``next()``, not at call time.
     - ``max_new_tokens_room`` approximates the real method's room estimate (frame cap via
-      ``config``/``default_max_new_tokens``, then the context room from a bucket-padded
-      prefill length) by calling the real ``_require_valid_overrides`` and
-      ``_branch_shape`` helpers and porting ``_frame_cap``'s two-line rule directly.
-      ``iter_audio_chunks`` raises the real runtime's ``ValueError`` when that context
-      room is ``<= 0``, before recording the call. Inputs with no ``attention_mask``
-      (the bare ``{}`` many tests pass) carry no prompt to measure and skip that check.
-      **Approximation gap**: the real ``_prefill_plan`` bucket-pads the prefill only when
-      the runtime's fast backbone-prefill path is enabled, and a frozen warmup cache can
-      refuse an unwarmed bucket and fall back to an exact-length eager prefill instead
-      (`models/fast_streaming.py:850-883`). This fake has no captured prefill graphs or
-      warmup state to consult, so it always bucket-pads to the nearest
-      ``_PREFILL_TOKEN_GRANULARITY`` (32) -- the same case the real runtime's default
-      ``prefill_path == "graph"`` reports. A test asserting an *exact* room number against
-      a frozen/eager fallback boundary needs the real runtime (`tests/gpu/`), not this.
+      ``config``/``default_max_new_tokens`` -- ``default_max_new_tokens`` defaults to
+      750, the deployed model's own ``generation_config.max_new_tokens``, and
+      ``FakeStreamingConfig.max_new_tokens`` defaults to 1500, the deployed server's
+      ceiling -- then the context room from the prefill length) by calling the real
+      ``_require_valid_overrides`` and ``_branch_shape`` helpers and porting
+      ``_frame_cap``'s two-line rule directly. ``_context_room`` uses the **exact**
+      prompt length by default and bucket-pads to the nearest
+      ``_PREFILL_TOKEN_GRANULARITY`` (32) only when ``self.config.fast_backbone_prefill``
+      is set -- mirroring ``_prefill_plan``'s own default (``FastStreamingConfig
+      .fast_backbone_prefill`` is ``False`` unless a profile turns the fast backbone-
+      prefill path on).
+      **Approximation gap**: a frozen warmup cache can still refuse an unwarmed bucket
+      and fall back to an exact-length eager prefill even with the flag on
+      (`models/fast_streaming.py:955-998`); this fake has no captured prefill graphs or
+      warmup state to consult, so with the flag on it always bucket-pads as if every
+      bucket were warmed. A test asserting an *exact* room number against a frozen/eager
+      fallback boundary needs the real runtime (`tests/gpu/`), not this.
+    - ``iter_audio_chunks`` raises the real runtime's ``ValueError`` when
+      ``max_new_tokens_room`` is ``<= 0``, before recording the call -- inputs with no
+      ``attention_mask`` (the bare ``{}`` a few call sites still pass, where there is no
+      prompt to measure) skip this and every room/cap check below entirely, staying
+      unconstrained. Otherwise, when that room allows fewer frames than ``chunks``
+      (``* frames_per_chunk``, plus any ``flush_frames``) would naturally produce, the
+      call is cut short at that many frames instead, with its last chunk marked
+      ``is_final=True`` -- the real loop's ``reached_limit``, whether the cap came from
+      ``max_new_tokens`` or the context room (both fold into one ``limit`` here, as they
+      do into the real loop's own two stop conditions). A natural (uncapped) ending keeps
+      using ``is_final_on_last``/``flush_frames`` exactly as documented above.
     - ``build_reference_prefix`` (the cached-KV "prefix" `Reference` variant) is
       deliberately not faked here: none of the tasks that use `FakeRuntime` today
       exercise a saved voice with no override, only the "codes" variant. Add it when a
@@ -409,7 +451,7 @@ class FakeRuntime:
         collect_timing: bool = False,
         prefill_path: str = "graph",
         config: FakeStreamingConfig | None = None,
-        default_max_new_tokens: int | None = None,
+        default_max_new_tokens: int | None = 750,
     ) -> None:
         # The real post-loop flush (module docstring, ``flush_frames`` bullet) only
         # exists because the main loop's ``chunk_ready`` check
@@ -473,11 +515,17 @@ class FakeRuntime:
         return min(self._frame_cap(requested), self._context_room(inputs, prefix_len))
 
     def _context_room(self, inputs: dict[str, Any], prefix_len: int) -> int:
-        """The real ``_context_room`` rule, with the fake's always-bucketed prefill."""
+        """The real ``_context_room``/``_prefill_plan`` rule: exact prompt length by
+        default, bucketed only when ``self.config.fast_backbone_prefill`` is set (review
+        finding #2 -- the real ``_prefill_plan`` only pads when the fast backbone-prefill
+        path is on, ``FastStreamingConfig.fast_backbone_prefill`` default ``False``; this
+        used to bucket unconditionally, which is backwards from the real default)."""
         from models.fast_streaming import _PREFILL_TOKEN_GRANULARITY, _branch_shape
 
         seq_len = _branch_shape(inputs).seq_len
         exact_len = prefix_len + seq_len
+        if not self.config.fast_backbone_prefill:
+            return self.config.max_seq_len - exact_len - 1
         bucketed_len = (
             prefix_len
             + -(-seq_len // _PREFILL_TOKEN_GRANULARITY) * _PREFILL_TOKEN_GRANULARITY
@@ -514,13 +562,28 @@ class FakeRuntime:
             repetition_penalty=repetition_penalty,
             max_new_tokens=max_new_tokens,
         )
-        prefix_len = 0 if prefix is None else int(getattr(prefix, "prefix_len", 0))
-        if "attention_mask" in inputs and self._context_room(inputs, prefix_len) <= 0:
-            # The real runtime's message, so tests match on the same text.
-            raise ValueError(
-                "prompt leaves no room to generate in the "
-                f"{self.config.max_seq_len}-token context"
-            )
+        # Strict, like the real runtime's own ``prefix.prefix_len`` (no fallback): a
+        # ``prefix`` must be a real-shaped object (``ReferencePrefix``, or a stand-in
+        # with the same attribute), not any value that happens not to crash a lenient
+        # ``getattr`` (review finding #3).
+        prefix_len = 0 if prefix is None else int(prefix.prefix_len)
+
+        # How many frames this call may produce at most, mirroring the real loop's own
+        # combination of the ``max_new_tokens`` cap and the context-room boundary
+        # (``max_new_tokens_room``, and the per-step ``prefill_len + step_idx >=
+        # max_seq_len - 1`` break) -- review finding #1. Skipped for ``inputs`` with no
+        # ``attention_mask`` (the bare ``{}`` some tests still pass): there is no prompt
+        # to measure, so those calls stay unconstrained, as before this fake modeled a
+        # cap at all.
+        limit: int | None = None
+        if "attention_mask" in inputs:
+            limit = self.max_new_tokens_room(max_new_tokens, inputs, prefix_len=prefix_len)
+            if limit <= 0:
+                # The real runtime's message, so tests match on the same text.
+                raise ValueError(
+                    "prompt leaves no room to generate in the "
+                    f"{self.config.max_seq_len}-token context"
+                )
 
         call_index = len(self.calls)
         self.calls.append(
@@ -537,10 +600,29 @@ class FakeRuntime:
                 "observed": token_observer is not None,
             }
         )
+
+        # ``chunks``/``frames_per_chunk``/``flush_frames`` describe how a call would end
+        # on its own (EOS with an empty buffer, a token-limit simulation, or a post-loop
+        # leftover flush -- the docstring bullets above); ``limit``, when it constrains
+        # fewer frames than that, cuts the call short instead, exactly as the real
+        # runtime's own cap/room would. A call that produces fewer frames than
+        # requested, cut short by ``limit``, gets its last chunk marked final -- the real
+        # loop's ``reached_limit``.
+        natural_frames = self.chunks * self.frames_per_chunk + (self.flush_frames or 0)
+        capped = limit is not None and limit < natural_frames
+        if capped:
+            regular_chunks = min(self.chunks, limit // self.frames_per_chunk)
+            cap_leftover = limit - regular_chunks * self.frames_per_chunk
+            if cap_leftover <= 0:
+                cap_leftover = None
+        else:
+            regular_chunks = self.chunks
+            cap_leftover = None
+
         frame_iter = iter(self.frames)
         total_frames = 0
         try:
-            for index in range(self.chunks):
+            for index in range(regular_chunks):
                 if self.fail_after is not None and index == self.fail_after:
                     raise RuntimeError("CUDA error: an illegal memory access (fake)")
                 if self.gate is not None and index == self.gate_at:
@@ -553,7 +635,10 @@ class FakeRuntime:
                         if frame is not None:
                             token_observer(frame)
                 total_frames += self.frames_per_chunk
-                is_final = self.is_final_on_last and index == self.chunks - 1
+                if capped:
+                    is_final = cap_leftover is None and index == regular_chunks - 1
+                else:
+                    is_final = self.is_final_on_last and index == self.chunks - 1
                 timing: dict[str, float | int | bool | str] = {
                     "chunk_index": index,
                     "codec_frames": self.frames_per_chunk,
@@ -579,7 +664,34 @@ class FakeRuntime:
                     is_final=is_final,
                     timing=timing,
                 )
-            if self.flush_frames is not None:
+            if capped:
+                if cap_leftover is not None:
+                    if token_observer is not None:
+                        for _ in range(cap_leftover):
+                            frame = next(frame_iter, None)
+                            if frame is not None:
+                                token_observer(frame)
+                    total_frames += cap_leftover
+                    yield FastStreamingChunk(
+                        audio=np.full(
+                            cap_leftover * CODEC_SAMPLES_PER_FRAME,
+                            call_index / 100,
+                            dtype=np.float32,
+                        ),
+                        sample_rate=self.sample_rate,
+                        codec_frames=cap_leftover,
+                        is_final=True,
+                        timing={
+                            "chunk_index": regular_chunks,
+                            "codec_frames": cap_leftover,
+                            "decode_launch_ms": 0.0,
+                            "total_frames": total_frames,
+                            "is_final": True,
+                            "codec_launch_ms": 0.0,
+                            "audio_d2h_ms": 0.0,
+                        },
+                    )
+            elif self.flush_frames is not None:
                 if token_observer is not None:
                     for _ in range(self.flush_frames):
                         frame = next(frame_iter, None)
@@ -608,7 +720,11 @@ class FakeRuntime:
                         "audio_d2h_ms": 0.0,
                     },
                 )
-            if token_observer is not None:
+            # Not when capped: the real loop samples nothing more once the cap/room
+            # stops it, so there are no further "trailing pad frames" to observe --
+            # unlike the natural-EOS case below, where frames already sampled after the
+            # last decoded chunk are still real observations to replay.
+            if not capped and token_observer is not None:
                 for frame in frame_iter:
                     token_observer(frame)
         finally:

@@ -73,7 +73,13 @@ async def resolve_reference(
     if isinstance(spec, NoReference):
         return NoRef()
     if isinstance(spec, InlineRef):
-        assert decoded_audio is not None, "InlineRef requires a decoded clip"
+        if decoded_audio is None:
+            # A caller bug, not a request error: routes_speech.py always decodes an
+            # InlineRef's bytes (reference_audio.decode) before resolving it, so a
+            # missing DecodedAudio here means that step was skipped, not that the
+            # request itself was invalid -- an assert would vanish under `-O` and let
+            # the encode below crash on `None.samples` instead.
+            raise ValueError("InlineRef requires a decoded clip (decoded_audio is None)")
         codes = await gpu.run(
             encode_prompt_waveform,
             audio_tokenizer,
@@ -140,9 +146,17 @@ def prepare_piece(
 # --- PCM ramp (contracts/http-api.md "Splitting": "chunks grow from --chunk-first to
 # --chunk-max codec frames") ----------------------------------------------------------
 
+# The bundled codec's frame size (qwen-tts's Mimi decoder upsample product /
+# "decode_upsample_rate"): 1,920 samples per 12.5 fps frame at the 24 kHz output the
+# checkpoint uses. Neither `FastBreezeStreamingRuntime` nor `FakeRuntime` expose this as
+# an attribute today, so `generate_piece` falls back to this constant; it still prefers
+# `runtime.samples_per_frame` first, so a future runtime that does expose it is used
+# automatically (review finding #8).
+_CODEC_SAMPLES_PER_FRAME = 1920
+
 
 def ramp_pcm(
-    chunks: Iterable[FastStreamingChunk], chunk_first: int, chunk_max: int
+    chunks: Iterable[FastStreamingChunk], chunk_first: int, chunk_max: int, samples_per_frame: int
 ) -> Iterator[bytes]:
     """Regroup one piece's streamed chunks into growing PCM byte flushes.
 
@@ -159,21 +173,19 @@ def ramp_pcm(
     flush. The ramp restarts for every piece (a fresh ``ramp_pcm`` call per piece), since
     C++ starts it afresh in each ``generate_chunk`` call too.
 
-    Samples-per-frame (1,920 on the bundled codec) is never hard-coded: each
-    ``FastStreamingChunk`` already carries ``audio.size`` and ``codec_frames``, so the
-    first non-empty chunk tells this the frame size directly.
+    ``samples_per_frame`` is the caller's to supply (review finding #8), not inferred from
+    the first chunk: inferring it silently accepts a piece with zero non-empty chunks (and
+    so never actually measures anything) as if that were fine, and ties this function's
+    correctness to chunk arrival order rather than a fact the caller already has.
     """
     chunk_max = max(1, chunk_max)
     chunk = min(max(1, chunk_first), chunk_max)
-    samples_per_frame = 0
     pending: list[Any] = []
     pending_samples = 0
     for streaming_chunk in chunks:
         audio = streaming_chunk.audio
         if audio.size == 0:
             continue
-        if samples_per_frame == 0:
-            samples_per_frame = audio.size // streaming_chunk.codec_frames
         pending.append(audio)
         pending_samples += audio.size
         if pending_samples < chunk * samples_per_frame:
@@ -232,7 +244,8 @@ def generate_piece(
         repetition_penalty=repetition_penalty,
         max_new_tokens=max_new_tokens,
     )
+    samples_per_frame = getattr(runtime, "samples_per_frame", _CODEC_SAMPLES_PER_FRAME)
     try:
-        yield from ramp_pcm(chunks, chunk_first, chunk_max)
+        yield from ramp_pcm(chunks, chunk_first, chunk_max, samples_per_frame)
     finally:
         chunks.close()

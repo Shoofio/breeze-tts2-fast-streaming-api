@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from breeze_infer.http_fields import InlineRef, NoReference, VoiceRef
 from breeze_infer.reference_audio import DecodedAudio
@@ -32,21 +33,15 @@ from tests.fakes import (
     FakeRuntime,
     FakeTokenizer,
     fake_model,
+    model_with_codec_facts,
 )
 
-
-def _model_with_codec_facts():
-    """``fake_model()`` plus the codec facts ``templates._codec_facts`` requires
-    (``codec_config.codebook_size``, cross-checked against ``codebook_pad_token_id``).
-    ``tests/fakes.py`` deliberately leaves ``fake_model()`` without ``codebook_size``
-    (another agent owns that file's ``fake_model()``; `tests/test_templates.py`'s own
-    ``_model_with_codec_facts`` tests that omission on purpose), so this augments the
-    ``SimpleNamespace`` locally, in this test module only -- same pattern, same values
-    (2048/2050) as `tests/test_templates.py`'s helper.
-    """
-    model = fake_model()
-    model.config.codec_config.codebook_size = 2048
-    return model
+# `model_with_codec_facts` (tests/fakes.py): `fake_model()` plus the codec facts
+# `templates._codec_facts` requires (`codec_config.codebook_size`), used everywhere below
+# that needs a model `prepare_piece` can actually run -- review-agent pass 1, finding 9,
+# which moved this out of a local duplicate here (and in tests/test_routes_speech.py) into
+# the shared fake, since `tests/test_templates.py`'s own `_model_with_codec_facts` still
+# tests the *omission* on purpose and stays local to that module.
 
 
 class _SyncGpu:
@@ -147,7 +142,7 @@ def test_resolve_reference_rejects_an_unknown_spec() -> None:
 
 def test_prepare_piece_no_reference_uses_the_instruction_template() -> None:
     inputs = prepare_piece(
-        FakeTokenizer(), _model_with_codec_facts(), NoRef(), "hello", "calm voice", 1.0
+        FakeTokenizer(), model_with_codec_facts(), NoRef(), "hello", "calm voice", 1.0
     )
 
     assert "input_ids" in inputs
@@ -162,7 +157,7 @@ def test_prepare_piece_codes_reference_bakes_in_ref_audio_codes() -> None:
     reference = CodesRef(codes=codes, ref_text="the reference transcript")
 
     inputs = prepare_piece(
-        FakeTokenizer(), _model_with_codec_facts(), reference, "piece text", "ins", 1.0
+        FakeTokenizer(), model_with_codec_facts(), reference, "piece text", "ins", 1.0
     )
 
     assert inputs["input_values"] is not None
@@ -178,7 +173,10 @@ def test_inline_reference_is_encoded_once_and_reused_across_pieces_and_cfg_rows(
     reused for every piece, and (inside a single-CFG piece) both the guided and
     unguided rows. Verified the way `tests/fakes.py`'s `FakeRuntime` docstring says a
     test for this should: a call count on `FakeCodec.encode`, not by inspecting some
-    ``reference=`` field (there is none on the real runtime)."""
+    ``reference=`` field (there is none on the real runtime) -- and (review finding #10)
+    by checking that the *same* encoded codes, value-equal, actually reach every piece's
+    inputs through both `prepare_piece` and `generate_piece`, not just that some
+    non-``None`` value is present."""
     codec = FakeCodec()
     gpu = _SyncGpu()
     spec = InlineRef(audio_bytes=b"raw", ref_text="ref text")
@@ -189,14 +187,38 @@ def test_inline_reference_is_encoded_once_and_reused_across_pieces_and_cfg_rows(
     )
     assert codec.encode_calls == 1
 
-    tokenizer, model = FakeTokenizer(), _model_with_codec_facts()
+    tokenizer, model = FakeTokenizer(), model_with_codec_facts()
+    runtime = FakeRuntime(chunks=1)
     # Three pieces; the second and third use cfg_scale != 1.0, so each of those also
-    # builds the unguided (negative) row -- both rows share the one reference.
-    for text, cfg_scale in [("first piece", 1.0), ("second piece", 2.5), ("third piece", 2.5)]:
+    # builds the unguided (negative) row -- both rows, and every piece, must carry the
+    # exact same encoded codes.
+    for index, (text, cfg_scale) in enumerate(
+        [("first piece", 1.0), ("second piece", 2.5), ("third piece", 2.5)]
+    ):
         inputs = prepare_piece(tokenizer, model, reference, text, "voice design", cfg_scale)
-        assert inputs["input_values"] is not None
+        # A fresh tensor every call (`_resolve_segment_audio_codes`/`_collate_inputs`
+        # copy it via .to()/.contiguous()/torch.cat), so this is value equality, not
+        # identity -- the same content the codec produced exactly once above.
+        assert torch.equal(inputs["input_values"][0], reference.codes)
         if cfg_scale != 1.0:
-            assert inputs["cfg_negative_input_values"] is not None
+            # Both CFG rows (the guided and unguided branches of one piece) embed the
+            # same reference, not two different encodes of it.
+            assert torch.equal(inputs["cfg_negative_input_values"][0], reference.codes)
+
+        # And downstream, generate_piece must hand the runtime these exact inputs
+        # unchanged -- the encoded reference travels through to the runtime call too.
+        list(
+            generate_piece(
+                runtime,
+                inputs,
+                request_id="r",
+                seed=piece_seed(0, index),
+                chunk_first=1,
+                chunk_max=25,
+            )
+        )
+        assert runtime.calls[index]["inputs"] is inputs
+        assert torch.equal(runtime.calls[index]["inputs"]["input_values"][0], reference.codes)
 
     # Still exactly one encode: the reference was never touched again after resolve.
     assert codec.encode_calls == 1
@@ -206,11 +228,13 @@ def test_inline_reference_is_encoded_once_and_reused_across_pieces_and_cfg_rows(
 
 
 def _streaming_chunk(value: float, codec_frames: int) -> SimpleNamespace:
-    """A `models.fast_streaming.FastStreamingChunk`-shaped object with the two fields
-    ``ramp_pcm`` reads (``.audio``, ``.codec_frames``) -- a plain `SimpleNamespace`
-    rather than the real class, so these tests never pay to import
-    ``models.fast_streaming`` (finding #8; the real class is exercised for real by the
-    `generate_piece` tests below, which go through `FakeRuntime`)."""
+    """A `models.fast_streaming.FastStreamingChunk`-shaped object with the one field
+    ``ramp_pcm`` reads (``.audio``; ``samples_per_frame`` is now a caller-supplied
+    parameter, review finding #8, so ``.codec_frames`` is no longer read by ``ramp_pcm``
+    itself -- it only sizes ``.audio`` here) -- a plain `SimpleNamespace` rather than the
+    real class, so these tests never pay to import ``models.fast_streaming`` (finding #8;
+    the real class is exercised for real by the `generate_piece` tests below, which go
+    through `FakeRuntime`)."""
     return SimpleNamespace(
         audio=np.full(codec_frames * CODEC_SAMPLES_PER_FRAME, value, dtype=np.float32),
         codec_frames=codec_frames,
@@ -234,14 +258,19 @@ def _assert_ramp_growth(sizes: list[int], chunk_max: int) -> None:
 
 
 def test_ramp_pcm_grows_from_chunk_first_to_chunk_max_preserving_the_total() -> None:
+    # review finding #6: the exact sequence _ramp_pcm's growth rule (chunk // 3 + 1,
+    # capped at chunk_max) produces for chunk_first=1, chunk_max=25, computed by hand
+    # from the ported rule itself (A:api.py's _ramp_pcm), not just checked for "grows":
+    # 1 -> 2 -> 3 -> 5 -> 7 -> 10 -> 14 -> 19 -> capped at 25, but only 19 frames of
+    # input are left by then (80 - 61 = 19 < 25), so the last flush is that 19-frame
+    # leftover, not a full 25.
     total_input_frames = 80
     chunks = [_streaming_chunk(i / 100.0, codec_frames=1) for i in range(total_input_frames)]
 
-    flushes = list(ramp_pcm(chunks, chunk_first=1, chunk_max=25))
+    flushes = list(ramp_pcm(chunks, chunk_first=1, chunk_max=25, samples_per_frame=CODEC_SAMPLES_PER_FRAME))
     sizes = [_frame_count(flush) for flush in flushes]
 
-    assert sizes[0] == 1  # never held back past chunk_first frames
-    _assert_ramp_growth(sizes, chunk_max=25)
+    assert sizes == [1, 2, 3, 5, 7, 10, 14, 19, 19]
     assert sum(sizes) == total_input_frames  # every frame is accounted for
 
 
@@ -250,7 +279,7 @@ def test_ramp_pcm_flushes_a_short_leftover_when_the_piece_ends() -> None:
     # buffered when the input runs out, not padded up to chunk_max.
     chunks = [_streaming_chunk(0.1, codec_frames=1) for _ in range(3)]
 
-    flushes = list(ramp_pcm(chunks, chunk_first=1, chunk_max=25))
+    flushes = list(ramp_pcm(chunks, chunk_first=1, chunk_max=25, samples_per_frame=CODEC_SAMPLES_PER_FRAME))
 
     assert sum(_frame_count(flush) for flush in flushes) == 3
 
@@ -261,19 +290,19 @@ def test_ramp_pcm_skips_empty_chunks() -> None:
         _streaming_chunk(0.5, codec_frames=1),
     ]
 
-    flushes = list(ramp_pcm(chunks, chunk_first=1, chunk_max=5))
+    flushes = list(ramp_pcm(chunks, chunk_first=1, chunk_max=5, samples_per_frame=CODEC_SAMPLES_PER_FRAME))
 
     assert sum(_frame_count(flush) for flush in flushes) == 1
 
 
 def test_ramp_pcm_on_no_chunks_yields_nothing() -> None:
-    assert list(ramp_pcm([], chunk_first=1, chunk_max=25)) == []
+    assert list(ramp_pcm([], chunk_first=1, chunk_max=25, samples_per_frame=CODEC_SAMPLES_PER_FRAME)) == []
 
 
 def test_ramp_pcm_clamps_chunk_first_above_chunk_max() -> None:
     chunks = [_streaming_chunk(0.2, codec_frames=1) for _ in range(10)]
 
-    flushes = list(ramp_pcm(chunks, chunk_first=100, chunk_max=4))
+    flushes = list(ramp_pcm(chunks, chunk_first=100, chunk_max=4, samples_per_frame=CODEC_SAMPLES_PER_FRAME))
 
     assert _frame_count(flushes[0]) == 4  # chunk_first clamped down to chunk_max
     assert sum(_frame_count(flush) for flush in flushes) == 10
@@ -281,11 +310,11 @@ def test_ramp_pcm_clamps_chunk_first_above_chunk_max() -> None:
 
 def test_ramp_pcm_handles_multi_frame_chunks() -> None:
     # frames_per_chunk=2 (the non-fast codec path): each streamed chunk already carries
-    # 2 codec frames, so samples_per_frame must be derived per chunk, not assumed to be
-    # the whole chunk's sample count.
+    # 2 codec frames worth of samples; ramp_pcm must sum a piece's frames correctly
+    # regardless of how many frames arrive per streamed chunk.
     chunks = [_streaming_chunk(0.3, codec_frames=2) for _ in range(6)]  # 12 frames total
 
-    flushes = list(ramp_pcm(chunks, chunk_first=1, chunk_max=25))
+    flushes = list(ramp_pcm(chunks, chunk_first=1, chunk_max=25, samples_per_frame=CODEC_SAMPLES_PER_FRAME))
 
     assert sum(_frame_count(flush) for flush in flushes) == 12
 
@@ -367,10 +396,13 @@ def test_generate_piece_close_propagates_to_the_runtime_generator() -> None:
 
 def test_generate_piece_carries_the_prefix_through() -> None:
     runtime = FakeRuntime(chunks=1)
+    # A real-shaped stand-in, not a bare string: FakeRuntime reads prefix.prefix_len
+    # strictly, like the real runtime's own ReferencePrefix (review finding #3).
+    prefix_stub = SimpleNamespace(prefix_len=64)
     list(
         generate_piece(
-            runtime, {}, request_id="r", seed=1, chunk_first=1, chunk_max=25, prefix="cached-kv"
+            runtime, {}, request_id="r", seed=1, chunk_first=1, chunk_max=25, prefix=prefix_stub
         )
     )
 
-    assert runtime.calls[0]["prefix"] == "cached-kv"
+    assert runtime.calls[0]["prefix"] is prefix_stub

@@ -5,6 +5,7 @@ Principle V), so a bug in them would silently corrupt every test that depends on
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import librosa
 import numpy as np
@@ -50,6 +51,9 @@ def test_records_seed_overrides_inputs_and_prefix_per_piece() -> None:
     # that by passing the *same* ``inputs``/``prefix`` object to every call, as below.
     runtime = FakeRuntime(chunks=1)
     shared_inputs = {"input_ids": np.zeros((1, 3)), "attention_mask": np.ones((1, 3))}
+    # A real-shaped stand-in, not a bare string: iter_audio_chunks reads prefix.prefix_len
+    # strictly, like the real runtime's own ReferencePrefix (review finding #3).
+    prefix_stub = SimpleNamespace(prefix_len=64)
     _drain(
         runtime,
         inputs=shared_inputs,
@@ -60,9 +64,9 @@ def test_records_seed_overrides_inputs_and_prefix_per_piece() -> None:
         top_p=0.9,
         repetition_penalty=1.2,
         max_new_tokens=300,
-        prefix="cached-kv",
+        prefix=prefix_stub,
     )
-    _drain(runtime, inputs=shared_inputs, request_id="req-0", seed=8, prefix="cached-kv")
+    _drain(runtime, inputs=shared_inputs, request_id="req-0", seed=8, prefix=prefix_stub)
 
     assert len(runtime.calls) == 2
     first, second = runtime.calls
@@ -73,12 +77,23 @@ def test_records_seed_overrides_inputs_and_prefix_per_piece() -> None:
     assert first["top_p"] == 0.9
     assert first["repetition_penalty"] == 1.2
     assert first["max_new_tokens"] == 300
-    assert first["prefix"] == "cached-kv"
+    assert first["prefix"] is prefix_stub
     # Piece 1 reuses the same (identical) inputs/prefix rather than re-encoding a
     # reference, which is exactly what T038's "inline reference encoded once" needs.
     assert second["seed"] == 8
     assert second["inputs"] is first["inputs"]
-    assert second["prefix"] == first["prefix"]
+    assert second["prefix"] is first["prefix"]
+
+
+def test_prefix_must_be_a_real_shaped_object_with_prefix_len() -> None:
+    # No lenient getattr fallback: a caller-supplied prefix that isn't shaped like
+    # ReferencePrefix (or a stand-in with the same attribute) must fail loudly, the same
+    # as the real runtime's own ``prefix.prefix_len`` access would.
+    runtime = FakeRuntime(chunks=1)
+    gen = runtime.iter_audio_chunks(_DEFAULT_INPUTS, prefix="not-shaped-like-a-prefix")
+
+    with pytest.raises(AttributeError):
+        next(gen)
 
 
 _INVALID_OVERRIDES = [
@@ -141,13 +156,18 @@ def test_fake_config_defaults_match_the_real_config() -> None:
 
 
 def test_max_new_tokens_room_none_uses_default_then_config_ceiling() -> None:
-    # No default_max_new_tokens given: falls back to config.max_new_tokens (1500).
+    # No override given: default_max_new_tokens defaults to 750, the deployed model's own
+    # generation_config.max_new_tokens (review finding #4) -- well under the 1500 ceiling,
+    # so 750 is what comes back here.
     runtime = FakeRuntime(config=FakeStreamingConfig(max_seq_len=2048))
-    assert runtime.max_new_tokens_room(None, _room_inputs(10)) == 1500
-    # An explicit model default (mirrors model.generation_config.max_new_tokens) is used
-    # instead, same as the real runtime's _frame_cap.
+    assert runtime.max_new_tokens_room(None, _room_inputs(10)) == 750
+    # A caller can still override the model default explicitly...
     runtime = FakeRuntime(default_max_new_tokens=5)
     assert runtime.max_new_tokens_room(None, _room_inputs(10)) == 5
+    # ...and a model with no default of its own (default_max_new_tokens=None) falls back
+    # to the ceiling alone, same as the real runtime's _frame_cap.
+    runtime = FakeRuntime(default_max_new_tokens=None, config=FakeStreamingConfig(max_seq_len=2048))
+    assert runtime.max_new_tokens_room(None, _room_inputs(10)) == 1500
 
 
 def test_max_new_tokens_room_clamped_by_config_ceiling() -> None:
@@ -166,9 +186,12 @@ def test_max_new_tokens_room_shrinks_with_prompt_and_prefix_length() -> None:
 
 
 def test_max_new_tokens_room_measures_the_negative_prompt_when_cfg_is_zero() -> None:
-    # cfg_scale 0 runs the negative prompt alone (the real _branch_shape): 100
-    # tokens pad to 128, so 256 - 128 - 1 frames remain, not 256 - 32 - 1.
-    runtime = FakeRuntime(config=FakeStreamingConfig(max_seq_len=256))
+    # cfg_scale 0 runs the negative prompt alone (the real _branch_shape). With
+    # fast_backbone_prefill on, 100 tokens pad to 128, so 256 - 128 - 1 frames remain,
+    # not 256 - 100 - 1 (exact) or 256 - 32 - 1 (the *positive* prompt's own length).
+    runtime = FakeRuntime(
+        config=FakeStreamingConfig(max_seq_len=256, fast_backbone_prefill=True)
+    )
     inputs = {
         **_room_inputs(10),
         "cfg_scale": 0.0,
@@ -178,16 +201,81 @@ def test_max_new_tokens_room_measures_the_negative_prompt_when_cfg_is_zero() -> 
     assert runtime.max_new_tokens_room(1500, inputs) == 127
 
 
+def test_context_room_is_exact_by_default_and_bucketed_only_when_configured() -> None:
+    # review finding #2: the real _prefill_plan only bucket-pads when the fast
+    # backbone-prefill path is on (FastStreamingConfig.fast_backbone_prefill, default
+    # False); this fake must default to the same exact-length behavior, not bucket
+    # unconditionally.
+    exact = FakeRuntime(config=FakeStreamingConfig(max_seq_len=256))
+    bucketed = FakeRuntime(
+        config=FakeStreamingConfig(max_seq_len=256, fast_backbone_prefill=True)
+    )
+    inputs = _room_inputs(100)
+
+    assert exact.max_new_tokens_room(1500, inputs) == 256 - 100 - 1  # exact prompt length
+    assert bucketed.max_new_tokens_room(1500, inputs) == 256 - 128 - 1  # padded to 128
+
+
 def test_iter_audio_chunks_raises_like_the_real_runtime_when_there_is_no_room() -> None:
     runtime = FakeRuntime(chunks=1, config=FakeStreamingConfig(max_seq_len=128))
-    # 127 tokens pad to 128 > max_seq_len, so the exact length is used: room 0.
+    # 127 tokens, exact length (the default): room 128 - 127 - 1 = 0.
     gen = runtime.iter_audio_chunks(_room_inputs(127))
 
     with pytest.raises(ValueError, match="no room"):
         next(gen)
     assert runtime.calls == []
-    # 95 tokens pad to 96, leaving 31 frames.
+    # 95 tokens, exact length: 128 - 95 - 1 = 32 frames remain.
     assert len(_drain(runtime, inputs=_room_inputs(95))) == 1
+
+
+def test_iter_audio_chunks_truncates_to_the_room_and_marks_the_last_chunk_final() -> None:
+    # review finding #1: chunks=5 would naturally produce 5 frames, but a small
+    # max_seq_len only leaves room for 3 (14 - 10 - 1) -- the call must stop there, with
+    # its last chunk marked final, like the real loop's reached_limit.
+    runtime = FakeRuntime(chunks=5, config=FakeStreamingConfig(max_seq_len=14))
+
+    chunks = _drain(runtime, inputs=_room_inputs(10))
+
+    assert len(chunks) == 3
+    assert [chunk.is_final for chunk in chunks] == [False, False, True]
+    assert [chunk.timing["is_final"] for chunk in chunks] == [False, False, True]
+    assert len(runtime.calls) == 1
+
+
+def test_iter_audio_chunks_truncates_via_max_new_tokens_too() -> None:
+    # Plenty of context room, but a small max_new_tokens override is the binding cap
+    # this time -- both fold into the one `limit` iter_audio_chunks stops at.
+    runtime = FakeRuntime(chunks=5)
+
+    chunks = _drain(runtime, inputs=_room_inputs(10), max_new_tokens=2)
+
+    assert len(chunks) == 2
+    assert [chunk.is_final for chunk in chunks] == [False, True]
+
+
+def test_truncation_can_end_mid_chunk_with_a_short_final_chunk() -> None:
+    # frames_per_chunk=2, room=15-11-1=3: 1 whole regular chunk (2 frames) plus a
+    # 1-frame leftover -- the cap can cut inside what would have been the second chunk,
+    # not just land on a chunk boundary.
+    runtime = FakeRuntime(chunks=5, frames_per_chunk=2, config=FakeStreamingConfig(max_seq_len=15))
+
+    chunks = _drain(runtime, inputs=_room_inputs(11))
+
+    assert [chunk.codec_frames for chunk in chunks] == [2, 1]
+    assert [chunk.is_final for chunk in chunks] == [False, True]
+    assert sum(chunk.codec_frames for chunk in chunks) == 3
+
+
+def test_capped_call_does_not_observe_frames_beyond_the_limit() -> None:
+    # Once the cap/room stops the real loop, nothing more is ever sampled -- unlike a
+    # natural EOS ending, there are no further "trailing pad frames" to replay.
+    frames = [torch.tensor([i]) for i in range(5)]
+    runtime = FakeRuntime(chunks=5, frames=frames, config=FakeStreamingConfig(max_seq_len=14))
+    observed: list[torch.Tensor] = []
+
+    list(runtime.iter_audio_chunks(_room_inputs(10), token_observer=observed.append))
+
+    assert [t.item() for t in observed] == [0, 1, 2]  # only the 3 frames room allowed
 
 
 def test_flush_frames_must_be_smaller_than_a_full_chunk() -> None:
