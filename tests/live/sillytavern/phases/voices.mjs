@@ -3,7 +3,7 @@
 // recording/transcript purely as upload content; the voice is saved under the `st_live_tmp` name.
 import fs from 'node:fs';
 import path from 'node:path';
-import { waitForEvent, readToasts, acceptPopupIfPresent, makeRecorder } from '../lib.mjs';
+import { expectEvent, readToasts, acceptPopupIfPresent, makeRecorder } from '../lib.mjs';
 
 const TMP_NAME = 'st_live_tmp';
 
@@ -28,43 +28,41 @@ export default async function voices(page, config, events) {
         await page.evaluate(() => { $('#breeze_upload_save').trigger('click'); });
     };
 
-    // A thrown error still leaves the steps already recorded in `results` intact, and lets the next
-    // composed phase run instead of aborting the whole `run.mjs` invocation.
+    // A thrown error (a page.evaluate failure, not an event wait — those are caught individually
+    // below) still leaves the steps already recorded in `results` intact, and lets the next composed
+    // phase run instead of aborting the whole `run.mjs` invocation.
     try {
         // 1. Upload st_live_tmp.
         let since = events.length;
         await fillUploadForm(TMP_NAME, sampleTranscript, sampleWav);
         await acceptPopupIfPresent(page, { accept: true, timeoutMs: 3000 }); // only if a stale copy exists
-        const uploaded = await waitForEvent(events, 'voice.uploaded', () => true, 60000, since).catch((e) => e);
-        step('st_live_tmp uploaded (voice.uploaded event)', uploaded instanceof Error === false, JSON.stringify(uploaded));
+        await expectEvent(step, events, since, 'voice.uploaded', () => true, 60000, 'st_live_tmp uploaded (voice.uploaded event)');
+        // refreshVoices() (and its `voices.refreshed` log) runs right after voice.uploaded, before the
+        // extension re-renders #breeze_voice_list — read the list only once that has happened.
+        await expectEvent(step, events, since, 'voices.refreshed', () => true, 15000, 'voice list refreshed after upload');
 
         const listedAfterUpload = await page.evaluate((n) => $('#breeze_voice_list').text().includes(n), TMP_NAME);
         step('st_live_tmp appears in the voice list', listedAfterUpload);
 
-        // 2. Re-upload the same name and accept "Replace". The extension's owner is moving its replace
-        //    flow to DELETE-then-POST (R16); until that lands, the server's 409 voice_exists on the raw
-        //    POST is expected and is not a Breeze-server bug, so it is recorded, not failed.
+        // 2. Re-upload the same name and accept "Replace". The extension's DELETE-then-POST replace
+        //    flow has landed (src/provider.js ~415-450: onUploadClick logs voice.replaced right after
+        //    the old copy is deleted, then voice.uploaded once the new one is saved), so this must
+        //    succeed now — a timeout or a voice.upload_failed is a real failure, not tolerated.
         since = events.length;
         await fillUploadForm(TMP_NAME, sampleTranscript, sampleWav);
-        const sawReplacePrompt = await acceptPopupIfPresent(page, { accept: true, timeoutMs: 5000 });
-        const replaceOutcome = await Promise.race([
-            waitForEvent(events, 'voice.uploaded', () => true, 15000, since).then(() => 'uploaded'),
-            waitForEvent(events, 'voice.upload_failed', () => true, 15000, since).then(() => 'upload_failed'),
-        ]).catch(() => 'timeout');
-        step(
-            'replace flow: re-upload st_live_tmp after confirming "Replace"',
-            true, // either outcome is acceptable; see comment above
-            sawReplacePrompt
-                ? `outcome=${replaceOutcome}${replaceOutcome === 'uploaded' ? '' : ' (blocked on extension, R16)'}`
-                : 'no replace prompt appeared — treating as blocked on extension',
-        );
+        await acceptPopupIfPresent(page, { accept: true, timeoutMs: 5000 });
+        await expectEvent(step, events, since, 'voice.replaced', () => true, 15000, 'st_live_tmp replaced (voice.replaced event)');
+        await expectEvent(step, events, since, 'voice.uploaded', () => true, 15000, 'st_live_tmp re-uploaded after replace (voice.uploaded event)');
+        const uploadFailed = events.slice(since).find((e) => e.event === 'voice.upload_failed');
+        step('replace did not fail (no voice.upload_failed)', !uploadFailed, JSON.stringify(uploadFailed ?? null));
+        await expectEvent(step, events, since, 'voices.refreshed', () => true, 15000, 'voice list refreshed after replace');
 
         // 3. Delete st_live_tmp.
         since = events.length;
         await page.evaluate((n) => { $(`.breeze_voice_delete[data-id="${n}"]`).trigger('click'); }, TMP_NAME);
         await acceptPopupIfPresent(page, { accept: true, timeoutMs: 5000 });
-        const deleted = await waitForEvent(events, 'voice.deleted', () => true, 20000, since).catch((e) => e);
-        step('st_live_tmp deleted (voice.deleted event)', deleted instanceof Error === false, JSON.stringify(deleted));
+        await expectEvent(step, events, since, 'voice.deleted', () => true, 20000, 'st_live_tmp deleted (voice.deleted event)');
+        await expectEvent(step, events, since, 'voices.refreshed', () => true, 15000, 'voice list refreshed after delete');
 
         const listedAfterDelete = await page.evaluate((n) => $('#breeze_voice_list').text().includes(n), TMP_NAME);
         step('st_live_tmp no longer in the voice list', !listedAfterDelete);

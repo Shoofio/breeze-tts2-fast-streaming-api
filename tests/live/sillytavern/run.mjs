@@ -8,7 +8,9 @@
 //   --record <name>   write specs/003-cpp-compatible-api/research/live-<name>.md instead of
 //                     live-<target>.md (T011 uses this to write live-phase0.md).
 import { config } from './config.mjs';
-import { launchBrowser, captureBreezeEvents, writeRecord } from './lib.mjs';
+import {
+    launchBrowser, captureBreezeEvents, writeRecord, openSillyTavern, captureSettings, restoreSettings,
+} from './lib.mjs';
 import health from './phases/health.mjs';
 import voices from './phases/voices.mjs';
 import speech from './phases/speech.mjs';
@@ -17,7 +19,8 @@ import full from './phases/full.mjs';
 const PHASES = { health, voices, speech, full };
 
 // Composition table (tasks.md T010): each CLI target runs these phase modules, in order. Every
-// target starts with health, because that phase opens SillyTavern and selects the provider.
+// target starts with health, because that phase selects the Breeze provider (run.mjs itself
+// navigates to SillyTavern first, below, before any phase runs).
 const COMPOSITIONS = {
     health: ['health'],
     voices: ['health', 'voices'],
@@ -51,6 +54,12 @@ async function main() {
 
     const { browser, page } = await launchBrowser(config);
     const events = captureBreezeEvents(page);
+    // Navigate once here, before any phase, so settings can be snapshotted before the `health`
+    // phase's selectBreezeProvider() starts changing them (review pass 1, finding 7). Every phase
+    // assumes the page is already loaded.
+    await openSillyTavern(page, config);
+    const settingsSnapshot = await captureSettings(page);
+
     const allResults = [];
     try {
         for (const name of names) {
@@ -63,6 +72,10 @@ async function main() {
         console.log('run aborted:', error.message);
         console.log('last events:', JSON.stringify(events.slice(-6)));
     } finally {
+        // Restore whatever the user had configured, even when a phase failed or threw.
+        await restoreSettings(page, settingsSnapshot).catch((error) => {
+            console.log('warning: failed to restore settings:', error.message);
+        });
         await browser.close();
     }
 
