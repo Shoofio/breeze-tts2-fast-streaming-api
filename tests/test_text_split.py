@@ -421,7 +421,8 @@ def _assert_cuts_keep_clusters(text: str, pieces: list[str]) -> None:
         pos = start + len(piece)
         for cut in (start, pos):
             if 0 < cut < len(text):
-                assert not _joins_previous(text[cut - 1], text[cut]), (text, piece)
+                before = text[cut - 2] if cut >= 2 else ""
+                assert not _joins_previous(text[cut - 1], text[cut], before), (text, piece)
                 regional_before = 0
                 while cut - regional_before > 0 and _regional(text[cut - regional_before - 1]):
                     regional_before += 1
@@ -454,6 +455,16 @@ def test_bc_39_zwj_joins_only_a_pictograph() -> None:
     assert _joins_previous("\u200d", "👩")
     assert not _joins_previous("\u200d", "b")
     assert not _joins_previous(" ", "\u0301")
+    # A ZWJ after a virama makes a half form: the consonant after it stays in the cluster.
+    assert _joins_previous("\u200d", "ष", "\u094d")
+
+
+def test_bc_39_half_form_after_virama_and_zwj_stays_whole() -> None:
+    """`क्‍ष` (virama + ZWJ + consonant) could be cut after the ZWJ."""
+    unit = "क\u094d\u200dष"
+    for pieces in (split_text(unit * 20, budget=4), segment(unit * 20, budget=4, final=False)[0]):
+        assert len(pieces) > 1
+        assert all(p == unit * (len(p) // len(unit)) for p in pieces), pieces
 
 
 @pytest.mark.parametrize(
@@ -474,7 +485,9 @@ def test_bc_39_long_joined_runs_are_cut_in_linear_time(text) -> None:
     whole = split_text(text, budget=20)
     streamed = segment(text, budget=20, final=False)
     assert time.perf_counter() - began < 0.5
-    assert whole or streamed[0] or weigh(streamed[1]) <= 3 * (_MAX_JOINED + 1)
+    bound = max(2 * 20, 3 * (_MAX_JOINED + 1))
+    assert all(weigh(piece) <= bound for piece in whole + streamed[0])
+    assert weigh(streamed[1]) <= bound
 
 
 # --- behaviour the port keeps ---

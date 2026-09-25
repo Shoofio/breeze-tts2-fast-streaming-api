@@ -127,29 +127,37 @@ def _hangul_type(ch: str) -> str:
     return ""
 
 
-def _joins_previous(prev: str, ch: str) -> bool:
+def _joins_previous(prev: str, ch: str, before: str = "") -> bool:
     """Whether `ch` continues the grapheme cluster that `prev` is in, so no cut goes between.
 
+    `before` is the character before `prev` when `prev` belongs to its cluster, else "".
+
     Nothing joins a break or a gap. Otherwise `ch` joins when it is a combining mark, ZWJ,
-    variation selector, skin-tone modifier or tag; when it is a pictograph after a ZWJ (after a
-    ZWJ a letter starts a new cluster); when it is a letter after a virama (an Indic conjunct);
-    or when it continues a Hangul syllable made of jamo. Flags (pairs of regional indicators)
-    need the count of indicators before them, so `_cluster_starts` handles those.
+    variation selector, skin-tone modifier or tag; when it is a pictograph after a ZWJ; when it
+    is a letter after a virama, or after a virama and a ZWJ (an Indic conjunct or half form;
+    after any other ZWJ a letter starts a new cluster); or when it continues a Hangul syllable
+    made of jamo. Flags (pairs of regional indicators) need the count of indicators before them,
+    so `_cluster_starts` handles those.
     """
     if prev in _CLAUSE_BREAKS or prev in _GAPS:
         return False
     if _extends(ch):
         return True
+    is_letter = unicodedata.category(ch) == "Lo"
     if prev == _ZWJ:
-        return _is_pictographic(ch)
-    if unicodedata.combining(prev) == 9:  # canonical combining class 9 is a virama
-        return unicodedata.category(ch) == "Lo"
+        return _is_pictographic(ch) or (is_letter and _is_virama(before))
+    if _is_virama(prev):
+        return is_letter
     before, after = _hangul_type(prev), _hangul_type(ch)
     return (
         (before == "L" and after in ("L", "V", "LV", "LVT"))
         or (before in ("LV", "V") and after in ("V", "T"))
         or (before in ("LVT", "T") and after == "T")
     )
+
+
+def _is_virama(ch: str) -> bool:
+    return ch != "" and unicodedata.combining(ch) == 9  # canonical combining class 9
 
 
 def _cluster_starts(text: str) -> list[bool]:
@@ -165,7 +173,10 @@ def _cluster_starts(text: str) -> list[bool]:
     regional = 1 if text and _is_regional(text[0]) else 0  # regional indicators in a row
     for c in range(1, len(text)):
         prev, ch = text[c - 1], text[c]
-        joins = _joins_previous(prev, ch) or (
+        # Look back past `prev` only inside the current cluster, so a buffer that starts at a
+        # cut gets the same answer as the whole text.
+        before = text[c - 2] if joined > 0 else ""
+        joins = _joins_previous(prev, ch, before) or (
             _is_regional(ch) and regional % 2 == 1  # the second indicator of a flag
         )
         if joins and joined < _MAX_JOINED:
