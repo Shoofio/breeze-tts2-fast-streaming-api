@@ -336,6 +336,11 @@ route (quickstart Scenario 1.3–1.4); the SillyTavern `health` live gate passes
     `500` and a streamed response;
   - a disallowed preflight gets `403`.
 
+  Note (review): the `A:tests/test_cors.py` parse tests weren't ported here after all -- they're
+  covered by `tests/test_settings.py`, since `settings.py` replaced `_parse_cors_origins` (and now
+  `canonical_origin`, in `breeze_infer/origins.py`) as the place `--cors` parsing and validation
+  actually lives.
+
 ### Implementation
 
 - [X] T027 [US5] Create `breeze_infer/cors.py` (R8):
@@ -420,7 +425,7 @@ the GPU smoke test.
   - Errors are `ApiError(400, invalid_audio | audio_too_long | audio_too_short)`.
   - `tests/test_reference_audio.py` generates valid inputs in-test: 8, 16 and 24-bit PCM, float,
     stereo 44.1 kHz, FLAC and OGG, all decoding to mono float32.
-- [ ] T037 [US1] Create `breeze_infer/http_fields.py`, happy path only (data-model.md
+- [X] T037 [US1] Create `breeze_infer/http_fields.py`, happy path only (data-model.md
   `SpeechRequest`):
   - `async read_fields(request)`: `request.form(max_files=1, max_fields=32, max_part_size=64 KiB)`
     merged with the query string.
