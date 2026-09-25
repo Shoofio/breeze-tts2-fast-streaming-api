@@ -3,35 +3,48 @@
 Ported from Breeze-TTS-2.cpp's `src/text_split.cpp` (`split_text`, `split_sentences`,
 `split_clauses`) and the `sentence_end`/`drain` helpers in `apps/server/ws_api.cpp`. The C++ had
 two segmenters that disagreed; this module has one, with the fixes listed in
-specs/003-cpp-compatible-api/research.md R11 (BC-39, BC-44, BC-46):
+specs/003-cpp-compatible-api/research.md R11 (BC-39, BC-44, BC-46).
 
-- One stop set on both interfaces: `\\n`; `.!?;` followed (after any closing `"')]`) by
-  whitespace or the end of a final buffer; and the CJK stops `。！？；…．`.
-- Closing quotes and brackets after `.!?;` stay with their sentence on both interfaces.
-- A sentence end at the very end of a non-final buffer waits for the next character, so `3.`
-  followed later by `14` stays whole.
-- Lengths are always weighted (see `weigh`), never UTF-8 bytes.
-- Unpunctuated non-final text is cut at the last clause mark or space once it is over budget, and
-  hard-cut once an unbroken run passes 2 x budget, so the streaming buffer stays bounded.
-- `first_budget` applies to the first returned piece only.
-- `budget == 0` means no length splitting.
-- Pieces are stripped and empty ones dropped; tabs and carriage returns inside a piece are kept.
+The shape is C++'s: text is cut into sentences, an over-budget sentence into clauses, and the
+units are packed into pieces up to the budget. The budget is soft: a single unit heavier than it
+stays whole. What differs from C++:
 
-Pure functions, no I/O. Python strings are indexed by code point, so there is no UTF-8 byte
-bookkeeping here.
+- Sentence ends: `\\n`; `.!?;` followed, after any closing quotes or brackets, by a space, tab,
+  CR, LF or U+3000 (not a no-break space, which is there to keep `Dr. Smith` together);
+  and the CJK stops `。！？；…．`, which absorb the stops and closers that follow them
+  (`真的吗？！`, `好。」`). In a non-final buffer a sentence end is only complete once the
+  character after it has arrived, so `3.` then `14` stays `3.14`.
+- Clauses: an over-budget sentence is cut after the first space, tab, CR, U+3000, `，` or `、`
+  once the clause weighs at least the budget. C++ also required the word before a space to be
+  longer than a quarter of the budget, so ordinary prose was never cut. `,` and `:` are not
+  break points themselves; the space after them is, so `1,000`, `10:30` and `http://` stay whole.
+- Unbroken runs: a clause that passes 2 x budget is closed at its last break; a run with no
+  break at all is hard-cut once over 2 x budget, into chunks within budget, never inside a
+  combining sequence. So no unit weighs more than 2 x budget.
+- Streaming: a non-final buffer gives up its complete sentences and every clause the rule above
+  has closed; the rest waits. Weights are always weighted, never UTF-8 bytes.
+- `first_budget` applies to the first returned piece only; `budget == 0` means no length limit.
+- Pieces are stripped, and text with no letter or digit is dropped: TTS can't speak
+  punctuation-only or emoji-only text. Tabs and carriage returns inside a piece are kept.
+
+Pure functions, no I/O.
 """
 
 from __future__ import annotations
 
+import unicodedata
 from itertools import pairwise
 
 _ASCII_STOPS = frozenset(".!?;")
 # CJK punctuation carries its own spacing, so it ends a sentence without a following gap.
 _CJK_STOPS = frozenset("。！？；…．")
-# Closing quotes and brackets right after `.!?;` belong to the sentence they close.
-_CLOSERS = frozenset("\"')]")
-# Where an over-budget sentence may be broken into clauses.
-_CLAUSE_MARKS = frozenset(",，、:")
+# Closing quotes and brackets right after a stop belong to the sentence they close.
+_CLOSERS = frozenset("\"')]}”’」』）》】〉〕〗〙〛］｝»›｣〞〟＂＇")
+# What ends a clause, and (with LF) what may follow `.!?;` to end a sentence.
+_SPACES = frozenset(" \t\r　")
+_GAPS = _SPACES | {"\n"}
+_CLAUSE_BREAKS = _SPACES | frozenset("，、")
+_ZWJ = "‍"
 
 
 def weigh(text: str) -> int:
@@ -47,128 +60,168 @@ def _char_weight(ch: str) -> int:
     return 1 if ord(ch) < 128 else 3
 
 
+def _speakable(text: str) -> bool:
+    return any(unicodedata.category(ch)[0] in "LN" for ch in text)
+
+
+def _joins_previous(ch: str) -> bool:
+    """True for a character that belongs to the one before it: a combining mark, a zero-width
+    joiner, a variation selector or an emoji skin-tone modifier."""
+    return (
+        unicodedata.category(ch).startswith("M")
+        or ch == _ZWJ
+        or "︀" <= ch <= "️"
+        or "\U000e0100" <= ch <= "\U000e01ef"
+        or "\U0001f3fb" <= ch <= "\U0001f3ff"
+    )
+
+
 def _sentence_ends(text: str, final: bool) -> list[int]:
     """Return the end index (exclusive) of every complete sentence in `text`.
 
-    `.!?;` only ends a sentence when whitespace follows it (after any closing quotes), so `3.14`
-    and `U.S.A` stay whole; `Dr. Smith` is cut, as in C++. In a non-final buffer, a sentence end
-    that reaches the end of the buffer is not complete yet: the next character might be a digit
-    or another closing quote.
+    `.!?;` only ends a sentence when a gap follows it (after any closers), so `3.14` and `U.S.A`
+    stay whole; `Dr. Smith` is cut, as in C++. A sentence end that reaches the end of a non-final
+    buffer is not complete yet: the next character might be a digit or another closer.
     """
     ends: list[int] = []
     n = len(text)
     i = 0
     while i < n:
         ch = text[i]
-        i += 1
         if ch in _ASCII_STOPS:
-            j = i
+            j = i + 1
             while j < n and text[j] in _CLOSERS:
                 j += 1
-            if j < n and not text[j].isspace():
-                continue
+            if (j < n and text[j] in _GAPS) or (j == n and final):
+                ends.append(j)
             i = j
-        elif ch != "\n" and ch not in _CJK_STOPS:
-            continue
-        if i == n and not final:
-            break
-        ends.append(i)
+        elif ch in _CJK_STOPS:
+            j = i + 1
+            while j < n and (text[j] in _CJK_STOPS or text[j] in _CLOSERS):
+                j += 1
+            if j < n or final:
+                ends.append(j)
+            i = j
+        else:
+            if ch == "\n" and (i + 1 < n or final):
+                ends.append(i + 1)
+            i += 1
     return ends
 
 
-def _split_clauses(sentence: str, budget: int) -> list[str]:
-    """Break an over-budget sentence at clause marks, or at spaces that are not too close together.
+def _split_clauses(text: str, limit: int, hard_limit: int) -> tuple[list[str], str]:
+    """Cut `text` into clauses; return the closed clauses and the open tail.
 
-    `since_break` is the weight since the last clause mark or space, so a space only counts as a
-    cut point when the word before it clears a quarter of the budget. A run with no clause mark or
-    space stays whole (C++ `split_clauses`).
+    A clause closes after the first break once it weighs at least `limit` (C++ `split_clauses`
+    without its quarter-budget condition). A clause that passes `hard_limit` because of a run
+    with no break is closed at its last break instead; if the run alone is over `hard_limit`, it
+    is hard-cut into chunks within `limit`. Each cut depends only on the text before it, so the same text gives the same
+    clauses whether it arrives whole or in pieces.
     """
-    if weigh(sentence) <= budget:
-        return [sentence]
-    out: list[str] = []
+    closed: list[str] = []
     start = 0
+    run_start = 0  # just after the last break, where the current unbroken run began
     cw = 0
-    since_break = 0
-    for i, ch in enumerate(sentence):
+    run_w = 0
+    for i, ch in enumerate(text):
         w = _char_weight(ch)
         cw += w
-        since_break += w
-        comma = ch in _CLAUSE_MARKS
-        space = ch == " "
-        if cw >= budget and (comma or (space and since_break > budget // 4)):
-            out.append(sentence[start : i + 1])
-            start = i + 1
-            cw = 0
-            since_break = 0
-        elif comma or space:
-            since_break = 0
-    if start < len(sentence):
-        out.append(sentence[start:])
-    return out
+        run_w += w
+        if ch in _CLAUSE_BREAKS:
+            run_start = i + 1
+            run_w = 0
+            if cw >= limit:
+                closed.append(text[start : i + 1])
+                start = i + 1
+                cw = 0
+        elif cw > hard_limit:
+            if run_start > start:
+                closed.append(text[start:run_start])
+                start = run_start
+                cw = run_w
+            if cw > hard_limit:
+                chunks, start = _hard_cut(text, start, i + 1, limit)
+                closed += chunks
+                run_start = start
+                cw = run_w = weigh(text[start : i + 1])
+    return closed, text[start:]
 
 
-def _units(text: str, ends: list[int], budget: int) -> list[str]:
+def _hard_cut(text: str, start: int, stop: int, limit: int) -> tuple[list[str], int]:
+    """Cut chunks off the front of the unbroken run `text[start:stop]` until what is left weighs
+    at most `limit`. Each chunk is as long as fits within `limit` (at least one character), and
+    a cut never separates a character from a combining mark, ZWJ or variation selector."""
+    chunks: list[str] = []
+    while weigh(text[start:stop]) > limit:
+        cut = None
+        w = 0
+        for c in range(start + 1, stop):
+            w += _char_weight(text[c - 1])
+            if w > limit and cut is not None:
+                break
+            if not _joins_previous(text[c]) and text[c - 1] != _ZWJ:
+                cut = c
+                if w > limit:
+                    break
+        if cut is None:
+            break  # one combining sequence: nowhere safe to cut yet
+        chunks.append(text[start:cut])
+        start = cut
+    return chunks, start
+
+
+def _units(text: str, ends: list[int], budget: int) -> list[tuple[str, bool]]:
     """Cut `text` into sentences at `ends` (plus any unfinished rest), then over-budget ones into
-    clauses. With no length splitting, sentences are the units."""
+    clauses. With no length limit, sentences are the units.
+
+    Each unit comes with a flag saying whether it is a closed clause (see `_pack`).
+    """
     bounds = [0, *ends]
     if bounds[-1] < len(text):
         bounds.append(len(text))
     sentences = [text[a:b] for a, b in pairwise(bounds)]
     if budget <= 0:
-        return sentences
-    return [clause for s in sentences for clause in _split_clauses(s, budget)]
+        return [(s, False) for s in sentences]
+    units: list[tuple[str, bool]] = []
+    for sentence in sentences:
+        closed, tail = _split_clauses(sentence, budget, 2 * budget)
+        units += [(c, True) for c in closed]
+        if tail:
+            units.append((tail, False))
+    return units
 
 
-def _last_break(text: str) -> int:
-    """Index of the last clause mark or space in `text`, or -1."""
-    for i in range(len(text) - 1, -1, -1):
-        if text[i] == " " or text[i] in _CLAUSE_MARKS:
-            return i
-    return -1
-
-
-def _hard_cut(run: str, budget: int) -> tuple[list[str], str]:
-    """Cut chunks of at most `budget` weight (at least one character each) off the front of an
-    unbroken run until what is left weighs at most `budget`."""
-    chunks: list[str] = []
-    rest_weight = weigh(run)
-    start = 0
-    while rest_weight > budget:
-        end = start
-        w = 0
-        while end < len(run) and (end == start or w + _char_weight(run[end]) <= budget):
-            w += _char_weight(run[end])
-            end += 1
-        chunks.append(run[start:end])
-        rest_weight -= w
-        start = end
-    return chunks, run[start:]
-
-
-def _pack(units: list[str], budget: int, first_budget: int) -> list[str]:
-    """Merge consecutive units into pieces up to the budget, then strip them and drop empties.
+def _pack(units: list[tuple[str, bool]], budget: int, first_budget: int) -> list[str]:
+    """Merge consecutive units into pieces up to the budget, then strip them.
 
     The first piece is packed against `first_budget` when it is set, every later one against
     `budget` (C++ `split_text`). The budget is soft: a single unit heavier than it stays whole.
-    A whitespace-only accumulation never closes a piece, so the opening budget really lands on
-    the first piece that is returned.
+    A piece always ends after a closed clause. In C++ that follows from the clause weighing at
+    least the budget; here a clause can also close short (at a break before a long run, or as a
+    hard-cut chunk), and a streamed clause is spoken before the next one arrives, so the rule
+    is explicit to give the same pieces either way. Units with nothing to speak are dropped
+    first, so they neither form a piece nor use up the opening budget.
     """
-    no_limit = budget <= 0
     limit = first_budget if first_budget > 0 else budget
     out: list[str] = []
     cur = ""
     cw = 0
-    for unit in units:
+    closes = False
+    for unit, unit_closes in units:
+        if not _speakable(unit):
+            continue
         w = weigh(unit)
-        if not no_limit and cur.strip() and cw + w > limit:
-            out.append(cur)
+        if cw > 0 and (closes or (budget > 0 and cw + w > limit)):
+            out.append(cur.strip())
             cur = ""
             cw = 0
             limit = budget
         cur += unit
         cw += w
-    out.append(cur)
-    return [p for p in (piece.strip() for piece in out) if p]
+        closes = unit_closes
+    if cur:
+        out.append(cur.strip())
+    return out
 
 
 def segment(
@@ -177,22 +230,20 @@ def segment(
     """Take the pieces that are ready to speak out of `buffer`.
 
     Returns `(pieces, remaining)`. With `final`, everything is ready and `remaining` is empty.
-    Otherwise the buffer is cut after its last complete sentence, and the unfinished rest is kept,
-    unless it is over budget:
-    - it is cut after its last clause mark or space;
-    - an unbroken run left after that (CJK without punctuation) is hard-cut once it weighs more
-      than 2 x budget.
-    So a non-final `remaining` weighs at most max(budget, first_budget) or 2 x budget.
+    Otherwise the pieces are the complete sentences plus the clauses of the unfinished rest
+    that are already closed (see `_split_clauses`); the open tail waits. For the opening piece
+    of a session, that rest is cut against the opening budget, so the first audio comes soon.
+    A non-final `remaining` weighs at most 2 x budget, give or take one combining sequence.
 
-    `budget` is the weighted piece length, and 0 means no length splitting (pieces are cut at
-    sentence ends only). `first_budget`, when positive, is the budget of the first returned
-    piece only; the caller decides when a piece is the opening one.
+    `budget` is the weighted piece length; 0 means no length limit, so everything ready is one
+    piece. `first_budget`, when positive, is the budget of the first returned piece only; the
+    caller decides when a piece is the opening one.
     """
     if final:
-        # The whole text is known, and a lone piece needs no short opening piece to anchor
-        # later ones, so text within budget stays one piece (C++ `split_text`).
         if budget <= 0 or weigh(buffer) <= budget:
-            return _pack([buffer], 0, 0), ""
+            # The whole text is known and fits one piece. A lone piece anchors nothing, so it
+            # needs no short opening piece either (C++ `split_text`).
+            return _pack([(buffer, False)], 0, 0), ""
         units = _units(buffer, _sentence_ends(buffer, True), budget)
         return _pack(units, budget, first_budget), ""
 
@@ -200,20 +251,12 @@ def segment(
     cut = ends[-1] if ends else 0
     units = _units(buffer[:cut], ends, budget)
     rest = buffer[cut:]
-
     if budget > 0:
-        opening = first_budget if first_budget > 0 else budget
-        # The rest becomes the first piece only when nothing before it is spoken now.
-        rest_limit = budget if buffer[:cut].strip() else opening
-        if weigh(rest) > rest_limit:
-            brk = _last_break(rest)
-            if brk >= 0:
-                units += _split_clauses(rest[: brk + 1], budget)
-                rest = rest[brk + 1 :]
-            if weigh(rest) > 2 * budget:
-                chunks, rest = _hard_cut(rest, budget)
-                units += chunks
-
+        # The rest becomes the opening piece only when nothing before it is spoken now.
+        opening = first_budget if 0 < first_budget < budget else budget
+        limit = budget if _speakable(buffer[:cut]) else opening
+        closed, rest = _split_clauses(rest, limit, 2 * budget)
+        units += [(c, True) for c in closed]
     return _pack(units, budget, first_budget), rest
 
 

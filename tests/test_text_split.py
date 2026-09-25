@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import random
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -26,17 +27,57 @@ DRAIN_CASES = {c["name"]: c for c in GOLDEN["drain"]}
 # Case name -> (expected new output, BC id). A split case's output is its piece list; a drain
 # case's output is (pieces, remaining).
 INTENTIONAL_DIFFERENCES: dict[str, tuple[object, str]] = {
-    # C++ treats a NUL after `.` as a closing quote (strchr matches the terminator), so `a.\0`
-    # ended a sentence. NUL is rejected at validation now; here it is an ordinary character.
+    # R11: C++ treats a NUL after `.` as a closing quote (strchr matches the terminator), so
+    # `a.\0` ended a sentence. NUL is rejected at validation now; here it is ordinary text.
     "nul_byte_in_text": (["a.\x00 b", "c d e", "f g h", "i j k", "l m n"], "BC-46"),
-    # C++ drain compared UTF-8 bytes (56 <= 60) and kept the buffer; by weight it is 82 > 60.
+    # Finding 1: C++ split_clauses only cut at a space after a word longer than a quarter of
+    # the budget, so ordinary prose ran far over budget. Now the first break once the clause
+    # reaches the budget cuts.
+    "english_multi_sentence": (
+        ["The quick brown fox jumps over", "the lazy dog.", "It was a sunny day!",
+         "Are you coming? Yes."],
+        "BC-39",
+    ),
+    "sentence_longer_than_budget_clause_split": (
+        ["This is a single very long sentence with", "no terminal punctuation yet, containing",
+         "several commas, which should force clause", "splitting, because it exceeds the budget",
+         "by quite a lot in total weight"],
+        "BC-39",
+    ),
+    "long_run_no_punctuation_space_split": (
+        ["supercalifragilisticexpialidocious", "word another word yetanotherword",
+         "andmore words continuing on and", "on without any commas or periods",
+         "anywhere in this run at all"],
+        "BC-39",
+    ),
+    "first_budget_smaller_than_budget": (
+        ["The quick brown fox jumps over", "the lazy dog.", "It was a sunny day!",
+         "Are you coming? Yes indeed."],
+        "BC-39",
+    ),
+    # Finding 6: emoji-only pieces are dropped; TTS can't speak them.
+    "emoji_and_accented_multibyte": (["ab, 😀😀", "cd, éé", "ff, 😀😀😀😀", "gg."], "BC-39"),
+    # Finding 2: C++ drain cut the unfinished rest at the buffer's last space, however long the
+    # piece; the rest now gives up only the clauses the budget has closed.
+    "drain_no_sentence_end_over_budget_space_split": (
+        (["this buffer has no terminal punctuation", "at all but it is definitely longer"],
+         "than the budget so"),
+        "BC-39",
+    ),
+    "drain_ellipsis_not_recognized_by_sentence_end": (
+        (["Wait for it…", "more words keep coming without", "any real stop here at all so it"],
+         "runs long"),
+        "BC-39",
+    ),
+    "drain_byte_vs_weight_asymmetry_drained": ((["привет как дела"], "сегодня хорошо"), "BC-39"),
+    # R11: C++ drain compared UTF-8 bytes (56 <= 60) and kept the buffer; by weight it is 82.
     "drain_byte_vs_weight_asymmetry_undrained": (
         (["привет как дела сегодня"], "хорошо"),
         "BC-39",
     ),
-    # C++ drain didn't absorb the closing quote, so `."` never ended a sentence.
+    # R11: C++ drain didn't absorb the closing quote, so `."` never ended a sentence.
     "drain_no_quote_absorption": ((['He said "done."'], " next"), "BC-39"),
-    # C++ drain's stop set left out the fullwidth period that split_text had.
+    # R11: C++ drain's stop set left out the fullwidth period that split_text had.
     "drain_fullwidth_period_not_sentence_end": ((["Done．"], "next"), "BC-39"),
 }
 
@@ -94,8 +135,9 @@ def _differences(bc: str) -> list[str]:
 
 @pytest.mark.parametrize("name", _differences("BC-39"))
 def test_bc_39_intentional_difference_from_cpp(name) -> None:
-    """C++ drained with its own stop set (no closing quotes, no `．`/`…`) and measured the
-    buffer in UTF-8 bytes; the shared segmenter uses one stop set and weighted length."""
+    """C++ let clauses run far over budget (split_clauses skipped spaces after short words),
+    drained the unfinished rest at the buffer's last space however long the piece, spoke
+    emoji-only pieces, drained with its own stop set and measured the buffer in UTF-8 bytes."""
     expected, _ = INTENTIONAL_DIFFERENCES[name]
     assert _new_output(name) == expected
     assert expected != _cpp_output(name), "no longer a difference; drop it from the table"
@@ -163,26 +205,81 @@ def test_bc_39_abbreviation_followed_by_a_space_is_cut_as_in_cpp() -> None:
     assert segment("Dr.", budget=15, final=False) == ([], "Dr.")
 
 
+def test_bc_39_only_plain_whitespace_ends_a_sentence() -> None:
+    """C++ accepted only ' ' and '\\n' after `.!?;`. Tab, CR and the ideographic space (U+3000)
+    now end a sentence too; a no-break space (U+00A0) keeps `Dr.\\u00a0Smith` together, which
+    is what it is for."""
+    assert segment("Dr. Smith and", budget=100, final=False) == ([], "Dr. Smith and")
+    assert split_text("Dr. Smith. Yes.", budget=10) == ["Dr. Smith.", "Yes."]
+    for gap in ("\t", "\r", "　"):
+        assert segment(f"Hi.{gap}there", budget=100, final=False) == (["Hi."], f"{gap}there")
+
+
 def test_bc_39_newline_cuts_on_the_websocket_too() -> None:
     """C++ drain's sentence_end ignored `\\n`, so line-separated text waited for the budget."""
     assert segment("first line\nsecond", budget=30, final=False) == (["first line"], "second")
     assert split_text("first line\nsecond line", budget=15) == ["first line", "second line"]
 
 
+# --- sentence ends, closers and clause marks ---
+
+
+def test_bc_39_cjk_stop_absorbs_following_stops_and_closers() -> None:
+    """C++ cut after every CJK stop, so `真的吗？！` left a piece that was only `！`."""
+    assert split_text("真的吗？！好的。", budget=20) == ["真的吗？！", "好的。"]
+    assert segment("好。」你", budget=20, final=False) == (["好。」"], "你")
+    # The run of stops might continue, so it waits at the end of a non-final buffer.
+    assert segment("好！！！", budget=20, final=False) == ([], "好！！！")
+    assert split_text("好！！！", budget=20) == ["好！！！"]
+
+
+def test_bc_39_typographic_and_cjk_closers_are_absorbed() -> None:
+    """C++ only absorbed `"')]`, so a curly or CJK closing quote after a stop blocked the cut
+    (after `.`) or started the next piece (after `。`)."""
+    assert segment("She said “yes.” Then", budget=30, final=False) == (
+        ["She said “yes.”"],
+        " Then",
+    )
+    assert segment("他说：“好。”然后", budget=30, final=False) == (["他说：“好。”"], "然后")
+    assert segment("『好。』你", budget=30, final=False) == (["『好。』"], "你")
+
+
+def test_bc_39_ascii_clause_marks_need_following_whitespace() -> None:
+    """C++ broke at any `,` or `:`, so `1,000`, `10:30` and `http://` could be split. Now the
+    space after them is the break."""
+    assert split_text("aaaaaaaa 1,000,000 x", budget=9) == ["aaaaaaaa", "1,000,000", "x"]
+    assert split_text("aaaaaaaa 10:30:00 x", budget=9) == ["aaaaaaaa", "10:30:00", "x"]
+    assert split_text("aaaaaaaa http://x.io x", budget=9) == ["aaaaaaaa", "http://x.io", "x"]
+    assert split_text("aaaaaaaa, bb", budget=9) == ["aaaaaaaa,", "bb"]
+    # A comma at the end of a non-final buffer waits to see what follows.
+    assert segment("abcdefgh,", budget=5, final=False) == ([], "abcdefgh,")
+    assert segment("abcdefgh, ij", budget=5, final=False) == (["abcdefgh,"], "ij")
+
+
 # --- budgets ---
+
+
+def test_bc_39_spaced_text_without_punctuation_is_cut_before_the_budget() -> None:
+    """C++ split_clauses only cut at a space after a word longer than a quarter of the budget,
+    so ordinary unpunctuated prose was never cut: `word ` x 400 at 600 was one 2,000-weight
+    piece, too long for the model's context."""
+    words = " ".join(["word"] * 120)
+    assert split_text("word " * 400, budget=600) == [words, words, words, " ".join(["word"] * 40)]
+    assert split_text("The quick brown fox jumps over the lazy dog.", budget=30) == [
+        "The quick brown fox jumps over",
+        "the lazy dog.",
+    ]
 
 
 def test_bc_39_opening_budget_applies_to_the_first_piece_only() -> None:
     """C++ drained the whole opening buffer against the 200 budget, so every piece of that
     drain was short, not just the first."""
-    text = "One two three. Four five six. Seven eight nine. "
+    text = "One two. Three four. Five six. "
     pieces, remaining = segment(text, budget=100, first_budget=10, final=False)
-    assert pieces == ["One two three.", "Four five six. Seven eight nine."]
+    assert pieces == ["One two.", "Three four. Five six."]
     assert remaining == " "
     # The same text without the opening budget packs into one piece.
-    assert segment(text, budget=100, final=False)[0] == [
-        "One two three. Four five six. Seven eight nine."
-    ]
+    assert segment(text, budget=100, final=False)[0] == ["One two. Three four. Five six."]
 
 
 def test_bc_39_opening_budget_bounds_unpunctuated_opening_text() -> None:
@@ -193,13 +290,13 @@ def test_bc_39_opening_budget_bounds_unpunctuated_opening_text() -> None:
     while not pieces:
         buffer += "word "
         pieces, buffer = segment(buffer, budget=100, first_budget=20, final=False)
-    assert pieces == ["word word word word word"]
+    assert pieces == ["word word word word"]
     assert buffer == ""
 
 
-def test_bc_38_budget_zero_means_no_length_splitting() -> None:
-    """C++ turned split_chars 0 into 600 on the WebSocket; 0 now means no length splitting on
-    both interfaces, and pieces are cut at sentence ends only."""
+def test_bc_38_budget_zero_means_no_length_limit() -> None:
+    """C++ turned split_chars 0 into 600 on the WebSocket; 0 now means no length limit on both
+    interfaces, so all the text that is ready is one piece."""
     text = "A long first sentence, with clauses. A second one! And an unfinished tail"
     assert split_text(text, budget=0) == [text]
     assert split_text(text, budget=0, first_budget=5) == [text]
@@ -217,11 +314,13 @@ def test_bc_39_cjk_without_punctuation_stays_bounded() -> None:
     and the buffer grew without bound."""
     budget = 20
     pieces, remaining = segment("中" * 1000, budget=budget, final=False)
-    assert weigh(remaining) <= budget
+    assert weigh(remaining) <= 2 * budget
     assert all(weigh(p) <= budget for p in pieces)
     assert "".join(pieces) + remaining == "中" * 1000
-    # Below 2 x budget an unbroken run waits for punctuation.
-    assert segment("中" * 10, budget=budget, final=False) == ([], "中" * 10)
+    # Up to 2 x budget an unbroken run waits for punctuation.
+    assert segment("中" * 13, budget=budget, final=False) == ([], "中" * 13)
+    # The whole text is hard-cut the same way, so HTTP and WebSocket agree.
+    assert split_text("中" * 1000, budget=budget)[:-1] == pieces
 
 
 def test_bc_39_cjk_clause_mark_is_the_first_fallback() -> None:
@@ -234,7 +333,11 @@ def test_bc_39_weighted_length_everywhere() -> None:
     """C++ drain measured UTF-8 bytes (2 per Cyrillic letter) where split_text used weight (3);
     both now use weight."""
     assert weigh("aé中😀") == 1 + 3 + 3 + 3
-    assert segment("привет как дела", budget=40, final=False) == (["привет как"], "дела")
+    # 'привет как дела ' weighs 42 but is only 29 UTF-8 bytes, so C++ drain wouldn't cut it.
+    assert segment("привет как дела сегодня", budget=40, final=False) == (
+        ["привет как дела"],
+        "сегодня",
+    )
 
 
 # --- text details ---
@@ -255,61 +358,165 @@ def test_empty_and_whitespace_only_give_no_pieces() -> None:
     assert segment("", budget=20, final=True) == ([], "")
 
 
-# --- C++ behaviour the port keeps ---
+def test_bc_39_pieces_without_a_letter_or_digit_are_dropped() -> None:
+    """C++ sent punctuation-only and emoji-only pieces to the model, which can't speak them."""
+    assert split_text("。", budget=20) == []
+    assert split_text("😀😀😀", budget=20) == []
+    assert split_text("Hi 😀", budget=20) == ["Hi 😀"]
+
+
+def _joins_previous(ch: str) -> bool:
+    return (
+        unicodedata.category(ch).startswith("M")
+        or ch == "‍"
+        or "︀" <= ch <= "️"
+        or "\U000e0100" <= ch <= "\U000e01ef"
+    )
+
+
+@pytest.mark.parametrize(
+    "run",
+    ["é" * 40, "a👨‍👩‍👧" * 10, "中️" * 30],
+    ids=["combining_accent", "zwj_family", "variation_selector"],
+)
+def test_bc_39_hard_cut_keeps_combining_sequences_whole(run) -> None:
+    """A hard cut never separates a character from a combining mark, ZWJ or variation selector
+    that belongs to it."""
+    for pieces in (split_text(run, budget=5), segment(run, budget=5, final=False)[0]):
+        assert len(pieces) > 1
+        for piece in pieces:
+            assert not _joins_previous(piece[0])
+            assert piece[-1] != "‍"
+
+
+# --- behaviour the port keeps ---
 
 
 @pytest.mark.parametrize(
     "prefix,run,suffix,budget",
     [
         ("short bits, more short bits, ", "x" * 50, ", and then a few more words after it.", 30),
-        ("今天天气, ", "中" * 40, ", and then some more text.", 20),
+        ("今天天气, ", "中" * 13, ", and then some more text.", 20),
     ],
-    ids=["ascii_unsplittable_run", "cjk_unsplittable_run"],
+    ids=["ascii_unbroken_run", "cjk_unbroken_run"],
 )
-def test_split_text_never_fragments_an_unsplittable_run(prefix, run, suffix, budget) -> None:
-    """With the whole text known, a run with no clause mark or space stays in one piece (soft
-    budget, as in C++); only the streaming buffer hard-cuts, to stay bounded."""
+def test_an_unbroken_run_within_twice_the_budget_stays_whole(prefix, run, suffix, budget) -> None:
+    """A run with no clause mark or space is kept whole up to 2 x budget (soft budget, as in
+    C++); the clause before it is closed at its last break so the run fits."""
     pieces = split_text(prefix + run + suffix, budget=budget)
     assert len([p for p in pieces if run in p]) == 1
 
 
-# --- property: the streaming buffer stays bounded and loses nothing ---
+# --- properties ---
 
-_ALPHABET = list("abcdefgh  ") + list(".,!?;:\"')\n\t3") + list("中文好。，、…．é")
+# Tokens, not single characters, so combining sequences stay well formed.
+_TOKENS = (
+    list("abcdefgh3") + ["  ", " ", " ", "\t", " ", "\n"]
+    + list(".,!?;:\"')") + ["1,000", "10:30", "http://x.io"]
+    + list("中文好。，、…．！？") + ["é", "é", "👨‍👩‍👧", "❤️"]
+    + list("”’」』）》】〉")
+)
+# Tokens without a sentence stop, for the chunking property.
+_UNSTOPPED_TOKENS = [t for t in _TOKENS if not any(ch in t for ch in "\n.!?;。！？…．")] + [
+    "x.io"
+]
+# The heaviest token: the open piece may exceed its bound by one token when the only cut point
+# would split a combining sequence that is still arriving.
+_CLUSTER_SLACK = max(weigh(t) for t in _TOKENS)
 
 
-def _no_space(text: str) -> str:
-    return "".join(text.split())
+def _random_text(rng: random.Random, tokens: list[str], max_tokens: int = 200) -> str:
+    return "".join(rng.choice(tokens) for _ in range(rng.randint(0, max_tokens)))
+
+
+def _stream(
+    text: str, rng: random.Random, budget: int, first_budget: int, bound: int | None = None
+) -> list[str]:
+    """Feed `text` to segment in random chunks the way the WebSocket session does, then flush."""
+    spoken: list[str] = []
+    buffer = ""
+    pos = 0
+    while pos < len(text):
+        step = rng.randint(1, 25)
+        buffer += text[pos : pos + step]
+        pos += step
+        # The session passes the opening budget until the first piece has been produced.
+        opening = first_budget if not spoken else 0
+        pieces, buffer = segment(buffer, budget=budget, first_budget=opening, final=False)
+        spoken += pieces
+        if bound is not None:
+            assert weigh(buffer) <= bound, (text, budget, first_budget, buffer)
+    opening = first_budget if not spoken else 0
+    pieces, rest = segment(buffer, budget=budget, first_budget=opening, final=True)
+    assert rest == ""
+    return spoken + pieces
+
+
+def _speakable(text: str) -> str:
+    return "".join(ch for ch in text if unicodedata.category(ch)[0] in "LN")
 
 
 def test_bc_39_streaming_leftover_stays_bounded() -> None:
     """C++ could hold an arbitrarily long unpunctuated buffer. Streamed in random chunks, a
-    non-final leftover now weighs at most max(budget, first_budget) or 2 x budget, pieces are
-    stripped and non-empty, and every non-space character comes out once, in order."""
+    non-final leftover now weighs at most max(first_budget, 2 x budget); pieces are stripped,
+    speakable and never start inside a combining sequence; and every letter and digit comes
+    out once, in order."""
     rng = random.Random(20260924)
     for _ in range(500):
         budget = rng.randint(1, 40)
         first_budget = rng.choice([0, rng.randint(1, 80)])
-        bound = max(budget, first_budget, 2 * budget)
-        text = "".join(rng.choice(_ALPHABET) for _ in range(rng.randint(0, 300)))
+        bound = max(first_budget, 2 * budget) + _CLUSTER_SLACK
+        text = _random_text(rng, _TOKENS)
+        spoken = _stream(text, rng, budget, first_budget, bound)
 
-        spoken: list[str] = []
-        buffer = ""
-        pos = 0
-        while pos < len(text):
-            step = rng.randint(1, 25)
-            buffer += text[pos : pos + step]
-            pos += step
-            # The session passes the opening budget until the first piece has been produced.
-            opening = first_budget if not spoken else 0
-            pieces, buffer = segment(buffer, budget=budget, first_budget=opening, final=False)
-            spoken += pieces
-            assert weigh(buffer) <= bound, (text, budget, first_budget, buffer)
-        pieces, rest = segment(
-            buffer, budget=budget, first_budget=first_budget if not spoken else 0, final=True
+        assert all(p == p.strip() and _speakable(p) for p in spoken)
+        assert not any(_joins_previous(p[0]) for p in spoken)
+        assert _speakable("".join(spoken)) == _speakable(text)
+
+
+def _within_soft_budget(piece: str, budget: int) -> bool:
+    """The soft-budget rule: a piece over budget is a single clause that was cut at the first
+    break after reaching the budget, so everything before its last inner break is under it."""
+    if weigh(piece) <= budget:
+        return True
+    inner = [i for i, ch in enumerate(piece[:-1]) if ch in " \t\r\u3000，、"]
+    return not inner or weigh(piece[: inner[-1]]) < budget
+
+
+def test_bc_39_pieces_stay_within_budget_when_breaks_exist() -> None:
+    """C++ let a clause of short words run on past the budget. When every word is shorter than
+    the budget, a piece is now over it only as a single clause that overshoots by the word in
+    progress, and the first piece only as a single unit (the opening budget is soft), whether
+    the text arrives whole or in random chunks."""
+    words = ["a", "to", "the", "word", "speech", "中", "中文"]
+    separators = [" ", " ", ", ", ". ", "! ", "，", "。", "\n", "” "]
+    rng = random.Random(7)
+    for _ in range(300):
+        budget = rng.randint(12, 60)
+        first_budget = rng.choice([0, rng.randint(1, 80)])
+        text = "".join(
+            rng.choice(words) + rng.choice(separators) for _ in range(rng.randint(0, 80))
         )
-        spoken += pieces
+        for pieces in (
+            split_text(text, budget=budget, first_budget=first_budget),
+            _stream(text, rng, budget, first_budget),
+        ):
+            for piece in pieces:
+                assert _within_soft_budget(piece, max(first_budget, budget)), (text, piece)
+            for piece in pieces[1:]:
+                assert _within_soft_budget(piece, budget), (text, budget, piece)
 
-        assert rest == ""
-        assert all(p and p == p.strip() for p in spoken)
-        assert _no_space("".join(spoken)) == _no_space(text)
+
+def test_bc_39_chunking_does_not_change_the_pieces() -> None:
+    """C++'s drain cut wherever the buffer happened to end, so the pieces depended on how the
+    client chunked its messages. Text with no sentence end now gives the same pieces whole or
+    in any chunks. Two limits: with sentence ends it can't, because the WebSocket speaks each
+    finished sentence at once where the whole text would pack it with the next; and without
+    the opening budget, because the WebSocket cuts an unfinished opening clause against it for
+    a quick first audio, where HTTP keeps the first clause whole (soft budget, US3)."""
+    rng = random.Random(11)
+    for _ in range(500):
+        budget = rng.randint(1, 40)
+        text = _random_text(rng, _UNSTOPPED_TOKENS)
+        whole = split_text(text, budget=budget)
+        assert _stream(text, rng, budget, 0) == whole, (text, budget)
