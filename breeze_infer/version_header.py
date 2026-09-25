@@ -6,6 +6,15 @@ mid-stream exception into a clean chunked terminator instead of letting it
 propagate (see specs/003-cpp-compatible-api/research.md R1) -- exactly the C++
 server defect (BC-17) this project fixes elsewhere. Wrapping ``send`` directly
 avoids that failure mode and adds no buffering.
+
+This only sees exceptions that reach it as a normal ``http.response.start`` message --
+i.e. ones an inner exception handler already turned into a response (see errors.py).
+An exception that escapes a layer *outside* this middleware, or outside Starlette's
+``ServerErrorMiddleware`` generally, before any response has started, propagates to
+uvicorn as a bare connection failure: uvicorn sends its own minimal 500 with no
+handler and no header. That's inherent to being outside ``send``'s reach, not a bug
+here; it's why the CORS and body-limit layers (research.md R6, R8) must not raise
+before sending a response themselves.
 """
 
 from __future__ import annotations
@@ -23,7 +32,7 @@ class VersionHeaderMiddleware:
     where that handshake is built.
     """
 
-    def __init__(self, app: ASGIApp, version: str = "") -> None:
+    def __init__(self, app: ASGIApp, version: str) -> None:
         self.app = app
         self._version = version.encode("ascii")
 
@@ -34,7 +43,14 @@ class VersionHeaderMiddleware:
 
         async def send_with_version(message: Message) -> None:
             if message["type"] == "http.response.start":
-                headers = list(message.get("headers", []))
+                # Drop any existing header with this name rather than appending a second one --
+                # a client reading headers by name typically only sees the first match, so a
+                # stale or duplicate value from an inner layer must not sit ahead of ours.
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != HEADER_NAME
+                ]
                 headers.append((HEADER_NAME, self._version))
                 message = {**message, "headers": headers}
             await send(message)

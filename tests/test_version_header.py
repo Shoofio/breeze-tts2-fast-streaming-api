@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, MutableMapping
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
+from breeze_infer import __version__ as VERSION
+from breeze_infer.body_limit import BodyLimitMiddleware
+from breeze_infer.errors import install_error_handlers
 from breeze_infer.version_header import VersionHeaderMiddleware
 
-VERSION = "2.0.0.dev1"
+
+class _RecordingEvents:
+    def emit(self, name: str, **fields: object) -> None:  # pragma: no cover - unused
+        pass
 
 
 def _build_app() -> FastAPI:
@@ -76,9 +82,9 @@ async def _send_413(
     receive: Callable[[], Awaitable[MutableMapping[str, Any]]],
     send: Callable[[MutableMapping[str, Any]], Awaitable[None]],
 ) -> None:
-    # Stands in for breeze_infer.body_limit, which lands separately (T015):
-    # a tiny ASGI app that sends 413 itself, the same shape that middleware
-    # will produce.
+    # A minimal hand-rolled ASGI app -- not breeze_infer.body_limit, which is exercised for real
+    # by test_header_on_real_chunked_413_path below -- kept here to test the header logic on a
+    # 413 in isolation from any particular producer of one.
     del scope, receive
     await send(
         {
@@ -104,3 +110,40 @@ def test_header_on_413() -> None:
     response = client.get("/anything")
     assert response.status_code == 413
     assert response.headers["x-breeze-version"] == VERSION
+
+
+def test_version_is_a_required_argument() -> None:
+    """V4: there's no sane default version string, so a caller must supply one."""
+    with pytest.raises(TypeError):
+        VersionHeaderMiddleware(_build_app())  # type: ignore[call-arg]
+
+
+def test_header_on_real_chunked_413_path() -> None:
+    """V5: the header must reach the client on the actual `BodyLimitMiddleware` 413 path, raised
+    as `ApiError` from `counting_receive` mid-body and turned into a response by
+    `errors.install_error_handlers` -- not just on a hand-rolled stand-in."""
+    app = FastAPI()
+    install_error_handlers(app, _RecordingEvents())
+
+    @app.post("/upload")
+    async def upload(request: Request) -> dict[str, int]:
+        body = await request.body()
+        return {"received": len(body)}
+
+    limited = BodyLimitMiddleware(app, limit=8)
+    wrapped = VersionHeaderMiddleware(limited, version=VERSION)
+    client = TestClient(wrapped, raise_server_exceptions=False)
+
+    def chunks() -> Iterator[bytes]:
+        for _ in range(4):
+            yield b"y" * 8
+
+    response = client.post("/upload", content=chunks())
+
+    assert response.request.headers.get("content-length") is None
+    assert response.status_code == 413
+    assert response.headers["x-breeze-version"] == VERSION
+    assert response.json() == {
+        "error": "request body is too large",
+        "code": "payload_too_large",
+    }
