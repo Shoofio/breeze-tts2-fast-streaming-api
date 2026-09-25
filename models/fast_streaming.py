@@ -785,7 +785,6 @@ class FastBreezeStreamingRuntime:
             torch.cuda.manual_seed_all(request_spec.seed)
             synthetic_inputs = prepare_inputs(
                 self.tokenizer,
-                self.audio_tokenizer,
                 self.model,
                 [
                     {

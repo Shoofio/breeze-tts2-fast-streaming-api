@@ -4,7 +4,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -143,17 +142,17 @@ def split_reference_prefix(
 
     ``prefix + guided`` renders exactly what ``build_segments`` renders, and
     ``prefix + unguided`` exactly what ``build_negative_segments`` renders, so a
-    prefix processed once can be continued by either suffix.
+    prefix processed once can be continued by either suffix. ``guided``/``unguided``
+    are not a third copy of the instruction/plain text-building logic: they reuse
+    ``_tts_instruction_segments``/``_tts_plain_segments``, the same helpers
+    ``_ref_edit_tata_segments``/``_ref_clone_tata_segments`` build their own trailing
+    segment from (review #5).
     """
-    prefix = _speaker_prefix(request)
-    guided = [
-        {
-            "type": "text",
-            "text": f"{prefix}{INSTRUCTION_BOS}{request['instruction']}{INSTRUCTION_EOS}{request['text']}",
-        }
-    ]
-    unguided = [{"type": "text", "text": f"{prefix}{request['text']}"}]
-    return _ref_prefix_segments(request), guided, unguided
+    return (
+        _ref_prefix_segments(request),
+        _tts_instruction_segments(request),
+        _tts_plain_segments(request),
+    )
 
 
 def get_template(name: str) -> TemplateSpec:
@@ -166,35 +165,65 @@ def get_template(name: str) -> TemplateSpec:
 
 
 def _resolve_segment_audio_codes(
-    audio_tokenizer: Any, segment: Segment
+    segment: Segment, *, codebooks: int, codebook_size: int
 ) -> torch.Tensor:
     """Reference audio is always pre-encoded before it reaches a template (see
-    ``_ref_audio_segment``), so this only ever normalizes an already-encoded codes
-    array/tensor. ``audio_tokenizer`` is accepted for call-site symmetry with the
-    other segment kinds but isn't used -- nothing here re-encodes audio.
+    ``_ref_audio_segment``), so this only normalizes and validates an already-encoded
+    codes array/tensor -- nothing here re-encodes audio, so it no longer takes an
+    ``audio_tokenizer`` (review #6).
+
+    Validation runs on the caller's own dtype and values, *before* the int16 cast: a
+    float/bool array or an out-of-range code that slipped through would otherwise be
+    silently coerced by the cast and only surface later as a CUDA device assert deep
+    in the backbone, which poisons the whole process (review #1/#2). One
+    ``torch.as_tensor`` call (review #7) covers both a numpy array and an existing
+    tensor, since it preserves the input's own dtype either way.
     """
-    del audio_tokenizer
     codes = segment.get("audio_codes")
     if codes is None:
         raise ValueError("Audio segment must include audio_codes")
-    if isinstance(codes, np.ndarray):
-        codes = torch.from_numpy(np.ascontiguousarray(codes, dtype=np.int16))
-    codes = torch.as_tensor(codes, dtype=torch.int16)
+
+    codes = torch.as_tensor(codes)
+    if codes.dtype is torch.bool or torch.is_floating_point(codes) or torch.is_complex(codes):
+        raise ValueError(f"audio_codes must have an integer dtype, got {codes.dtype}")
     if codes.ndim != 2:
         raise ValueError(
             f"audio_codes must be 2D [frames, codebooks], got {tuple(codes.shape)}"
         )
-    return codes.cpu().contiguous()
+    if codes.shape[0] == 0:
+        raise ValueError("audio_codes must have at least 1 frame")
+    if codes.shape[1] != codebooks:
+        raise ValueError(
+            f"audio_codes must have {codebooks} codebooks, got {codes.shape[1]}"
+        )
+    low, high = int(codes.min()), int(codes.max())
+    if low < 0 or high >= codebook_size:
+        raise ValueError(
+            f"audio_codes values must be in [0, {codebook_size}), "
+            f"got range [{low}, {high}]"
+        )
+
+    return codes.to(torch.int16).cpu().contiguous()
 
 
 def _missing_fields(request: Request, fields: tuple[str, ...]) -> list[str]:
-    """Required fields that are absent, blank or ``None``.
+    """Required fields that are absent, ``None``, or blank/whitespace-only.
+
+    A string value is stripped before the truthy check, so ``" "`` counts as missing
+    the same as ``""`` (review #10).
 
     ``ref_audio_codes`` never belongs in ``fields``: it's array-valued, and a bare
     ``bool()`` on a multi-element array raises, so it's checked separately by
     ``_check_reference_source`` instead of this truthy check.
     """
-    return [field for field in fields if not request.get(field)]
+    missing = []
+    for field in fields:
+        value = request.get(field)
+        if isinstance(value, str):
+            value = value.strip()
+        if not value:
+            missing.append(field)
+    return missing
 
 
 def _check_reference_source(template: TemplateSpec, request: Request) -> None:
@@ -206,14 +235,42 @@ def _check_reference_source(template: TemplateSpec, request: Request) -> None:
         )
 
 
+def _validate_reference_request(
+    template: TemplateSpec, request: Request, fields: tuple[str, ...]
+) -> None:
+    """Shared by ``prepare_inputs`` and ``prepare_prefix_inputs`` (review #8): both
+    need the same two checks -- the given ``fields`` are present, and (for a
+    reference-audio template) ``ref_audio_codes`` is too -- just against a different
+    field tuple (the full template vs. the reference-prefix-only fields).
+    """
+    missing = _missing_fields(request, fields)
+    if missing:
+        raise ValueError(
+            f"Request {request.get('id')} missing template fields: {missing}"
+        )
+    _check_reference_source(template, request)
+
+
+def _codec_facts(model_config: Any) -> tuple[int, int]:
+    """``(codebooks, codebook_size)``, read off the model config the same way
+    ``_prepare_one`` already reads ``num_codebooks`` (a ``getattr`` with the real
+    checkpoint's own value as the fallback default) rather than a new parameter --
+    every caller here already has ``model_config`` (review #1).
+    """
+    codebooks = getattr(model_config, "num_codebooks", 16)
+    codec_config = getattr(model_config, "codec_config", None)
+    codebook_size = getattr(codec_config, "codebook_size", 2048)
+    return codebooks, codebook_size
+
+
 def _prepare_one(
     tokenizer: Any,
-    audio_tokenizer: Any,
     model_config: Any,
     segments: list[Segment],
 ) -> dict[str, torch.Tensor]:
     rendered_segments: list[dict[str, str]] = []
     audio_tokens_list: list[torch.Tensor] = []
+    codebooks, codebook_size = _codec_facts(model_config)
 
     for segment in segments:
         segment_type = segment["type"]
@@ -226,7 +283,9 @@ def _prepare_one(
         if segment_type != "audio":
             raise ValueError(f"Unknown segment type: {segment_type}")
 
-        codes = _resolve_segment_audio_codes(audio_tokenizer, segment)
+        codes = _resolve_segment_audio_codes(
+            segment, codebooks=codebooks, codebook_size=codebook_size
+        )
         if segment.get("drop_last_frame", False):
             if codes.shape[0] <= 1:
                 raise ValueError(
@@ -255,11 +314,10 @@ def _prepare_one(
         else:
             text_ids_mask.extend([False] * segment_len)
 
-    num_codebooks = getattr(model_config, "num_codebooks", 16)
     if audio_tokens_list:
         audio_tokens = torch.cat(audio_tokens_list, dim=0).unsqueeze(0)
     else:
-        audio_tokens = torch.zeros((1, 0, num_codebooks), dtype=torch.int16)
+        audio_tokens = torch.zeros((1, 0, codebooks), dtype=torch.int16)
 
     encoded["audio_tokens"] = audio_tokens
     encoded["text_ids_mask"] = torch.tensor([text_ids_mask], dtype=torch.bool)
@@ -309,21 +367,18 @@ def _collate_inputs(
 
 def _prepare_segment_batches(
     tokenizer: Any,
-    audio_tokenizer: Any,
     model_config: Any,
     device: str,
     segment_batches: list[list[Segment]],
 ) -> dict[str, torch.Tensor | None]:
     inputs_list = [
-        _prepare_one(tokenizer, audio_tokenizer, model_config, segments)
-        for segments in segment_batches
+        _prepare_one(tokenizer, model_config, segments) for segments in segment_batches
     ]
     return _collate_inputs(tokenizer, inputs_list, device)
 
 
 def prepare_inputs(
     tokenizer: Any,
-    audio_tokenizer: Any,
     model: Any,
     requests: list[Request],
     template: TemplateSpec,
@@ -333,17 +388,11 @@ def prepare_inputs(
     guidance_scale_ins: float | None,
 ) -> dict[str, torch.Tensor | None | float]:
     for request in requests:
-        missing = _missing_fields(request, template.required_fields)
-        if missing:
-            raise ValueError(
-                f"Request {request.get('id')} missing template fields: {missing}"
-            )
-        _check_reference_source(template, request)
+        _validate_reference_request(template, request, template.required_fields)
 
     positive_segments = [template.build_segments(request) for request in requests]
     inputs = _prepare_segment_batches(
         tokenizer,
-        audio_tokenizer,
         model.config,
         model.device,
         positive_segments,
@@ -363,7 +412,6 @@ def prepare_inputs(
         ]:
             branch_inputs = _prepare_segment_batches(
                 tokenizer,
-                audio_tokenizer,
                 model.config,
                 model.device,
                 [branches[branch_name] for branches in branch_batches],
@@ -383,7 +431,6 @@ def prepare_inputs(
             )
         negative_inputs = _prepare_segment_batches(
             tokenizer,
-            audio_tokenizer,
             model.config,
             model.device,
             [template.build_negative_segments(request) for request in requests],
@@ -401,19 +448,14 @@ def prepare_inputs(
 
 def prepare_prefix_inputs(
     tokenizer: Any,
-    audio_tokenizer: Any,
     model: Any,
     request: Request,
 ) -> dict[str, torch.Tensor | None]:
     """Batch-1 inputs for the reference prefix of ``ref_edit_tata`` alone."""
     template = get_template("ref_edit_tata")
-    missing = _missing_fields(request, ("ref_text",))
-    if missing:
-        raise ValueError(f"Request {request.get('id')} missing {missing[0]}")
-    _check_reference_source(template, request)
+    _validate_reference_request(template, request, ("ref_text",))
     return _prepare_segment_batches(
         tokenizer,
-        audio_tokenizer,
         model.config,
         model.device,
         [_ref_prefix_segments(request)],
@@ -422,7 +464,6 @@ def prepare_prefix_inputs(
 
 def prepare_suffix_inputs(
     tokenizer: Any,
-    audio_tokenizer: Any,
     model: Any,
     request: Request,
     *,
@@ -438,12 +479,10 @@ def prepare_suffix_inputs(
     if missing:
         raise ValueError(f"Request {request.get('id')} missing {missing[0]}")
     _, guided, unguided = split_reference_prefix(request)
-    inputs = _prepare_segment_batches(
-        tokenizer, audio_tokenizer, model.config, model.device, [guided]
-    )
+    inputs = _prepare_segment_batches(tokenizer, model.config, model.device, [guided])
     if guidance_scale != 1.0:
         negative = _prepare_segment_batches(
-            tokenizer, audio_tokenizer, model.config, model.device, [unguided]
+            tokenizer, model.config, model.device, [unguided]
         )
         inputs["cfg_negative_prompt_ids"] = negative["input_ids"]
         inputs["cfg_negative_prompt_attention_mask"] = negative["attention_mask"]

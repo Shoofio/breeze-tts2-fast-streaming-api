@@ -73,13 +73,12 @@ def synthesize(env, request: dict, *, cfg: float, seed: int, prefix=None, max_fr
     set_all_seeds(seed)
     if prefix is not None:
         inputs = prepare_suffix_inputs(
-            env.tokenizer, env.audio_tokenizer, env.model, request, guidance_scale=cfg
+            env.tokenizer, env.model, request, guidance_scale=cfg
         )
     else:
         template = "ref_edit_tata" if request.get("ref_text") else "tts_instruction"
         inputs = prepare_inputs(
             env.tokenizer,
-            env.audio_tokenizer,
             env.model,
             [request],
             get_template(template),

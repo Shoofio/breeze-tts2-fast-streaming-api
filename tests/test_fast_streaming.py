@@ -131,7 +131,7 @@ def test_ref_edit_tata_negative_branch_is_clone_without_instruction() -> None:
     request = {
         "text": "target",
         "instruction": "speak softly",
-        "ref_audio_path": "/tmp/ref.wav",
+        "ref_audio_codes": np.zeros((4, 16), dtype=np.int16),
         "ref_text": "reference",
         "speaker": "S0",
     }

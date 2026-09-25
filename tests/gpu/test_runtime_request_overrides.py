@@ -25,7 +25,6 @@ SENTENCE = (
 def _inputs(env, text: str):
     return prepare_inputs(
         env.tokenizer,
-        env.audio_tokenizer,
         env.model,
         [
             {
@@ -147,14 +146,13 @@ def test_reference_prefix_longer_than_every_prefill_bucket_builds_eagerly(
     replays_before = cache.replays
 
     prefix = runtime.build_reference_prefix(
-        prepare_prefix_inputs(env.tokenizer, env.audio_tokenizer, env.model, reference)
+        prepare_prefix_inputs(env.tokenizer, env.model, reference)
     )
 
     assert prefix.prefix_len > 548, "the prefix must exceed the old guard"
     assert cache.replays == replays_before
     inputs = prepare_suffix_inputs(
         env.tokenizer,
-        env.audio_tokenizer,
         env.model,
         {
             **reference,

@@ -117,17 +117,21 @@ def main() -> None:
     if args.ref_audio is not None:
         # templates.py only accepts pre-encoded reference codes (no path variant --
         # see breeze_infer/audio.py and R10), so the CLI encodes the file itself.
-        wav, sample_rate = sf.read(args.ref_audio, always_2d=True, dtype="float32")
-        request["ref_audio_codes"] = encode_prompt_waveform(
-            audio_tokenizer, wav, sample_rate
-        )
+        try:
+            wav, sample_rate = sf.read(args.ref_audio, always_2d=True, dtype="float32")
+            request["ref_audio_codes"] = encode_prompt_waveform(
+                audio_tokenizer, wav, sample_rate
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(
+                f"Could not encode reference audio '{args.ref_audio}': {exc}"
+            ) from exc
         request["ref_text"] = args.ref_text.strip()
         template_name = "ref_edit_tata"
 
     set_all_seeds(args.seed)
     inputs = prepare_inputs(
         tokenizer,
-        audio_tokenizer,
         model,
         [request],
         get_template(template_name),
