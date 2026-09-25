@@ -208,7 +208,7 @@ On Linux, Triton builds a small helper with `gcc` the first time it populates a 
 
 | Action | Command |
 | --- | --- |
-| Run the server (browser clients) | `scripts/start_breeze.sh --cors http://127.0.0.1:8000` (`--cors` works after T022) |
+| Run the server (browser clients) | `scripts/start_breeze.sh --cors http://127.0.0.1:8000` (`--cors` works after T028) |
 | Unit and integration tests (no GPU) | `.venv/bin/pytest` |
 | GPU tests | `BREEZE_MODEL=<path> .venv/bin/pytest -m gpu` |
 | Lint | `.venv/bin/ruff check .` |

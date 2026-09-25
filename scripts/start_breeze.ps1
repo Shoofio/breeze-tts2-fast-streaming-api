@@ -76,7 +76,7 @@ param(
     [string]$BindHost = '0.0.0.0',
     [int]$Port = 8080,
     [string[]]$Cors,
-    [ValidatePattern('^(\d+|disabled)$')]
+    [ValidatePattern('^(\d+|disabled)\z')]
     [string]$WsPort,
     [string]$ModelPath,
     [switch]$NoFastAll,
@@ -230,14 +230,20 @@ try {
         $fastFlag,
         '--attn-implementation', $AttnImplementation
     )
-    $corsJoined = if ($Cors) { $Cors -join ',' } else { $null }
+    $corsJoined = $Cors -join ','
     if ($corsJoined) { $argList += @('--cors', $corsJoined) }
     if ($WsPort) { $argList += @('--ws-port', $WsPort) }
     if ($ExtraArgs) { $argList += $ExtraArgs }
 
-    $corsDisplay = if (-not $corsJoined) { 'off' } else { $corsJoined }
-    $wsPortDisplay = if ($WsPort) { $WsPort } else { "$($Port + 1) (derived)" }
-    Write-Host "==> Serving $ModelPath on http://${BindHost}:$Port (cors: $corsDisplay, ws-port: $wsPortDisplay, $fastFlag, attn $AttnImplementation)" -ForegroundColor Green
+    # Only report the WS port when the caller set -WsPort explicitly. When
+    # it's absent the server derives its own port (HTTP port + 1), and this
+    # script has no way to know that value without duplicating that rule --
+    # so it says nothing about WS rather than guessing.
+    $corsDisplay = if ($corsJoined) { $corsJoined } else { 'off' }
+    $bannerParts = @("cors: $corsDisplay")
+    if ($WsPort) { $bannerParts += "ws-port: $WsPort" }
+    $bannerParts += @($fastFlag, "attn $AttnImplementation")
+    Write-Host "==> Serving $ModelPath on http://${BindHost}:$Port ($($bannerParts -join ', '))" -ForegroundColor Green
     & $VenvPy @argList
     exit $LASTEXITCODE
 }
