@@ -278,6 +278,20 @@ def _branch_shape(inputs: dict[str, Any]) -> _BranchShape:
     return _BranchShape(cfg, 2, seq_len)
 
 
+class PromptLength(NamedTuple):
+    """What a prompt's room depends on: the backbone batch it runs as and its length."""
+
+    branch_batch_size: int
+    seq_len: int
+
+
+def prompt_length(inputs: dict[str, Any]) -> PromptLength:
+    """``inputs``' `PromptLength`, for sizing a prompt by length alone
+    (``FastBreezeStreamingRuntime.room_for_length``) without keeping its tensors."""
+    _, branch_batch_size, seq_len = _branch_shape(inputs)
+    return PromptLength(branch_batch_size, seq_len)
+
+
 def _get_device(model: torch.nn.Module) -> torch.device:
     try:
         return next(model.parameters()).device
@@ -1078,13 +1092,22 @@ class FastBreezeStreamingRuntime:
         CFG padding and graph-bucket padding. A result below the request's cap
         means the piece will be clamped; ``<= 0`` means no room to generate.
         """
+        return self.room_for_length(requested, prompt_length(inputs), prefix_len=prefix_len)
+
+    def room_for_length(
+        self, requested: int | None, length: PromptLength, *, prefix_len: int = 0
+    ) -> int:
+        """``max_new_tokens_room`` for a prompt known only by its `PromptLength`: the same
+        rule, so a caller can size a prompt it has measured but not kept, or one it has
+        lengthened by arithmetic (a reference added to every row adds the same tokens to
+        each, so to ``seq_len``)."""
         _require_valid_overrides(max_new_tokens=requested)
-        room = self._context_room(_branch_shape(inputs), prefix_len)
+        room = self._context_room(length.branch_batch_size, length.seq_len, prefix_len)
         return min(self.frame_cap(requested), room)
 
-    def _context_room(self, shape: _BranchShape, prefix_len: int) -> int:
-        """Frames the context leaves after a prefill of ``shape`` (``<= 0``: none)."""
-        _, branch_batch_size, seq_len = shape
+    def _context_room(self, branch_batch_size: int, seq_len: int, prefix_len: int) -> int:
+        """Frames the context leaves after a prefill of ``seq_len`` tokens per row
+        (``<= 0``: none)."""
         _, prefill_len = self._prefill_plan(branch_batch_size, seq_len, prefix_len)
         return self.config.max_seq_len - prefill_len - 1
 
@@ -1273,7 +1296,7 @@ class FastBreezeStreamingRuntime:
         )
         shape = _branch_shape(inputs)
         prefix_len = 0 if prefix is None else int(prefix.prefix_len)
-        if self._context_room(shape, prefix_len) <= 0:
+        if self._context_room(shape.branch_batch_size, shape.seq_len, prefix_len) <= 0:
             raise NoRoomError(
                 "prompt leaves no room to generate in the "
                 f"{self.config.max_seq_len}-token context"

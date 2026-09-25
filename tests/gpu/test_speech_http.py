@@ -2,9 +2,9 @@
 
 Builds the *whole* app through `breeze_infer.api.create_app` -- the same wiring
 `breeze_infer.api.main` uses in production -- on the real, warmed runtime
-`tests/gpu/conftest.py`'s session-scoped `gpu_env` fixture loads. A `Readiness` is
-marked ready with that runtime directly (mirrors `load_in_background`'s
-`readiness.mark_ready(loaded.runtime)`), and each test gets its own `GpuGate` /
+`tests/gpu/conftest.py`'s session-scoped `gpu_env` fixture loads. The components are
+marked ready with that runtime and a CPU copy of its tokenizer through
+`Components.mark_ready`, the step `load_in_background` ends with, and each test gets its own `GpuGate` /
 `GpuThread` / `RecordingEvents`, so a lease or event held by one test can never
 leak into the next.
 
@@ -38,7 +38,9 @@ from fastapi.testclient import TestClient
 from breeze_infer.api import Components, create_app
 from breeze_infer.gpu import GpuGate, GpuThread
 from breeze_infer.limits import MAX_TEXT_CHARS
+from breeze_infer.model_loading import LoadedModel
 from breeze_infer.routes_health import Readiness
+from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.runtime import resolve_device
 from breeze_infer.settings import DEFAULT_CHUNK_MAX, settings_from_args
 from breeze_infer.streaming import BYTES_PER_SAMPLE
@@ -70,10 +72,10 @@ EVENT_POLL_TIMEOUT_SECONDS = 5.0
 
 
 def _components(gpu_env) -> tuple[Components, RecordingEvents]:
-    # The model directory is never opened here (nothing loads through Settings):
-    # `readiness` is marked ready directly with `gpu_env.runtime` below.
-    readiness = Readiness()
-    readiness.mark_ready(gpu_env.runtime)
+    # The model directory is never opened here (nothing loads through Settings): the
+    # components are marked ready with `gpu_env.runtime` by the same step the server's own
+    # load ends with (`Components.mark_ready`), which also installs the speech route's CPU
+    # tokenizer copy, made here as `model_loading.load_model` makes it.
     events = RecordingEvents()
     device = resolve_device()
     components = Components(
@@ -81,9 +83,11 @@ def _components(gpu_env) -> tuple[Components, RecordingEvents]:
         events=events,
         gate=GpuGate(),
         gpu=GpuThread(device, torch.cuda.set_device),
-        readiness=readiness,
+        readiness=Readiness(),
         ws_port=lambda: 0,
+        cpu_tokenizer=CpuTokenizer(),
     )
+    components.mark_ready(LoadedModel.from_runtime(gpu_env.runtime, {}))
     return components, events
 
 
@@ -95,6 +99,7 @@ def speech_app(gpu_env) -> Iterator[tuple[TestClient, RecordingEvents]]:
         yield client, events
     finally:
         components.gpu.shutdown()
+        components.cpu_tokenizer.shutdown()
 
 
 def _pcm_stats(body: bytes) -> tuple[int, bool]:

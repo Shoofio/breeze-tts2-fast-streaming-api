@@ -20,6 +20,7 @@ from breeze_infer.api import Components, create_app
 from breeze_infer.events import Emitter
 from breeze_infer.gpu import GpuGate, GpuThread
 from breeze_infer.routes_health import Readiness, install_health
+from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.settings import settings_from_args
 from tests.fakes import FakeRuntime
 
@@ -36,6 +37,7 @@ def _components(readiness: Readiness) -> Components:
         gpu=GpuThread("cpu", lambda _device: None),
         readiness=readiness,
         ws_port=lambda: WS_PORT,
+        cpu_tokenizer=CpuTokenizer(),
     )
 
 

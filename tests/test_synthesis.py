@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -19,9 +20,11 @@ import torch
 from breeze_infer.http_fields import InlineRef, NoReference, VoiceRef
 from breeze_infer.reference_audio import DecodedAudio
 from breeze_infer.synthesis import (
+    AnchorSizing,
     CodesRef,
     NoRef,
     PieceRoom,
+    anchor_sizing,
     codec_samples_per_frame,
     generate_piece,
     piece_frame_limit,
@@ -33,7 +36,7 @@ from breeze_infer.synthesis import (
     resolve_reference,
     stand_in_reference,
 )
-from models.fast_streaming import NoRoomError
+from models.fast_streaming import NoRoomError, PromptLength, prompt_length
 from tests.fakes import (
     CODEC_SAMPLES_PER_FRAME,
     FakeCodec,
@@ -503,6 +506,49 @@ def test_predicted_room_matches_the_room_of_the_real_inputs(cfg_scale: float) ->
         )
 
         assert predicted == piece_room(runtime, real, None)
+
+
+# --- anchor sizing: later pieces' lengths, measured before the gate ---------------------------
+
+
+ANCHOR_TEXT = "The opening piece, which becomes the anchor."
+LATER_TEXTS = ["A second piece.", "A third, somewhat longer piece of the text.", "Fourth."]
+
+
+@pytest.mark.parametrize("cfg_scale", [1.0, 3.0, 0.0])
+def test_anchor_sizing_predicts_every_anchored_prompt_length(cfg_scale: float) -> None:
+    """The anchor check after piece 0 is arithmetic on lengths measured before the gate; it
+    must give exactly the length the real anchored prompt has, for any frame count, on every
+    CFG branch shape."""
+    runtime = FakeRuntime()
+    runtime.model = model_with_codec_facts()
+
+    sizing = anchor_sizing(
+        runtime, FakeTokenizer(), ANCHOR_TEXT, LATER_TEXTS, "Speak.", cfg_scale
+    )
+
+    def real_length(reference: Any, text: str) -> PromptLength:
+        return prompt_length(
+            prepare_piece(FakeTokenizer(), runtime.model, reference, text, "Speak.", cfg_scale)
+        )
+
+    assert sizing.later_lengths == tuple(real_length(NoRef(), text) for text in LATER_TEXTS)
+    for frames in (1, 2, 7, 40):
+        anchor = CodesRef(
+            codes=torch.zeros((frames, 16), dtype=torch.int16), ref_text=ANCHOR_TEXT
+        )
+        for text, length in zip(LATER_TEXTS, sizing.later_lengths, strict=True):
+            assert sizing.anchored(length, frames) == real_length(anchor, text)
+
+
+def test_anchor_sizing_needs_no_gpu_model() -> None:
+    """It runs on the CPU executor before the gate: a model view with only `config` works."""
+    runtime = SimpleNamespace(model=SimpleNamespace(config=model_with_codec_facts().config))
+
+    sizing = anchor_sizing(runtime, FakeTokenizer(), ANCHOR_TEXT, LATER_TEXTS, "Speak.", 1.0)
+
+    assert isinstance(sizing, AnchorSizing)
+    assert len(sizing.later_lengths) == len(LATER_TEXTS)
 
 
 @pytest.mark.xfail(

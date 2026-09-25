@@ -141,11 +141,15 @@ frame. It never happens on cancel, on failure, or when piece 0 produced zero fra
 skipped, with `speech.anchor_skipped` (`piece_index` 0, `reason`), when:
 - `piece_truncated`: piece 0 used its whole frame limit (its cap or its room), so it stopped
   there rather than at EOS;
-- `no_room`: with the anchor as its reference, some later piece would have less than
-  `MIN_SUFFIX_FRAMES` (12) frames of context room (a room limited by the piece's own cap doesn't
-  count). The anchor is never trimmed to fit: its codes must stay paired with its text.
-  This is decided once piece 0 has finished and before piece 1 starts, by sizing every later
-  piece's prompt with the anchor on the CPU; those prompts are not kept.
+- `no_room`: some later piece would get less room than its cap with the anchor as its reference,
+  while it would get its full cap without it. A piece whose room is below its cap either way
+  doesn't count: it is clamped whatever piece 0 does. The anchor is never trimmed to fit: its
+  codes must stay paired with its text.
+  Every later piece's prompt length without an anchor, and what the anchor's text and each of
+  its frames add, are measured on the CPU before the GPU gate is taken; no prompt is kept. Once
+  piece 0 has finished, and before piece 1 starts, the decision is arithmetic on those lengths
+  plus the anchor's frame count, with each room taken from the runtime (CFG rows and prefill
+  bucket padding included).
 
 A skipped anchor leaves the later pieces as voice design.
 
@@ -153,7 +157,8 @@ A skipped anchor leaves the later pieces as voice design.
 
 `(index, text, seed = (request_seed + index) & 0xFFFFFFFF)`.
 - Its model inputs are built on the GPU thread when the stream reaches it, not ahead of time, and
-  are not kept once it has been generated.
+  are not kept once it has been generated. Only its prompt length is measured ahead, before the
+  gate, for the anchor decision ("Reference").
 - Its token cap is `min(max_new_tokens or 750, room)`.
 - A room of 0 fails: `400 text_too_long` for piece 0 before streaming, or an aborted stream for a
   later piece.

@@ -38,9 +38,10 @@ from breeze_infer.api import create_app
 from breeze_infer.limits import ANCHOR_CHARS
 from breeze_infer.settings import DEFAULT_SPLIT_CHARS
 from breeze_infer.streaming import BYTES_PER_SAMPLE
-from breeze_infer.synthesis import CodesRef, NoRef, Reference
+from breeze_infer.synthesis import CodesRef, NoRef, Reference, anchor_sizing
 from breeze_infer.synthesis import prepare_piece as _real_prepare_piece
 from breeze_infer.text_split import split_text
+from models.fast_streaming import prompt_length
 from tests.gpu.test_speech_http import (
     SAMPLE_RATE,
     SPEECH_PATH,
@@ -149,6 +150,7 @@ def _run_once(
     finally:
         routes_speech.prepare_piece = original_prepare_piece
         components.gpu.shutdown()
+        components.cpu_tokenizer.shutdown()
 
 
 def _save_wav(body: bytes) -> None:
@@ -269,3 +271,34 @@ def test_long_voice_design_completes_every_run(gpu_env) -> None:
     # (a length change) is cheap to notice, and so anyone diffing runs by hand has the exact
     # values to start from.
     assert len(set(body_lengths)) == 1, f"runs produced different-length audio: {body_lengths}"
+
+
+@pytest.mark.parametrize("cfg_scale", [1.0, 3.0])
+def test_anchor_sizing_matches_real_prompts_with_the_real_tokenizer(
+    gpu_env, cfg_scale: float
+) -> None:
+    """The anchor check adds the anchor's length to each later piece's prompt length, measured
+    without it. That rests on the real tokenizer splitting the prompt at the audio markers, so
+    the sum must equal the real anchored prompt's length for every piece of the passage."""
+    pieces = split_text(
+        LONG_PASSAGE,
+        budget=DEFAULT_SPLIT_CHARS,
+        first_budget=min(ANCHOR_CHARS, DEFAULT_SPLIT_CHARS),
+    )
+    instruction = "A calm adult male voice, clear and natural."
+    codebooks = int(gpu_env.model.config.num_codebooks)
+    sizing = anchor_sizing(
+        gpu_env.runtime, gpu_env.tokenizer, pieces[0], pieces[1:], instruction, cfg_scale
+    )
+
+    for frames in (1, 57, 300):
+        anchor = CodesRef(
+            codes=np.zeros((frames, codebooks), dtype=np.int16), ref_text=pieces[0]
+        )
+        for text, length in zip(pieces[1:], sizing.later_lengths, strict=True):
+            real = prompt_length(
+                _real_prepare_piece(
+                    gpu_env.tokenizer, gpu_env.model, anchor, text, instruction, cfg_scale
+                )
+            )
+            assert sizing.anchored(length, frames) == real

@@ -37,6 +37,7 @@ from breeze_infer.events import Emitter
 from breeze_infer.gpu import GpuGate, GpuThread
 from breeze_infer.limits import MAX_BODY_BYTES
 from breeze_infer.routes_health import Readiness
+from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.settings import settings_from_args
 from breeze_infer.version_header import VersionHeaderMiddleware
 from tests.fakes import FakeRuntime
@@ -72,6 +73,7 @@ def make_client() -> Iterator[Callable[[Sequence[str]], TestClient]]:
             gpu=GpuThread("cpu", lambda _device: None),
             readiness=readiness,
             ws_port=lambda: 8081,
+            cpu_tokenizer=CpuTokenizer(),
         )
         made.append(components)
         # raise_server_exceptions=False: a 500 is a legitimate response to assert on here (its

@@ -136,7 +136,8 @@ covers the whole text, and the same speaker is heard throughout.
    opening budget (or `split_chars`, if that is smaller). The budget is soft, as in C++: a single
    clause longer than 200 is kept whole. Every later piece uses the first piece's audio and text
    as its reference. Anchoring is skipped (later pieces stay voice design) when the first piece
-   was truncated or the anchor would leave a later piece too little room.
+   was truncated, or when the anchor would cut a later piece below its token cap while that piece
+   would get its full cap without it (a piece limited by the context either way doesn't count).
 2. **Given** text longer than `split_chars`, **When** a reference (`voice_id` or inline) is given,
    **Then** every piece uses that reference.
 3. **Given** a request seed `s`, **When** piece `i` is generated, **Then** it uses seed

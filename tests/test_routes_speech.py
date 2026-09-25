@@ -18,6 +18,7 @@ import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -70,6 +71,11 @@ def _build_components(
     argv = [str(Path(__file__).parent)]
     if split_chars is not None:
         argv += ["--split-chars", str(split_chars)]
+    # What the model load installs: its own copy of the runtime's tokenizer. A plain
+    # `FakeTokenizer` holds no state, so a fresh one is as good as a copy. Installed up front
+    # because most tests here mark `readiness` ready directly, with a runtime alone.
+    cpu_tokenizer = CpuTokenizer()
+    cpu_tokenizer.install(FakeTokenizer())
     return Components(
         settings=settings_from_args(argv),
         events=events if events is not None else Emitter(io.StringIO(), lambda: 0.0),
@@ -77,9 +83,7 @@ def _build_components(
         gpu=GpuThread("cpu", lambda _device: None),
         readiness=readiness,
         ws_port=lambda: 0,
-        # What the model load installs: its own copy of the runtime's tokenizer. A plain
-        # `FakeTokenizer` holds no state, so a fresh one is as good as a copy.
-        cpu_tokenizer=CpuTokenizer(FakeTokenizer()),
+        cpu_tokenizer=cpu_tokenizer,
     )
 
 
@@ -468,7 +472,8 @@ def test_the_cpu_room_check_uses_the_copy_made_at_load_never_the_gpu_threads() -
         assert all(name.startswith("breeze-gpu") for name in tokenizer.threads)
         assert tokenizer.copies == []  # no request copies it: the load already did
         assert cpu_copy.threads
-        assert not any(name.startswith("breeze-gpu") for name in cpu_copy.threads)
+        # Never a default-pool worker either: the check has its own single-thread executor.
+        assert all(name.startswith("breeze-cpu-tokenizer") for name in cpu_copy.threads)
     finally:
         components.gpu.shutdown()
 
@@ -497,8 +502,8 @@ class _OverlapDetectingTokenizer(FakeTokenizer):
 
 
 def test_concurrent_cpu_room_checks_are_serialized() -> None:
-    """Two requests at once both run their CPU room check on worker threads, before the busy
-    check, against the one CPU copy: they must take turns on it."""
+    """Two requests at once both run their CPU room check before the busy check, against the
+    one CPU copy: its single executor thread makes them take turns on it."""
     readiness = Readiness()
     components = _build_components(readiness)
     try:
@@ -564,15 +569,14 @@ def test_the_model_load_copies_the_tokenizer_on_the_gpu_thread(
 
 def test_the_cpu_copy_is_installed_before_the_server_reports_ready() -> None:
     readiness = Readiness()
-    components = _build_components(readiness)
+    components = replace(_build_components(readiness), cpu_tokenizer=CpuTokenizer())
     runtime = _fake_runtime()
     cpu_copy = FakeTokenizer()
     seen_at_ready: list[bool] = []
     original_mark_ready = readiness.mark_ready
 
     def mark_ready(ready_runtime: Any) -> None:
-        with components.cpu_tokenizer.borrow() as installed:
-            seen_at_ready.append(installed is cpu_copy)
+        seen_at_ready.append(components.cpu_tokenizer._tokenizer is cpu_copy)
         original_mark_ready(ready_runtime)
 
     readiness.mark_ready = mark_ready  # type: ignore[method-assign]
@@ -585,6 +589,53 @@ def test_the_cpu_copy_is_installed_before_the_server_reports_ready() -> None:
 
     assert seen_at_ready == [True]
     assert readiness.runtime is runtime
+
+
+def test_mark_ready_installs_the_copy_and_the_runtime_in_one_step() -> None:
+    """The one way the server (and the GPU tests) become ready: a `LoadedModel` carries both."""
+    readiness = Readiness()
+    components = replace(_build_components(readiness), cpu_tokenizer=CpuTokenizer())
+    try:
+        runtime = _fake_runtime()
+        cpu_copy = FakeTokenizer()
+
+        components.mark_ready(LoadedModel(runtime=runtime, report={}, cpu_tokenizer=cpu_copy))
+
+        assert readiness.runtime is runtime
+        assert components.cpu_tokenizer._tokenizer is cpu_copy
+        client = _client_for(components)
+        assert client.post(SPEECH_PATH, data={"text": "hello there"}).status_code == 200
+    finally:
+        components.gpu.shutdown()
+
+
+def test_components_and_loaded_model_both_require_a_cpu_tokenizer() -> None:
+    readiness = Readiness()
+    fields = {
+        name: getattr(_build_components(readiness), name)
+        for name in ("settings", "events", "gate", "gpu", "readiness", "ws_port")
+    }
+    with pytest.raises(TypeError, match="cpu_tokenizer"):
+        Components(**fields)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="cpu_tokenizer"):
+        LoadedModel(runtime=_fake_runtime(), report={})  # type: ignore[call-arg]
+
+
+def test_installing_no_cpu_tokenizer_is_rejected() -> None:
+    with pytest.raises(ValueError, match="tokenizer"):
+        CpuTokenizer().install(None)
+
+
+def test_loaded_model_from_runtime_copies_the_runtimes_tokenizer() -> None:
+    tokenizer = _ThreadRecordingTokenizer()
+    runtime = SimpleNamespace(tokenizer=tokenizer)
+
+    loaded = LoadedModel.from_runtime(runtime, {"device": "cpu"})
+
+    [copied] = tokenizer.copies
+    assert loaded.cpu_tokenizer is copied
+    assert loaded.runtime is runtime
+    assert loaded.report == {"device": "cpu"}
 
 
 # --- events: frame prediction, pieces ---------------------------------------------------------

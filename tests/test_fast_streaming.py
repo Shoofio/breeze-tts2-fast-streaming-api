@@ -29,11 +29,13 @@ from models.fast_streaming import (
     FastStreamingChunk,
     FastStreamingConfig,
     NonFiniteLogitsError,
+    PromptLength,
     _branch_shape,
     _BranchBatch,
     _frame_flags,
     _get_dtype,
     is_backbone_eos_token,
+    prompt_length,
     reject_dual_cfg,
     select_fast_cfg,
 )
@@ -1212,6 +1214,35 @@ def test_room_counts_graph_bucket_padding() -> None:
     assert runtime.max_new_tokens_room(1500, _prompt(1000), prefix_len=33) == (
         2048 - 33 - 1024 - 1
     )
+
+
+@pytest.mark.parametrize("fast_backbone_prefill", [False, True], ids=["eager", "bucketed"])
+@pytest.mark.parametrize(
+    "inputs",
+    [_prompt(100), _prompt(1990), _prompt(7, 9), {**_prompt(7, 1995), "cfg_scale": 0.0}],
+    ids=["short", "near-the-end", "cfg", "cfg-0"],
+)
+def test_room_for_a_prompt_length_matches_the_room_for_its_inputs(
+    inputs: dict, fast_backbone_prefill: bool
+) -> None:
+    """The anchor check sizes later pieces by length alone (`prompt_length`), so the room it
+    gets from a length must be exactly the room the inputs themselves get."""
+    runtime = _room_runtime(fast_backbone_prefill=fast_backbone_prefill)
+
+    for requested in (None, 40, 1500):
+        assert runtime.room_for_length(requested, prompt_length(inputs)) == (
+            runtime.max_new_tokens_room(requested, inputs)
+        )
+
+
+def test_prompt_length_is_the_branch_batch_and_the_longer_row() -> None:
+    assert prompt_length(_prompt(7)) == PromptLength(branch_batch_size=1, seq_len=7)
+    assert prompt_length(_prompt(7, 9)) == PromptLength(branch_batch_size=2, seq_len=9)
+
+
+def test_room_for_length_rejects_an_invalid_request() -> None:
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        _room_runtime().room_for_length(0, PromptLength(1, 10))
 
 
 def test_room_uses_the_exact_length_when_a_frozen_cache_falls_back_to_eager() -> None:

@@ -59,6 +59,34 @@ class StreamAborted(Exception):
     """
 
 
+# What `install_error_handlers` answers with a handler of its own -- a client's error, a
+# framework rejection, a poisoned GPU -- plus `StreamAborted`, whose response has already started
+# and whose outcome is already reported. None of them is a server failure to log as
+# `request.failed`; everything else that reaches the catch-all handler is.
+_NOT_REPORTED = (
+    ApiError,
+    StarletteHTTPException,
+    GpuUnavailable,
+    FormParserError,
+    RequestValidationError,
+    StreamAborted,
+)
+
+
+def report_unhandled(events: Emitter, request_id: str, exc: BaseException) -> None:
+    """Emit `request.failed` for `exc` if it is a server failure, by the one rule the catch-all
+    handler below applies.
+
+    Public for a route that must report a failure in the handler's place, because something
+    else will now reach the client instead (`routes_speech._close_quietly`: a cancellation
+    that arrived while closing). Only an `Exception` is reported: a `BaseException` such as
+    `KeyboardInterrupt` never reaches that handler, since the process is going down.
+    """
+    if not isinstance(exc, Exception) or isinstance(exc, _NOT_REPORTED):
+        return
+    events.emit("request.failed", level="error", request_id=request_id, error=repr(exc))
+
+
 def _envelope(message: str, code: str) -> dict[str, str]:
     return {"error": message, "code": code}
 
@@ -268,13 +296,12 @@ def install_error_handlers(app: FastAPI, events: Emitter) -> None:
         # detail that isn't the API's contract to expose -- but keep the real error
         # in the structured event log via repr(). Starlette's ServerErrorMiddleware
         # re-raises after this response is sent, so uvicorn also prints a traceback;
-        # that duplicate is intended.
-        if isinstance(exc, StreamAborted):
-            # ServerErrorMiddleware only sends this if the response hasn't started, and a
-            # StreamAborted always comes after it has: this response is never sent.
-            return JSONResponse(_envelope("internal error", "internal_error"), status_code=500)
+        # that duplicate is intended. A `StreamAborted` is not reported (`report_unhandled`),
+        # and its response is never sent: ServerErrorMiddleware only sends one if the
+        # response hasn't started, and a StreamAborted always comes after it has.
+        #
         # Without the request-id middleware (a bare test app) there is no id to reuse, but
         # the event still needs one to be traceable.
         request_id = _request_id_of(request) or f"api-{uuid.uuid4().hex}"
-        events.emit("request.failed", level="error", request_id=request_id, error=repr(exc))
+        report_unhandled(events, request_id, exc)
         return JSONResponse(_envelope("internal error", "internal_error"), status_code=500)

@@ -25,7 +25,7 @@ import torch
 from breeze_infer.audio import encode_prompt_waveform, pcm16
 from breeze_infer.http_fields import InlineRef, NoReference, ReferenceSpec, VoiceRef
 from breeze_infer.templates import get_template, prepare_inputs
-from models.fast_streaming import NoRoomError
+from models.fast_streaming import NoRoomError, PromptLength, prompt_length
 
 if TYPE_CHECKING:
     from breeze_infer.reference_audio import DecodedAudio
@@ -229,13 +229,10 @@ def predicted_room(
 ) -> PieceRoom:
     """A piece's room, computed from inputs built on the CPU and then dropped.
 
-    The speech route uses it for piece 0 before the GPU gate is taken, and for every later
-    piece when deciding whether piece 0 can anchor them (`routes_speech`).
+    The speech route uses it for piece 0 before the GPU gate is taken (`routes_speech`).
 
-    Builds the piece's inputs exactly as `prepare_piece` does, but on the CPU (a view of the
-    model with only its ``config`` and ``device="cpu"``, the two attributes
-    `templates.prepare_inputs` reads), so this needs neither the GPU thread nor the gate, and
-    leaves no tensor on the device.
+    Builds the piece's inputs exactly as `prepare_piece` does, but on the CPU (`_cpu_model`),
+    so this needs neither the GPU thread nor the gate, and leaves no tensor on the device.
     That view is safe exactly as long as templates read nothing else from the model: any
     other attribute is an AttributeError here, and
     `tests/test_synthesis.py::test_predicted_room_matches_the_room_of_the_real_inputs` runs
@@ -244,13 +241,83 @@ def predicted_room(
     the real one will have, and the route still checks the real inputs on the GPU thread
     afterwards, in case the codec's frame count differs from the prediction.
 
-    ``tokenizer`` must be one no other thread is using at the same time: off the GPU thread,
-    the route's own copy (`routes_speech.CpuTokenizer`), never ``runtime.tokenizer``; on the
-    GPU thread, ``runtime.tokenizer`` itself.
+    ``tokenizer`` must be one no other thread is using at the same time: the route's own copy
+    (`routes_speech.CpuTokenizer`), never ``runtime.tokenizer``, which the GPU thread uses.
     """
-    cpu_model = SimpleNamespace(config=runtime.model.config, device="cpu")
-    inputs = prepare_piece(tokenizer, cpu_model, reference, text, instruction, cfg_scale)
+    inputs = prepare_piece(
+        tokenizer, _cpu_model(runtime), reference, text, instruction, cfg_scale
+    )
     return piece_room(runtime, inputs, requested)
+
+
+def _cpu_model(runtime: Any) -> Any:
+    """The model view `predicted_room` and `anchor_sizing` build prompts with: its ``config``
+    and ``device="cpu"``, the two attributes `templates.prepare_inputs` reads."""
+    return SimpleNamespace(config=runtime.model.config, device="cpu")
+
+
+@dataclass(frozen=True)
+class AnchorSizing:
+    """What deciding on piece 0's anchor needs, measured before piece 0 exists
+    (`anchor_sizing`), so the decision itself is arithmetic.
+
+    ``later_lengths`` are the later pieces' prompt lengths without an anchor, in order. An
+    anchor of ``frames`` frames adds ``anchor_tokens + frames * tokens_per_frame`` tokens to
+    every row of each of them (`anchored`).
+    """
+
+    later_lengths: tuple[PromptLength, ...]
+    anchor_tokens: int
+    tokens_per_frame: int
+
+    def anchored(self, length: PromptLength, frames: int) -> PromptLength:
+        """``length`` with an anchor of ``frames`` frames in front of every row."""
+        added = self.anchor_tokens + frames * self.tokens_per_frame
+        return length._replace(seq_len=length.seq_len + added)
+
+
+def anchor_sizing(
+    runtime: Any,
+    tokenizer: Any,
+    anchor_text: str,
+    later_texts: list[str],
+    instruction: str,
+    cfg_scale: float,
+) -> AnchorSizing:
+    """Measure what `AnchorSizing` holds, from prompts built on the CPU and then dropped.
+
+    ``anchor_text`` is piece 0's text, the anchor's transcript; its frames are not known yet.
+    What the anchor adds is measured, not re-derived from `templates.py`'s rules: piece 1 is
+    built with stand-in anchors of one and of two frames, and the differences give the
+    per-frame and the fixed part. That the addition is the same for every later piece, every
+    CFG row and any frame count holds because the reference segments come first on every row,
+    ahead of the same text segment, and the tokenizer splits the prompt at the audio markers
+    between them; `tests/test_synthesis.py` checks it with the fake tokenizer and
+    `tests/gpu/test_speech_long_text.py` with the real one.
+
+    ``tokenizer`` follows `predicted_room`'s rule: one no other thread is using.
+    """
+    cpu_model = _cpu_model(runtime)
+    codebooks = int(runtime.model.config.num_codebooks)
+
+    def length(reference: Reference, text: str) -> PromptLength:
+        return prompt_length(
+            prepare_piece(tokenizer, cpu_model, reference, text, instruction, cfg_scale)
+        )
+
+    def stand_in(frames: int) -> CodesRef:
+        codes = torch.zeros((frames, codebooks), dtype=torch.int16)
+        return CodesRef(codes=codes, ref_text=anchor_text)
+
+    later_lengths = tuple(length(NoRef(), text) for text in later_texts)
+    one_frame = length(stand_in(1), later_texts[0]).seq_len
+    two_frames = length(stand_in(2), later_texts[0]).seq_len
+    tokens_per_frame = two_frames - one_frame
+    return AnchorSizing(
+        later_lengths=later_lengths,
+        anchor_tokens=one_frame - tokens_per_frame - later_lengths[0].seq_len,
+        tokens_per_frame=tokens_per_frame,
+    )
 
 
 def piece_frame_limit(

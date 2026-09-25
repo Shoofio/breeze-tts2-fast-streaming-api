@@ -146,6 +146,20 @@ def test_max_new_tokens_room_rejects_invalid_requested() -> None:
         FakeRuntime().max_new_tokens_room(2.5, _room_inputs(10))
 
 
+@pytest.mark.parametrize("fast_backbone_prefill", [False, True], ids=["exact", "bucketed"])
+def test_room_for_length_matches_max_new_tokens_room(fast_backbone_prefill: bool) -> None:
+    from models.fast_streaming import prompt_length
+
+    runtime = FakeRuntime(
+        config=FakeStreamingConfig(max_seq_len=256, fast_backbone_prefill=fast_backbone_prefill)
+    )
+    for seq_len in (10, 100, 240, 255):
+        inputs = {"attention_mask": torch.ones((1, seq_len))}
+        assert runtime.room_for_length(40, prompt_length(inputs)) == (
+            runtime.max_new_tokens_room(40, inputs)
+        )
+
+
 def test_fake_config_defaults_match_the_real_config() -> None:
     from models.fast_streaming import FastStreamingConfig
 

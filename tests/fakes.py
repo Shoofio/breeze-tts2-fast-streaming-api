@@ -401,7 +401,7 @@ class FakeRuntime:
       750, the deployed model's own ``generation_config.max_new_tokens``, and
       ``FakeStreamingConfig.max_new_tokens`` defaults to 1500, the deployed server's
       ceiling -- then the context room from the prefill length) by calling the real
-      ``_require_valid_overrides`` and ``_branch_shape`` helpers and porting
+      ``_require_valid_overrides`` and ``prompt_length`` helpers and porting
       ``frame_cap``'s two-line rule directly. ``_context_room`` uses the **exact**
       prompt length by default and bucket-pads to the nearest
       ``_PREFILL_TOKEN_GRANULARITY`` (32) only when ``self.config.fast_backbone_prefill``
@@ -515,12 +515,19 @@ class FakeRuntime:
         class docstring's "Approximation gap" paragraph for what this can't reproduce
         without real captured prefill graphs."""
         # Lazy for the same reason as in iter_audio_chunks below (finding #8).
+        from models.fast_streaming import prompt_length
+
+        return self.room_for_length(requested, prompt_length(inputs), prefix_len=prefix_len)
+
+    def room_for_length(self, requested: int | None, length: Any, *, prefix_len: int = 0) -> int:
+        """``FastBreezeStreamingRuntime.room_for_length``: the room above, for a prompt known
+        only by its ``PromptLength``."""
         from models.fast_streaming import _require_valid_overrides
 
         _require_valid_overrides(max_new_tokens=requested)
-        return min(self.frame_cap(requested), self._context_room(inputs, prefix_len))
+        return min(self.frame_cap(requested), self._context_room(length.seq_len, prefix_len))
 
-    def _context_room(self, inputs: dict[str, Any], prefix_len: int) -> int:
+    def _context_room(self, seq_len: int, prefix_len: int) -> int:
         """The real ``_context_room``/``_prefill_plan`` rule: exact prompt length by
         default, bucketed only when ``self.config.fast_backbone_prefill`` is set (review
         finding #2 -- the real ``_prefill_plan`` only pads when the fast backbone-prefill
@@ -536,13 +543,8 @@ class FakeRuntime:
         that point stays eager too (keeps room monotonic in prompt length -- see the
         real docstring).
         """
-        from models.fast_streaming import (
-            _PREFILL_TOKEN_GRANULARITY,
-            MIN_SUFFIX_FRAMES,
-            _branch_shape,
-        )
+        from models.fast_streaming import _PREFILL_TOKEN_GRANULARITY, MIN_SUFFIX_FRAMES
 
-        seq_len = _branch_shape(inputs).seq_len
         exact_len = prefix_len + seq_len
         if not self.config.fast_backbone_prefill:
             return self.config.max_seq_len - exact_len - 1

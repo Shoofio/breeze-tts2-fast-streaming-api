@@ -61,8 +61,15 @@ class Components:
     gpu: GpuThread
     readiness: Readiness
     ws_port: Callable[[], int]
-    # Empty until the model load installs its tokenizer copy (`load_in_background`).
-    cpu_tokenizer: CpuTokenizer = field(default_factory=CpuTokenizer)
+    # Empty until `mark_ready` installs the model load's tokenizer copy.
+    cpu_tokenizer: CpuTokenizer
+
+    def mark_ready(self, loaded: LoadedModel) -> None:
+        """Serve `loaded`: its CPU tokenizer copy and its runtime, in one step, so the server
+        is never ready without the copy the speech route sizes requests with. The copy goes
+        in first: the first request the server admits may need it."""
+        self.cpu_tokenizer.install(loaded.cpu_tokenizer)
+        self.readiness.mark_ready(loaded.runtime)
 
 
 def create_app(components: Components) -> ASGIApp:
@@ -251,9 +258,7 @@ async def load_in_background(
     """
     try:
         loaded = await components.gpu.run(load)
-        # Before `mark_ready`: the first request the server admits may need it.
-        components.cpu_tokenizer.install(loaded.cpu_tokenizer)
-        components.readiness.mark_ready(loaded.runtime)
+        components.mark_ready(loaded)
         components.events.emit(
             "model.loaded", sample_rate=int(loaded.runtime.sample_rate), **loaded.report
         )
@@ -501,8 +506,8 @@ async def _stop_gpu(
 
 
 async def _drain_gpu(components: Components, server: uvicorn.Server) -> bool:
-    """Close every open generation on the GPU thread, then stop the thread, within
-    `GPU_DRAIN_SECONDS`. Returns whether the thread stopped."""
+    """Close every open generation on the GPU thread, then stop the CPU tokenizer's executor
+    and the GPU thread, within `GPU_DRAIN_SECONDS`. Returns whether the GPU thread stopped."""
     # Requests uvicorn left running: it doesn't cancel them on a forced exit, and cancels
     # without waiting when the graceful timeout expires. Each one's GpuSession queues its
     # gen.close() as it unwinds, and the GPU thread must still be there to run it.
@@ -513,6 +518,9 @@ async def _drain_gpu(components: Components, server: uvicorn.Server) -> bool:
     deadline = loop.time() + GPU_DRAIN_SECONDS
     if requests:
         await asyncio.wait(requests, timeout=GPU_DRAIN_SECONDS)
+    # No request is left to need it. Without waiting: a check already running on it takes
+    # milliseconds and ends on its own.
+    components.cpu_tokenizer.shutdown()
     remaining = max(0.0, deadline - loop.time())
     return await asyncio.to_thread(components.gpu.shutdown, remaining)
 
@@ -583,6 +591,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         gpu=GpuThread(device, set_device, partial(report_close_failed, events)),
         readiness=readiness,
         ws_port=lambda: 0,  # the WebSocket server arrives in Phase 8 (T077)
+        cpu_tokenizer=CpuTokenizer(),
     )
     app = create_app(components)
     load = partial(load_model, settings, device, environ)

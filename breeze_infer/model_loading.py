@@ -32,14 +32,24 @@ class LoadedModel:
     """The ready runtime plus the facts worth reporting in `model.loaded`.
 
     `cpu_tokenizer` is a copy of the runtime's tokenizer for the speech route's CPU room check
-    (`routes_speech.CpuTokenizer`), which must never share the GPU thread's. It is made here,
-    during the load, so no request ever waits for it. `None` only for a stand-in load that
-    never serves speech.
+    (`routes_speech.CpuTokenizer`), which must never share the GPU thread's. Required: the
+    speech route cannot size a request without it (`api.Components.mark_ready` installs it
+    together with the runtime). `from_runtime` makes the copy.
     """
 
     runtime: Any
     report: dict[str, Any]
-    cpu_tokenizer: Any = None
+    cpu_tokenizer: Any
+
+    @classmethod
+    def from_runtime(cls, runtime: Any, report: dict[str, Any]) -> LoadedModel:
+        """`runtime` with its own tokenizer copied for the CPU room check.
+
+        Call it before the server reports ready, while nothing else uses the tokenizer: a deep
+        copy of a real one can take hundreds of ms, which the first speech request would
+        otherwise spend on the GPU thread, stalling any stream already running.
+        """
+        return cls(runtime=runtime, report=report, cpu_tokenizer=copy.deepcopy(runtime.tokenizer))
 
 
 def configure_compile_cache(
@@ -90,10 +100,6 @@ def load_model(
         attn_implementation=settings.attn_implementation,
     )
     update_generation_config_for_breeze(model)
-    # Copied here, on the GPU thread and before the server reports ready: nothing else uses the
-    # tokenizer yet, and a deep copy of a real one can take hundreds of ms, which the first speech
-    # request would otherwise spend on the GPU thread, stalling any stream already running.
-    cpu_tokenizer = copy.deepcopy(tokenizer)
     runtime = FastBreezeStreamingRuntime(
         model, audio_tokenizer, streaming_config(settings), tokenizer=tokenizer
     )
@@ -112,4 +118,5 @@ def load_model(
             profile, manifest_path=cache_dir / MANIFEST_NAME
         )
         report.update(warmup_report(manifest))
-    return LoadedModel(runtime=runtime, report=report, cpu_tokenizer=cpu_tokenizer)
+    # On the GPU thread, before the server reports ready (`LoadedModel.from_runtime`).
+    return LoadedModel.from_runtime(runtime, report)

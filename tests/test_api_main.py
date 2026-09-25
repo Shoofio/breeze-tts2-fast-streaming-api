@@ -36,8 +36,9 @@ from breeze_infer.gpu import GpuGate, GpuSession, GpuThread, report_close_failed
 from breeze_infer.limits import MAX_BODY_BYTES, TCP_USER_TIMEOUT_MS
 from breeze_infer.model_loading import LoadedModel
 from breeze_infer.routes_health import Readiness
+from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.settings import settings_from_args
-from tests.fakes import FakeRuntime
+from tests.fakes import FakeRuntime, FakeTokenizer
 
 MODEL_DIR = str(Path(__file__).parent)  # any existing directory; nothing loads it
 
@@ -54,6 +55,7 @@ def _components(sink: io.StringIO) -> Components:
         ),
         readiness=readiness,
         ws_port=lambda: 0,
+        cpu_tokenizer=CpuTokenizer(),
     )
 
 
@@ -312,7 +314,9 @@ posix_only = pytest.mark.skipif(
 
 
 def _loaded() -> LoadedModel:
-    return LoadedModel(runtime=FakeRuntime(), report={"device": "cpu"})
+    return LoadedModel(
+        runtime=FakeRuntime(), report={"device": "cpu"}, cpu_tokenizer=FakeTokenizer()
+    )
 
 
 async def _serve(
@@ -373,6 +377,8 @@ def test_serve_loads_in_the_background_then_stops_cleanly_on_sigterm() -> None:
     assert loaded["device"] == "cpu"
     with pytest.raises(RuntimeError):  # serve() shut the GPU thread down
         asyncio.run(components.gpu.run(lambda: None))
+    with pytest.raises(RuntimeError):  # and the CPU tokenizer's executor
+        asyncio.run(components.cpu_tokenizer.run(lambda _tokenizer: None))
 
 
 def test_serve_answers_loading_while_the_model_loads() -> None:
@@ -430,7 +436,10 @@ def test_a_failed_load_is_reported_and_the_server_exits_non_zero() -> None:
         # A BaseException from the loader (sys.exit in a library, say).
         pytest.param(lambda: (_ for _ in ()).throw(SystemExit(3)), id="system-exit"),
         # A loader result that breaks marking ready / reporting it.
-        pytest.param(lambda: LoadedModel(runtime=object(), report={}), id="bad-result"),
+        pytest.param(
+            lambda: LoadedModel(runtime=object(), report={}, cpu_tokenizer=FakeTokenizer()),
+            id="bad-result",
+        ),
     ],
 )
 def test_any_failure_in_the_load_task_ends_the_server(load: Any) -> None:

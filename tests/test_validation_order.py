@@ -31,12 +31,17 @@ from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
+from python_multipart.exceptions import FormParserError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import Request
 
 from breeze_infer import routes_speech
 from breeze_infer.api import _gpu_unresponsive
-from breeze_infer.gpu import GpuCloseTimeout, GpuGate, GpuSession
+from breeze_infer.errors import ApiError, StreamAborted, install_error_handlers
+from breeze_infer.gpu import GpuCloseTimeout, GpuGate, GpuSession, GpuUnavailable
 from breeze_infer.limits import MAX_BODY_BYTES
 from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_speech import _serve_speech
@@ -758,3 +763,104 @@ def test_a_second_cancel_while_closing_after_a_cancel_is_undone(
             components.gpu.shutdown()
 
     asyncio.run(scenario())
+
+
+# --- which original a cancel while closing beats, and how it is reported (review 28 #3, #6) ---
+
+
+class _HangingClose:
+    """A session stand-in whose close waits until it is cancelled."""
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+
+    async def aclose(self) -> None:
+        self.entered.set()
+        await asyncio.Event().wait()
+
+
+async def _cancel_while_closing(
+    original: BaseException, events: RecordingEvents
+) -> tuple[asyncio.Task[Any], object]:
+    """Run `_close_quietly` for `original` in its own task and cancel it mid-close. Returns
+    the task and what it ended with: `"returned"` (the caller would re-raise `original`), or
+    the exception it raised."""
+    session = _HangingClose()
+
+    async def closing() -> str:
+        await routes_speech._close_quietly(session, events, "test-request", original)
+        return "returned"
+
+    task = asyncio.ensure_future(closing())
+    await asyncio.wait_for(session.entered.wait(), timeout=5.0)
+    task.cancel()
+    try:
+        return task, await task
+    except asyncio.CancelledError as cancelled:
+        return task, cancelled
+
+
+@pytest.mark.parametrize("original", [KeyboardInterrupt(), SystemExit(3)], ids=["ctrl-c", "exit"])
+def test_a_cancel_while_closing_never_replaces_a_process_exit(original: BaseException) -> None:
+    """The process is going down: the original is re-raised unchanged, the cancel is undone
+    (no stale count), and nothing is reported as a request failure."""
+    events = RecordingEvents()
+
+    async def scenario() -> None:
+        task, ended = await _cancel_while_closing(original, events)
+        assert ended == "returned"
+        assert task.cancelling() == 0
+
+    asyncio.run(scenario())
+    assert events.calls == []
+
+
+def test_a_cancel_while_closing_beats_an_ordinary_exception() -> None:
+    events = RecordingEvents()
+    original = RuntimeError("priming broke")
+
+    async def scenario() -> None:
+        task, ended = await _cancel_while_closing(original, events)
+        assert isinstance(ended, asyncio.CancelledError)
+        assert ended.__cause__ is original
+        assert task.cancelling() == 1
+
+    asyncio.run(scenario())
+    assert [name for name, _ in events.calls] == ["request.failed"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("priming broke"),
+        ValueError("a bad override"),
+        ApiError(400, "text_too_long", "text is too long"),
+        GpuUnavailable("the GPU stopped responding"),
+        StarletteHTTPException(413),
+        FormParserError("malformed body"),
+        RequestValidationError([]),
+        StreamAborted(),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+def test_a_cancel_while_closing_reports_exactly_what_the_catch_all_handler_would(
+    error: Exception,
+) -> None:
+    """The cancel means errors.py's handlers never see `error`, so the route reports it in
+    their place: the same `request.failed` event for a server failure, and nothing for an
+    error one of errors.py's own handlers answers (a client error, a poisoned GPU, a stream
+    that already started)."""
+    handler_events = RecordingEvents()
+    app = FastAPI()
+    install_error_handlers(app, handler_events)
+
+    @app.get("/fail")
+    async def fail(request: Request) -> None:
+        request.state.request_id = "test-request"
+        raise error
+
+    TestClient(app, raise_server_exceptions=False).get("/fail")
+    route_events = RecordingEvents()
+    asyncio.run(_cancel_while_closing(error, route_events))
+
+    assert route_events.calls == handler_events.calls

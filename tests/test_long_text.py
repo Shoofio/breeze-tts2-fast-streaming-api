@@ -12,6 +12,7 @@ from the runtime's `inputs` themselves (the anchor's codes can, from `input_valu
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
 from typing import Any
 
@@ -26,7 +27,6 @@ from breeze_infer.limits import ANCHOR_CHARS
 from breeze_infer.routes_health import Readiness
 from breeze_infer.synthesis import CodesRef, NoRef, anchor_codes, prepare_piece
 from breeze_infer.text_split import split_text
-from models.fast_streaming import MIN_SUFFIX_FRAMES
 from tests.fakes import (
     CODEC_CODEBOOKS,
     FakeStreamingConfig,
@@ -192,6 +192,73 @@ def test_later_pieces_are_prepared_one_at_a_time_as_the_stream_reaches_them(
     assert _events(env.events, "speech.anchor_skipped") == []
     # Piece i is prepared once, after the i pieces before it have started generating.
     assert started_before == [(text, index) for index, text in enumerate(pieces)]
+
+
+def test_later_pieces_are_sized_before_the_gate_on_the_cpu_executor(
+    envs: list[Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The anchor decision needs every later piece's length. Those are measured once, on the
+    CPU copy's own thread and before the gate is taken, not on the GPU thread between
+    piece 0 and piece 1."""
+    runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(6), _frame(7)])
+    env = _env(envs, runtime, split_chars=100)
+    sized: list[tuple[str, bool, list[str]]] = []
+    real_sizing = routes_speech.anchor_sizing
+
+    def spy(sizing_runtime, tokenizer, anchor_text, later_texts, instruction, cfg_scale):
+        # Read-only, from the executor thread: the gate itself belongs to the event loop.
+        gate_free = env.components.gate._owner is None
+        sized.append((threading.current_thread().name, gate_free, list(later_texts)))
+        return real_sizing(
+            sizing_runtime, tokenizer, anchor_text, later_texts, instruction, cfg_scale
+        )
+
+    monkeypatch.setattr(routes_speech, "anchor_sizing", spy)
+    pieces = _no_reference_pieces(SENTENCES, 100)
+
+    response = env.speak(text=SENTENCES)
+
+    assert response.status_code == 200
+    [(thread, gate_free, later)] = sized
+    assert thread.startswith("breeze-cpu-tokenizer")
+    assert gate_free  # before the gate: a busy server still answers 400s first
+    assert later == pieces[1:]
+
+
+class _CallRecordingTokenizer(FakeTokenizer):
+    """Records how many pieces had started generating (`runtime.calls`) at each call."""
+
+    def __init__(self, runtime: Any) -> None:
+        self._runtime = runtime
+        self.started_at: list[int] = []
+
+    def __call__(self, text: str, **kwargs: Any) -> Any:
+        self.started_at.append(len(self._runtime.calls))
+        return super().__call__(text, **kwargs)
+
+
+def test_between_piece_0_and_piece_1_only_piece_1_is_tokenized_on_the_gpu_thread(
+    envs: list[Env],
+) -> None:
+    """With the lengths measured before the gate, the anchor check after piece 0 is arithmetic:
+    the GPU thread's tokenizer only builds piece 1's own inputs before piece 1 starts."""
+    frames = [_frame(5), _frame(6), _frame(7)]
+    runtime = _fake_runtime(chunks=3, frames=frames)
+    gpu_tokenizer = _CallRecordingTokenizer(runtime)
+    runtime.tokenizer = gpu_tokenizer
+    env = _env(envs, runtime, split_chars=100)
+    pieces = _no_reference_pieces(SENTENCES, 100)
+    assert len(pieces) > 3
+    counting = _CallRecordingTokenizer(runtime)
+    anchor = CodesRef(codes=torch.stack(frames), ref_text=pieces[0])
+    prepare_piece(counting, model_with_codec_facts(), anchor, pieces[1], INSTRUCTION, 1.0)
+
+    response = env.speak(text=SENTENCES)
+
+    assert response.status_code == 200
+    assert _events(env.events, "speech.anchor_skipped") == []
+    between_0_and_1 = gpu_tokenizer.started_at.count(1)
+    assert between_0_and_1 == len(counting.started_at)
 
 
 def test_no_anchor_when_piece_0_produced_no_frames(
@@ -374,17 +441,27 @@ def test_bc_47_later_piece_without_room_aborts_the_stream(envs: list[Env]) -> No
         server.stop()
 
 
+# Piece 0 is short; every later piece is one long sentence of the same length.
+SHORT_THEN_LONG = "Short one. " + " ".join(
+    f"Long sentence number {n} keeps going for quite a while, on and on, "
+    "to fill out its whole piece."
+    for n in range(4)
+)
+
+
 def test_partial_room_clamps_and_emits_piece_clamped(envs: list[Env]) -> None:
-    """FR-036a: piece 1 has room to start but less than its cap. It is generated up to the
-    room, ends normally, and the server records `speech.piece_clamped` with the client's
-    `requested`, the server's `cap` and the `room`."""
+    """FR-036a: piece 1 has room to start but less than its cap, with the anchor and without
+    it, so the anchor is kept (a piece clamped either way doesn't count against it). It is
+    generated up to the room, ends normally, and the server records `speech.piece_clamped`
+    with the client's `requested`, the server's `cap` and the `room`."""
     frames = [_frame(n) for n in range(1, 41)]
-    pieces = _no_reference_pieces(SENTENCES, 100)
+    pieces = _no_reference_pieces(SHORT_THEN_LONG, 100)
+    assert pieces[0] == "Short one." and len(pieces) == 5
     anchor = CodesRef(codes=torch.stack(frames), ref_text=pieces[0])
     room = 30
-    assert room >= MIN_SUFFIX_FRAMES  # enough that the anchor is kept (#4)
     max_seq_len = _seq_len(anchor, pieces[1]) + 1 + room
-    cap = 50
+    room_without_anchor = max_seq_len - _seq_len(NoRef(), pieces[1]) - 1
+    cap = room_without_anchor + 1  # clamped without the anchor too
     # Piece 0's prompt is much shorter, so it keeps its full cap; only later pieces clamp.
     assert max_seq_len - _seq_len(NoRef(), pieces[0]) - 1 >= cap
     runtime = _fake_runtime(
@@ -392,12 +469,11 @@ def test_partial_room_clamps_and_emits_piece_clamped(envs: list[Env]) -> None:
     )
     env = _env(envs, runtime, split_chars=100)
 
-    response = env.speak(text=SENTENCES, max_new_tokens=str(cap))
+    response = env.speak(text=SHORT_THEN_LONG, max_new_tokens=str(cap))
 
     assert response.status_code == 200
+    assert _events(env.events, "speech.anchor_skipped") == []
     clamped = _events(env.events, "speech.piece_clamped")
-    # Every later piece carries the same anchor and a same-length sentence, so each is
-    # clamped alike; piece 0 is not.
     assert [(e["piece_index"], e["requested"], e["cap"], e["room"]) for e in clamped] == [
         (index, cap, cap, room) for index in range(1, len(pieces))
     ]
@@ -432,31 +508,56 @@ def test_a_truncated_piece_0_is_not_an_anchor(
     assert skipped["request_id"] == response.headers["x-request-id"]
 
 
-def test_an_anchor_that_leaves_a_later_piece_too_little_room_is_skipped(
+def test_an_anchor_that_would_clamp_a_piece_that_otherwise_fits_is_skipped(
     envs: list[Env], prepared: list[dict[str, Any]]
 ) -> None:
-    """With piece 0 as its reference, piece 1 would have less than MIN_SUFFIX_FRAMES left. The
-    anchor is skipped whole (never trimmed: its codes must match its text), and the later
-    pieces are voice design, which fits."""
+    """With piece 0 as its reference, piece 1 would get less than its cap (30 of 50 frames),
+    while without the anchor it gets all 50. The anchor is skipped whole (never trimmed: its
+    codes must match its text), and the later pieces are voice design at their full cap. The
+    30 frames it would have left are well above the old 12-frame threshold."""
     frames = [_frame(n) for n in range(1, 5)]
     pieces = _no_reference_pieces(SENTENCES, 100)
     anchor = CodesRef(codes=torch.stack(frames), ref_text=pieces[0])
-    max_seq_len = _seq_len(anchor, pieces[1]) + 1 + (MIN_SUFFIX_FRAMES - 1)
+    cap = 50
+    max_seq_len = _seq_len(anchor, pieces[1]) + 1 + 30
+    assert max_seq_len - _seq_len(NoRef(), pieces[1]) - 1 >= cap
     runtime = _fake_runtime(
         chunks=4, frames=frames, config=FakeStreamingConfig(max_seq_len=max_seq_len)
     )
     env = _env(envs, runtime, split_chars=100)
 
-    response = env.speak(text=SENTENCES)
+    response = env.speak(text=SENTENCES, max_new_tokens=str(cap))
 
     assert response.status_code == 200
-    # The anchor was tried for piece 1 first; each piece's last preparation is what ran.
-    used = {p["text"]: p["reference"] for p in prepared}
-    assert list(used) == pieces
-    assert all(isinstance(reference, NoRef) for reference in used.values())
+    assert [p["text"] for p in prepared] == pieces
+    assert all(isinstance(p["reference"], NoRef) for p in prepared)
     [skipped] = _events(env.events, "speech.anchor_skipped")
     assert skipped["reason"] == "no_room"
+    assert _events(env.events, "speech.piece_clamped") == []
+    assert [call["max_new_tokens"] for call in runtime.calls[1:]] == [cap] * (len(pieces) - 1)
     assert len(_events(env.events, "speech.completed")) == 1
+
+
+def test_an_anchor_that_leaves_every_piece_its_full_cap_is_kept(
+    envs: list[Env], prepared: list[dict[str, Any]]
+) -> None:
+    """The boundary of the rule: with the anchor, piece 1 still gets exactly its cap."""
+    frames = [_frame(n) for n in range(1, 5)]
+    pieces = _no_reference_pieces(SENTENCES, 100)
+    anchor = CodesRef(codes=torch.stack(frames), ref_text=pieces[0])
+    cap = 50
+    max_seq_len = _seq_len(anchor, pieces[1]) + 1 + cap
+    runtime = _fake_runtime(
+        chunks=4, frames=frames, config=FakeStreamingConfig(max_seq_len=max_seq_len)
+    )
+    env = _env(envs, runtime, split_chars=100)
+
+    response = env.speak(text=SENTENCES, max_new_tokens=str(cap))
+
+    assert response.status_code == 200
+    assert _events(env.events, "speech.anchor_skipped") == []
+    assert all(isinstance(p["reference"], CodesRef) for p in prepared[1:])
+    assert _events(env.events, "speech.piece_clamped") == []
 
 
 def test_split_chars_below_the_opening_budget_does_not_make_piece_0_the_largest(
