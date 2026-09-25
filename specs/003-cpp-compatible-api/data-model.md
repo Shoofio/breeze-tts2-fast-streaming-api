@@ -59,7 +59,7 @@ Produced by `http_fields.parse_speech()`. Every field is already validated.
 | `temperature` | float or None | `0` or absent → None (model default); otherwise 0 < x ≤ 10 |
 | `top_k` | int or None | `0` or absent → None; otherwise 1–10,000 |
 | `top_p` | float or None | `0` or absent → None; otherwise 0 < x ≤ 1 |
-| `repetition_penalty` | float or None | `0` or absent → None; otherwise 0 < x ≤ 10 |
+| `repetition_penalty` | float or None | `0` or absent → None; otherwise 1e-4 ≤ x ≤ 10 |
 | `max_new_tokens` | int or None | `0` or absent → None (750); otherwise 1–1,500 |
 | `split_chars` | int | Absent → `settings.split_chars`; otherwise 0–10,000 (`0` = no length splitting) |
 

@@ -91,7 +91,7 @@ the server). `HEAD` is supported.
 | `temperature` | decimal | `0` = model default | 0 or (0, 10] (BC-03) |
 | `top_k` | integer | `0` = model default | 0–10,000 |
 | `top_p` | decimal | `0` = model default | 0 or (0, 1] |
-| `repetition_penalty` | decimal | `0` = model default | 0 or (0, 10] |
+| `repetition_penalty` | decimal | `0` = model default | 0 or [0.0001, 10] (below 1e-4 the logits overflow) |
 | `max_new_tokens` | integer | `0` = model default (750) | 0–1,500 (BC-04) |
 | `split_chars` | integer | server `--split-chars` (600) | 0–10,000. `0` = no length splitting |
 
