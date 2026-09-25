@@ -141,6 +141,7 @@ Generation stops within one chunk, and the GPU is released.
 | Status | Code | Message |
 |---|---|---|
 | 400 | `invalid_field` | `<field> must be <rule>` |
+| 400 | `invalid_field` | `content type must be multipart/form-data or application/x-www-form-urlencoded` |
 | 400 | `duplicate_field` | `<field> was given more than once` |
 | 400 | `text_required` | `text is required` |
 | 400 | `text_too_long` | `text is too long` (over the limit, or the first piece doesn't fit the context, BC-47) |

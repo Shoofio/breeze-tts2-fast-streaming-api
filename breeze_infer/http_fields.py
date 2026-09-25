@@ -15,33 +15,48 @@ multipart body parses as an empty form with status 200, so `text` (and every oth
 required field) has to be checked explicitly here rather than relying on the parser to
 reject a short body.
 
-**T037 review 1** found that `request.form()` itself -- Starlette's own parser, not
-FastAPI's `Form()` -- is also too permissive for this contract, in ways plain happy-path
-testing didn't exercise. `read_fields` below no longer calls `request.form()` at all;
-instead it drives the two content types by hand:
+**Two review passes since** found `request.form()` itself -- Starlette's own parser, not
+FastAPI's `Form()` -- and `request.query_params` too permissive for this contract, in ways
+plain happy-path testing didn't exercise. `read_fields` below never calls either; instead it
+drives everything by hand, off `request.scope["query_string"]` and the body:
 
+- `application/x-www-form-urlencoded` (and the query string, which is the same wire format)
+  goes through `_urlencoded_pairs_sync`, built on `urllib.parse.parse_qsl` -- but *not* using
+  its `encoding`/`errors` parameters, which are silently ignored when its input is `bytes`
+  (verified against cpython's `urllib/parse.py`: the bytes branch's `_unquote` calls
+  `unquote_to_bytes` directly, with no decode step at all). `parse_qsl` is used purely for
+  its percent-decoding and its `max_num_fields` guard (a `ValueError` before any per-field
+  work at all, review 2 findings #1/#2/#9); the actual UTF-8 decode, `errors="strict"`, is
+  done here, by hand, on the bytes it returns -- which is also why a raw, un-percent-escaped
+  UTF-8 sequence in the body decodes correctly too, not just a `%XX`-escaped one:
+  `unquote_to_bytes` passes bytes it doesn't recognize as an escape straight through, so
+  either spelling reaches this module's own decode step as the same bytes. A body over
+  `_TO_THREAD_THRESHOLD` is parsed with `asyncio.to_thread` instead of inline, so a large
+  body's CPU-bound split/decode work doesn't block the event loop (review 2 finding #9).
 - `multipart/form-data` goes through `_StrictMultiPartParser`, a thin subclass of
-  Starlette's own `MultiPartParser` (finding #4: its `on_part_end` silently re-decodes an
-  invalid UTF-8 text part as latin-1 instead of rejecting it -- `_user_safe_decode` in
-  `starlette/formparsers.py` -- and never checks the declared charset at all).
-- `application/x-www-form-urlencoded` is parsed by hand with
-  `urllib.parse.unquote_plus(..., errors="strict")` (finding #4 again: Starlette's own
-  urlencoded parser calls `unquote_plus` with its default `errors="replace"`, which never
-  raises either).
+  Starlette's own `MultiPartParser` (its `on_part_end` silently re-decodes an invalid UTF-8
+  text part as latin-1 instead of rejecting it -- `_user_safe_decode` in
+  `starlette/formparsers.py`).
 
-Every other field except `ref_audio` must be a string (finding #1); `ref_audio` must be a
-file part, not a string, wherever it's given (finding #2). `ref_audio`'s bytes are read
-bounded to `MAX_AUDIO_BYTES + 1` (finding #6), and every `UploadFile`/`FormData` this module
-touches is closed before `read_fields` returns (finding #5) -- `Fields` only ever holds the
-plain strings and bytes actually extracted, never Starlette's own form objects.
+Both paths reject a declared charset other than `utf-8`/`utf8` (case-insensitive, review 2
+finding #6). Every field except `ref_audio` must be text (review 1 finding #1); `ref_audio`
+must be a file part, not text, wherever and however many times it's given -- multipart is
+checked one part at a time in wire order so a text-then-file `ref_audio` can't hide behind a
+later, valid file part (review 2 finding #3; `form.get` alone only sees the *last* same-named
+entry). A client-controlled field name is truncated before it's echoed into an error message
+(review 2 finding #7). `ref_audio`'s bytes are read bounded to `MAX_AUDIO_BYTES + 1`, and
+every `UploadFile`/`FormData` this module touches is closed before `read_fields` returns --
+`Fields` only ever holds the plain strings and bytes actually extracted, never Starlette's
+own form or query objects.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeVar
-from urllib.parse import unquote_plus
+from urllib.parse import parse_qsl
 
 from fastapi import Request
 from python_multipart.multipart import parse_options_header
@@ -57,32 +72,45 @@ DEFAULT_INSTRUCTION = "Speak clearly and naturally."
 DEFAULT_CFG_SCALE = 1.0
 DEFAULT_SEED = 42
 
-# The limits passed to the multipart parser (research.md R6).
+# The limits passed to the multipart parser, and to _urlencoded_pairs_sync by hand
+# (research.md R6).
 FORM_MAX_FILES = 1
 FORM_MAX_FIELDS = 32
-# T037 review 1, finding #3: a 4-byte UTF-8 code point (e.g. an emoji, or a CJK Extension-B
-# character) percent-encodes to 12 ASCII bytes ("%XX" x 4), so a urlencoded `text` field at
-# the full MAX_TEXT_CHARS (10,000) needs up to 120,000 bytes on the wire. The old flat
-# 64 KiB limit -- copied uncritically from research.md's example -- would have cut that off
-# as a generic parser error before the field-level length check (T048's `text_too_long`)
-# ever got to run. `_read_urlencoded_pairs` enforces this same bound on each value by hand
-# (Starlette's own per-field accounting no longer applies once its urlencoded parser is
-# bypassed, per finding #4); `_StrictMultiPartParser` still gets it from Starlette's own
-# per-part accounting, which was already value-only, so this only ever widens what fits.
-FORM_MAX_PART_SIZE = MAX_TEXT_CHARS * 12
+# T037 review 1 finding #3, review 2 finding #4: a 4-byte UTF-8 code point (an emoji, or a
+# CJK Extension-B character) percent-encodes to 12 ASCII bytes ("%XX" x 4), so a urlencoded
+# `text` field at the full MAX_TEXT_CHARS (10,000) needs up to 120,000 bytes on the wire.
+# Doubled from that exact figure to leave real headroom: the field-level length check
+# (T048's `text_too_long`) must always be the one that actually rejects an over-length
+# `text`, never this module's own generic parser-error message arriving first by a
+# coincidence of exact boundaries.
+FORM_MAX_PART_SIZE = 2 * MAX_TEXT_CHARS * 12
+
+# review 2 finding #9: a body (or query string) larger than this is parsed off the event
+# loop, via asyncio.to_thread, rather than inline.
+_TO_THREAD_THRESHOLD = 64 * 1024
+
+# review 2 finding #6: the only charset this contract accepts, spelled either way,
+# case-insensitively.
+_UTF8_CHARSET_NAMES = frozenset({"utf-8", "utf8"})
+
+# review 2 finding #7: how much of a client-controlled field name survives into an error
+# message before it's truncated.
+_FIELD_LABEL_MAX_CHARS = 64
 
 
 @dataclass(frozen=True)
 class Fields:
     """The request's fields, already reduced to plain strings and bytes.
 
-    Never Starlette's `FormData` (T037 review 1, finding #5): that type holds each
-    `UploadFile`'s own open `SpooledTemporaryFile`, and `read_fields` closes every one of
-    those before returning -- there would be nothing left downstream to read from even if
-    something tried.
+    Never Starlette's `FormData` or `QueryParams` straight from `request.query_params`
+    (review 1 finding #5, review 2 finding #5): `FormData` holds each `UploadFile`'s own
+    open `SpooledTemporaryFile` (closed before `read_fields` returns -- there'd be nothing
+    left downstream to read from even if something tried), and `request.query_params` is
+    Starlette's own lenient parse (silently `errors="replace"`), not this module's strict
+    one. `form` and `query` here are both freshly built `QueryParams` over already-decoded,
+    already-validated strings.
 
-    `form` and `query` are both `QueryParams` (an immutable str -> str multi-dict; `getlist`
-    gives every value for a name), kept apart rather than merged into one mapping so T048's
+    `form` and `query` are kept apart rather than merged into one mapping so T048's
     duplicate check -- "`getlist(k)` has more than one value in the form or the query
     string, or the same key appears in both" (research.md R6) -- can be built directly from
     them instead of reconstructing which source each value came from.
@@ -105,95 +133,151 @@ class Fields:
 async def read_fields(request: Request) -> Fields:
     """Read the body (bounded per research.md R6) and merge it with the query string.
 
-    Routes on the request's declared media type (finding #7): `multipart/form-data` and
+    The query string is parsed by the same strict routine as a urlencoded body (review 2
+    finding #5), from `request.scope["query_string"]` -- the raw wire bytes, not
+    `request.query_params` (Starlette's own lenient parse).
+
+    Routes on the request's declared media type: `multipart/form-data` and
     `application/x-www-form-urlencoded` are parsed as the module docstring describes;
     anything else is `400 invalid_field` *unless* the body is empty -- a query-only request
-    with no body has no content type worth trusting, and still has to work.
+    with no body has no content type worth trusting, and still has to work (review 1
+    finding #7, review 2 finding #8).
     """
-    if "ref_audio" in request.query_params:
-        # ref_audio can only ever be a file part, and a query string can't carry one
-        # (finding #2's other half; the multipart/urlencoded halves are below).
-        raise ApiError(400, "invalid_field", "ref_audio must be a file part")
+    query_pairs = await _parse_urlencoded_bytes(request.scope["query_string"])
+    _reject_ref_audio_text(query_pairs)
 
-    media_type = _media_type(request)
+    media_type, charset = _content_type(request)
     if media_type == "multipart/form-data":
         pairs, ref_audio = await _read_multipart_fields(request)
     elif media_type == "application/x-www-form-urlencoded":
-        pairs = await _read_urlencoded_pairs(request)
+        if not _is_utf8_charset(charset):
+            raise ApiError(400, "invalid_field", "request body must be UTF-8 text")
+        body = await request.body()  # already bounded by BodyLimitMiddleware
+        pairs = await _parse_urlencoded_bytes(body)
         _reject_ref_audio_text(pairs)
         ref_audio = None
     else:
-        body = await request.body()  # already bounded by BodyLimitMiddleware
-        if body:
-            raise ApiError(400, "invalid_field", "unsupported content type")
+        if await _has_body(request):
+            raise ApiError(
+                400,
+                "invalid_field",
+                "content type must be multipart/form-data or "
+                "application/x-www-form-urlencoded",
+            )
         pairs, ref_audio = [], None
 
-    return Fields(form=QueryParams(pairs), query=request.query_params, ref_audio=ref_audio)
+    return Fields(form=QueryParams(pairs), query=QueryParams(query_pairs), ref_audio=ref_audio)
 
 
-def _media_type(request: Request) -> str:
-    """The request's Content-Type media type, lowercased and without parameters; `""` when
-    the header is absent."""
+def _content_type(request: Request) -> tuple[str, str]:
+    """The request's Content-Type media type and charset (default `utf-8`), both
+    lowercased; the media type carries no parameters."""
     header = request.headers.get("content-type", "")
-    media_type, _ = parse_options_header(header)
-    return media_type.decode("latin-1").lower()
+    media_type, params = parse_options_header(header)
+    charset = params.get(b"charset", b"utf-8")
+    return media_type.decode("latin-1").lower(), charset.decode("latin-1").lower()
+
+
+def _is_utf8_charset(charset: str) -> bool:
+    """review 2 finding #6: accept `utf-8`/`utf8` case-insensitively, reject anything
+    else declared (multipart's per-part charset, or the urlencoded Content-Type's)."""
+    return charset.lower() in _UTF8_CHARSET_NAMES
+
+
+def _label(name: str) -> str:
+    """Truncate a client-controlled field name before it's echoed into an error message
+    (review 2 finding #7) -- nothing bounds a field *name*'s length yet (T048 adds a length
+    check to field *values*), so without this an arbitrarily long name could make the error
+    response itself arbitrarily large."""
+    if len(name) <= _FIELD_LABEL_MAX_CHARS:
+        return name
+    return name[:_FIELD_LABEL_MAX_CHARS] + "…"
+
+
+def _display_label(raw: bytes) -> str:
+    """A label for a field name that failed to decode as UTF-8 itself: latin-1 never
+    fails, so this always produces *something* to show, truncated the same way."""
+    return _label(raw.decode("latin-1"))
+
+
+async def _has_body(request: Request) -> bool:
+    """True if the request has a non-empty body, read only up to the first chunk (review 2
+    finding #8) -- rejecting an unsupported content type shouldn't first buffer an
+    arbitrarily large body just to learn that it's non-empty. `Request.stream()` only ever
+    yields a non-empty chunk for real body data, with one trailing `b""` at the true end
+    (`starlette/requests.py`), so the first item it yields already answers this.
+    """
+    async for chunk in request.stream():
+        return bool(chunk)
+    return False
 
 
 def _reject_ref_audio_text(pairs: list[tuple[str, str]]) -> None:
-    """Finding #2, the urlencoded half: `ref_audio` can only be a multipart file part, so a
-    same-named urlencoded field is rejected the same way a string multipart field is
-    (`_read_ref_audio_part` below)."""
+    """`ref_audio` can only be a multipart file part, so a same-named field anywhere else
+    (a urlencoded field, or a query parameter) is rejected the same way a string multipart
+    field is (`_split_multipart_fields` below)."""
     if any(name == "ref_audio" for name, _ in pairs):
         raise ApiError(400, "invalid_field", "ref_audio must be a file part")
 
 
-async def _read_urlencoded_pairs(request: Request) -> list[tuple[str, str]]:
-    """Hand-parsed `application/x-www-form-urlencoded`, `errors="strict"` (finding #4).
-
-    `request.body()` is already bounded by `BodyLimitMiddleware` overall (research.md R6),
-    so this only needs its own per-value bound (`FORM_MAX_PART_SIZE`, finding #3). The body
-    is decoded latin-1 first -- a lossless, always-successful byte<->codepoint mapping, used
-    purely so the ASCII structure (`&`, `=`) can be split on with plain `str` methods; the
-    real decode is each `unquote_plus` call's own `encoding="utf-8"`, which is where a
-    genuinely invalid UTF-8 payload (or one that was never percent-escaped UTF-8 to begin
-    with) is rejected.
+async def _parse_urlencoded_bytes(data: bytes) -> list[tuple[str, str]]:
+    """`data` (a request body or `scope["query_string"]`), parsed and strictly UTF-8
+    decoded. Runs inline for a small payload, or off the event loop for a large one
+    (review 2 finding #9) -- `_urlencoded_pairs_sync` is plain CPU-bound work either way.
     """
-    body = await request.body()
+    if len(data) > _TO_THREAD_THRESHOLD:
+        return await asyncio.to_thread(_urlencoded_pairs_sync, data)
+    return _urlencoded_pairs_sync(data)
+
+
+def _urlencoded_pairs_sync(body: bytes) -> list[tuple[str, str]]:
+    """The synchronous work behind `_parse_urlencoded_bytes` (review 2 findings #1/#2/#9):
+    split on `parse_qsl`, then UTF-8 decode every name and value by hand -- see the module
+    docstring for why `parse_qsl`'s own `encoding`/`errors` parameters can't be trusted to
+    do that for a `bytes` input.
+    """
     if not body:
         return []
+    try:
+        raw_pairs = parse_qsl(body, keep_blank_values=True, max_num_fields=FORM_MAX_FIELDS)
+    except ValueError:
+        # parse_qsl's own "Max number of fields exceeded" guard: one O(len(body)) count of
+        # the separator byte, raised before any per-field split or decode work starts, so a
+        # huge body with many tiny fields is rejected in roughly one pass over the bytes.
+        raise ApiError(400, "invalid_field", "could not parse the request body") from None
 
     pairs: list[tuple[str, str]] = []
-    for chunk in body.decode("latin-1").split("&"):
-        if not chunk:
-            continue
-        raw_name, _, raw_value = chunk.partition("=")
-        if len(raw_value) > FORM_MAX_PART_SIZE:
-            # Mirrors `MultiPartParser.on_part_data`'s own check, which is value-only too
-            # (headers/field names aren't counted against `max_part_size` there either).
+    for raw_name, raw_value in raw_pairs:
+        if len(raw_name) + len(raw_value) > FORM_MAX_PART_SIZE:
+            # review 2 finding #7: the name counts against the bound too, not just the
+            # value -- a giant name could otherwise dodge this check entirely.
             raise ApiError(400, "invalid_field", "could not parse the request body")
-        name = _unquote_utf8(raw_name, field=raw_name)
-        value = _unquote_utf8(raw_value, field=name)
+        try:
+            name = raw_name.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ApiError(
+                400, "invalid_field", f"{_display_label(raw_name)} must be UTF-8 text"
+            ) from None
+        try:
+            value = raw_value.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ApiError(
+                400, "invalid_field", f"{_label(name)} must be UTF-8 text"
+            ) from None
         pairs.append((name, value))
     return pairs
-
-
-def _unquote_utf8(raw: str, *, field: str) -> str:
-    try:
-        return unquote_plus(raw, encoding="utf-8", errors="strict")
-    except UnicodeDecodeError:
-        raise ApiError(400, "invalid_field", f"{field} must be UTF-8 text") from None
 
 
 class _StrictMultiPartParser(MultiPartParser):
     """Starlette's own `MultiPartParser.on_part_end` (`starlette/formparsers.py`) decodes a
     text part with `_user_safe_decode`, which silently falls back to a latin-1 decode when
     the part isn't valid under its charset -- so a genuinely corrupt UTF-8 part is never
-    rejected, just mojibake'd (finding #4). This overrides only that one callback: the
-    declared charset must be `utf-8` (this contract has never supported anything else), and
-    the bytes must actually decode as `utf-8` with `errors="strict"`, or the field is
-    rejected the same way every other field-level error in this module is. Everything else
-    -- boundary parsing, file spooling, the file/field count and size limits -- is untouched
-    Starlette machinery, reached via `super()`.
+    rejected, just mojibake'd. This overrides only that one callback: the declared charset
+    must be UTF-8 (`_is_utf8_charset`, review 2 finding #6), and the bytes must actually
+    decode as `utf-8` with `errors="strict"`, or the field is rejected the same way every
+    other field-level error in this module is. Everything else -- boundary parsing, file
+    spooling, the file/field count and size limits -- is untouched Starlette machinery,
+    reached via `super()`.
     """
 
     def on_part_end(self) -> None:
@@ -201,18 +285,20 @@ class _StrictMultiPartParser(MultiPartParser):
             super().on_part_end()
             return
         field_name = self._current_part.field_name
-        if self._charset.lower() != "utf-8":
-            raise ApiError(400, "invalid_field", f"{field_name} must be UTF-8 text")
+        if not _is_utf8_charset(self._charset):
+            raise ApiError(400, "invalid_field", f"{_label(field_name)} must be UTF-8 text")
         try:
             value = self._current_part.data.decode("utf-8")
         except UnicodeDecodeError:
-            raise ApiError(400, "invalid_field", f"{field_name} must be UTF-8 text") from None
+            raise ApiError(
+                400, "invalid_field", f"{_label(field_name)} must be UTF-8 text"
+            ) from None
         self.items.append((field_name, value))
 
 
 async def _read_multipart_fields(request: Request) -> tuple[list[tuple[str, str]], bytes | None]:
     """`multipart/form-data`, via `_StrictMultiPartParser` -- not `request.form()`, which
-    constructs the base (silently-lossy) parser and gives no way to swap it in (finding #4).
+    constructs the base (silently-lossy) parser and gives no way to swap it in.
 
     Mirrors what `Request._get_form` does for this content type (`starlette/requests.py`):
     the same limits, and the same fallback for a boundary/limit error (`MultiPartException`,
@@ -234,40 +320,43 @@ async def _read_multipart_fields(request: Request) -> tuple[list[tuple[str, str]
         raise ApiError(400, "invalid_field", "could not parse the request body") from exc
 
     try:
-        pairs = _text_pairs(form)
-        ref_audio = await _read_ref_audio_part(form.get("ref_audio"))
+        pairs, ref_audio_part = _split_multipart_fields(form)
+        ref_audio = await _read_ref_audio_bytes(ref_audio_part)
     finally:
-        # Finding #5: close every `UploadFile` this form holds -- `ref_audio`'s, and (on the
-        # finding #1 path inside `_text_pairs`) any file wrongly sent under another field's
-        # name -- before returning. `Fields` never holds `form` itself.
+        # Every UploadFile this form holds -- ref_audio's, and any file wrongly sent under
+        # another field's name -- is closed before returning. `Fields` never holds `form`.
         await form.close()
 
     return pairs, ref_audio
 
 
-def _text_pairs(form: FormData) -> list[tuple[str, str]]:
-    """Every field except `ref_audio`, checked to actually be text (finding #1): a file part
-    sent under any other field name is rejected outright."""
+def _split_multipart_fields(form: FormData) -> tuple[list[tuple[str, str]], UploadFile | None]:
+    """One pass over every part, in wire order (review 2 finding #3): every `ref_audio`
+    entry must be a file, checked as it's encountered, not just the *last* one --
+    `form.get("ref_audio")` alone would miss an earlier, invalid text `ref_audio` sent
+    before a later, valid file part under the same name. Every other field must be text
+    (review 1 finding #1): a file part sent under any other field name is rejected outright.
+    """
     pairs: list[tuple[str, str]] = []
+    ref_audio_part: UploadFile | None = None
     for name, value in form.multi_items():
         if name == "ref_audio":
+            if not isinstance(value, UploadFile):
+                raise ApiError(400, "invalid_field", "ref_audio must be a file part")
+            ref_audio_part = value
             continue
         if isinstance(value, UploadFile):
-            raise ApiError(400, "invalid_field", f"{name} must be a text field")
+            raise ApiError(400, "invalid_field", f"{_label(name)} must be a text field")
         pairs.append((name, value))
-    return pairs
+    return pairs, ref_audio_part
 
 
-async def _read_ref_audio_part(part: str | UploadFile | None) -> bytes | None:
-    """`form.get` plus an `isinstance` check (finding #8): a string `ref_audio` is rejected
-    (finding #2), and a real file part is read bounded to one byte past `MAX_AUDIO_BYTES`
-    (finding #6) -- enough for `reference_audio.decode()` to tell "too big" from "right at
-    the limit" later without this module ever buffering more than that itself.
-    """
+async def _read_ref_audio_bytes(part: UploadFile | None) -> bytes | None:
+    """A real `ref_audio` file part is read bounded to one byte past `MAX_AUDIO_BYTES` --
+    enough for `reference_audio.decode()` to tell "too big" from "right at the limit" later
+    without this module ever buffering more than that itself."""
     if part is None:
         return None
-    if not isinstance(part, UploadFile):
-        raise ApiError(400, "invalid_field", "ref_audio must be a file part")
     return await part.read(MAX_AUDIO_BYTES + 1)
 
 
@@ -285,7 +374,7 @@ def _first(fields: Fields, name: str) -> str | None:
 
 
 # A parser matching _parse_int/_parse_float's own shape, used by _optional_number so its
-# return type tracks whichever one is passed in (finding #9) -- `int | None` for `_parse_int`,
+# return type tracks whichever one is passed in -- `int | None` for `_parse_int`,
 # `float | None` for `_parse_float` -- rather than the wider `int | float | None` either call
 # site would otherwise have to narrow back down itself.
 _Number = TypeVar("_Number", int, float)

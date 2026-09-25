@@ -4,7 +4,8 @@ Table-driven tests for the malformed corpus (bad numbers, ranges, duplicates, co
 characters) arrive with T044/T048; this file only checks that valid input parses to the
 defaults and values the contract promises, and that the handful of rules T037 already
 owns (BC-02 empty-means-absent, BC-09 blank instruction, BC-10 required text, FR-006's
-`0` -> `None`) hold, plus the T037 review 1 findings listed below `# --- review 1 findings`.
+`0` -> `None`) hold, plus the review 1 (`# --- review 1 findings`) and review 2
+(`# --- review 2 findings`) findings below.
 
 A tiny FastAPI app drives `read_fields` through a real `Request`, exercising both
 `multipart/form-data` (with a real file part for `ref_audio`) and
@@ -15,6 +16,7 @@ hand and skipping that parsing entirely.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -22,6 +24,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from starlette.datastructures import FormData
 
 from breeze_infer import http_fields
 from breeze_infer.errors import install_error_handlers
@@ -29,6 +32,7 @@ from breeze_infer.http_fields import (
     DEFAULT_CFG_SCALE,
     DEFAULT_INSTRUCTION,
     DEFAULT_SEED,
+    FORM_MAX_FIELDS,
     FORM_MAX_PART_SIZE,
     InlineRef,
     NoReference,
@@ -416,15 +420,20 @@ def test_ref_audio_in_the_query_string_gets_400(tmp_path: Path) -> None:
 
 
 def test_form_max_part_size_is_derived_from_max_text_chars() -> None:
-    assert FORM_MAX_PART_SIZE == MAX_TEXT_CHARS * 12
+    # review 2 finding #4: doubled from the exact 12-bytes-per-4-byte-codepoint figure, so
+    # the field-level length check (T048's text_too_long) is always what actually rejects
+    # an over-length `text`, not this module's own generic parser-error message landing on
+    # the boundary first.
+    assert FORM_MAX_PART_SIZE == 2 * MAX_TEXT_CHARS * 12
 
 
 def test_a_full_length_four_byte_char_text_field_fits_urlencoded(tmp_path: Path) -> None:
     # "🎉" is a 4-byte UTF-8 code point; percent-encoded it's exactly 12 ASCII bytes
-    # ("%XX" x 4), so MAX_TEXT_CHARS of them is exactly at FORM_MAX_PART_SIZE.
+    # ("%XX" x 4), so MAX_TEXT_CHARS of them is exactly at half of FORM_MAX_PART_SIZE --
+    # comfortably under it, with headroom to spare (review 2 finding #4).
     text = "\U0001f389" * MAX_TEXT_CHARS
     encoded_value = quote(text, safe="")
-    assert len(encoded_value) == FORM_MAX_PART_SIZE
+    assert len(encoded_value) < FORM_MAX_PART_SIZE
     body = f"text={encoded_value}".encode("ascii")
 
     response = _client(tmp_path).post(
@@ -543,7 +552,9 @@ def test_unsupported_content_type_with_a_body_gets_400(tmp_path: Path) -> None:
 
     assert response.status_code == 400
     assert response.json() == {
-        "error": "unsupported content type",
+        "error": (
+            "content type must be multipart/form-data or application/x-www-form-urlencoded"
+        ),
         "code": "invalid_field",
     }
 
@@ -555,12 +566,13 @@ def test_query_only_request_with_no_body_still_works(tmp_path: Path) -> None:
     assert response.json()["text"] == "hi"
 
 
-# finding #9: _optional_number's TypeVar keeps int/float sampling fields distinct -- a
-# type-checker concern, verified here only by the existing zero-means-default tests still
-# passing for both an int field (top_k) and a float field (temperature).
+# review 1 finding #9: _optional_number's TypeVar keeps int/float sampling fields distinct
+# -- a type-checker concern, verified here only by the existing zero-means-default tests
+# still passing for both an int field (top_k) and a float field (temperature).
 
 
-# finding #10: form values take precedence over query values (no duplicate check yet).
+# review 1 finding #10: form values take precedence over query values (no duplicate check
+# yet).
 
 
 def test_form_value_takes_precedence_over_query_value(tmp_path: Path) -> None:
@@ -570,3 +582,214 @@ def test_form_value_takes_precedence_over_query_value(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert response.json()["seed"] == 111
+
+
+# --- review 2 findings ----------------------------------------------------------------
+
+
+def _multipart_field_part(name: str, value: str) -> bytes:
+    return (
+        f'--xxxxBOUNDARYxxxx\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+        f"{value}\r\n"
+    ).encode("ascii")
+
+
+def _multipart_close() -> bytes:
+    return b"--xxxxBOUNDARYxxxx--\r\n"
+
+
+_MULTIPART_CONTENT_TYPE = "multipart/form-data; boundary=xxxxBOUNDARYxxxx"
+
+
+# findings #1+2+9: the urlencoded parser is rebuilt on parse_qsl over raw bytes, decoding
+# strictly by hand (parse_qsl's own encoding/errors parameters are silently ignored for a
+# bytes input), and capping the field count before doing any per-field work.
+
+
+def test_raw_unescaped_utf8_urlencoded_value_is_decoded(tmp_path: Path) -> None:
+    """"你好" sent as raw UTF-8 bytes, not percent-escaped."""
+    response = _client(tmp_path).post(
+        "/speech",
+        content="text=你好".encode(),
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "你好"
+
+
+def test_raw_unescaped_invalid_utf8_urlencoded_value_gets_400(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech",
+        content=b"text=\xff\xfe",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "text must be UTF-8 text", "code": "invalid_field"}
+
+
+def test_urlencoded_field_count_over_the_cap_gets_400(tmp_path: Path) -> None:
+    extra = "&".join(f"f{i}=v" for i in range(FORM_MAX_FIELDS + 1))
+    body = f"text=hi&{extra}".encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+
+
+def test_a_huge_body_of_many_pairs_fails_fast_on_the_field_cap(tmp_path: Path) -> None:
+    """A ~26 MiB urlencoded body of millions of tiny fields must be rejected by parse_qsl's
+    max_num_fields guard -- one pass over the bytes -- not by actually splitting and
+    decoding each field (which would take far longer for this many)."""
+    pair = b"a=1&"
+    body = pair * (27_000_000 // len(pair))  # ~26 MiB, millions of pairs
+
+    start = time.monotonic()
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    elapsed = time.monotonic() - start
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+    assert elapsed < 5.0, f"took {elapsed:.2f}s -- did not fail fast on the field cap"
+
+
+# finding #3: a text-then-file ref_audio is rejected regardless of order.
+
+
+def test_ref_audio_text_then_file_gets_400(tmp_path: Path) -> None:
+    """`form.get("ref_audio")` alone only sees the *last* same-named entry -- a valid file,
+    here -- which would silently hide an earlier, invalid text `ref_audio` sent first."""
+    body = (
+        _multipart_field_part("ref_audio", "not a file")
+        + (
+            "--xxxxBOUNDARYxxxx\r\n"
+            'Content-Disposition: form-data; name="ref_audio"; filename="ref.wav"\r\n'
+            "Content-Type: audio/wav\r\n\r\n"
+            "later, valid-looking bytes\r\n"
+        ).encode("ascii")
+        + _multipart_close()
+    )
+
+    response = _client(tmp_path).post(
+        "/speech", content=body, headers={"content-type": _MULTIPART_CONTENT_TYPE}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio must be a file part",
+        "code": "invalid_field",
+    }
+
+
+# finding #5: the query string is parsed by the same strict routine as the body.
+
+
+def test_invalid_utf8_query_string_value_gets_400(tmp_path: Path) -> None:
+    response = _client(tmp_path).post("/speech?text=%FF%FE")
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "text must be UTF-8 text", "code": "invalid_field"}
+
+
+# finding #6: accept utf-8/utf8 case-insensitively; reject any other declared charset.
+
+
+@pytest.mark.parametrize("charset", ["utf-8", "UTF-8", "utf8", "UTF8"])
+def test_accepted_charset_spellings_for_urlencoded(tmp_path: Path, charset: str) -> None:
+    response = _client(tmp_path).post(
+        "/speech",
+        content=b"text=hi",
+        headers={"content-type": f"application/x-www-form-urlencoded; charset={charset}"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_urlencoded_declaring_a_non_utf8_charset_gets_400(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech",
+        content=b"text=hi",
+        headers={"content-type": "application/x-www-form-urlencoded; charset=iso-8859-1"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "request body must be UTF-8 text",
+        "code": "invalid_field",
+    }
+
+
+@pytest.mark.parametrize("charset", ["utf-8", "UTF8"])
+def test_accepted_charset_spellings_for_multipart(tmp_path: Path, charset: str) -> None:
+    body = _multipart_field_part("text", "hi") + _multipart_close()
+    content_type = f"multipart/form-data; boundary=xxxxBOUNDARYxxxx; charset={charset}"
+
+    response = _client(tmp_path).post(
+        "/speech", content=body, headers={"content-type": content_type}
+    )
+
+    assert response.status_code == 200
+
+
+# finding #7: a client-controlled field name is truncated before it's echoed into an error.
+
+
+def test_long_field_name_is_truncated_in_the_error_message(tmp_path: Path) -> None:
+    long_name = "x" * 100
+    response = _client(tmp_path).post(
+        "/speech",
+        data={"text": "hi"},
+        files={long_name: ("f.txt", b"not text", "text/plain")},
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["code"] == "invalid_field"
+    assert body["error"] == "x" * 64 + "… must be a text field"
+
+
+# finding #8: an unsupported content type only matters when the body is actually non-empty.
+
+
+def test_unsupported_content_type_with_empty_body_still_works(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech?text=hi", headers={"content-type": "application/json"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "hi"
+
+
+# finding #10: the multipart form (and its UploadFile) is actually closed.
+
+
+def test_multipart_form_is_closed_after_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    closed_calls: list[FormData] = []
+    original_close = FormData.close
+
+    async def spy_close(self: FormData) -> None:
+        closed_calls.append(self)
+        await original_close(self)
+
+    monkeypatch.setattr(FormData, "close", spy_close)
+
+    response = _client(tmp_path).post(
+        "/speech",
+        data={"text": "hi", "ref_text": "hello"},
+        files={"ref_audio": ("ref.wav", b"audio bytes", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert len(closed_calls) == 1
