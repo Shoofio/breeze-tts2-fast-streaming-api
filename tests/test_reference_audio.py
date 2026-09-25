@@ -12,6 +12,8 @@ used here for real rather than faked) so the round trip through libsndfile is re
 from __future__ import annotations
 
 import io
+import random
+import time
 import warnings
 
 import librosa
@@ -59,6 +61,18 @@ def _flac_with_bogus_total_samples(wav: np.ndarray, sample_rate: int) -> bytes:
     field_start = 8 + 13
     data[field_start] &= 0xF0
     data[field_start + 1 : field_start + 5] = b"\x00\x00\x00\x00"
+    return bytes(data)
+
+
+def _corrupt_middle_third(blob: bytes, rng: random.Random, num_bytes: int = 64) -> bytes:
+    """`num_bytes` random-value bytes at a random offset in the middle third of
+    `blob` -- the reproduction that found the silently-truncated-FLAC bug."""
+    data = bytearray(blob)
+    third = len(data) // 3
+    start = third + rng.randrange(third)
+    num = min(num_bytes, len(data) - start)
+    for i in range(start, start + num):
+        data[i] = rng.randrange(256)
     return bytes(data)
 
 
@@ -254,6 +268,102 @@ def test_flac_unknown_length_over_max_ref_seconds_is_audio_too_long() -> None:
     assert exc_info.value.status == 400
     assert exc_info.value.code == "audio_too_long"
     assert exc_info.value.message == "ref_audio is longer than 30 seconds"
+
+
+def test_flac_unknown_length_recovers_the_exact_sample_count() -> None:
+    """The tolerant read used to lose up to one internal block's worth of the tail;
+    it now recovers every sample a read did successfully decode before hitting the
+    stream's real end, via a NaN-sentineled output buffer, so a 0.2 s piped clip
+    decodes as exactly 0.2 s, not slightly under it."""
+    wav = _sine(0.2, _SR)
+    blob = _flac_with_bogus_total_samples(wav, _SR)
+
+    audio = decode(blob)
+
+    assert audio.samples.shape[0] == wav.shape[0]
+    assert audio.duration_seconds == pytest.approx(0.2, abs=1e-9)
+
+
+def test_flac_unknown_length_at_exactly_the_minimum_is_accepted() -> None:
+    """An 80 ms (1,920-sample) piped clip is exactly the minimum accepted length --
+    exact tail recovery must not lose even a single sample of that margin."""
+    wav = np.full((1920, 1), 0.1, dtype=np.float64)
+    blob = _flac_with_bogus_total_samples(wav, CODEC_SAMPLE_RATE)
+
+    audio = decode(blob)
+
+    assert audio.samples.shape[0] == 1920
+    assert audio.predicted_frames == 1
+
+
+def test_flac_unknown_length_under_minimum_is_audio_too_short_not_invalid_audio() -> None:
+    """A piped clip well under the old 256-sample block size (and under the 80 ms
+    minimum) must be classified by its actual length -- audio_too_short -- not
+    misread as unreadable because it happened to be short."""
+    wav = np.full((100, 1), 0.1, dtype=np.float64)
+    blob = _flac_with_bogus_total_samples(wav, _SR)
+
+    with pytest.raises(ApiError) as exc_info:
+        decode(blob)
+    assert exc_info.value.status == 400
+    assert exc_info.value.code == "audio_too_short"
+    assert exc_info.value.message == "ref_audio is too short"
+
+
+def test_flac_unknown_length_never_silently_accepts_truncated_corruption() -> None:
+    """Randomized mid-stream corruption (64 bytes replaced at a random offset in the
+    middle third of the file) must never produce a silently truncated "success".
+    libFLAC is genuinely resilient to a lot of random corruption -- many trials
+    decode with output identical to the clean file, since the corrupted bytes
+    happened to land somewhere the decoder tolerates -- but every trial that
+    doesn't decode losslessly must be rejected outright, never accepted with a
+    plausible-looking but shorter result. That silent truncation, not "any
+    corruption at all", was the actual bug: an accepted result must always match
+    the clean file's length exactly.
+    """
+    wav = _sine(1.0, _SR)
+    clean_blob = _flac_with_bogus_total_samples(wav, _SR)
+    clean_audio = decode(clean_blob)
+
+    rng = random.Random(0)
+    accepted = rejected = 0
+    for _ in range(150):
+        corrupted = _corrupt_middle_third(clean_blob, rng)
+        try:
+            audio = decode(corrupted)
+        except ApiError as exc:
+            assert exc.code == "invalid_audio"
+            rejected += 1
+            continue
+        accepted += 1
+        # Accepted only because this particular corruption changed nothing
+        # decodable -- never a truncated fraction of the real content.
+        assert audio.samples.shape[0] == clean_audio.samples.shape[0]
+        assert audio.duration_seconds == pytest.approx(clean_audio.duration_seconds)
+
+    assert accepted + rejected == 150
+    assert rejected > 0  # this corruption technique does bite sometimes
+
+
+def test_flac_unknown_length_decodes_quickly_even_when_incompressible() -> None:
+    """Performance sanity bound: a 192 kHz stereo clip near the 30 s cap, filled with
+    incompressible noise (so the file is genuinely large, comparable to a real
+    17 MiB reproduction) must still decode in well under a second -- large blocks
+    are the common read path for an unknown-length stream too, not just a
+    trustworthy one, and the exact-recovery machinery only runs once, at the tail.
+    """
+    rng = np.random.default_rng(0)
+    sample_rate = 192_000
+    num_samples = int(29.9 * sample_rate)
+    wav = rng.uniform(-0.9, 0.9, (num_samples, 2))
+    blob = _flac_with_bogus_total_samples(wav, sample_rate)
+
+    start = time.monotonic()
+    audio = decode(blob)
+    elapsed = time.monotonic() - start
+
+    assert audio.samples.shape[0] == num_samples
+    assert elapsed < 3.0  # generous bound; measured well under 1 s locally
 
 
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
