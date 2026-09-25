@@ -596,10 +596,12 @@ def _serve_with(
     main_loop_raises: BaseException | None,
     drain_raises: BaseException | None = None,
     wait_until: Any = None,
+    cancel_when: Any = None,
 ) -> tuple[ServeOutcome, BaseException | None, list[asyncio.Task[Any]]]:
     """Run serve() with uvicorn's main loop (once `wait_until()` holds) returning or raising
     `main_loop_raises`, and the GPU drain optionally raising `drain_raises` (the real
-    `_stop_gpu` still runs around it). Returns the outcome, whatever serve() raised, and the
+    `_stop_gpu` still runs around it). With `cancel_when`, the task awaiting serve() is
+    cancelled once `cancel_when()` holds. Returns the outcome, whatever serve() raised, and the
     tasks still pending once it had."""
 
     async def main_loop(self: Any) -> None:
@@ -621,6 +623,17 @@ def _serve_with(
 
     async def scenario() -> None:
         app = create_app(components)
+        # serve() awaited in this task, not its own: SystemExit out of a task would escape the
+        # event loop, so a cancel has to reach this task instead.
+        serving = asyncio.current_task()
+        assert serving is not None
+
+        async def cancel_once() -> None:
+            await _wait_until(cancel_when)
+            serving.cancel()
+
+        if cancel_when is not None:
+            asyncio.create_task(cancel_once())
         try:
             await serve(components, app, [_bind_one("127.0.0.1", 0)], load, outcome)
         except BaseException as exc:  # noqa: BLE001 - returned for the test to inspect
@@ -652,6 +665,51 @@ def test_crash_exit_codes_follow_python(crash: BaseException, exit_code: int) ->
     assert api._crash_exit_code(crash) == exit_code
 
 
+@pytest.mark.parametrize(
+    ("code", "exit_code"),
+    [
+        (257, 1),
+        (-1, 255),
+        (512, 0),
+        (-256, 0),
+        (2**31 + 1, 1),  # past a C int: os._exit itself would raise OverflowError
+        (2**32, 0),
+        (-(2**31) - 1, 255),
+    ],
+)
+def test_on_posix_a_crash_code_is_the_8_bit_status_the_process_exits_with(
+    monkeypatch: pytest.MonkeyPatch, code: int, exit_code: int
+) -> None:
+    monkeypatch.setattr(api, "_WINDOWS", False)
+
+    assert api._crash_exit_code(SystemExit(code)) == exit_code
+
+
+@pytest.mark.parametrize(
+    ("code", "exit_code"),
+    [
+        (257, 257),  # Windows keeps the whole code
+        (-256, -256),
+        (2**31 - 1, 2**31 - 1),
+        (-(2**31), -(2**31)),
+        (2**31, 1),  # past a C int: os._exit would raise OverflowError instead of exiting
+        (2**31 + 1, 1),
+        (2**32, 1),
+        (-(2**31) - 1, 1),
+    ],
+)
+def test_on_windows_a_crash_code_past_a_c_int_exits_1(
+    monkeypatch: pytest.MonkeyPatch, code: int, exit_code: int
+) -> None:
+    monkeypatch.setattr(api, "_WINDOWS", True)
+
+    assert api._crash_exit_code(SystemExit(code)) == exit_code
+
+
+def test_outcome_equality_includes_gpu_failed() -> None:
+    assert ServeOutcome(70, hard_exit=True, gpu_failed=True) != ServeOutcome(70, hard_exit=True)
+
+
 @pytest.mark.usefixtures("keep_sigint")
 @pytest.mark.parametrize(
     ("crash", "exit_code"),
@@ -661,6 +719,7 @@ def test_crash_exit_codes_follow_python(crash: BaseException, exit_code: int) ->
         (SystemExit(0), 0),  # a load in progress is not a GPU failure: 0 stands
         (SystemExit(None), 0),
         (SystemExit(70), 70),  # 70 from the crash itself; still not a GPU failure
+        (SystemExit(2**31 + 1), 1),  # past a C int: 1 on every platform
         (KeyboardInterrupt(), 130),
     ],
     ids=[
@@ -669,6 +728,7 @@ def test_crash_exit_codes_follow_python(crash: BaseException, exit_code: int) ->
         "system-exit-0",
         "system-exit-none",
         "system-exit-70",
+        "system-exit-past-c-int",
         "keyboard-interrupt",
     ],
 )
@@ -696,7 +756,6 @@ def test_a_crash_during_the_load_hard_exits_with_its_code_and_one_error_event(
 
     assert raised is crash
     assert outcome == ServeOutcome(exit_code, hard_exit=True)
-    assert outcome.gpu_failed is False
     assert type(crash).__name__ in capsys.readouterr().err
     [stopping] = _stopping_events(sink)  # one event, not a warning plus an error
     assert (stopping["level"], stopping["reason"]) == ("error", "load in progress")
@@ -777,7 +836,7 @@ def test_a_failing_gpu_stop_hard_exits_with_ex_software(
 
     assert raised is stop_error
     assert pending == []
-    assert outcome == ServeOutcome(70, hard_exit=True)
+    assert outcome == ServeOutcome(70, hard_exit=True, gpu_failed=True, drain_error=stop_error)
     assert "OSError: stop broke" in capsys.readouterr().err
     [stopping] = _stopping_events(sink)
     assert (stopping["level"], stopping["reason"]) == ("error", "gpu stop failed")
@@ -794,8 +853,16 @@ def test_a_failing_gpu_stop_hard_exits_with_ex_software(
         (SystemExit(4), 4),
         (SystemExit(0), 70),  # a GPU failure never exits 0
         (SystemExit(None), 70),
+        (SystemExit(2**31 + 1), 1),  # past a C int: 1 on every platform, not 0
     ],
-    ids=["exception", "sigint", "system-exit", "system-exit-0", "system-exit-none"],
+    ids=[
+        "exception",
+        "sigint",
+        "system-exit",
+        "system-exit-0",
+        "system-exit-none",
+        "system-exit-past-c-int",
+    ],
 )
 def test_a_crash_and_a_failing_gpu_stop_keep_the_crash_code_and_report_both(
     monkeypatch: pytest.MonkeyPatch,
@@ -821,7 +888,9 @@ def test_a_crash_and_a_failing_gpu_stop_keep_the_crash_code_and_report_both(
 
     assert raised is crash
     assert pending == []
-    assert outcome == ServeOutcome(exit_code, hard_exit=True)
+    assert outcome == ServeOutcome(
+        exit_code, hard_exit=True, gpu_failed=True, drain_error=stop_error
+    )
     stderr = capsys.readouterr().err
     assert type(crash).__name__ in stderr
     assert "OSError: stop broke" in stderr
@@ -838,6 +907,7 @@ def test_a_cancelled_serve_with_a_failing_gpu_stop_re_raises_the_cancellation(
     """A cancellation always propagates; the stop failure is still reported and exits 70."""
     sink = io.StringIO()
     components = _components(sink)
+    stop_error = OSError("stop broke")
 
     try:
         outcome, raised, pending = _serve_with(
@@ -845,7 +915,7 @@ def test_a_cancelled_serve_with_a_failing_gpu_stop_re_raises_the_cancellation(
             components,
             _loaded,
             asyncio.CancelledError(),
-            drain_raises=OSError("stop broke"),
+            drain_raises=stop_error,
             wait_until=_loaded_in(components),
         )
     finally:
@@ -853,7 +923,7 @@ def test_a_cancelled_serve_with_a_failing_gpu_stop_re_raises_the_cancellation(
 
     assert isinstance(raised, asyncio.CancelledError)
     assert pending == []
-    assert outcome == ServeOutcome(70, hard_exit=True)
+    assert outcome == ServeOutcome(70, hard_exit=True, gpu_failed=True, drain_error=stop_error)
     [stopping] = _stopping_events(sink)
     assert (stopping["level"], stopping["reason"]) == ("error", "gpu stop failed")
     assert "crash" not in stopping
@@ -902,6 +972,146 @@ def test_cancelling_serve_while_the_gpu_drains_is_a_cancel_not_a_stop_failure(
     assert "stop_error" not in stopping
 
 
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_crash_exiting_0_and_a_cancelled_gpu_stop_exit_0(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A cancel is someone stopping us, not a GPU failure: the crash's 0 stands."""
+    sink = io.StringIO()
+    components = _components(sink)
+    draining = threading.Event()
+    crash = SystemExit(0)
+
+    async def stuck_drain(*_args: Any) -> bool:
+        draining.set()
+        await asyncio.Event().wait()  # never finishes on its own
+        return True
+
+    monkeypatch.setattr(api, "_drain_gpu", stuck_drain)
+    try:
+        outcome, raised, pending = _serve_with(
+            monkeypatch,
+            components,
+            _loaded,
+            crash,
+            wait_until=_loaded_in(components),
+            cancel_when=draining.is_set,
+        )
+    finally:
+        components.gpu.shutdown()
+
+    assert raised is crash
+    assert pending == []
+    assert outcome == ServeOutcome(0, hard_exit=True, gpu_failed=False)
+    assert "SystemExit" in capsys.readouterr().err
+    [stopping] = _stopping_events(sink)
+    assert (stopping["level"], stopping["reason"]) == ("error", "gpu stop cancelled")
+    assert "SystemExit" in stopping["crash"]
+    assert "stop_error" not in stopping
+
+
+def _serve_with_a_cancel_after_the_drain(
+    monkeypatch: pytest.MonkeyPatch, components: Components, drain_ends: bool | BaseException
+) -> tuple[ServeOutcome, BaseException | None, list[asyncio.Task[Any]]]:
+    """`_serve_with`, but the drain ends at once (returning `drain_ends`, or raising it), and
+    then a cancel lands on `_stop_gpu`'s cleanup, while it waits for its tasks."""
+    real_gather = asyncio.gather
+    drain_ended: list[bool] = []
+
+    async def drain(*_args: Any) -> bool:
+        drain_ended.append(True)
+        if isinstance(drain_ends, BaseException):
+            raise drain_ends
+        return drain_ends
+
+    def gather_cancelled_once_the_drain_ended(*awaitables: Any, **kwargs: Any) -> Any:
+        if drain_ended:  # only `_stop_gpu`'s wait for its tasks, after the drain ended
+            current = asyncio.current_task()
+            assert current is not None
+            current.cancel()
+        return real_gather(*awaitables, **kwargs)
+
+    monkeypatch.setattr(api, "_drain_gpu", drain)
+    monkeypatch.setattr(api.asyncio, "gather", gather_cancelled_once_the_drain_ended)
+    try:
+        result = _serve_with(
+            monkeypatch, components, _loaded, None, wait_until=_loaded_in(components)
+        )
+    finally:
+        components.gpu.shutdown()
+    assert drain_ended == [True]
+    return result
+
+
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_cancel_after_the_drain_timed_out_still_exits_ex_software(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The drain has already timed out when a cancel lands on `_stop_gpu`'s cleanup: the GPU
+    is stuck all the same, so the process must not exit 0."""
+    sink = io.StringIO()
+    components = _components(sink)
+
+    outcome, raised, pending = _serve_with_a_cancel_after_the_drain(
+        monkeypatch, components, False
+    )
+
+    assert isinstance(raised, asyncio.CancelledError)
+    assert pending == []
+    assert outcome == ServeOutcome(70, hard_exit=True, gpu_failed=True)
+    [stopping] = _stopping_events(sink)
+    # The timeout is what happened to the GPU, so an alert on it still fires.
+    assert (stopping["level"], stopping["reason"]) == ("warning", "gpu drain timed out")
+
+
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_cancel_after_the_drain_failed_is_still_a_gpu_stop_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The drain has already raised when a cancel lands on `_stop_gpu`'s cleanup: the failure,
+    not the cancel, is what happened to the GPU. The cancel still propagates."""
+    sink = io.StringIO()
+    components = _components(sink)
+    drain_error = RuntimeError("drain broke")
+
+    outcome, raised, pending = _serve_with_a_cancel_after_the_drain(
+        monkeypatch, components, drain_error
+    )
+
+    assert isinstance(raised, asyncio.CancelledError)
+    assert pending == []
+    assert outcome == ServeOutcome(
+        70, hard_exit=True, gpu_failed=True, drain_error=drain_error
+    )
+    assert "RuntimeError: drain broke" in capsys.readouterr().err
+    [stopping] = _stopping_events(sink)
+    assert (stopping["level"], stopping["reason"]) == ("error", "gpu stop failed")
+    assert "RuntimeError: drain broke" in stopping["stop_error"]
+    assert "crash" not in stopping
+
+
+def test_stopping_the_gpu_clears_a_reused_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def drained(*_args: Any) -> bool:
+        return True
+
+    monkeypatch.setattr(api, "_drain_gpu", drained)
+    # Left from an earlier run.
+    outcome = ServeOutcome(70, hard_exit=True, gpu_failed=True, drain_error=OSError("old"))
+
+    async def scenario() -> str | None:
+        async def loaded() -> bool:
+            return True
+
+        loading = asyncio.create_task(loaded())
+        await loading
+        # No components or server: the drain is replaced, and nothing else uses them.
+        no_components: Any = None
+        return await api._stop_gpu(no_components, None, loading, asyncio.Event(), outcome)
+
+    assert asyncio.run(scenario()) is None
+    assert outcome == ServeOutcome(0)
+
+
 def _returns_once(condition: Any) -> Any:
     async def main_loop(self: Any) -> None:
         await _wait_until(condition)
@@ -918,8 +1128,14 @@ def _returns_once(condition: Any) -> Any:
         (KeyboardInterrupt(), False, 130, "gpu drain timed out"),
         (SystemExit(0), False, 70, "gpu drain timed out"),  # a GPU failure never exits 0
         (SystemExit(None), False, 70, "gpu drain timed out"),
-        # os._exit keeps 8 bits: 256 would exit 0, so it counts as 0 too.
+        # This test runs on POSIX only, where the process exits with the code's low 8 bits:
+        # these would all exit 0, so they count as 0 too.
         (SystemExit(256), False, 70, "gpu drain timed out"),
+        (SystemExit(512), False, 70, "gpu drain timed out"),
+        (SystemExit(-256), False, 70, "gpu drain timed out"),
+        (SystemExit(2**32), False, 70, "gpu drain timed out"),
+        # Past a C int, with low 8 bits 1: exits 1, not 70 and not an OverflowError.
+        (SystemExit(2**31 + 1), False, 1, "gpu drain timed out"),
         # An operator stopped the drain: the GPU may be busy, but it didn't fail. 0 stands.
         (SystemExit(0), True, 0, "signal during drain"),
     ],
@@ -929,6 +1145,10 @@ def _returns_once(condition: Any) -> Any:
         "system-exit-0",
         "system-exit-none",
         "system-exit-256",
+        "system-exit-512",
+        "system-exit-minus-256",
+        "system-exit-2-to-the-32",
+        "system-exit-past-c-int",
         "system-exit-0-signal-during-drain",
     ],
 )
@@ -964,8 +1184,9 @@ def test_a_crash_with_a_stuck_drain_exits_with_the_crash_code_but_never_0(
             return await _start_request(port)
 
         async def signal_once_draining() -> None:
-            # Requests are cancelled only once uvicorn has returned and the drain began.
-            await asyncio.to_thread(cancelled.wait, 10)
+            # Requests are cancelled only once uvicorn has returned and the drain began. Never
+            # signal otherwise: with no handler left, SIGTERM would kill the whole test run.
+            assert await asyncio.to_thread(cancelled.wait, 10)
             os.kill(os.getpid(), signal.SIGTERM)
 
         requesting = asyncio.create_task(client())
@@ -989,8 +1210,9 @@ def test_a_crash_with_a_stuck_drain_exits_with_the_crash_code_but_never_0(
         proceed.set()
         components.gpu.shutdown()
     assert raised == [crash]
-    assert outcome == ServeOutcome(exit_code, hard_exit=True)
-    assert outcome.gpu_failed is (not signal_while_draining)
+    assert outcome == ServeOutcome(
+        exit_code, hard_exit=True, gpu_failed=not signal_while_draining
+    )
     assert type(crash).__name__ in capsys.readouterr().err
     [stopping] = _stopping_events(sink)
     # `reason` stays the hard-exit reason, so an alert on "gpu drain timed out" still fires.
@@ -1106,7 +1328,7 @@ def test_a_drain_past_its_bound_hard_exits_with_ex_software(
 
     outcome, _ = _run_with_stuck_close(components, extra_signal=False)
 
-    assert outcome == ServeOutcome(70, hard_exit=True)
+    assert outcome == ServeOutcome(70, hard_exit=True, gpu_failed=True)
     stopping = _events(sink)[-1]
     assert (stopping["event"], stopping["reason"]) == ("server.stopping", "gpu drain timed out")
 

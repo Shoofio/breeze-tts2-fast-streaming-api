@@ -20,7 +20,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
@@ -107,6 +107,9 @@ GPU_DRAIN_SECONDS = 10.0
 # software error"), so a supervisor can tell a stuck GPU from a clean stop (0) or a failed
 # model load (1). Spelled out because `os.EX_SOFTWARE` exists on POSIX only.
 EXIT_GPU_STUCK = 70
+
+# How os._exit treats an exit code differs by platform (see `_os_exit_code`).
+_WINDOWS = os.name == "nt"
 
 
 def bind_http_sockets(host: str, port: int) -> list[socket.socket]:
@@ -286,20 +289,26 @@ class ServeOutcome:
     normal exit would join it and hang for as long as that takes, so `main()` ends the process
     with `os._exit(exit_code)`.
 
-    `exit_code`, all set by `_stop_gpu` and `_conclude`:
+    `exit_code`, all set by `_stop_gpu` and `_conclude`, is always the code the process will
+    really exit with:
     - 0: a clean stop;
     - 1: the model load failed;
     - 70 (`EXIT_GPU_STUCK`): a GPU failure (below) with no crash, or with a crash whose code
-      would exit 0;
-    - a crash's own code (`_crash_exit_code`): 1, `SystemExit`'s code, or 130 for Ctrl+C.
+      is 0;
+    - a crash's own code (`_crash_exit_code`, normalised for the platform): 1, `SystemExit`'s
+      code, or 130 for Ctrl+C.
 
-    `gpu_failed`: the drain timed out or the GPU stop failed, so the GPU may be stuck. Left out
-    of equality, so tests compare codes; it only feeds the "never exit 0" rule.
+    `gpu_failed`: the drain timed out or the GPU stop failed, so the GPU may be stuck. It feeds
+    the "never exit 0" rule.
+
+    `drain_error`: what the GPU drain raised, recorded the moment it ended, so a cancel landing
+    on `_stop_gpu`'s cleanup afterwards can't hide the failure (see `_conclude`).
     """
 
     exit_code: int = 0
     hard_exit: bool = False
-    gpu_failed: bool = field(default=False, compare=False)
+    gpu_failed: bool = False
+    drain_error: BaseException | None = None
 
 
 _CLIENT_ABORT_LOG_FILTER = ClientAbortLogFilter()
@@ -379,14 +388,29 @@ async def serve(
 
 
 def _crash_exit_code(crash: BaseException) -> int:
-    """The code Python itself would exit with, had the exception gone uncaught."""
+    """The code the process exits with for `crash`: Python's own choice had the exception gone
+    uncaught, normalised to what `os._exit` really exits with (see `_os_exit_code`)."""
     if isinstance(crash, SystemExit):
         if crash.code is None:
             return 0
-        return crash.code if isinstance(crash.code, int) else 1
+        return _os_exit_code(crash.code) if isinstance(crash.code, int) else 1
     if isinstance(crash, KeyboardInterrupt):
         return 130  # the shell convention for "killed by SIGINT"
     return 1
+
+
+def _os_exit_code(code: int) -> int:
+    """`code` as the process will really exit with it through `os._exit`, which takes a C int:
+    past that it raises OverflowError instead of exiting, and the interpreter's shutdown then
+    joins the busy GPU thread forever.
+    - POSIX: the parent sees only the low 8 bits, so keep just those (257 exits 1, -1 exits
+      255, 2**32 exits 0).
+    - Windows: the whole code is the exit code, so keep one that fits in a C int, and exit 1
+      (the generic failure code) for one that doesn't.
+    """
+    if not _WINDOWS:
+        return code & 0xFF
+    return code if -(2**31) <= code < 2**31 else 1
 
 
 def _conclude(
@@ -407,14 +431,18 @@ def _conclude(
     | `_stop_gpu` cancelled             | yes       | unchanged                  | "gpu stop cancelled" | warning |
     | `_stop_gpu` failed                | yes       | 70                         | "gpu stop failed"    | error   |
     | crash, no hard exit               | no        | Python's, as it propagates | "serve raised"       | error   |
-    | crash + any hard exit above       | yes       | the crash's (`_crash_exit_code`); 70 if it would exit 0 after a GPU failure | as above | error |
+    | crash + any hard exit above       | yes       | the crash's (`_crash_exit_code`); 70 if that is 0 after a GPU failure | as above | error |
 
     A GPU failure is a drain timeout or a failed `_stop_gpu` (`outcome.gpu_failed`). It never
-    exits 0, so a supervisor restarts a process whose GPU may be stuck: a crash code that
-    `os._exit` would turn into 0 (0, None, or any multiple of 256, as it keeps only 8 bits)
-    becomes 70. A signal during the drain and a cancelled `_stop_gpu` also hard-exit with the
-    GPU possibly busy, but they are not GPU failures (someone asked us to stop), so a crash
-    code of 0 there still exits 0.
+    exits 0, so a supervisor restarts a process whose GPU may be stuck: a crash code of 0
+    becomes 70. That code is already the one the process will exit with, so on POSIX it also
+    covers SystemExit(None) and any multiple of 256 (only the low 8 bits reach the parent);
+    on Windows, only 0 and None. A signal during the drain and a cancelled `_stop_gpu` also
+    hard-exit with the GPU possibly busy, but they are not GPU failures (someone asked us to
+    stop), so a crash code of 0 there still exits 0. A cancel that lands after the drain had
+    already timed out or raised is still that GPU failure (see `_stop_gpu`), and is reported
+    as it: "gpu drain timed out", or "gpu stop failed" with the drain's own traceback. The
+    cancel itself still propagates.
 
     `_stop_gpu` ending early (failed or cancelled) is a hard exit because the GPU thread may
     still be busy, and a normal exit would join it. The event carries `crash` and
@@ -426,18 +454,27 @@ def _conclude(
         crash = None
     stop_cancelled = isinstance(stop_error, asyncio.CancelledError)
     stop_failure = None if stop_cancelled else stop_error
+    if stop_failure is None and outcome.drain_error is not None:
+        # The drain raised, then a cancel landed on `_stop_gpu`'s cleanup: the failure is what
+        # happened to the GPU, so it is the one reported and acted on.
+        stop_failure = outcome.drain_error
     if stop_failure is not None:
         outcome.gpu_failed = True
     # Exit code first, so a failure while reporting can't leave a crash exiting 0.
     if stop_error is not None:
         outcome.hard_exit = True
-        hard_exit_reason = "gpu stop cancelled" if stop_cancelled else "gpu stop failed"
+        if stop_failure is not None:
+            hard_exit_reason = "gpu stop failed"
+        elif outcome.gpu_failed:
+            # The cancel came after the drain had timed out: report what happened to the GPU,
+            # so an alert on "gpu drain timed out" still fires.
+            hard_exit_reason = "gpu drain timed out"
+        else:
+            hard_exit_reason = "gpu stop cancelled"
     if crash is not None and outcome.hard_exit:
-        # The crash's own code wins, except that a GPU failure never exits 0: judged on what
-        # the process will really exit with, as os._exit keeps only the low 8 bits.
+        # The crash's own code wins, except that a GPU failure never exits 0.
         crash_code = _crash_exit_code(crash)
-        exits_0 = crash_code % 256 == 0
-        outcome.exit_code = EXIT_GPU_STUCK if outcome.gpu_failed and exits_0 else crash_code
+        outcome.exit_code = EXIT_GPU_STUCK if outcome.gpu_failed and crash_code == 0 else crash_code
     elif stop_failure is not None:
         outcome.exit_code = EXIT_GPU_STUCK
     if crash is None and not outcome.hard_exit:
@@ -476,13 +513,20 @@ async def _stop_gpu(
     Returns why it hard-exits (None if not); `serve()` reports it.
     """
     load_failed = loading.done() and not loading.cancelled() and not loading.result()
+    # All together, so an outcome reused from an earlier run carries nothing stale.
     outcome.exit_code = 1 if load_failed else 0
+    outcome.hard_exit = False
+    outcome.gpu_failed = False
+    outcome.drain_error = None
     if not loading.done():
         loading.cancel()
         outcome.hard_exit = True
         return "load in progress"
 
     drain = asyncio.create_task(_drain_gpu(components, server))
+    # Recorded the moment the drain returns, not after the awaits below: a cancel landing on
+    # one of those would otherwise skip it, and a stuck GPU would exit 0.
+    drain.add_done_callback(partial(_record_drain_failure, outcome))
     interrupted = asyncio.create_task(drain_interrupted.wait())
     try:
         await asyncio.wait([drain, interrupted], return_when=asyncio.FIRST_COMPLETED)
@@ -497,12 +541,23 @@ async def _stop_gpu(
     if signalled:
         outcome.hard_exit = True
         return "signal during drain"
-    if not drain.result():
+    if not drain.result():  # raises the drain's own failure, if it had one
+        return "gpu drain timed out"  # already recorded by `_record_drain_failure`
+    return None
+
+
+def _record_drain_failure(outcome: ServeOutcome, drain: asyncio.Task[bool]) -> None:
+    """`drain`'s done-callback: record how it failed, if it did. Returning False (the GPU
+    thread didn't stop within `GPU_DRAIN_SECONDS`) is the GPU failure itself; an exception is
+    kept for `_conclude`, which treats it as a failed GPU stop. One we cancelled didn't fail."""
+    if drain.cancelled():
+        return
+    if drain.exception() is not None:
+        outcome.drain_error = drain.exception()
+    elif not drain.result():
         outcome.exit_code = EXIT_GPU_STUCK
         outcome.hard_exit = True
         outcome.gpu_failed = True
-        return "gpu drain timed out"
-    return None
 
 
 async def _drain_gpu(components: Components, server: uvicorn.Server) -> bool:

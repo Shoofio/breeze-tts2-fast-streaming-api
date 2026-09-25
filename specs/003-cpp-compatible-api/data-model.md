@@ -290,10 +290,14 @@ offending record's field names), so one bad field never breaks the request emitt
     a clean stop. `reason` is the hard-exit reason if there is one, else `serve raised`. The
     hard-exit reasons: `load in progress`, `signal during drain` and `gpu stop cancelled`
     (the GPU may be busy, but someone asked to stop: not a GPU failure), and
-    `gpu drain timed out` and `gpu stop failed` (the GPU failures, which exit 70). A crash
-    exits with its own code (1, `SystemExit`'s code, 130 for Ctrl+C), except that after a
-    GPU failure a code the process would exit 0 with (0, None, or a multiple of 256) becomes
-    70: a GPU failure never exits 0. Optional `crash` and `stop_error`, each a formatted
+    `gpu drain timed out` and `gpu stop failed` (the GPU failures, which exit 70 unless
+    `serve()` crashed with a non-zero code, in which case the crash's code wins; a cancel
+    landing after the drain had already timed out or raised still reports that failure, with
+    the drain's own traceback as `stop_error`). A crash exits with its own code (1,
+    `SystemExit`'s code, 130 for Ctrl+C), normalised to what the process can really exit
+    with: on POSIX its low 8 bits (257 exits 1, 256 exits 0); on Windows the code itself, or
+    1 if it doesn't fit in a C int. After a GPU failure, a normalised code of 0 becomes 70: a
+    GPU failure never exits 0. Optional `crash` and `stop_error`, each a formatted
     traceback; `level` is `error` when either is present, else `warning`. A cancellation is
     never a crash or a stop failure), `ws.bind_failed`,
     `model.loaded`,
