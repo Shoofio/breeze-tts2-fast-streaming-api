@@ -885,7 +885,7 @@ def _returns_once(condition: Any) -> Any:
 
 @posix_only
 @pytest.mark.usefixtures("keep_sigint")
-def test_serve_raising_with_a_stuck_drain_keeps_ex_software(
+def test_a_crash_with_a_stuck_drain_exits_with_the_crash_code(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr(api, "GPU_DRAIN_SECONDS", 0.5)
@@ -919,7 +919,8 @@ def test_serve_raising_with_a_stuck_drain_keeps_ex_software(
     finally:
         proceed.set()
         components.gpu.shutdown()
-    assert outcome == ServeOutcome(70, hard_exit=True)
+    # One rule: a crash's own code wins over any hard exit; 70 only without a crash.
+    assert outcome == ServeOutcome(1, hard_exit=True)
     assert "RuntimeError: uvicorn broke" in capsys.readouterr().err
     [stopping] = _stopping_events(sink)
     # `reason` stays the hard-exit reason, so an alert on "gpu drain timed out" still fires.

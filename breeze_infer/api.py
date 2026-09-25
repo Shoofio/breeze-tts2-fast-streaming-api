@@ -380,7 +380,7 @@ def _conclude(
     | `_stop_gpu` cancelled             | yes       | unchanged                  | "gpu stop cancelled" | warning |
     | `_stop_gpu` failed                | yes       | 70                         | "gpu stop failed"    | error   |
     | crash, no hard exit               | no        | Python's, as it propagates | "serve raised"       | error   |
-    | crash + any hard exit above       | yes       | the crash's (`_crash_exit_code`), but 70 after a drain timeout | as above | error |
+    | crash + any hard exit above       | yes       | the crash's (`_crash_exit_code`) | as above   | error   |
 
     `_stop_gpu` ending early (failed or cancelled) is a hard exit because the GPU thread may
     still be busy, and a normal exit would join it. The event carries `crash` and
@@ -392,13 +392,13 @@ def _conclude(
         crash = None
     stop_cancelled = isinstance(stop_error, asyncio.CancelledError)
     stop_failure = None if stop_cancelled else stop_error
-    drain_timed_out = outcome.exit_code == EXIT_GPU_STUCK  # only `_stop_gpu` sets it
     # Exit code first, so a failure while reporting can't leave a crash exiting 0.
     if stop_error is not None:
         outcome.hard_exit = True
         hard_exit_reason = "gpu stop cancelled" if stop_cancelled else "gpu stop failed"
     if crash is not None and outcome.hard_exit:
-        outcome.exit_code = EXIT_GPU_STUCK if drain_timed_out else _crash_exit_code(crash)
+        # One rule: a crash's own code wins over any hard exit; 70 is only for no crash.
+        outcome.exit_code = _crash_exit_code(crash)
     elif stop_failure is not None:
         outcome.exit_code = EXIT_GPU_STUCK
     if crash is None and not outcome.hard_exit:
