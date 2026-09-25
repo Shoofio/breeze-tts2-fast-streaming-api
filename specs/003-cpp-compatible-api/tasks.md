@@ -596,7 +596,7 @@ and `test_bc_46` tests.
   - `test_bc_47_first_piece_without_room_gets_400_text_too_long`;
   - `test_bc_47_later_piece_without_room_aborts_the_stream`, with a real uvicorn as in T040;
   - `test_partial_room_clamps_and_emits_piece_clamped` (FR-036a).
-- [ ] T051 [P] [US3] Port `A:tests/gpu/test_speech_long_text.py` to
+- [X] T051 [P] [US3] Port `A:tests/gpu/test_speech_long_text.py` to
   `tests/gpu/test_speech_long_text.py`: a fixed 3,000-character passage, no reference,
   `--fast-all`, 5 runs. Every stream completes, and the audio duration exceeds a floor derived
   from the text length (SC-004). Save the first run's audio as
