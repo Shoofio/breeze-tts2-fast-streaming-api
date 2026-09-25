@@ -302,11 +302,11 @@ def test_prefix_inputs_also_require_reference_codes() -> None:
 
 
 def test_suffix_inputs_do_not_require_reference_codes() -> None:
-    """review #8, this round: the suffix carries no audio (``split_reference_prefix``'s
-    ``guided``/``unguided`` pieces never touch ``ref_audio_codes``), so
-    ``prepare_suffix_inputs`` must not reject a request that has no codes at all --
-    the codes were already consumed by ``prepare_prefix_inputs`` for the same
-    request, earlier in the real call sequence.
+    """review #8 (prior round): the suffix carries no audio (its guided/unguided
+    segments never touch ``ref_audio_codes``), so ``prepare_suffix_inputs`` must not
+    reject a request that has no codes at all -- the codes were already consumed by
+    ``prepare_prefix_inputs`` for the same request, earlier in the real call
+    sequence.
     """
     request = {
         "id": "s",
@@ -321,6 +321,30 @@ def test_suffix_inputs_do_not_require_reference_codes() -> None:
     )
 
     assert inputs["input_values"] is None
+
+
+def test_suffix_inputs_do_not_require_ref_text_either() -> None:
+    """review #4/#9, this round: prepare_suffix_inputs used to call
+    split_reference_prefix, which also builds the reference prefix and so reads
+    request['ref_text'] even though that piece was immediately discarded -- a
+    request with only id/text/instruction (no ref_text, no speaker, no
+    ref_audio_codes) raised a bare KeyError. It must now build the guided/unguided
+    segments directly and succeed.
+    """
+    request = {"id": "s", "text": "hi", "instruction": "calm"}
+
+    inputs = prepare_suffix_inputs(
+        FakeTokenizer(), _model_with_codec_facts(), request, guidance_scale=1.0
+    )
+
+    assert inputs["input_values"] is None
+
+    # Also exercised on the negative (unguided) branch, which is built lazily only
+    # when guidance_scale != 1.0 and must not need ref_text either.
+    cfg_inputs = prepare_suffix_inputs(
+        FakeTokenizer(), _model_with_codec_facts(), request, guidance_scale=4.0
+    )
+    assert "cfg_negative_prompt_ids" in cfg_inputs
 
 
 def test_suffix_inputs_still_require_text_and_instruction() -> None:

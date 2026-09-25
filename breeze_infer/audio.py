@@ -222,12 +222,34 @@ def _tensor_identity(header: dict[str, Any]) -> dict[str, list[Any]]:
     return identity
 
 
+def _validate_weight_filename(name: Any) -> str:
+    """A ``weight_map`` value must be a plain filename inside the checkpoint
+    directory, not a path (review #5): no ``/`` or ``\\`` (which could reach outside
+    the directory, e.g. an absolute path or ``../other.safetensors``), not the bare
+    special names ``.``/``..``, and it must end in ``.safetensors`` -- the only
+    format ``_safetensors_header`` knows how to parse.
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"weight_map value must be a filename string, got {name!r}")
+    if "/" in name or "\\" in name:
+        raise ValueError(f"weight_map value must not contain a path separator: {name!r}")
+    if name in (".", ".."):
+        raise ValueError(f"weight_map value must not be '.' or '..': {name!r}")
+    if not name.endswith(".safetensors"):
+        raise ValueError(f"weight_map value must end in .safetensors: {name!r}")
+    return name
+
+
 def _weight_map_files(index_path: Path) -> list[Path]:
     """The shard filenames a ``*.safetensors.index.json`` lists, validated (review
-    #9): a same-shaped-but-wrong index (``weight_map`` not an object, or one whose
-    values aren't all filenames) raises ``ValueError`` here instead of surfacing as
-    a ``TypeError`` from ``Path.__truediv__`` or an ``AttributeError`` from
-    ``dict.get`` on something that isn't a dict.
+    #9, prior round; #5, this round): a same-shaped-but-wrong index (``weight_map``
+    not an object, or a value that isn't a plain ``*.safetensors`` filename) raises
+    ``ValueError`` here instead of surfacing as a ``TypeError`` from
+    ``Path.__truediv__`` or an ``AttributeError`` from ``dict.get`` on something
+    that isn't a dict -- or, worse, silently resolving a path outside the checkpoint
+    directory. Every value is validated *before* ``filenames`` (the deduplicated
+    set) is built, so a single bad entry is never lost to set deduplication ahead of
+    being checked.
     """
     index = json.loads(index_path.read_text())
     if not isinstance(index, dict):
@@ -235,9 +257,9 @@ def _weight_map_files(index_path: Path) -> list[Path]:
     weight_map = index.get("weight_map")
     if not isinstance(weight_map, dict) or not weight_map:
         raise ValueError(f"{index_path} has no usable 'weight_map'")
+    for name in weight_map.values():
+        _validate_weight_filename(name)
     filenames = set(weight_map.values())
-    if not all(isinstance(name, str) and name for name in filenames):
-        raise ValueError(f"{index_path}'s 'weight_map' values must all be filenames")
     return [index_path.parent / name for name in sorted(filenames)]
 
 

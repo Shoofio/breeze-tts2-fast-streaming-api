@@ -454,9 +454,18 @@ def test_codec_fingerprint_rejects_a_malformed_tensor_entry(tmp_path, bad_header
         {"weight_map": 5},
         {"weight_map": ["model.safetensors"]},
         {"weight_map": {"decoder.weight": 5}},
+        {"weight_map": {"decoder.weight": ["model.safetensors"]}},
+        {"weight_map": {"decoder.weight": {"nested": "model.safetensors"}}},
         ["model.safetensors"],
     ],
-    ids=["scalar_map", "list_map", "non_string_filename", "list_index"],
+    ids=[
+        "scalar_map",
+        "list_map",
+        "int_filename",
+        "list_filename",
+        "dict_filename",
+        "list_index",
+    ],
 )
 def test_codec_fingerprint_rejects_a_malformed_index(tmp_path, bad_index) -> None:
     """review #9: same guarantee as the header case, for model.safetensors.index.json."""
@@ -464,6 +473,49 @@ def test_codec_fingerprint_rejects_a_malformed_index(tmp_path, bad_index) -> Non
     directory.mkdir()
     (directory / "config.json").write_text(json.dumps(_codec_config()))
     (directory / "model.safetensors.index.json").write_text(json.dumps(bad_index))
+
+    with pytest.raises(ValueError):
+        codec_fingerprint(directory)
+
+
+@pytest.mark.parametrize(
+    "bad_filename",
+    [
+        "../other.safetensors",
+        "/etc/other.safetensors",
+        "subdir/model.safetensors",
+        "subdir\\model.safetensors",
+        ".",
+        "..",
+        "model.bin",
+        "",
+    ],
+    ids=[
+        "parent_traversal",
+        "absolute_path",
+        "forward_slash",
+        "backslash",
+        "dot",
+        "dotdot",
+        "wrong_extension",
+        "empty",
+    ],
+)
+def test_codec_fingerprint_rejects_a_weight_map_filename_that_is_not_plain(
+    tmp_path, bad_filename
+) -> None:
+    """review #5: a weight_map value must be a plain filename inside the checkpoint
+    directory -- no path separator (which could reach outside the directory via
+    '../' or an absolute path), not '.'/'..', and it must end in '.safetensors'.
+    Each value is validated before the (deduplicating) set of filenames is built, so
+    a single bad entry can't be lost to deduplication ahead of being checked.
+    """
+    directory = tmp_path / "codec"
+    directory.mkdir()
+    (directory / "config.json").write_text(json.dumps(_codec_config()))
+    (directory / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"decoder.weight": bad_filename}})
+    )
 
     with pytest.raises(ValueError):
         codec_fingerprint(directory)

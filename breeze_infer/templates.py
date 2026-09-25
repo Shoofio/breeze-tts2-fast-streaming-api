@@ -281,6 +281,18 @@ def _check_reference_source(template: TemplateSpec, request: Request) -> None:
         )
 
 
+def _validate_fields(request: Request, fields: tuple[str, ...]) -> None:
+    """The field-presence half of validation, usable on its own (review #4/#9, this
+    round): ``prepare_suffix_inputs`` needs exactly this and nothing more -- no
+    ``ref_audio_codes`` check, since the suffix carries no audio at all.
+    """
+    missing = _missing_fields(request, fields)
+    if missing:
+        raise ValueError(
+            f"Request {request.get('id')} missing template fields: {missing}"
+        )
+
+
 def _validate_reference_request(
     template: TemplateSpec, request: Request, fields: tuple[str, ...]
 ) -> None:
@@ -288,14 +300,11 @@ def _validate_reference_request(
     round): both need the same two checks -- the given ``fields`` are present, and
     (for a reference-audio template) ``ref_audio_codes`` is too -- just against a
     different field tuple (the full template vs. the reference-prefix-only fields).
-    ``prepare_suffix_inputs`` does *not* use this (review #8, this round): the
-    suffix carries no audio, so it must not require ``ref_audio_codes``.
+    Split into ``_validate_fields`` (the field-presence half) plus
+    ``_check_reference_source`` (review #4/#9, this round) so a caller that only
+    needs the first half -- ``prepare_suffix_inputs`` -- can use just that.
     """
-    missing = _missing_fields(request, fields)
-    if missing:
-        raise ValueError(
-            f"Request {request.get('id')} missing template fields: {missing}"
-        )
+    _validate_fields(request, fields)
     _check_reference_source(template, request)
 
 
@@ -562,21 +571,20 @@ def prepare_suffix_inputs(
     (``input_ids`` plus ``cfg_negative_*`` when ``guidance_scale != 1``) but
     carries no audio, so the runtime's branch builder can consume it unchanged.
 
-    Unlike ``prepare_inputs``/``prepare_prefix_inputs``, this does *not* run
-    ``_check_reference_source`` (review #8, this round): the suffix is pure text --
-    ``split_reference_prefix``'s ``guided``/``unguided`` pieces never touch
-    ``ref_audio_codes`` -- so requiring it here would reject a perfectly valid
-    suffix-only call for a reference whose codes are already cached in the prefix
-    this suffix is meant to follow.
+    Unlike ``prepare_inputs``/``prepare_prefix_inputs``, this needs neither
+    ``ref_audio_codes`` nor ``ref_text`` (review #4/#9, this round): the suffix is
+    pure text, continuing a prefix that ``prepare_prefix_inputs`` already prepared
+    separately for the same request. So it builds ``guided``/``unguided`` directly
+    from ``_tts_instruction_segments``/``_tts_plain_segments`` rather than calling
+    ``split_reference_prefix``, which also computes the reference prefix (and so
+    reads ``request['ref_text']``, even though that piece is then discarded) --
+    a request with only ``id``/``text``/``instruction`` must work here.
     """
-    missing = _missing_fields(request, ("text", "instruction"))
-    if missing:
-        raise ValueError(
-            f"Request {request.get('id')} missing template fields: {missing}"
-        )
-    _, guided, unguided = split_reference_prefix(request)
+    _validate_fields(request, ("text", "instruction"))
+    guided = _tts_instruction_segments(request)
     inputs = _prepare_segment_batches(tokenizer, model.config, model.device, [guided])
     if guidance_scale != 1.0:
+        unguided = _tts_plain_segments(request)
         negative = _prepare_segment_batches(
             tokenizer, model.config, model.device, [unguided]
         )
