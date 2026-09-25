@@ -291,8 +291,8 @@ allowed origin, a disallowed origin and no origin, for every route and the WebSo
     server.
   - Each violation MUST be a `400`.
 - **FR-009**: Reference audio MUST be decoded by a bounds-safe decoder. Anything it can't decode,
-  that is empty, over 30 seconds, over the upload size limit (25 MiB), or too short to produce at
-  least one reference frame MUST be rejected with `400`. Any sample rate and channel count MUST be
+  that is empty, over 30 seconds, over the upload size limit (25 MiB), or shorter than one full
+  codec frame (80 ms, 1,920 samples at 24 kHz) MUST be rejected with `400`. Any sample rate and channel count MUST be
   accepted and converted.
 - **FR-010**: An empty or whitespace-only `instruction` MUST mean the default instruction
   (`"Speak clearly and naturally."`) on every interface.
@@ -471,7 +471,7 @@ by area, not listed in numeric order (BC-46 to BC-48 were added later).
 | BC-13 | `ref_text` without `ref_audio`/`voice_id` ignored silently (HTTP and WebSocket `start`) | `400` on HTTP; `error` event on WebSocket | Clients sending a stray transcript |
 | BC-14 | `voice_id` plus `ref_audio`: the upload is ignored | `400` (mutually exclusive) | Clients sending both |
 | BC-15 | Malformed WAV can over-read memory or divide by zero; 8/24-bit PCM decodes as silence | Safe decode of all common PCM/float formats; undecodable input gets `400` | Clients with such files (now work or get a clear error) |
-| BC-16 | Reference clip of unlimited length; a clip too short for any frame is silently ignored | `400` over 30 s or under one frame | Clients sending such clips |
+| BC-16 | Reference clip of unlimited length; a clip too short for any frame is silently ignored | `400` over 30 s or under one full codec frame (80 ms) | Clients sending such clips |
 
 **HTTP: responses, errors and CORS**
 

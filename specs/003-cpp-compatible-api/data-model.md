@@ -100,7 +100,9 @@ Failures:
 - empty upload gives `invalid_audio`;
 - any of these header checks failing gives `invalid_audio`;
 - more than 30 s gives `audio_too_long`;
-- fewer than 1 predicted frame gives `audio_too_short`.
+- shorter than one full codec frame (80 ms: fewer than 1,920 samples once resampled to 24 kHz)
+  gives `audio_too_short`. The codec itself rounds a partial frame up, so without this minimum a
+  1-sample clip would become one frame of mostly padding (decided with the user, 2026-09-25).
 
 ## Reference (synthesis-internal)
 

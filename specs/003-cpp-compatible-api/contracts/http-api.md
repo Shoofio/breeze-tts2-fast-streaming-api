@@ -79,7 +79,7 @@ allowed (BC-23). Requests without `Origin` are unaffected.
 | `text` | string | required | Non-blank (BC-10); ≤ 10,000 characters (BC-05); no control characters except TAB, CR and LF (BC-46) |
 | `instruction` | string | `Speak clearly and naturally.` | ≤ 2,000 characters; blank → default (BC-09); control-character rule |
 | `voice_id` | string | — | A registered id |
-| `ref_audio` | file part | — | WAV, WAVEX, FLAC or OGG; 1–8 channels; 8–192 kHz; ≤ 25 MiB; ≤ 30 s; at least 1 codec frame (BC-11, BC-15, BC-16) |
+| `ref_audio` | file part | — | WAV, WAVEX, FLAC or OGG; 1–8 channels; 8–192 kHz; ≤ 25 MiB; ≤ 30 s; at least 80 ms, one full codec frame (BC-11, BC-15, BC-16) |
 | `ref_text` | string | — | ≤ 2,000 characters; control-character rule |
 | `cfg_scale` | decimal | `1.0` | Finite, 0–100. `1` = no CFG; `0` = unconditional only |
 | `seed` | integer | `42` | 0–4294967295 |

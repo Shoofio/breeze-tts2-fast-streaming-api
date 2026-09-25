@@ -265,7 +265,7 @@ that table is SC-002's evidence.
   absorption and the fullwidth period (BC-39, from the port itself); four split goldens from
   removing C++'s quarter-budget space guard, which let spaced text with no punctuation grow past the
   context; one from dropping emoji-only pieces; and three drain goldens from the streaming clause
-  rules (bounded overflow and the opening budget on the first piece only). The planning estimate
+  rules (the over-budget clause rule and bounded overflow). The planning estimate
   here was 5 and 5, and the port alone changed 1 and 3. The rest match once normalized (empty,
   whitespace-only) or were already right in C++ `split_text`. The
   table is `INTENTIONAL_DIFFERENCES` in `tests/test_text_split.py`.
