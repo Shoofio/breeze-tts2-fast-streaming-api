@@ -15,7 +15,7 @@ A frozen value object, built once at the composition root from the command line.
 | `host` | `127.0.0.1` | HTTP and WebSocket both bind here only |
 | `port` | `8080` | 1–65535 |
 | `ws_port` | `port + 1` | 1–65535, or `disabled` |
-| `cors` | off | `*` or a comma-separated allowlist (trimmed). `*` mixed with other entries is a startup error |
+| `cors` | off | `*` or a comma-separated allowlist (trimmed). Startup errors: `*` mixed with other entries, an empty list, or an entry that isn't a bare `scheme://host[:port]` origin (it could never match a browser `Origin`) |
 | `split_chars` | `600` | ≥ 0 |
 | `chunk_first` / `chunk_max` | `1` / `25` frames | ≥ 1; `chunk_first` is clamped to `chunk_max` |
 | `voices_dir` | `voices` | Created if missing |

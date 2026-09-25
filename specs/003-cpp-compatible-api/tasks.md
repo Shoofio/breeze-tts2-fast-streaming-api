@@ -289,10 +289,11 @@ phases as follows:
   - `scripts/start_breeze.ps1`: `-Port 8080`, and new `-Cors` and `-WsPort` parameters.
   - `docker/run.sh`: publish `8080:8080` and `8081:8081` and pass `--port 8080`.
   - `docker/README.md` if it mentions 7860.
-- [X] T025 [P] Set `breeze_infer/__init__.py` `__version__ = "2.0.0.dev1"`. Create
+- [ ] T025 [P] Set `breeze_infer/__init__.py` `__version__ = "2.0.0.dev1"`. Create
   `breeze_infer/version_header.py`, a pure-ASGI middleware that adds
   `X-Breeze-Version: <__version__>` to every HTTP response start message (FR-037a). Wire it in
-  `api.py` just inside the CORS middleware once T028 lands (until then, outermost).
+  `api.py` as the outermost layer, so CORS's own preflight and `403` responses carry it too (changed
+  after review, 2026-09-24; it was "just inside CORS").
   `tests/test_version_header.py` checks the header on `200`, `404`, `413`, `500` and a streamed
   response. Create `CHANGELOG.md`
   with an "Unreleased — 2.0.0" section that states the old Python API is removed and lists
@@ -337,8 +338,9 @@ route (quickstart Scenario 1.3–1.4); the SillyTavern `health` live gate passes
     `route.matches(scope)` and `route.methods`, and it rejects unsafe methods (`POST`/`DELETE`)
     with a disallowed `Origin` by returning the `403` envelope before calling the app.
 - [ ] T028 [US5] Wire it up in `breeze_infer/api.py`:
-  `CorsMiddleware(BodyLimitMiddleware(fastapi_app))`, so CORS is outermost and even `413`s and
-  `500`s carry headers. Build the policy from `Settings`. With CORS off the policy allows no
+  `VersionHeaderMiddleware(CorsMiddleware(BodyLimitMiddleware(fastapi_app)))`, so CORS sits
+  outside the body limit and the app, and even `413`s and `500`s carry its headers; the version
+  header stays outermost (T025). Build the policy from `Settings`. With CORS off the policy allows no
   origin, and every `OPTIONS` falls through to `405`.
 - [ ] T029 [US5] **Live gate (health)**. Standing rule 8: the version is already `2.0.0.dev1`;
   update the CHANGELOG for BC-19–BC-23.
