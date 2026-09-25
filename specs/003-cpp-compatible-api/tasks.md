@@ -491,7 +491,7 @@ the GPU smoke test.
   - `409` while a WebSocket waiter is queued (drive `GpuGate` directly);
   - piece seeds;
   - `503 loading` before ready.
-- [ ] T043 [US1] Create the GPU smoke test `tests/gpu/test_speech_http.py`: voice design and inline
+- [X] T043 [US1] Create the GPU smoke test `tests/gpu/test_speech_http.py`: voice design and inline
   reference return a PCM stream of plausible length, with the whole app on the real runtime. Then
   run `bench_api --api new` and compare with the T002 baseline ("SC-007 method" below), recording
   the numbers in `research/bench-phase2.md`. If a gating case's time to first audio regresses more
