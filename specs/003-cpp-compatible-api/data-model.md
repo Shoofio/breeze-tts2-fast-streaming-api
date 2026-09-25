@@ -269,8 +269,10 @@ offending record's field names), so one bad field never breaks the request emitt
   - server: `server.started` (with every bound `addresses`), `server.bind_failed`,
     `server.stopping` (exactly one when the process hard-exits or `serve()` crashes; none on
     a clean stop. `reason`: the hard-exit reason, `load in progress`, `signal during drain`,
-    `gpu drain timed out` (exits 70), `gpu stop cancelled` or `gpu stop failed` (exits 70),
-    else `serve raised`; if `serve()` crashed, the exit code is the crash's own; optional
+    `gpu drain timed out` (exits 70 unless `serve()` crashed with a non-zero code),
+    `gpu stop cancelled`, or `gpu stop failed` (exits 70 unless `serve()` crashed with a
+    non-zero code), else `serve raised`; a crash otherwise exits with its own code (1,
+    `SystemExit`'s code, 130 for Ctrl+C), so a GPU failure never exits 0; optional
     `crash` and `stop_error`, each a formatted traceback; `level` is `error` when either is
     present, else `warning`. A cancellation is never a crash or a stop failure), `ws.bind_failed`,
     `model.loaded`,

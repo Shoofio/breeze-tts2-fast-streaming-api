@@ -649,9 +649,10 @@ def test_crash_exit_codes_follow_python(crash: BaseException, exit_code: int) ->
     [
         (RuntimeError("uvicorn broke"), 1),
         (SystemExit(3), 3),  # SystemExit's own int code is kept
+        (SystemExit(0), 0),  # a load in progress is not a GPU failure: 0 stands
         (KeyboardInterrupt(), 130),
     ],
-    ids=["exception", "system-exit", "keyboard-interrupt"],
+    ids=["exception", "system-exit", "system-exit-0", "keyboard-interrupt"],
 )
 def test_a_crash_during_the_load_hard_exits_with_its_code_and_one_error_event(
     monkeypatch: pytest.MonkeyPatch,
@@ -768,8 +769,14 @@ def test_a_failing_gpu_stop_hard_exits_with_ex_software(
 @pytest.mark.usefixtures("keep_sigint")
 @pytest.mark.parametrize(
     ("crash", "exit_code"),
-    [(RuntimeError("uvicorn broke"), 1), (KeyboardInterrupt(), 130), (SystemExit(4), 4)],
-    ids=["exception", "sigint", "system-exit"],
+    [
+        (RuntimeError("uvicorn broke"), 1),
+        (KeyboardInterrupt(), 130),
+        (SystemExit(4), 4),
+        (SystemExit(0), 70),  # a GPU failure never exits 0
+        (SystemExit(None), 70),
+    ],
+    ids=["exception", "sigint", "system-exit", "system-exit-0", "system-exit-none"],
 )
 def test_a_crash_and_a_failing_gpu_stop_keep_the_crash_code_and_report_both(
     monkeypatch: pytest.MonkeyPatch,
@@ -885,8 +892,21 @@ def _returns_once(condition: Any) -> Any:
 
 @posix_only
 @pytest.mark.usefixtures("keep_sigint")
-def test_a_crash_with_a_stuck_drain_exits_with_the_crash_code(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize(
+    ("crash", "exit_code"),
+    [
+        (RuntimeError("uvicorn broke"), 1),
+        (KeyboardInterrupt(), 130),
+        (SystemExit(0), 70),  # a GPU failure never exits 0
+        (SystemExit(None), 70),
+    ],
+    ids=["exception", "sigint", "system-exit-0", "system-exit-none"],
+)
+def test_a_crash_with_a_stuck_drain_exits_with_the_crash_code_but_never_0(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    crash: BaseException,
+    exit_code: int,
 ) -> None:
     monkeypatch.setattr(api, "GPU_DRAIN_SECONDS", 0.5)
     sink = io.StringIO()
@@ -894,38 +914,45 @@ def test_a_crash_with_a_stuck_drain_exits_with_the_crash_code(
     proceed, cancelled, streaming = (threading.Event() for _ in range(3))
     outcome = ServeOutcome()
     app = _stuck_close_app(components, proceed, cancelled, streaming)
+    raised: list[BaseException] = []
 
     async def broken_main_loop(self: Any) -> None:
         await asyncio.to_thread(streaming.wait, 10)  # a request holds the GPU
-        raise RuntimeError("uvicorn broke")
+        raise crash
 
     monkeypatch.setattr(api._Server, "main_loop", broken_main_loop)
 
     async def scenario() -> None:
         sock = _bind_one("127.0.0.1", 0)
         port = sock.getsockname()[1]
-        serving = asyncio.create_task(serve(components, app, [sock], _loaded, outcome))
-        await _wait_until(lambda: components.readiness.runtime is not None)
-        writer = await _start_request(port)
+
+        async def client() -> asyncio.StreamWriter:
+            await _wait_until(lambda: components.readiness.runtime is not None)
+            return await _start_request(port)
+
+        requesting = asyncio.create_task(client())
+        # serve() awaited in this task, not its own: SystemExit and KeyboardInterrupt out of
+        # a task escape the event loop instead of reaching the `except` here.
         try:
-            with pytest.raises(RuntimeError, match="uvicorn broke"):
-                await asyncio.wait_for(serving, 10)
+            await serve(components, app, [sock], _loaded, outcome)
+        except BaseException as exc:  # noqa: BLE001 - inspected below
+            raised.append(exc)
         finally:
             proceed.set()  # unstick the GPU before asyncio.run's cleanup
-            writer.close()
+            (await requesting).close()
 
     try:
         asyncio.run(scenario())
     finally:
         proceed.set()
         components.gpu.shutdown()
-    # One rule: a crash's own code wins over any hard exit; 70 only without a crash.
-    assert outcome == ServeOutcome(1, hard_exit=True)
-    assert "RuntimeError: uvicorn broke" in capsys.readouterr().err
+    assert raised == [crash]
+    assert outcome == ServeOutcome(exit_code, hard_exit=True)
+    assert type(crash).__name__ in capsys.readouterr().err
     [stopping] = _stopping_events(sink)
     # `reason` stays the hard-exit reason, so an alert on "gpu drain timed out" still fires.
     assert (stopping["level"], stopping["reason"]) == ("error", "gpu drain timed out")
-    assert "uvicorn broke" in stopping["crash"]
+    assert type(crash).__name__ in stopping["crash"]
 
 
 def test_hard_exit_survives_a_broken_stdout(monkeypatch: pytest.MonkeyPatch) -> None:

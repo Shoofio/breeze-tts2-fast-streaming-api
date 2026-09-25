@@ -380,7 +380,10 @@ def _conclude(
     | `_stop_gpu` cancelled             | yes       | unchanged                  | "gpu stop cancelled" | warning |
     | `_stop_gpu` failed                | yes       | 70                         | "gpu stop failed"    | error   |
     | crash, no hard exit               | no        | Python's, as it propagates | "serve raised"       | error   |
-    | crash + any hard exit above       | yes       | the crash's (`_crash_exit_code`) | as above   | error   |
+    | crash + any hard exit above       | yes       | the crash's (`_crash_exit_code`); 70 if that is 0 after a GPU failure | as above | error |
+
+    A GPU failure is a drain timeout or a failed `_stop_gpu`. It never exits 0, so a supervisor
+    restarts a process whose GPU may be stuck, even when the crash was `SystemExit(0)`.
 
     `_stop_gpu` ending early (failed or cancelled) is a hard exit because the GPU thread may
     still be busy, and a normal exit would join it. The event carries `crash` and
@@ -392,13 +395,16 @@ def _conclude(
         crash = None
     stop_cancelled = isinstance(stop_error, asyncio.CancelledError)
     stop_failure = None if stop_cancelled else stop_error
+    # Read before the exit code changes: only `_stop_gpu` sets 70, for a drain timeout.
+    gpu_failed = stop_failure is not None or outcome.exit_code == EXIT_GPU_STUCK
     # Exit code first, so a failure while reporting can't leave a crash exiting 0.
     if stop_error is not None:
         outcome.hard_exit = True
         hard_exit_reason = "gpu stop cancelled" if stop_cancelled else "gpu stop failed"
     if crash is not None and outcome.hard_exit:
-        # One rule: a crash's own code wins over any hard exit; 70 is only for no crash.
-        outcome.exit_code = _crash_exit_code(crash)
+        # The crash's own code wins, except that a GPU failure never exits 0.
+        crash_code = _crash_exit_code(crash)
+        outcome.exit_code = EXIT_GPU_STUCK if gpu_failed and crash_code == 0 else crash_code
     elif stop_failure is not None:
         outcome.exit_code = EXIT_GPU_STUCK
     if crash is None and not outcome.hard_exit:
