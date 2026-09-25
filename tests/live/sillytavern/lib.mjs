@@ -428,8 +428,14 @@ export function writeRecord(name, results, snapshot = null) {
         fs.writeFileSync(fullSnapshotPath, JSON.stringify(snapshot, null, 2));
         console.log(`full settings snapshot (untracked, for manual restore): ${fullSnapshotPath}`);
 
-        const redactedBreeze = redactSecrets(snapshot.tts?.Breeze ?? null);
-        snapshotSection = `\n## Settings snapshot (Breeze block only; secrets redacted)\n\nThe complete snapshot — every TTS provider's settings, not just Breeze's — was written to \`${fullSnapshotPath}\` (untracked; not this record). Restore from there by hand if the automatic restore failed.\n\n\`\`\`json\n${JSON.stringify(redactedBreeze, null, 2)}\n\`\`\`\n`;
+        // Scalar settings only: voice lists, voice maps and cached transcripts are personal data
+        // and stay in the untracked snapshot.
+        const breeze = snapshot.tts?.Breeze ?? {};
+        const scalars = Object.fromEntries(
+            Object.entries(breeze).filter(([, v]) => v === null || typeof v !== 'object'),
+        );
+        const redactedBreeze = redactSecrets(scalars);
+        snapshotSection = `\n## Breeze settings in effect (scalars only; secrets redacted)\n\nThe complete snapshot — every TTS provider's settings, not just Breeze's — was written to \`${fullSnapshotPath}\` (untracked; not this record). Restore from there by hand if the automatic restore failed.\n\n\`\`\`json\n${JSON.stringify(redactedBreeze, null, 2)}\n\`\`\`\n`;
     }
 
     const body = `# Live SillyTavern run: ${name}
