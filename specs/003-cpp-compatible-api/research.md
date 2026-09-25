@@ -260,9 +260,13 @@ It also changes three things:
 **Golden tests**: `gen_goldens.py` no longer rewrites the test file. The test compares against
 normalized C++ output and keeps a table of intentional differences, each tagged with its BC id;
 that table is SC-002's evidence.
-- **Still valid:** 11 split goldens and 7 drain goldens.
-- **Change:** 5 split goldens (the first-budget pair, empty, whitespace-only, NUL) and 5 drain
-  goldens (ellipsis, the two byte-vs-weight cases, quotes, fullwidth period).
+- **Change after normalization (stripped, empties dropped), measured in T020:** 1 split golden
+  (NUL, BC-46) and 3 drain goldens (the undrained byte-vs-weight case, quote absorption, and the
+  fullwidth period; BC-39). The planning estimate here was 5 and 5. The other candidates match once
+  normalized (empty, whitespace-only), give the same pieces by another route (the ellipsis, the
+  drained byte-vs-weight case), or were already right in C++ `split_text` (the first-budget pair;
+  the whole-drain opening budget lived in `ws_api.cpp`, which no golden exercises at 200). The
+  table is `INTENTIONAL_DIFFERENCES` in `tests/test_text_split.py`.
 
 **Rationale**: FR-014/FR-031. The same text gives the same pieces over HTTP and WebSocket.
 

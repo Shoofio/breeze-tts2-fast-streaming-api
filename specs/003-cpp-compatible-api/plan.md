@@ -140,7 +140,7 @@ tests/
 ├── fakes.py             # FakeRuntime at the GPU edge (Complexity Tracking)   [port A, extended]
 ├── test_*.py            # units and real-server integration, one file per module; bc_ ids in names
 ├── test_malformed_corpus.py, test_speech_abort.py, test_ws_isolation.py
-├── cpp_golden/          # C++ segmenter oracle and the table of intentional differences   [port A]
+├── cpp_golden/          # C++ segmenter oracle (the differences table is in test_text_split.py)   [port A]
 ├── gpu/                 # long text, cfg values, overrides, voice equivalence, prefix buckets
 └── live/
     ├── cpp_examples.py  # SC-001 runner over the C++ docs examples
