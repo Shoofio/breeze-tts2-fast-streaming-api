@@ -681,8 +681,13 @@ def test_urlencoded_field_count_over_the_cap_gets_400(tmp_path: Path) -> None:
 
 def test_a_huge_body_of_many_pairs_fails_fast_on_the_field_cap(tmp_path: Path) -> None:
     """A ~26 MiB urlencoded body of millions of tiny fields must be rejected by parse_qsl's
-    max_num_fields guard -- one pass over the bytes -- not by actually splitting and
-    decoding each field (which would take far longer for this many)."""
+    max_num_fields guard -- one pass over the bytes -- not by a real per-field parse (which
+    would take far longer for this many). T048 post-final review finding #3:
+    `_urlencoded_pairs_sync`'s fallback for that guard now also checks for a duplicate name,
+    but only via a single cheap split (`_names_from_raw_urlencoded`), no percent-decoding or
+    per-field UTF-8 validation -- so this still has to fail fast, and every one of these
+    millions of pairs is named `a`, a genuine duplicate, so the answer is now the more useful
+    `duplicate_field`, not the generic error."""
     pair = b"a=1&"
     body = pair * (27_000_000 // len(pair))  # ~26 MiB, millions of pairs
 
@@ -694,9 +699,12 @@ def test_a_huge_body_of_many_pairs_fails_fast_on_the_field_cap(tmp_path: Path) -
     )
     elapsed = time.monotonic() - start
 
-    assert response.status_code == 400
-    assert response.json()["code"] == "invalid_field"
     assert elapsed < 5.0, f"took {elapsed:.2f}s -- did not fail fast on the field cap"
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "a was given more than once",
+        "code": "duplicate_field",
+    }
 
 
 # finding #3: a text-then-file ref_audio is rejected regardless of order.
@@ -1478,6 +1486,25 @@ def test_cfg_scale_tiny_value_with_unrepresentable_exponent_is_accepted(
     assert response.json()["cfg_scale"] == 0.0
 
 
+def test_cfg_scale_negative_tiny_value_with_unrepresentable_exponent_gets_400(
+    tmp_path: Path,
+) -> None:
+    """T048 post-final review finding #1: the fallback used to lose the literal's sign --
+    `float("-1e-999999999999999999999")` underflows to exactly `-0.0`, and
+    `Decimal(-0.0) >= Decimal("0")` is true (decimal treats `-0` and `0` as equal for
+    comparison), so a genuinely negative `cfg_scale` this tiny was wrongly accepted as
+    in-range, with the stored value `-0.0` -- while the representable `cfg_scale=-1e-400`
+    correctly got 400. The fallback now rebuilds a `Decimal` straight from the literal's own
+    sign and digits (only the exponent is re-anchored to something `Decimal` accepts), so
+    this is out of range the same way `-1e-400` already is."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "cfg_scale": "-1e-999999999999999999999"}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+
+
 def test_cfg_scale_huge_positive_exponent_with_nonzero_mantissa_gets_400(
     tmp_path: Path,
 ) -> None:
@@ -1605,13 +1632,14 @@ def test_bc_08_three_ref_audio_file_parts_get_400(tmp_path: Path) -> None:
 
 
 def test_bc_08_five_ref_audio_file_parts_still_get_duplicate_field(tmp_path: Path) -> None:
-    """T048 post-final review finding #5: five `ref_audio` file parts is one past
+    """T048 post-final review finding #3: five `ref_audio` file parts is one past
     `FORM_MAX_FILES` (4) -- Starlette's own parser refuses to hand back that many file parts
-    at all, raising `MultiPartException("Too many files...")` before BC-08's own duplicate
-    pass ever gets raw items to count. `_parse_multipart_form` maps that specific exception
-    back to `duplicate_field` when every file part involved (the four it already parsed, plus
-    the fifth that tripped the limit) is named `ref_audio` -- rather than leaving the client
-    with the generic parser error, which wouldn't name the field at all."""
+    at all, raising `MultiPartException` before BC-08's own duplicate pass ever gets raw
+    items to count. `_parse_multipart_form` falls back to the same `_check_no_duplicate_names`
+    BC-08 already uses elsewhere, run over every name the parser had already produced
+    (`parser.items`) plus the one that tripped the limit (`parser._current_part.field_name`)
+    -- finding all five named `ref_audio` -- rather than leaving the client with the generic
+    parser error, which wouldn't name the field at all."""
     boundary = "xxxxBOUNDARYxxxx"
 
     def part(n: int) -> str:
@@ -1637,6 +1665,250 @@ def test_bc_08_five_ref_audio_file_parts_still_get_duplicate_field(tmp_path: Pat
     assert response.status_code == 400
     assert response.json() == {
         "error": "ref_audio was given more than once",
+        "code": "duplicate_field",
+    }
+
+
+def test_bc_08_ref_audio_before_and_after_three_foo_files_still_gets_duplicate_field(
+    tmp_path: Path,
+) -> None:
+    """T048 post-final review finding #3: the general rule doesn't care *where* in the run
+    of file parts a repeated name falls -- `ref_audio`, three unrelated `foo` files, then a
+    second `ref_audio` still trips `FORM_MAX_FILES` on the fifth part, and the first
+    `ref_audio` is still sitting in `parser.items` by the time the duplicate check runs."""
+    boundary = "xxxxBOUNDARYxxxx"
+
+    def part(name: str, n: int) -> str:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"; filename="{n}.bin"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+            f"file bytes {n}\r\n"
+        )
+
+    body = (
+        part("ref_audio", 1)
+        + part("foo", 2)
+        + part("foo", 3)
+        + part("foo", 4)
+        + part("ref_audio", 5)
+        + f"--{boundary}--\r\n"
+    ).encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio was given more than once",
+        "code": "duplicate_field",
+    }
+
+
+def test_bc_08_four_ref_audio_files_then_one_foo_still_gets_duplicate_field(
+    tmp_path: Path,
+) -> None:
+    """The name that trips the limit doesn't have to be the repeated one itself -- four
+    `ref_audio` files fill every slot `FORM_MAX_FILES` allows, and an unrelated fifth
+    (`foo`) is what actually raises, but `ref_audio` is still the name repeated four times
+    over in `parser.items`."""
+    boundary = "xxxxBOUNDARYxxxx"
+
+    def part(name: str, n: int) -> str:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"; filename="{n}.bin"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+            f"file bytes {n}\r\n"
+        )
+
+    body = (
+        part("ref_audio", 1)
+        + part("ref_audio", 2)
+        + part("ref_audio", 3)
+        + part("ref_audio", 4)
+        + part("foo", 5)
+        + f"--{boundary}--\r\n"
+    ).encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio was given more than once",
+        "code": "duplicate_field",
+    }
+
+
+def test_bc_08_five_foo_file_parts_get_duplicate_field_not_just_ref_audio(
+    tmp_path: Path,
+) -> None:
+    """T048 post-final review finding #3: the old mechanism only ever recognised `ref_audio`
+    specifically (it matched Starlette's "Too many files" message text, then checked the
+    field name against that one literal string); the general rule catches any repeated
+    name, `ref_audio` or not."""
+    boundary = "xxxxBOUNDARYxxxx"
+
+    def part(n: int) -> str:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="foo"; filename="{n}.bin"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+            f"file bytes {n}\r\n"
+        )
+
+    body = (part(1) + part(2) + part(3) + part(4) + part(5) + f"--{boundary}--\r\n").encode(
+        "ascii"
+    )
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "foo was given more than once",
+        "code": "duplicate_field",
+    }
+
+
+def test_bc_08_five_distinctly_named_file_parts_keep_the_generic_error(
+    tmp_path: Path,
+) -> None:
+    """A file-count limit hit by five *distinct* names has no duplicate to report -- the
+    generic parser error is still what the client gets, same as before this rule existed."""
+    boundary = "xxxxBOUNDARYxxxx"
+
+    def part(name: str) -> str:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"; filename="{name}.bin"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+            f"file bytes {name}\r\n"
+        )
+
+    body = (
+        part("a") + part("b") + part("c") + part("d") + part("e") + f"--{boundary}--\r\n"
+    ).encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "could not parse the request body",
+        "code": "invalid_field",
+    }
+
+
+def test_bc_08_multipart_limit_hit_with_parser_missing_private_attribute_stays_400_not_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T048 post-final review finding #3: `parser.items` and `parser._current_part` are
+    read through `getattr` guards specifically because neither is a stable, documented
+    Starlette attribute. Simulated here by deleting `_current_part` at the exact moment a
+    `MultiPartException` is about to propagate (as if a future Starlette release renamed or
+    dropped it) -- the five distinct file names below give no duplicate to find from
+    `parser.items` alone even with the attribute intact, so this must still fall back to the
+    generic error, not crash with a 500."""
+
+    class _ParserMissingCurrentPart(http_fields._StrictMultiPartParser):
+        def on_headers_finished(self) -> None:
+            try:
+                super().on_headers_finished()
+            except http_fields.MultiPartException:
+                del self._current_part
+                raise
+
+    monkeypatch.setattr(http_fields, "_StrictMultiPartParser", _ParserMissingCurrentPart)
+
+    boundary = "xxxxBOUNDARYxxxx"
+
+    def part(name: str) -> str:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{name}"; filename="{name}.bin"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+            f"file bytes {name}\r\n"
+        )
+
+    body = (
+        part("a") + part("b") + part("c") + part("d") + part("e") + f"--{boundary}--\r\n"
+    ).encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "could not parse the request body",
+        "code": "invalid_field",
+    }
+
+
+def test_bc_08_33_same_named_multipart_text_fields_get_duplicate_field(
+    tmp_path: Path,
+) -> None:
+    """T048 post-final review finding #3: 33 `seed` text fields is one past
+    `FORM_MAX_FIELDS` (32) -- the *field* limit, not the file limit, but
+    `on_headers_finished` sets `_current_part.field_name` before checking either one, so the
+    same general rule applies regardless of which limit actually trips."""
+    boundary = "xxxxBOUNDARYxxxx"
+
+    def part(n: int) -> str:
+        return (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="seed"\r\n\r\n'
+            f"{n}\r\n"
+        )
+
+    body = ("".join(part(n) for n in range(33)) + f"--{boundary}--\r\n").encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "seed was given more than once",
+        "code": "duplicate_field",
+    }
+
+
+def test_bc_08_33_same_named_urlencoded_fields_get_duplicate_field(tmp_path: Path) -> None:
+    """T048 post-final review finding #3: the urlencoded equivalent -- `parse_qsl`'s own
+    `max_num_fields` guard (`test_urlencoded_field_count_over_the_cap_gets_400`) fires before
+    it has split or decoded a single field, so `_urlencoded_pairs_sync` re-derives just the
+    raw field names (cheap: no percent-decoding, no UTF-8 validation, since this only ever
+    feeds a duplicate-name check) to run the same duplicate check against."""
+    body = "&".join(f"seed={n}" for n in range(FORM_MAX_FIELDS + 1)).encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "seed was given more than once",
         "code": "duplicate_field",
     }
 
@@ -1755,6 +2027,30 @@ def test_ref_audio_in_query_wins_over_an_unrelated_body_only_duplicate(
         content=b"seed=1&seed=2",
         headers={"content-type": "application/x-www-form-urlencoded"},
         params={"ref_audio": "x"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio must be a file part",
+        "code": "invalid_field",
+    }
+
+
+def test_ref_audio_in_query_wins_over_a_cross_source_seed_duplicate(
+    tmp_path: Path,
+) -> None:
+    """T048 post-final review finding #8: the query holds both `ref_audio` and one `seed`;
+    the body holds a second `seed` -- a genuine duplicate only once the two are combined,
+    which is exactly what the second, per-branch `_check_no_duplicate_names` pass (query
+    names plus the body's) exists to catch. But `ref_audio` in the query is rejected by the
+    query-only pass *before* that second pass -- or the body itself -- is ever reached, so
+    `ref_audio must be a file part` wins over `duplicate_field` for `seed`, exactly as the
+    module docstring's query-first ordering intends."""
+    response = _client(tmp_path).post(
+        "/speech",
+        content=b"seed=2",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        params={"ref_audio": "x", "seed": "1"},
     )
 
     assert response.status_code == 400
