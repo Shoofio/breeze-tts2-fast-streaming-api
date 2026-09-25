@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import threading
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -30,9 +31,10 @@ import torch
 # ``models.fast_streaming`` pulls in the cudagraph submodules and costs real wall-clock
 # time to import (finding #8, T021 review 2) even though most of this module's own
 # consumers (FakeCodec, codec_frame_count, RecordingEvents, FakeTokenizer) need none of
-# it. So the real import is deferred to inside ``FakeRuntime.iter_audio_chunks`` below;
-# this one is TYPE_CHECKING-only (never runs) purely so the return-type annotation
-# resolves for a type checker/linter without paying for it at runtime.
+# it. So the real import is deferred to inside ``FakeRuntime.iter_audio_chunks`` and
+# ``FakeRuntime.max_new_tokens_room`` below; this one is TYPE_CHECKING-only (never runs)
+# purely so the return-type annotation resolves for a type checker/linter without paying
+# for it at runtime.
 if TYPE_CHECKING:
     from models.fast_streaming import FastStreamingChunk
 
@@ -157,8 +159,8 @@ def codec_frame_count(num_samples: int, sr: int) -> int:
 
 
 class _EncoderOutput:
-    """Minimal stand-in for transformers' ``ModelOutput``, giving both attribute and
-    string-key access to one field.
+    """Minimal stand-in for transformers' ``ModelOutput``, giving attribute, string-key
+    and integer-index access to one field.
 
     The real return type, ``Qwen3TTSTokenizerV2EncoderOutput``
     (``qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2``), literally *is* a
@@ -168,13 +170,24 @@ class _EncoderOutput:
     sandbox (mostly filesystem stats across its many submodules on a slow mount, not CPU
     -- the same class of cost finding #8 raised about ``models.fast_streaming``), which
     isn't worth paying for one field's dict/attribute duality.
+
+    ``result[0]`` and ``result["audio_codes"]`` both give ``audio_codes`` itself (not a
+    1-tuple containing it), matching ``ModelOutput.__getitem__``: an integer key indexes
+    ``to_tuple()`` (the object's non-``None`` values, in field order), and with exactly
+    one field that tuple is ``(audio_codes,)``, so index ``0`` unwraps straight back to
+    ``audio_codes``.
     """
 
     def __init__(self, audio_codes: list[torch.Tensor]) -> None:
         self.audio_codes = audio_codes
 
-    def __getitem__(self, key: str) -> list[torch.Tensor]:
-        return getattr(self, key)
+    def to_tuple(self) -> tuple[list[torch.Tensor]]:
+        return (self.audio_codes,)
+
+    def __getitem__(self, key: str | int) -> list[torch.Tensor]:
+        if isinstance(key, str):
+            return getattr(self, key)
+        return self.to_tuple()[key]
 
 
 class FakeCodec:
@@ -216,7 +229,9 @@ class FakeCodec:
         self.last_wav: np.ndarray | None = None
         self.last_sr: int | None = None
 
-    def encode(self, wav: np.ndarray, sr: int) -> _EncoderOutput:
+    def encode(
+        self, wav: np.ndarray, sr: int, return_dict: bool = True
+    ) -> _EncoderOutput | tuple[list[torch.Tensor]]:
         if len(wav) == 0:
             raise RuntimeError(
                 "FakeCodec.encode: a 0-sample wav can't be encoded (mirrors the real "
@@ -239,10 +254,31 @@ class FakeCodec:
             seed + frame_idx * self.CODEBOOKS + codebook_idx
         ) % self.CODEBOOK_SIZE
         codes = torch.as_tensor(codes_codebook_major, dtype=torch.int64).transpose(0, 1)
-        return _EncoderOutput([codes])
+        output = _EncoderOutput([codes])
+        # Like the real ``ModelOutput``-returning ``encode()``: ``return_dict=False``
+        # gives the plain tuple (``to_tuple()``) instead of the attribute/dict-style
+        # wrapper, matching how e.g. ``transformers`` model forwards accept the same
+        # flag (review finding: encode()'s real signature has this parameter and the
+        # fake didn't).
+        return output if return_dict else output.to_tuple()
 
 
 # --- FakeRuntime: the streaming runtime at the generation edge ---------------------
+
+
+@dataclass(frozen=True)
+class FakeStreamingConfig:
+    """The subset of ``models.fast_streaming.FastStreamingConfig`` that
+    ``FakeRuntime.max_new_tokens_room``/``_frame_cap`` read (``max_new_tokens``, the
+    per-request ceiling, and ``max_seq_len``, the context length). A plain local
+    dataclass, not the real one: constructing a `FakeRuntime` must never import
+    ``models.fast_streaming`` just to build its default ``config`` (the module-import
+    cost this file's docstring and finding #8 already avoid). Field defaults match
+    ``FastStreamingConfig``'s own defaults.
+    """
+
+    max_new_tokens: int = 750
+    max_seq_len: int = 1024
 
 
 class FakeRuntime:
@@ -302,24 +338,46 @@ class FakeRuntime:
       ``token_observer`` is exercised with no arguments beyond it, rather than silently
       observing nothing because the caller forgot to size a ``frames=`` list to match.
 
-    Assumptions, to reconcile once `synthesis.py` (T038) lands and the real runtime
-    changes (R12) are made:
-    - ``iter_audio_chunks`` on the real runtime (``models/fast_streaming.py`` today) takes
-      only ``inputs`` plus ``request_id``, ``seed``, ``token_observer`` and ``prefix``.
-      This fake additionally accepts ``reference`` and the five per-request sampling
-      overrides (``temperature``, ``top_k``, ``top_p``, ``repetition_penalty``,
-      ``max_new_tokens``) that R12 decision 1 plans to add to that same method. They are
-      recorded, not applied to the fake chunks.
-    - ``reference`` is whatever `synthesis.py`'s ``resolve_reference``/``prepare_piece``
-      pass through (a `Reference` variant, or ``None``); recording it lets a test assert
-      an inline reference is encoded once and the same object is reused for every piece
-      and both CFG rows, instead of being re-encoded per piece (T038).
-    - ``max_new_tokens_room`` mirrors the *planned* runtime addition of the same name
-      (R12 decision 3, `research.md` "R12"; not implemented in `models/fast_streaming.py`
-      yet) rather than a method that exists today, since T050's room-clamp tests need it.
+    Alignment with the real runtime (review finding: this fake used to accept calls the
+    real runtime rejects, so a test could pass here and still raise in production):
+    - ``iter_audio_chunks`` takes exactly the real method's keyword set
+      (``models/fast_streaming.py:FastBreezeStreamingRuntime.iter_audio_chunks``):
+      ``request_id``, ``seed``, ``token_observer``, ``prefix``, and the five per-request
+      sampling overrides (``temperature``, ``top_k``, ``top_p``, ``repetition_penalty``,
+      ``max_new_tokens``). There is no ``reference=`` keyword on the real method and none
+      here either -- a reference reaches the runtime two ways, both already covered by
+      existing parameters: baked into ``inputs`` as ``ref_audio_codes`` (by
+      `breeze_infer.templates.prepare_inputs`, for the "codes" `Reference` variant), or
+      as a cached-KV ``prefix`` (the "prefix" variant, `build_reference_prefix`'s
+      result). `synthesis.py`'s `resolve_reference`/`prepare_piece` build one of those
+      two shapes; a test asserting "the inline reference is encoded once and reused for
+      every piece and both CFG rows" (T038) does so by asserting `FakeCodec.encode_calls`
+      stays 1 while every recorded call's ``inputs["input_values"]`` (or, once a saved
+      voice's prefix path exists, ``prefix``) is the same object, not by inspecting a
+      ``reference`` field on these calls -- there is none.
+    - The five overrides are validated exactly as the real ``_require_valid_overrides``
+      does, by calling that same function (imported lazily, like ``FastStreamingChunk``
+      below, so constructing or draining a `FakeRuntime` that never overrides anything
+      still never pays to import ``models.fast_streaming``): ``None`` is the default,
+      anything else must be finite and > 0, and ``top_k``/``max_new_tokens`` must be a
+      non-bool ``int``. Since ``iter_audio_chunks`` is a generator function, validation
+      -- here and on the real runtime -- runs on the first ``next()``, not at call time.
+    - ``max_new_tokens_room`` approximates the real method's room estimate (frame cap via
+      ``config``/``default_max_new_tokens``, then the context room from a bucket-padded
+      prefill length) by calling the real ``_require_valid_overrides`` and
+      ``select_fast_cfg`` helpers and porting ``_frame_cap``'s two-line rule directly.
+      **Approximation gap**: the real ``_prefill_plan`` bucket-pads the prefill only when
+      the runtime's fast backbone-prefill path is enabled, and a frozen warmup cache can
+      refuse an unwarmed bucket and fall back to an exact-length eager prefill instead
+      (`models/fast_streaming.py:850-883`). This fake has no captured prefill graphs or
+      warmup state to consult, so it always bucket-pads to the nearest
+      ``_PREFILL_TOKEN_GRANULARITY`` (32) -- the same case the real runtime's default
+      ``prefill_path == "graph"`` reports. A test asserting an *exact* room number against
+      a frozen/eager fallback boundary needs the real runtime (`tests/gpu/`), not this.
     - ``build_reference_prefix`` (the cached-KV "prefix" `Reference` variant) is
-      deliberately not faked here: none of T036/T038/T040/T050 exercise a saved voice
-      with no override, only the "codes" variant. Add it when a task needs it.
+      deliberately not faked here: none of the tasks that use `FakeRuntime` today
+      exercise a saved voice with no override, only the "codes" variant. Add it when a
+      task needs it.
 
     ``fail_after`` raises ``RuntimeError`` once that many chunks of a call have been
     yielded, standing in for a mid-stream CUDA error (checked, like the gate, before that
@@ -347,10 +405,35 @@ class FakeRuntime:
         is_final_on_last: bool = False,
         collect_timing: bool = False,
         prefill_path: str = "graph",
+        config: FakeStreamingConfig | None = None,
+        default_max_new_tokens: int | None = None,
     ) -> None:
+        # The real post-loop flush (module docstring, ``flush_frames`` bullet) only
+        # exists because the main loop's ``chunk_ready`` check
+        # (``len(chunk_buffer) >= self._codec_chunk_frames``) can leave 1..frames_per_chunk-1
+        # frames buffered when generation ends -- never a full chunk's worth (the loop
+        # would have flushed that already) and never zero (there would be nothing left to
+        # flush). And a piece ends exactly one way: either it runs out of frames inside
+        # the loop (a possible ``is_final_on_last`` chunk) or it has leftovers after
+        # (``flush_frames``), never both, since the loop's own ``reached_limit`` branch
+        # already flushes and breaks before any post-loop code can run.
+        if flush_frames is not None and not (0 < flush_frames < frames_per_chunk):
+            raise ValueError(
+                "flush_frames must be > 0 and < frames_per_chunk (a full chunk would "
+                f"have flushed already), got flush_frames={flush_frames!r} "
+                f"frames_per_chunk={frames_per_chunk!r}"
+            )
+        if is_final_on_last and flush_frames:
+            raise ValueError(
+                "is_final_on_last and flush_frames both simulate how a piece ends and "
+                "are mutually exclusive: the real loop's reached_limit branch already "
+                "flushes and breaks, so there is never a post-loop flush after it"
+            )
         self.chunks = chunks
         self.frames_per_chunk = frames_per_chunk
         self.flush_frames = flush_frames
+        self.config = config or FakeStreamingConfig()
+        self.default_max_new_tokens = default_max_new_tokens
         if frames is None:
             # One dummy tensor per frame this call will observe, so token_observer is
             # exercised even when the caller passes no ``frames=`` (finding #1).
@@ -367,16 +450,45 @@ class FakeRuntime:
         self.calls: list[dict[str, Any]] = []
         self.closed = 0
 
+    def _frame_cap(self, requested: int | None) -> int:
+        """Ports ``FastBreezeStreamingRuntime._frame_cap`` exactly (it's two lines and
+        pure Python -- no need to import the real one just for this)."""
+        if requested is None:
+            requested = self.default_max_new_tokens or self.config.max_new_tokens
+        return min(int(requested), self.config.max_new_tokens)
+
     def max_new_tokens_room(
         self, requested: int | None, inputs: dict[str, Any], *, prefix_len: int = 0
     ) -> int:
-        """The planned rule (R12 #3) minus prefill bucket padding (no graphs here)."""
-        cap = requested if requested is not None and 0 < requested < float("inf") else 750
-        prompt_len = int(inputs["input_ids"].shape[1])
-        negative = inputs.get("cfg_negative_prompt_ids")
-        if negative is not None:
-            prompt_len = max(prompt_len, int(negative.shape[1]))
-        return min(int(cap), 1500, 2048 - (prompt_len + prefix_len) - 1)
+        """Approximates ``FastBreezeStreamingRuntime.max_new_tokens_room`` -- see the
+        class docstring's "Approximation gap" paragraph for what this can't reproduce
+        without real captured prefill graphs."""
+        # Lazy for the same reason as in iter_audio_chunks below (finding #8).
+        from models.fast_streaming import (
+            _PREFILL_TOKEN_GRANULARITY,
+            _require_valid_overrides,
+            select_fast_cfg,
+        )
+
+        _require_valid_overrides(max_new_tokens=requested)
+        cfg = select_fast_cfg(inputs)
+        if cfg.use_negative_as_main:
+            seq_len = int(inputs["cfg_negative_prompt_attention_mask"].shape[1])
+        elif cfg.mode == "no_cfg":
+            seq_len = int(inputs["attention_mask"].shape[1])
+        else:
+            seq_len = max(
+                int(inputs["attention_mask"].shape[1]),
+                int(inputs["cfg_negative_prompt_attention_mask"].shape[1]),
+            )
+        exact_len = prefix_len + seq_len
+        bucketed_len = (
+            prefix_len
+            + -(-seq_len // _PREFILL_TOKEN_GRANULARITY) * _PREFILL_TOKEN_GRANULARITY
+        )
+        prefill_len = bucketed_len if bucketed_len <= self.config.max_seq_len else exact_len
+        room = self.config.max_seq_len - prefill_len - 1
+        return min(self._frame_cap(requested), room)
 
     def iter_audio_chunks(
         self,
@@ -384,18 +496,29 @@ class FakeRuntime:
         *,
         request_id: str | None = None,
         seed: int | None = None,
-        reference: Any = None,
+        token_observer: Callable[[torch.Tensor], None] | None = None,
+        prefix: Any | None = None,
         temperature: float | None = None,
         top_k: int | None = None,
         top_p: float | None = None,
         repetition_penalty: float | None = None,
         max_new_tokens: int | None = None,
-        token_observer: Callable[[torch.Tensor], None] | None = None,
-        prefix: Any | None = None,
     ) -> Iterator[FastStreamingChunk]:
         # Lazy: models.fast_streaming (cudagraph submodules) is slow to import, and most
         # of tests/fakes.py's own consumers never call this method (finding #8).
-        from models.fast_streaming import FastStreamingChunk
+        from models.fast_streaming import FastStreamingChunk, _require_valid_overrides
+
+        # Validated -- and, like the real generator, only once the caller starts
+        # iterating, not at call time -- with the exact same rules the real runtime
+        # uses, by calling that same function rather than re-implementing its rules
+        # (review finding: the fake used to accept calls the real runtime rejects).
+        _require_valid_overrides(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_new_tokens=max_new_tokens,
+        )
 
         call_index = len(self.calls)
         self.calls.append(
@@ -403,7 +526,6 @@ class FakeRuntime:
                 "inputs": inputs,
                 "request_id": request_id,
                 "seed": seed,
-                "reference": reference,
                 "temperature": temperature,
                 "top_k": top_k,
                 "top_p": top_p,

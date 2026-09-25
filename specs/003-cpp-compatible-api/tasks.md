@@ -413,8 +413,11 @@ the GPU smoke test.
 - [ ] T035 [P] [US1] Update `breeze_infer/templates.py` and `breeze_infer/audio.py`:
   - Port the `A:6fb3736` hunks: `ref_audio_codes` segments, `required_fields` without the path,
     `_check_reference_source`, the prefix/suffix split, `encode_prompt_waveform(tokenizer, wav,
-    sr)`, and `codec_fingerprint` (sha256 of `config.json`, codebooks, codebook size and sample
-    rate, with no path).
+    sr)`, and `codec_fingerprint` (sha256 of the codec config's required identity fields from
+    both `encoder_config` and `decoder_config` in `audio_tokenizer/config.json`, plus the
+    safetensors header -- tensor name/dtype/shape, not trained values -- of the one weight file
+    the codec loader actually reads; no path hashed; detects an architecture/shape/dtype change,
+    not a retrain of same-shaped weights).
   - Move `_pcm16` from the old `api.py` to `audio.pcm16`.
   - Remove `encode_prompt_audio(path)` and the temporary-file upload path.
 - [ ] T036 [P] [US1] Create `breeze_infer/reference_audio.py` (R9):
@@ -435,7 +438,7 @@ the GPU smoke test.
   - Build the `ReferenceSpec` variants.
   - Missing or blank `text` gives `400 text_required` (BC-10).
   - `tests/test_http_fields.py` covers defaults and parsing of valid values.
-- [ ] T038 [US1] Create `breeze_infer/synthesis.py`, the single-reference part (data-model
+- [X] T038 [US1] Create `breeze_infer/synthesis.py`, the single-reference part (data-model
   `Reference`, `Piece`):
   - the `Reference` variants;
   - `resolve_reference(spec, …)`: an inline reference is encoded once on the `GpuThread` into
