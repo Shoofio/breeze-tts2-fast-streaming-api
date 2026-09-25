@@ -79,7 +79,8 @@ phases as follows:
   - Add `tests/test_bench_api.py`, covering argument parsing and median maths.
 - [ ] T002 Record the performance baseline (quickstart Scenario 0.1, SC-007):
   1. Start the current API, `.venv/bin/python -m breeze_infer.api <model> --port 7860 --fast-all`.
-  2. Run `python -m breeze_infer.bench_api --api old --url http://127.0.0.1:7860 --runs 3`.
+  2. Run `python -m breeze_infer.bench_api --api old --url http://127.0.0.1:7860` (defaults:
+     `--warmup 3 --runs 10`; see "SC-007 method" below).
   3. Write the GPU name, commit SHA, command lines and medians to
      `specs/003-cpp-compatible-api/research/baseline-2026-09-24.md` (use the actual date).
 - [ ] T003 Update `requirements.txt` (R4, plan "Dependency changes"):
@@ -472,8 +473,9 @@ the GPU smoke test.
   - `503 loading` before ready.
 - [ ] T043 [US1] Create the GPU smoke test `tests/gpu/test_speech_http.py`: voice design and inline
   reference return a PCM stream of plausible length, with the whole app on the real runtime. Then
-  run `bench_api --api new` and compare with the T002 baseline, recording the numbers in
-  `research/bench-phase2.md`. If the time to first audio regresses more than 10%, stop and
+  run `bench_api --api new` and compare with the T002 baseline ("SC-007 method" below), recording
+  the numbers in `research/bench-phase2.md`. If a gating case's time to first audio regresses more
+  than 10%, stop and
   investigate before continuing (SC-007).
 
 **Checkpoint**: HTTP speech works end to end on the GPU.
@@ -846,7 +848,8 @@ on the new server.
   `specs/003-cpp-compatible-api/spec.md`, collect the test names under `tests/`, and assert that
   every BC-01 to BC-48 has at least one `test_bc_NN_*` whose docstring states the C++ behavior it
   rejects. Fill any gaps it reveals.
-- [ ] T082 Final benchmark (SC-007): `bench_api --api new`, 3 runs, compared with the T002 baseline.
+- [ ] T082 Final benchmark (SC-007): `bench_api --api new` (`--warmup 3 --runs 10`), compared with the
+  T002 baseline as described in "SC-007 method" below.
   Record it in `research/bench-final.md`. A regression over 10% blocks sign-off.
 - [ ] T083 [P] Rewrite `README.md`'s API section (SC-008, FR-038):
   - every endpoint, field, range, default and error code, from the contracts;
@@ -871,6 +874,19 @@ on the new server.
     Merge only after the user confirms.
 
 ---
+
+## SC-007 method (decided 2026-09-24, after T002)
+
+T002 showed that 3 runs with one warm-up leave cold runs in the median (medium_design: 223 ms over
+3 runs against a steady 75 ms over 10). So every benchmark in this feature (T002, T043, T054, T082)
+runs `--warmup 3 --runs 10`, and compares its 10-run medians with the T002 10-run medians.
+
+- **Gating cases:** `short_design`, `short_inline` and `medium_inline`. `medium_inline` has an
+  inline reference, so it is one piece on both APIs and stays like-for-like.
+- **Reported only:** `medium_design`, which becomes two anchored pieces on the new API by design,
+  and `short_voice`, which has no baseline.
+- **Context, not a gate:** TTFA min and p25 are reported too, because `short_design` TTFA is
+  bimodal.
 
 ## Dependencies & Execution Order
 

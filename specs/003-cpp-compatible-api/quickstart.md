@@ -34,7 +34,7 @@ These are also listed in the README development section (Constitution X).
 | Unit and integration tests (no GPU) | `.venv/bin/pytest` |
 | GPU tests | `BREEZE_MODEL=<path> .venv/bin/pytest -m gpu` |
 | Lint | `.venv/bin/ruff check .` |
-| Benchmark | `.venv/bin/python -m breeze_infer.bench_api --url http://127.0.0.1:8080 --runs 3` |
+| Benchmark | `.venv/bin/python -m breeze_infer.bench_api --url http://127.0.0.1:8080` (`--warmup 3 --runs 10` by default) |
 | SillyTavern live test | `node tests/live/sillytavern/run.mjs <phase>` (`health`, `voices`, `speech`, `full`) |
 | C++ docs example check | `.venv/bin/python -m tests.live.cpp_examples --url http://127.0.0.1:8080` |
 
@@ -123,8 +123,9 @@ These are also listed in the README development section (Constitution X).
    result must be a listed BC id (SC-001).
 2. **Breaking-change coverage:** `.venv/bin/pytest -k bc_` runs one test per BC id. Each fails
    against the C++ behavior, as recorded in the test docstrings (SC-002).
-3. **Performance:** the benchmark medians for time to first audio and real-time factor are within
-   10% of the Scenario 0 baseline (SC-007).
+3. **Performance:** the 10-run benchmark medians for time to first audio and real-time factor on
+   the gating cases (`short_design`, `short_inline`, `medium_inline`) are within 10% of the
+   Scenario 0 10-run baseline (SC-007; the method is in tasks.md "SC-007 method").
 4. **Documentation:** the README lists every endpoint, field, error code, launch option, WebSocket
    message and BC id (SC-008).
 5. **SillyTavern's own live suite:** `cd <SillyTavern checkout>/extensions/SillyTavern-BreezeTTS && npm
