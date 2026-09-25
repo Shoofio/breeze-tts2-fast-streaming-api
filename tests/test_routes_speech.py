@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -24,9 +25,10 @@ import soundfile as sf
 import torch
 from fastapi.testclient import TestClient
 
+from breeze_infer import routes_speech
 from breeze_infer.api import Components, create_app
 from breeze_infer.events import Emitter
-from breeze_infer.gpu import GpuGate, GpuThread
+from breeze_infer.gpu import GpuCloseTimeout, GpuGate, GpuSession, GpuThread
 from breeze_infer.routes_health import Readiness
 from breeze_infer.settings import settings_from_args
 from tests.fakes import (
@@ -414,5 +416,178 @@ def test_gate_is_released_when_the_first_step_is_done_with_no_audio() -> None:
         assert response.status_code == 500
         assert response.json() == {"error": "internal error", "code": "internal_error"}
         assert _gate_is_free(components)
+    finally:
+        components.gpu.shutdown()
+
+
+# --- the CPU room check has its own tokenizer (HF fast tokenizers aren't shareable) ----------
+
+
+class _ThreadRecordingTokenizer(FakeTokenizer):
+    """Records which thread called it; a deep copy is a fresh recorder, kept in `copies`."""
+
+    def __init__(self) -> None:
+        self.threads: list[str] = []
+        self.copies: list[_ThreadRecordingTokenizer] = []
+
+    def __call__(self, text: str, **kwargs: Any) -> Any:
+        self.threads.append(threading.current_thread().name)
+        return super().__call__(text, **kwargs)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _ThreadRecordingTokenizer:
+        copied = _ThreadRecordingTokenizer()
+        self.copies.append(copied)
+        return copied
+
+
+def test_the_cpu_room_check_never_uses_the_gpu_threads_tokenizer() -> None:
+    readiness = Readiness()
+    components = _build_components(readiness)
+    try:
+        runtime = _fake_runtime()
+        tokenizer = _ThreadRecordingTokenizer()
+        runtime.tokenizer = tokenizer
+        readiness.mark_ready(runtime)
+        client = _client_for(components)
+
+        for _ in range(2):
+            assert client.post(SPEECH_PATH, data={"text": "hello there"}).status_code == 200
+
+        assert tokenizer.threads
+        assert all(name.startswith("breeze-gpu") for name in tokenizer.threads)
+        [copied] = tokenizer.copies  # copied once, then reused
+        assert copied.threads
+        assert not any(name.startswith("breeze-gpu") for name in copied.threads)
+    finally:
+        components.gpu.shutdown()
+
+
+# --- events: frame prediction, pieces ---------------------------------------------------------
+
+
+class _ExtraFrameCodec(FakeCodec):
+    """Encodes one frame more than `reference_audio.predicted_frames` predicts."""
+
+    def encode(self, wav: Any, sr: int, return_dict: bool = True) -> Any:
+        output = super().encode(wav, sr)
+        codes = output.audio_codes[0]
+        output.audio_codes[0] = torch.cat([codes, codes[-1:]])
+        return output
+
+
+def test_a_frame_prediction_mismatch_is_reported_and_the_request_still_succeeds() -> None:
+    readiness = Readiness()
+    events = RecordingEvents()
+    components = _build_components(readiness, events=events)
+    try:
+        runtime = _fake_runtime()
+        runtime.audio_tokenizer = _ExtraFrameCodec()
+        readiness.mark_ready(runtime)
+        client = _client_for(components)
+
+        response = client.post(
+            SPEECH_PATH,
+            data={"text": "hello there", "ref_text": "a reference transcript"},
+            files={"ref_audio": ("ref.wav", _wav_bytes(), "audio/wav")},
+        )
+
+        assert response.status_code == 200
+        [mismatch] = [f for name, f in events.calls if name == "speech.frame_prediction_mismatch"]
+        assert mismatch["level"] == "warning"
+        assert mismatch["request_id"] == response.headers["x-request-id"]
+        assert mismatch["actual_frames"] == mismatch["predicted_frames"] + 1
+    finally:
+        components.gpu.shutdown()
+
+
+def test_piece_done_is_emitted_for_every_piece() -> None:
+    readiness = Readiness()
+    events = RecordingEvents()
+    components = _build_components(readiness, split_chars=15, events=events)
+    try:
+        runtime = _fake_runtime(chunks=2)
+        readiness.mark_ready(runtime)
+        client = _client_for(components)
+
+        # With a reference there is no opening budget: three pieces of one sentence each.
+        response = client.post(
+            SPEECH_PATH,
+            data={"text": "Hi there. Go now yes. See you soon.", "ref_text": "a transcript"},
+            files={"ref_audio": ("ref.wav", _wav_bytes(), "audio/wav")},
+        )
+
+        assert response.status_code == 200
+        done = [f for name, f in events.calls if name == "speech.piece_done"]
+        assert [(f["piece_index"], f["frames"]) for f in done] == [(0, 2), (1, 2), (2, 2)]
+        assert {f["request_id"] for f in done} == {response.headers["x-request-id"]}
+    finally:
+        components.gpu.shutdown()
+
+
+# --- a failing close before the 200 is reported, never raised (finding 6) --------------------
+
+
+def _session_whose_close_fails(error: BaseException) -> type[GpuSession[Any]]:
+    class _FailingCloseSession(GpuSession[Any]):
+        async def aclose(self) -> None:
+            await super().aclose()  # the gate is released as usual
+            raise error
+
+    return _FailingCloseSession
+
+
+@pytest.mark.parametrize(
+    ("runtime_kwargs", "outcome"),
+    [
+        ({"fail_after": 0}, "request.failed"),  # priming raised: the `except` cleanup
+        ({"chunks": 0}, "speech.failed"),  # priming found no audio: the DONE branch
+    ],
+)
+def test_a_close_failure_before_the_200_is_reported_not_raised(
+    monkeypatch: pytest.MonkeyPatch, runtime_kwargs: dict[str, Any], outcome: str
+) -> None:
+    monkeypatch.setattr(
+        routes_speech, "GpuSession", _session_whose_close_fails(RuntimeError("close broke"))
+    )
+    readiness = Readiness()
+    events = RecordingEvents()
+    components = _build_components(readiness, events=events)
+    try:
+        readiness.mark_ready(_fake_runtime(**runtime_kwargs))
+        client = _client_for(components)
+
+        response = client.post(SPEECH_PATH, data={"text": "hello there"})
+
+        # The original failure reaches the client, not the close error.
+        assert response.status_code == 500
+        request_id = response.headers["x-request-id"]
+        [close_failed] = [f for name, f in events.calls if name == "gpu.close_failed"]
+        assert close_failed["request_id"] == request_id
+        assert "close broke" in str(close_failed["error"])
+        assert [f["request_id"] for name, f in events.calls if name == outcome] == [request_id]
+        assert _gate_is_free(components)
+    finally:
+        components.gpu.shutdown()
+
+
+def test_a_close_timeout_before_the_200_is_left_to_the_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate's `on_poisoned` reports a close timeout (`gpu.close_timeout`), so the route
+    doesn't report it a second time as `gpu.close_failed`."""
+    monkeypatch.setattr(
+        routes_speech, "GpuSession", _session_whose_close_fails(GpuCloseTimeout("still closing"))
+    )
+    readiness = Readiness()
+    events = RecordingEvents()
+    components = _build_components(readiness, events=events)
+    try:
+        readiness.mark_ready(_fake_runtime(chunks=0))
+        client = _client_for(components)
+
+        response = client.post(SPEECH_PATH, data={"text": "hello there"})
+
+        assert response.status_code == 500
+        assert [name for name, _ in events.calls if name == "gpu.close_failed"] == []
     finally:
         components.gpu.shutdown()

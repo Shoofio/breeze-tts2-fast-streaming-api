@@ -137,7 +137,15 @@ The resolved reference for a request or session. It is never exposed on the wire
 | prefix | `ReferencePrefix` (cached KV) plus the stored `ref_text`, for a saved or unnamed voice with no override |
 
 Transitions: `none` becomes `codes(anchor)` after piece 0 succeeds with at least one non-pad
-frame. It never happens on cancel, on failure, or when piece 0 produced zero frames.
+frame. It never happens on cancel, on failure, or when piece 0 produced zero frames. It is also
+skipped, with `speech.anchor_skipped` (`piece_index` 0, `reason`), when:
+- `piece_truncated`: piece 0 used its whole frame limit (its cap or its room), so it stopped
+  there rather than at EOS;
+- `no_room`: with the anchor as its reference, some later piece would have less than
+  `MIN_SUFFIX_FRAMES` (12) frames of context room (a room limited by the piece's own cap doesn't
+  count). The anchor is never trimmed to fit: its codes must stay paired with its text.
+
+A skipped anchor leaves the later pieces as voice design.
 
 ## Piece
 
@@ -145,7 +153,9 @@ frame. It never happens on cancel, on failure, or when piece 0 produced zero fra
 - Its token cap is `min(max_new_tokens or 750, room)`.
 - A room of 0 fails: `400 text_too_long` for piece 0 before streaming, or an aborted stream for a
   later piece.
-- A room that is smaller than the cap clamps the piece and emits `speech.piece_clamped`.
+- A room that is smaller than the cap clamps the piece and emits `speech.piece_clamped`
+  (`piece_index`, `requested`: the client's `max_new_tokens` or null for the default, `cap`:
+  the server-clamped value, `room`).
 
 ## Voice
 
@@ -280,8 +290,9 @@ offending record's field names), so one bad field never breaks the request emitt
     `gpu.close_timeout` (a `gen.close()` ran past 30 s: the GPU gate is poisoned and `/health`
     answers `503 gpu_unavailable` until restart);
   - voices: `voices.loaded`, `voice.skipped`, `voice.created`, `voice.deleted`;
-  - speech: `speech.accepted`, `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`,
-    `speech.piece_done` (`piece_index`, `frames`), `speech.completed` (`rtf`),
+  - speech: `speech.accepted`, `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`
+    (`piece_index`, `requested`, `cap`, `room`), `speech.anchor_skipped` (`piece_index`,
+    `reason`: `piece_truncated` or `no_room`), `speech.piece_done` (`piece_index`, `frames`), `speech.completed` (`rtf`),
     `speech.failed`, `speech.aborted`, `speech.frame_prediction_mismatch`
     (`predicted_frames`, `actual_frames`);
   - WebSocket: `ws.connected`, `ws.rejected` (`reason`), `ws.closed` (`code`), `ws.piece`;

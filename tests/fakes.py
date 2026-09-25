@@ -288,7 +288,7 @@ class FakeCodec:
 @dataclass(frozen=True)
 class FakeStreamingConfig:
     """The subset of ``models.fast_streaming.FastStreamingConfig`` that
-    ``FakeRuntime.max_new_tokens_room``/``_frame_cap``/``_context_room`` read
+    ``FakeRuntime.max_new_tokens_room``/``frame_cap``/``_context_room`` read
     (``max_new_tokens``, the per-request ceiling; ``max_seq_len``, the context length;
     ``fast_backbone_prefill``, whether the prefill bucket-pads). A plain local
     dataclass, not the real one: constructing a `FakeRuntime` must never import
@@ -402,7 +402,7 @@ class FakeRuntime:
       ``FakeStreamingConfig.max_new_tokens`` defaults to 1500, the deployed server's
       ceiling -- then the context room from the prefill length) by calling the real
       ``_require_valid_overrides`` and ``_branch_shape`` helpers and porting
-      ``_frame_cap``'s two-line rule directly. ``_context_room`` uses the **exact**
+      ``frame_cap``'s two-line rule directly. ``_context_room`` uses the **exact**
       prompt length by default and bucket-pads to the nearest
       ``_PREFILL_TOKEN_GRANULARITY`` (32) only when ``self.config.fast_backbone_prefill``
       is set -- mirroring ``_prefill_plan``'s own default (``FastStreamingConfig
@@ -501,8 +501,8 @@ class FakeRuntime:
         self.calls: list[dict[str, Any]] = []
         self.closed = 0
 
-    def _frame_cap(self, requested: int | None) -> int:
-        """Ports ``FastBreezeStreamingRuntime._frame_cap`` exactly (it's two lines and
+    def frame_cap(self, requested: int | None) -> int:
+        """Ports ``FastBreezeStreamingRuntime.frame_cap`` exactly (it's two lines and
         pure Python -- no need to import the real one just for this)."""
         if requested is None:
             requested = self.default_max_new_tokens or self.config.max_new_tokens
@@ -518,7 +518,7 @@ class FakeRuntime:
         from models.fast_streaming import _require_valid_overrides
 
         _require_valid_overrides(max_new_tokens=requested)
-        return min(self._frame_cap(requested), self._context_room(inputs, prefix_len))
+        return min(self.frame_cap(requested), self._context_room(inputs, prefix_len))
 
     def _context_room(self, inputs: dict[str, Any], prefix_len: int) -> int:
         """The real ``_context_room``/``_prefill_plan`` rule: exact prompt length by

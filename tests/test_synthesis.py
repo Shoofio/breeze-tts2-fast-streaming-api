@@ -21,18 +21,25 @@ from breeze_infer.reference_audio import DecodedAudio
 from breeze_infer.synthesis import (
     CodesRef,
     NoRef,
+    PieceRoom,
     codec_samples_per_frame,
     generate_piece,
+    piece_frame_limit,
+    piece_room,
     piece_seed,
+    predicted_room,
     prepare_piece,
     ramp_pcm,
     resolve_reference,
+    stand_in_reference,
 )
+from models.fast_streaming import NoRoomError
 from tests.fakes import (
     CODEC_SAMPLES_PER_FRAME,
     FakeCodec,
     FakeRuntime,
     FakeTokenizer,
+    RecordingEvents,
     fake_model,
     model_with_codec_facts,
 )
@@ -464,3 +471,84 @@ def test_codec_samples_per_frame_without_the_accessor_raises() -> None:
 
     with pytest.raises(TypeError, match="get_decode_upsample_rate"):
         codec_samples_per_frame(runtime)
+
+
+def test_piece_room_takes_the_cap_from_the_runtimes_public_frame_cap() -> None:
+    runtime = SimpleNamespace(
+        frame_cap=lambda requested: 40,
+        max_new_tokens_room=lambda requested, inputs: 25,
+    )
+
+    assert piece_room(runtime, {}, None) == PieceRoom(cap=40, room=25)
+
+
+# --- predicted_room: piece 0's room before the gate (review 26b #7) ----------------------------
+
+
+@pytest.mark.parametrize("cfg_scale", [1.0, 2.5, 0.0])
+def test_predicted_room_matches_the_room_of_the_real_inputs(cfg_scale: float) -> None:
+    """`predicted_room` builds its inputs with a model view that has only `config` and
+    `device`. This fails (AttributeError) if `templates.prepare_inputs` ever reads more of the
+    model, on any branch: no CFG, CFG with a negative prompt, and a reference."""
+    runtime = FakeRuntime()
+    runtime.model = model_with_codec_facts()
+    codes = torch.zeros((7, 16), dtype=torch.int16)
+    for reference in (NoRef(), CodesRef(codes=codes, ref_text="a reference transcript")):
+        real = prepare_piece(
+            FakeTokenizer(), runtime.model, reference, "Hello there.", "Speak.", cfg_scale
+        )
+
+        predicted = predicted_room(
+            runtime, FakeTokenizer(), reference, "Hello there.", "Speak.", cfg_scale, None
+        )
+
+        assert predicted == piece_room(runtime, real, None)
+
+
+@pytest.mark.xfail(
+    reason="T066: a voice_id reference has no stand-in until the voice registry is wired; "
+    "a voice_id request must not 500 before the gate (review 26b #6)",
+    raises=TypeError,
+    strict=True,
+)
+def test_a_voice_reference_has_a_stand_in_for_the_pre_gate_room_check() -> None:
+    stand_in_reference(VoiceRef(voice_id="alice", ref_text_override=None), None, 16)
+
+
+# --- piece_frame_limit: clamping (FR-036a, review 26b #9) ---------------------------------------
+
+
+def test_a_clamped_piece_reports_the_clients_request_the_cap_and_the_room() -> None:
+    events = RecordingEvents()
+
+    limit = piece_frame_limit(
+        PieceRoom(cap=750, room=30), events, request_id="r", piece_index=2, requested=None
+    )
+
+    assert limit == 30
+    assert events.calls == [
+        (
+            "speech.piece_clamped",
+            {
+                "level": "warning",
+                "request_id": "r",
+                "piece_index": 2,
+                "requested": None,
+                "cap": 750,
+                "room": 30,
+            },
+        )
+    ]
+
+
+def test_a_piece_within_its_cap_is_not_clamped_and_no_room_raises() -> None:
+    events = RecordingEvents()
+
+    assert piece_frame_limit(
+        PieceRoom(cap=50, room=50), events, request_id="r", piece_index=0, requested=50
+    ) == 50
+    with pytest.raises(NoRoomError):
+        piece_frame_limit(
+            PieceRoom(cap=50, room=0), events, request_id="r", piece_index=1, requested=50
+        )
+    assert events.calls == []

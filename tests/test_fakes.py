@@ -165,7 +165,7 @@ def test_max_new_tokens_room_none_uses_default_then_config_ceiling() -> None:
     runtime = FakeRuntime(default_max_new_tokens=5)
     assert runtime.max_new_tokens_room(None, _room_inputs(10)) == 5
     # ...and a model with no default of its own (default_max_new_tokens=None) falls back
-    # to the ceiling alone, same as the real runtime's _frame_cap.
+    # to the ceiling alone, same as the real runtime's frame_cap.
     runtime = FakeRuntime(default_max_new_tokens=None, config=FakeStreamingConfig(max_seq_len=2048))
     assert runtime.max_new_tokens_room(None, _room_inputs(10)) == 1500
 

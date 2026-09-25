@@ -26,11 +26,13 @@ from breeze_infer.limits import ANCHOR_CHARS
 from breeze_infer.routes_health import Readiness
 from breeze_infer.synthesis import CodesRef, NoRef, anchor_codes, prepare_piece
 from breeze_infer.text_split import split_text
+from models.fast_streaming import MIN_SUFFIX_FRAMES
 from tests.fakes import (
     CODEC_CODEBOOKS,
     FakeStreamingConfig,
     FakeTokenizer,
     RecordingEvents,
+    codec_frame_count,
     model_with_codec_facts,
 )
 from tests.test_routes_speech import (
@@ -45,11 +47,16 @@ from tests.test_speech_abort import LiveServer, wait_until
 PAD = 2050  # fake_model()'s codebook_pad_token_id, as the real checkpoint's
 INSTRUCTION = "Speak calmly."
 
-# Six sentences of about 60 characters: with split_chars=100 and the 200-character opening
-# budget, piece 0 packs three of them and every later piece one.
+# Six sentences of about 60 characters: with split_chars=100, every piece is one of them.
 SENTENCES = " ".join(
     f"Sentence number {n} is here to fill out the long passage well." for n in range(6)
 )
+
+
+def _no_reference_pieces(text: str, split_chars: int) -> list[str]:
+    """How the route splits `text` with no reference: the opening budget, capped at the
+    piece budget so piece 0 is never the largest (review 26b #3)."""
+    return split_text(text, budget=split_chars, first_budget=min(ANCHOR_CHARS, split_chars))
 
 
 def _frame(value: int) -> torch.Tensor:
@@ -141,7 +148,7 @@ def test_first_piece_anchors_every_later_piece(
 ) -> None:
     runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(PAD), _frame(7)])
     env = _env(envs, runtime, split_chars=100)
-    pieces = split_text(SENTENCES, budget=100, first_budget=ANCHOR_CHARS)
+    pieces = _no_reference_pieces(SENTENCES, 100)
     assert len(pieces) >= 3
 
     response = env.speak(text=SENTENCES)
@@ -227,7 +234,7 @@ def test_the_opening_budget_applies_only_without_a_reference(
     with_reference = [p["text"] for p in prepared]
 
     assert response.status_code == 200
-    assert no_reference == split_text(text, budget=600, first_budget=ANCHOR_CHARS)
+    assert no_reference == _no_reference_pieces(text, 600)
     assert with_reference == split_text(text, budget=600)
     assert no_reference[0] != with_reference[0]  # only the first piece is packed differently
 
@@ -295,34 +302,42 @@ def _gate_is_free(gate: GpuGate, server: LiveServer) -> bool:
 
 
 def test_bc_47_later_piece_without_room_aborts_the_stream(envs: list[Env]) -> None:
-    """Piece 0 fits; piece 1, carrying piece 0's text and frames as its anchor, doesn't. The
-    200 is already out by then, so the stream ends without the chunked terminator (FR-013)."""
-    frames = [_frame(5), _frame(6)]
-    pieces = split_text(SENTENCES, budget=100, first_budget=ANCHOR_CHARS)
-    anchor = CodesRef(codes=torch.stack(frames), ref_text=pieces[0])
-    piece_0_len = _seq_len(NoRef(), pieces[0])
-    piece_1_len = _seq_len(anchor, pieces[1])
-    assert piece_1_len > piece_0_len + 1
-    # Piece 0 has room for its 2 frames; piece 1's prompt fills the context exactly.
-    max_seq_len = piece_1_len + 1
-    runtime = _fake_runtime(
-        chunks=2, frames=frames, config=FakeStreamingConfig(max_seq_len=max_seq_len)
+    """Piece 0 fits; piece 1, a much longer sentence with the same reference, doesn't. The
+    200 is already out by then, so the stream ends without the chunked terminator (FR-013).
+    A reference, not an anchor: an anchor that leaves no room is skipped instead (#4)."""
+    wav = _wav_bytes()
+    reference = CodesRef(
+        codes=torch.zeros((codec_frame_count(8000, 16000), CODEC_CODEBOOKS), dtype=torch.int16),
+        ref_text="a reference transcript",
     )
-    env = _env(envs, runtime, split_chars=100)
+    long_sentence = " ".join(["This long sentence keeps going"] * 9) + "."
+    text = f"Short one. {long_sentence}"
+    pieces = split_text(text, budget=285)
+    assert pieces == ["Short one.", long_sentence]
+    # Piece 0 has room for its frames; piece 1's prompt fills the context exactly.
+    max_seq_len = _seq_len(reference, pieces[1]) + 1
+    assert max_seq_len - _seq_len(reference, pieces[0]) - 1 >= 2
+    runtime = _fake_runtime(chunks=2, config=FakeStreamingConfig(max_seq_len=max_seq_len))
+    env = _env(envs, runtime)
     server = LiveServer(create_app(env.components))
     try:
         received = bytearray()
         url = f"http://127.0.0.1:{server.port}{SPEECH_PATH}"
+        data = {
+            "text": text,
+            "instruction": INSTRUCTION,
+            "ref_text": reference.ref_text,
+            "split_chars": "285",
+        }
+        files = {"ref_audio": ("ref.wav", wav, "audio/wav")}
         with (
             httpx.Client(timeout=10) as client,
-            client.stream(
-                "POST", url, data={"text": SENTENCES, "instruction": INSTRUCTION}
-            ) as response,
+            client.stream("POST", url, data=data, files=files) as response,
         ):
             assert response.status_code == 200
             with pytest.raises(httpx.RemoteProtocolError):
-                for data in response.iter_raw():
-                    received += data
+                for data_chunk in response.iter_raw():
+                    received += data_chunk
 
         assert len(received) > 0  # piece 0's audio went out before the failure
         assert len(runtime.calls) == 1  # piece 1 never started
@@ -336,17 +351,19 @@ def test_bc_47_later_piece_without_room_aborts_the_stream(envs: list[Env]) -> No
 
 def test_partial_room_clamps_and_emits_piece_clamped(envs: list[Env]) -> None:
     """FR-036a: piece 1 has room to start but less than its cap. It is generated up to the
-    room, ends normally, and the server records `speech.piece_clamped`."""
-    frames = [_frame(n) for n in range(1, 11)]
-    pieces = split_text(SENTENCES, budget=100, first_budget=ANCHOR_CHARS)
+    room, ends normally, and the server records `speech.piece_clamped` with the client's
+    `requested`, the server's `cap` and the `room`."""
+    frames = [_frame(n) for n in range(1, 41)]
+    pieces = _no_reference_pieces(SENTENCES, 100)
     anchor = CodesRef(codes=torch.stack(frames), ref_text=pieces[0])
-    room = 5
+    room = 30
+    assert room >= MIN_SUFFIX_FRAMES  # enough that the anchor is kept (#4)
     max_seq_len = _seq_len(anchor, pieces[1]) + 1 + room
     cap = 50
-    # Piece 0's prompt is much shorter, so it keeps its full cap; only piece 1 is clamped.
+    # Piece 0's prompt is much shorter, so it keeps its full cap; only later pieces clamp.
     assert max_seq_len - _seq_len(NoRef(), pieces[0]) - 1 >= cap
     runtime = _fake_runtime(
-        chunks=10, frames=frames, config=FakeStreamingConfig(max_seq_len=max_seq_len)
+        chunks=40, frames=frames, config=FakeStreamingConfig(max_seq_len=max_seq_len)
     )
     env = _env(envs, runtime, split_chars=100)
 
@@ -356,13 +373,77 @@ def test_partial_room_clamps_and_emits_piece_clamped(envs: list[Env]) -> None:
     clamped = _events(env.events, "speech.piece_clamped")
     # Every later piece carries the same anchor and a same-length sentence, so each is
     # clamped alike; piece 0 is not.
-    assert [(e["piece_index"], e["requested"], e["room"]) for e in clamped] == [
-        (index, cap, room) for index in range(1, len(pieces))
+    assert [(e["piece_index"], e["requested"], e["cap"], e["room"]) for e in clamped] == [
+        (index, cap, cap, room) for index in range(1, len(pieces))
     ]
     assert clamped[0]["request_id"] == response.headers["x-request-id"]
     assert runtime.calls[0]["max_new_tokens"] == cap
     assert runtime.calls[1]["max_new_tokens"] == room
+    assert runtime.calls[1]["inputs"]["input_values"] is not None  # anchored
     done = {e["piece_index"]: e["frames"] for e in _events(env.events, "speech.piece_done")}
-    assert done[0] == 10
+    assert done[0] == 40
     assert done[1] == room
     assert len(_events(env.events, "speech.completed")) == 1
+
+
+# --- when piece 0 is not used as the anchor (review 26b #2, #4) --------------------------------
+
+
+def test_a_truncated_piece_0_is_not_an_anchor(
+    envs: list[Env], prepared: list[dict[str, Any]]
+) -> None:
+    """Piece 0 stopped at its cap, not at EOS: its audio may end mid-word, so it doesn't
+    anchor, and the later pieces stay voice design."""
+    runtime = _fake_runtime(chunks=10, frames=[_frame(n) for n in range(1, 11)])
+    env = _env(envs, runtime, split_chars=100)
+
+    response = env.speak(text=SENTENCES, max_new_tokens="3")
+
+    assert response.status_code == 200
+    assert all(isinstance(p["reference"], NoRef) for p in prepared)
+    [skipped] = _events(env.events, "speech.anchor_skipped")
+    assert skipped["reason"] == "piece_truncated"
+    assert skipped["piece_index"] == 0
+    assert skipped["request_id"] == response.headers["x-request-id"]
+
+
+def test_an_anchor_that_leaves_a_later_piece_too_little_room_is_skipped(
+    envs: list[Env], prepared: list[dict[str, Any]]
+) -> None:
+    """With piece 0 as its reference, piece 1 would have less than MIN_SUFFIX_FRAMES left. The
+    anchor is skipped whole (never trimmed: its codes must match its text), and the later
+    pieces are voice design, which fits."""
+    frames = [_frame(n) for n in range(1, 5)]
+    pieces = _no_reference_pieces(SENTENCES, 100)
+    anchor = CodesRef(codes=torch.stack(frames), ref_text=pieces[0])
+    max_seq_len = _seq_len(anchor, pieces[1]) + 1 + (MIN_SUFFIX_FRAMES - 1)
+    runtime = _fake_runtime(
+        chunks=4, frames=frames, config=FakeStreamingConfig(max_seq_len=max_seq_len)
+    )
+    env = _env(envs, runtime, split_chars=100)
+
+    response = env.speak(text=SENTENCES)
+
+    assert response.status_code == 200
+    # The anchor was tried for piece 1 first; each piece's last preparation is what ran.
+    used = {p["text"]: p["reference"] for p in prepared}
+    assert list(used) == pieces
+    assert all(isinstance(reference, NoRef) for reference in used.values())
+    [skipped] = _events(env.events, "speech.anchor_skipped")
+    assert skipped["reason"] == "no_room"
+    assert len(_events(env.events, "speech.completed")) == 1
+
+
+def test_split_chars_below_the_opening_budget_does_not_make_piece_0_the_largest(
+    envs: list[Env], prepared: list[dict[str, Any]]
+) -> None:
+    text = " ".join(f"Short sentence {n} of the long text here." for n in range(12))
+    env = _env(envs, _fake_runtime(chunks=1, frames=[_frame(5)]), split_chars=100)
+
+    response = env.speak(text=text)
+
+    assert response.status_code == 200
+    lengths = [len(p["text"]) for p in prepared]
+    assert len(lengths) > 2
+    assert lengths[0] <= 100
+    assert lengths[0] <= max(lengths[1:])

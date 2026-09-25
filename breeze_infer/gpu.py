@@ -21,6 +21,7 @@ import asyncio
 import enum
 import threading
 import time
+import traceback
 from collections import deque
 from collections.abc import Callable, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -182,6 +183,27 @@ class GpuCloseTimeout(Exception):
     gate (`GpuGate.poison`), so no later request runs on a GPU that may still be occupied, and
     the server reports itself unhealthy until restarted. The caller logs it.
     """
+
+
+def report_close_failed(events: Any, error: BaseException, *, request_id: str | None = None) -> None:
+    """Emit `gpu.close_failed` for a `gen.close()` that raised; the one reporter for it.
+
+    Used for a close no request saw (`GpuThread`'s `on_close_error`, wired in `api.main`) and
+    for a close the speech route had to swallow so its own failure reaches the client
+    (`routes_speech.py`), which passes its `request_id`. A `GpuCloseTimeout` is skipped: the
+    close hasn't failed, it is still running, and the gate's `on_poisoned` callback already
+    reports that as `gpu.close_timeout`. `events` is duck-typed (`events.Emitter.emit`).
+    """
+    if isinstance(error, GpuCloseTimeout):
+        return
+    fields = {} if request_id is None else {"request_id": request_id}
+    events.emit(
+        "gpu.close_failed",
+        level="error",
+        error=repr(error),
+        traceback="".join(traceback.format_exception(error)),
+        **fields,
+    )
 
 
 # How long a caller waits for `gen.close()`. A close normally waits behind at most one

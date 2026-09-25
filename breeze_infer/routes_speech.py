@@ -12,7 +12,7 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
 2. `read_fields` and `parse_speech` (`http_fields.py`) -- field syntax, ranges and the
    `reference_conflict`/`ref_text_required`/`reference_required` checks all happen inside
    `parse_speech` already;
-3. `split_text` and the "nothing to speak" check are CPU-only, so they run here too, before
+3. `split_text` and the "nothing to speak" safety net are CPU-only, so they run here too, before
    the voice lookup, the reference decode and the busy check (review-agent pass 1, finding 1:
    FR-007 puts every `400`/`404` before `409 busy`, and this is a `400` this phase can already
    produce; T046 review: it's still stage 2, "field syntax and ranges", a property of `text`
@@ -45,11 +45,9 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
    while the contract says every `500` closes the connection (finding 5), which only happens
    when `ServerErrorMiddleware` sees an exception it re-raises after answering.
 
-`request_id` is set on `http_request.state` as the first thing this route does (finding 4), so
-even a failure the catch-all `Exception` handler reports (`request.failed`) correlates with the
-same id a client's own `X-Request-Id` header would show. `ApiError`s raised anywhere in here are
-caught once, at the very end, purely to add that header to the response too -- `errors.py`'s own
-`ApiError` handler has no request to read an id from otherwise.
+The request's id comes from `request_id.RequestIdMiddleware` (`request.state.request_id`), which
+also stamps it on every response as `X-Request-Id`, errors included, so this route's `speech.*`
+events, a `request.failed` from the catch-all handler and the client's header all agree.
 
 `speech.accepted` is emitted once a request has cleared every check above and is about to start
 generating (piece count, reference kind); `speech.first_audio` once priming actually produced
@@ -68,8 +66,7 @@ itself since no `SpeechResponse` is ever built for it.
 # which refers to the local `components`, when the route is defined (routes_health.py does the
 # same, for the same reason).
 import asyncio
-import contextlib
-import traceback
+import copy
 from collections.abc import AsyncGenerator, Callable, Iterator
 from typing import Annotated, Any, Protocol
 
@@ -77,9 +74,9 @@ from fastapi import Depends, FastAPI, Request
 from starlette.responses import Response
 
 from breeze_infer import reference_audio
-from breeze_infer.errors import ApiError, api_error_response
+from breeze_infer.errors import ApiError
 from breeze_infer.events import Emitter
-from breeze_infer.gpu import DONE, GpuGate, GpuSession, GpuThread
+from breeze_infer.gpu import DONE, GpuGate, GpuSession, GpuThread, report_close_failed
 from breeze_infer.http_fields import (
     InlineRef,
     NoReference,
@@ -110,7 +107,7 @@ from breeze_infer.synthesis import (
     stand_in_reference,
 )
 from breeze_infer.text_split import split_text
-from models.fast_streaming import NoRoomError
+from models.fast_streaming import MIN_SUFFIX_FRAMES, NoRoomError
 
 
 class SpeechComponents(Protocol):
@@ -166,8 +163,44 @@ def _check_frame_prediction(
     )
 
 
+def _opening_budget(request: SpeechRequest) -> int:
+    """`split_text`'s `first_budget`: the soft opening budget with no reference, but never
+    more than `split_chars`, so piece 0 is never the largest piece and this agrees with the
+    streaming `segment()` path, which drops the opening budget when it isn't smaller
+    (review 26b #3). `0` (no opening piece) with a reference or with no length splitting."""
+    if not isinstance(request.reference, NoReference) or request.split_chars <= 0:
+        return 0
+    return min(ANCHOR_CHARS, request.split_chars)
+
+
+class CpuTokenizer:
+    """The tokenizer the CPU-side room check uses: a copy of the runtime's, never the same
+    object.
+
+    `_check_first_piece_room` tokenizes on a worker thread while the GPU thread may be using
+    the runtime's tokenizer for another request's piece. A Hugging Face fast tokenizer is one
+    Rust object behind a borrow checker, and using it from two threads at once can fail with
+    "Already borrowed", so the check gets its own instance. It is deep-copied once, on first
+    use, and on the GPU thread, so the copy itself never overlaps the GPU thread's own use of
+    the original; a new runtime (a different tokenizer object) gets a fresh copy.
+    """
+
+    def __init__(self, gpu: GpuThread) -> None:
+        self._gpu = gpu
+        self._source: Any = None
+        self._copy: Any = None
+
+    async def get(self, tokenizer: Any) -> Any:
+        if self._source is not tokenizer:
+            # Two first requests may both copy; either copy is as good, so no lock.
+            copied = await self._gpu.run(copy.deepcopy, tokenizer)
+            self._source, self._copy = tokenizer, copied
+        return self._copy
+
+
 async def _check_first_piece_room(
     runtime: Any,
+    tokenizer: Any,
     request: SpeechRequest,
     text: str,
     decoded_audio: reference_audio.DecodedAudio | None,
@@ -177,7 +210,8 @@ async def _check_first_piece_room(
     FR-007 puts every `400` before `409 busy`, so this can't wait for the codec: an inline
     reference is sized by its *predicted* frame count (`stand_in_reference`), and the inputs
     are built on the CPU (`predicted_room`). It runs on a worker thread, not the event loop,
-    because tokenizing a long piece is blocking CPU work. The real inputs are checked again
+    because tokenizing a long piece is blocking CPU work, with `tokenizer`, the check's own
+    copy (`CpuTokenizer`), never the one the GPU thread uses. The real inputs are checked again
     on the GPU thread once the reference is encoded (`_prepare_first_piece`), which covers a
     codec whose frame count differs from the prediction.
     """
@@ -189,6 +223,7 @@ async def _check_first_piece_room(
     room = await asyncio.to_thread(
         predicted_room,
         runtime,
+        tokenizer,
         stand_in,
         text,
         request.instruction,
@@ -262,27 +297,34 @@ def _iter_pieces(
     it, and no room raises `NoRoomError`, which aborts the stream once the `200` is out
     (BC-47). With no reference, piece 0's frames are collected through the runtime's
     `token_observer` and, once piece 0 has finished, become every later piece's reference
-    together with its text (`anchor_codes`). Only piece 0 can anchor (data-model.md
-    "Reference"): if it produced no non-pad frame, the later pieces stay voice design. A
-    cancelled or failed piece 0 never reaches the anchoring step at all.
+    together with its text, unless `_anchor_for_later_pieces` decides against it. Only piece
+    0 can anchor (data-model.md "Reference"); without an anchor the later pieces stay voice
+    design. A cancelled or failed piece 0 never reaches the anchoring step at all.
     """
     anchoring = isinstance(reference, NoRef) and len(pieces) > 1
-    pad_id = int(runtime.model.config.codebook_pad_token_id)
+    anchored_inputs: list[dict[str, Any]] = []  # later pieces' inputs, built with the anchor
     for index, text in enumerate(pieces):
         if index == 0:
             inputs, room = first_inputs, first_room
         else:
-            inputs = prepare_piece(
-                runtime.tokenizer,
-                runtime.model,
-                reference,
-                text,
-                request.instruction,
-                request.cfg_scale,
-            )
+            if anchored_inputs:
+                inputs = anchored_inputs[index - 1]
+            else:
+                inputs = prepare_piece(
+                    runtime.tokenizer,
+                    runtime.model,
+                    reference,
+                    text,
+                    request.instruction,
+                    request.cfg_scale,
+                )
             room = piece_room(runtime, inputs, request.max_new_tokens)
         max_new_tokens = piece_frame_limit(
-            room, events, request_id=request_id, piece_index=index
+            room,
+            events,
+            request_id=request_id,
+            piece_index=index,
+            requested=request.max_new_tokens,
         )
         frames: list[Any] | None = [] if anchoring and index == 0 else None
         piece_bytes = 0
@@ -310,9 +352,108 @@ def _iter_pieces(
             frames=piece_bytes // _PCM_BYTES_PER_SAMPLE // samples_per_frame,
         )
         if frames is not None:
-            codes = anchor_codes(frames, pad_id)
-            if codes is not None:
-                reference = CodesRef(codes=codes, ref_text=text)
+            reference, anchored_inputs = _anchor_for_later_pieces(
+                runtime,
+                frames,
+                text,
+                pieces[1:],
+                request,
+                events,
+                request_id=request_id,
+                frame_limit=max_new_tokens,
+            )
+
+
+def _anchor_for_later_pieces(
+    runtime: Any,
+    frames: list[Any],
+    text: str,
+    later_texts: list[str],
+    request: SpeechRequest,
+    events: Emitter,
+    *,
+    request_id: str,
+    frame_limit: int,
+) -> tuple[Reference, list[dict[str, Any]]]:
+    """The reference for the pieces after piece 0 -- piece 0's own audio and text, or
+    `NoRef()` -- and, with the anchor, every later piece's inputs (else an empty list).
+
+    `frames` are every frame piece 0 generated (pad frames included), `frame_limit` the
+    `max_new_tokens` it ran with. The anchor is skipped, with `speech.anchor_skipped`:
+    - `piece_truncated`: piece 0 used its whole limit, so it stopped at its cap or room
+      rather than at EOS, and its audio may end mid-word -- not a clean reference;
+    - `no_room`: with the anchor as their reference, some later piece would be left, by the
+      context rather than by its own cap, with less than `MIN_SUFFIX_FRAMES` frames. The
+      anchor is never trimmed to fit instead: its codes must stay paired with its text.
+    Zero non-pad frames means there is nothing to anchor on; that needs no event.
+
+    The room check needs every later piece's inputs with the anchor, built here on the GPU
+    thread (this runs inside `_iter_pieces`); they are returned so the loop uses them rather
+    than building them twice. They are small: token ids and the anchor's codes.
+    """
+    if len(frames) >= frame_limit:
+        _skip_anchor(events, request_id, "piece_truncated")
+        return NoRef(), []
+    codes = anchor_codes(frames, int(runtime.model.config.codebook_pad_token_id))
+    if codes is None:
+        return NoRef(), []
+    anchor = CodesRef(codes=codes, ref_text=text)
+    later_inputs = []
+    for later_text in later_texts:
+        inputs = prepare_piece(
+            runtime.tokenizer,
+            runtime.model,
+            anchor,
+            later_text,
+            request.instruction,
+            request.cfg_scale,
+        )
+        room = piece_room(runtime, inputs, request.max_new_tokens)
+        if room.room < room.cap and room.room < MIN_SUFFIX_FRAMES:
+            _skip_anchor(events, request_id, "no_room")
+            return NoRef(), []
+        later_inputs.append(inputs)
+    return anchor, later_inputs
+
+
+def _skip_anchor(events: Emitter, request_id: str, reason: str) -> None:
+    events.emit("speech.anchor_skipped", request_id=request_id, piece_index=0, reason=reason)
+
+
+async def _outlast(gpu_task: asyncio.Future[Any]) -> None:
+    """Wait for an abandoned GPU-thread call, during cleanup for an exception already in
+    flight, without letting anything but a process exit replace that exception.
+
+    - The call's own failure is dropped: the caller's exception is what must be reported.
+    - Another cancellation while waiting stops the wait (the lease is released by the
+      call's done-callback, not here) and is undone with `uncancel()`, so the task's
+      cancellation count stays as it was and the caller re-raises its original exception.
+    - `KeyboardInterrupt`/`SystemExit` are not caught: the process is going down.
+    """
+    try:
+        await asyncio.shield(gpu_task)
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if task is not None:
+            task.uncancel()
+    except Exception:  # noqa: BLE001, S110 -- the caller's own exception takes precedence
+        pass
+
+
+async def _close_quietly(session: GpuSession[bytes], events: Emitter, request_id: str) -> None:
+    """Close `session` during cleanup for a failure that must still reach the client (T046
+    review, finding 6): a close error is reported (`gpu.report_close_failed`, which leaves a
+    close timeout to the gate's own `gpu.close_timeout`), never raised. A cancellation while
+    closing is undone as in `_outlast`; `aclose()` has released or poisoned the gate by then.
+    """
+    try:
+        await session.aclose()
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        if task is not None:
+            task.uncancel()
+    except Exception as close_error:  # noqa: BLE001 -- reported, never raised
+        report_close_failed(events, close_error, request_id=request_id)
 
 
 async def _rest_of_audio(session: GpuSession[bytes]) -> AsyncGenerator[bytes, None]:
@@ -333,26 +474,24 @@ async def _serve_speech(
     request_id: str,
     received_at: float,
     clock: Callable[[], float],
+    cpu_tokenizer: CpuTokenizer,
 ) -> Response:
-    """Everything `install_speech`'s route does beyond naming the request and adding
-    `X-Request-Id` to whatever this raises -- a separate function so that wrapping (module
-    docstring, finding 4) has nothing else to do."""
+    """Everything `install_speech`'s route does once it has the runtime and the request's id;
+    separate so tests can drive (and cancel) it directly."""
     fields = await read_fields(http_request)
     request = parse_speech(fields, components.settings)
 
     # CPU-only, so it runs before the voice lookup, the reference decode and the busy
-    # check (FR-007 review: this is still stage 2, "field syntax and ranges" -- it's a
-    # property of `text` alone parse_speech's own field checks already validated, not a
-    # new stage of its own -- so it must come before stage 4's unknown-voice `404` too,
-    # not just before decode/busy): text.strip() is non-blank (BC-10, parse_speech), but
-    # split_text also drops units with no letter or digit to speak (text_split.py's
-    # _speakable) -- text like "..." clears text_required but leaves nothing to
-    # synthesize.
+    # check (FR-007 stage 2, "field syntax and ranges"). `parse_speech` already rejects text
+    # with nothing speakable (`text_required`, by the same rule text_split.py drops units by),
+    # so an empty split is not expected here: the check below is only a safety net, should
+    # the two rules ever drift apart, so such text still gets the same `400` rather than an
+    # IndexError on `pieces[0]`.
     #
     # With no reference, piece 0 is packed against the soft opening budget (US3 scenario 1):
     # it becomes the anchor for every later piece, so it should be short enough for a quick
     # first audio. A reference already fixes the voice, so there is no opening piece.
-    first_budget = ANCHOR_CHARS if isinstance(request.reference, NoReference) else 0
+    first_budget = _opening_budget(request)
     pieces = split_text(request.text, budget=request.split_chars, first_budget=first_budget)
     if not pieces:
         raise ApiError(400, "text_required", "text is required")
@@ -368,7 +507,9 @@ async def _serve_speech(
             reference_audio.decode, request.reference.audio_bytes
         )
 
-    await _check_first_piece_room(runtime, request, pieces[0], decoded_audio)
+    await _check_first_piece_room(
+        runtime, await cpu_tokenizer.get(runtime.tokenizer), request, pieces[0], decoded_audio
+    )
 
     # None means busy (409); a poisoned gate raises GpuUnavailable instead (gpu.py), which
     # propagates straight past this route to errors.py's own handler (503 gpu_unavailable).
@@ -455,31 +596,9 @@ async def _serve_speech(
             # interrupted waiting for it -- the same pattern `GpuSession._release` already
             # uses for the analogous case just below (`session.aclose()`).
             gpu_task.add_done_callback(lambda _task: lease.release())
-            with contextlib.suppress(BaseException):
-                # Suppressed, not propagated: the exception this `except` is already
-                # handling must be what reaches the caller, even if the abandoned GPU call
-                # itself also fails, for some unrelated reason, while we wait for it here.
-                await asyncio.shield(gpu_task)
+            await _outlast(gpu_task)
         elif session is not None:
-            try:
-                await session.aclose()
-            except Exception as close_error:  # noqa: BLE001 -- reported, never raised
-                # A close failure here must never replace the exception this `except`
-                # block is already handling (T046 review, finding 6): a `400` followed by
-                # a `GpuCloseTimeout` must still reach the client as the `400`, not an
-                # opaque close error. Reported as its own event instead (mirrors
-                # streaming.py's `_close_and_report`, which the same rule already governs
-                # for a response that streamed past its first chunk) -- the same
-                # `gpu.close_failed` name `api.py`'s own `_report_close_failed` uses for an
-                # abandoned close's error (data-model.md's event list), just with a
-                # `request_id` here since this one has a request to attribute it to.
-                components.events.emit(
-                    "gpu.close_failed",
-                    level="error",
-                    request_id=request_id,
-                    error=repr(close_error),
-                    traceback="".join(traceback.format_exception(close_error)),
-                )
+            await _close_quietly(session, components.events, request_id)
         else:
             lease.release()
         raise
@@ -495,18 +614,9 @@ async def _serve_speech(
             reason="no_audio",
             audio_seconds=0.0,
         )
-        try:
-            await session.aclose()
-        except Exception as close_error:  # noqa: BLE001 -- reported, never raised
-            # Same rule as the `except BaseException` cleanup above: a close failure must
-            # not replace "no_audio" as the reason this request failed.
-            components.events.emit(
-                "gpu.close_failed",
-                level="error",
-                request_id=request_id,
-                error=repr(close_error),
-                traceback="".join(traceback.format_exception(close_error)),
-            )
+        # Same rule as the `except BaseException` cleanup above: a close failure must not
+        # replace "no_audio" as the reason this request failed.
+        await _close_quietly(session, components.events, request_id)
         # Not ApiError: every 500 must close the connection (contracts/http-api.md), which
         # only happens on the genuinely unhandled path (errors.py's catch-all re-raises after
         # answering); ApiError(500, ...) would be an ordinary, keep-alive JSON response.
@@ -527,7 +637,6 @@ async def _serve_speech(
         sample_rate=int(runtime.sample_rate),
         clock=clock,
         started_at=started_at,
-        headers={"X-Request-Id": request_id},
     )
 
 
@@ -536,46 +645,26 @@ def install_speech(
     components: SpeechComponents,
     *,
     clock: Callable[[], float],
-    new_request_id: Callable[[], str],
 ) -> None:
     """Register `POST /v1/audio/speech`.
 
-    `clock` and `new_request_id` are injected (Constitution III): `new_request_id` names each
-    request for its `speech.*` events, `request.state.request_id` and its `X-Request-Id`
-    response header; `clock` times `ttfa_ms` and feeds `SpeechResponse`'s own `rtf` (module
-    docstring: two different readings of the same clock, not the same reading reused).
+    `clock` is injected (Constitution III): it times `ttfa_ms` and feeds `SpeechResponse`'s own
+    `rtf` (module docstring: two different readings of the same clock, not the same reading
+    reused). The request's id is `request_id.RequestIdMiddleware`'s, read from its state.
     """
-
-    async def _name_request(http_request: Request) -> str:
-        """A `Depends()` of its own, declared before `require_ready` below (T046 review,
-        finding 8): FastAPI resolves same-level dependencies in declaration order, so this
-        runs -- and sets `request.state.request_id` -- even when `require_ready` itself
-        then raises `503 loading`/`gpu_unavailable`, which happens *before* the route
-        body (and so before this id would otherwise ever be set) gets to run at all.
-        Without this, that response would have no id for `errors.py`'s handlers to attach
-        as `X-Request-Id`, and no correlation for the client to report back.
-        """
-        request_id = new_request_id()
-        http_request.state.request_id = request_id
-        return request_id
+    cpu_tokenizer = CpuTokenizer(components.gpu)
 
     @app.post("/v1/audio/speech")
     async def speech(
         http_request: Request,
-        request_id: Annotated[str, Depends(_name_request)],
         runtime: Annotated[Any, Depends(components.readiness.require_ready)],
     ) -> Response:
-        received_at = clock()
-        try:
-            return await _serve_speech(
-                http_request,
-                runtime,
-                components,
-                request_id=request_id,
-                received_at=received_at,
-                clock=clock,
-            )
-        except ApiError as exc:
-            # errors.py's own ApiError handler has no request to read an id from; this adds
-            # the same header a 200 gets, cheaply, since this route already has the id.
-            return api_error_response(exc, headers={"X-Request-Id": request_id})
+        return await _serve_speech(
+            http_request,
+            runtime,
+            components,
+            request_id=http_request.state.request_id,
+            received_at=clock(),
+            clock=clock,
+            cpu_tokenizer=cpu_tokenizer,
+        )

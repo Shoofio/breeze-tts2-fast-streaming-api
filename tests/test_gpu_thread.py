@@ -639,3 +639,45 @@ def test_shutdown_with_a_timeout_counts_a_still_running_set_device() -> None:
     finally:
         proceed.set()
     assert gpu.shutdown(TIMEOUT) is True
+
+
+# --- report_close_failed: the one gpu.close_failed reporter (api.py and routes_speech.py) ------
+
+
+class _Events:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def emit(self, name: str, **fields: object) -> None:
+        self.calls.append((name, fields))
+
+
+def _raised(error: BaseException) -> BaseException:
+    try:
+        raise error
+    except BaseException as caught:  # noqa: BLE001 - only to give it a traceback
+        return caught
+
+
+def test_report_close_failed_emits_the_error_and_its_traceback() -> None:
+    events = _Events()
+
+    gpu_module.report_close_failed(events, _raised(RuntimeError("close broke")))
+    gpu_module.report_close_failed(events, _raised(ValueError("again")), request_id="req-1")
+
+    [(name, first), (_, second)] = events.calls
+    assert name == "gpu.close_failed"
+    assert first["level"] == "error"
+    assert "close broke" in str(first["error"])
+    assert "RuntimeError" in str(first["traceback"])
+    assert "request_id" not in first
+    assert second["request_id"] == "req-1"
+
+
+def test_report_close_failed_skips_a_close_timeout() -> None:
+    # The gate's on_poisoned callback already reports it, as gpu.close_timeout.
+    events = _Events()
+
+    gpu_module.report_close_failed(events, GpuCloseTimeout("still closing"), request_id="r")
+
+    assert events.calls == []

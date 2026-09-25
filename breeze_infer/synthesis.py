@@ -208,18 +208,19 @@ def piece_room(runtime: Any, inputs: dict[str, Any], requested: int | None) -> P
     """``inputs``' room, from the runtime's own estimate (`max_new_tokens_room`, which shares
     ``_prefill_plan`` with the decode loop, so it stops exactly where the loop would).
 
-    The cap comes from the runtime's ``_frame_cap``, the one place that resolves ``None`` to
+    The cap comes from the runtime's ``frame_cap``, the one place that resolves ``None`` to
     the model default and applies the ceiling; re-deriving it here would be a second copy of
     that rule to keep in step.
     """
     return PieceRoom(
-        cap=runtime._frame_cap(requested),
+        cap=runtime.frame_cap(requested),
         room=runtime.max_new_tokens_room(requested, inputs),
     )
 
 
 def predicted_room(
     runtime: Any,
+    tokenizer: Any,
     reference: Reference,
     text: str,
     instruction: str,
@@ -231,21 +232,34 @@ def predicted_room(
     Builds the piece's inputs exactly as `prepare_piece` does, but on the CPU (a view of the
     model with only its ``config`` and ``device="cpu"``, the two attributes
     `templates.prepare_inputs` reads), so this needs neither the GPU thread nor the gate.
+    That view is safe exactly as long as templates read nothing else from the model: any
+    other attribute is an AttributeError here, and
+    `tests/test_synthesis.py::test_predicted_room_matches_the_room_of_the_real_inputs` runs
+    every template branch through it to catch that.
     ``reference`` is `stand_in_reference`'s result, so the prompt has the length the real
-    one will have. The route still checks the real inputs on the GPU thread afterwards, in
+    one will have. ``tokenizer`` must not be the one the GPU thread uses (``runtime.tokenizer``):
+    this runs on another thread at the same time (`routes_speech.CpuTokenizer`). The route still checks the real inputs on the GPU thread afterwards, in
     case the codec's frame count differs from the prediction.
     """
     cpu_model = SimpleNamespace(config=runtime.model.config, device="cpu")
-    inputs = prepare_piece(runtime.tokenizer, cpu_model, reference, text, instruction, cfg_scale)
+    inputs = prepare_piece(tokenizer, cpu_model, reference, text, instruction, cfg_scale)
     return piece_room(runtime, inputs, requested)
 
 
-def piece_frame_limit(room: PieceRoom, events: Any, *, request_id: str, piece_index: int) -> int:
+def piece_frame_limit(
+    room: PieceRoom,
+    events: Any,
+    *,
+    request_id: str,
+    piece_index: int,
+    requested: int | None,
+) -> int:
     """The ``max_new_tokens`` to generate a piece with, or ``NoRoomError`` if it has no room.
 
     A room below the cap clamps the piece: it is generated up to the room and ends
     normally, as reaching ``max_new_tokens`` does, and ``speech.piece_clamped`` records it
-    (FR-036a). Passing the room as ``max_new_tokens`` (rather than letting the context stop
+    (FR-036a) with the client's ``requested`` value (``None``: the model default), the
+    server's ``cap`` for it and the ``room``. Passing the room as ``max_new_tokens`` (rather than letting the context stop
     the loop) makes the runtime mark the last chunk final, as at any other token limit.
 
     No room at all raises. For piece 0 the route has already turned that into ``400
@@ -260,7 +274,8 @@ def piece_frame_limit(room: PieceRoom, events: Any, *, request_id: str, piece_in
             level="warning",
             request_id=request_id,
             piece_index=piece_index,
-            requested=room.cap,
+            requested=requested,
+            cap=room.cap,
             room=room.room,
         )
     return room.room

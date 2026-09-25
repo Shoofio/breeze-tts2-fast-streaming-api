@@ -1043,13 +1043,15 @@ class FastBreezeStreamingRuntime:
         self._backbone_prefill_graph = cache
         return cache
 
-    def _frame_cap(self, requested: int | None) -> int:
+    def frame_cap(self, requested: int | None) -> int:
         """Frames a request may generate, before any context limit.
 
         ``requested`` is the request's own ``max_new_tokens``; ``None`` means the
         model's ``generation_config.max_new_tokens`` (750 for Breeze, as in the
         C++ server). Either is clamped to the ``max_new_tokens`` ceiling. A model
-        with no default of its own is limited by the ceiling alone.
+        with no default of its own is limited by the ceiling alone. Public so the
+        server reports a clamped piece's cap by this same rule
+        (``breeze_infer.synthesis.piece_room``).
         """
         if requested is None:
             requested = (
@@ -1078,7 +1080,7 @@ class FastBreezeStreamingRuntime:
         """
         _require_valid_overrides(max_new_tokens=requested)
         room = self._context_room(_branch_shape(inputs), prefix_len)
-        return min(self._frame_cap(requested), room)
+        return min(self.frame_cap(requested), room)
 
     def _context_room(self, shape: _BranchShape, prefix_len: int) -> int:
         """Frames the context leaves after a prefill of ``shape`` (``<= 0``: none)."""
@@ -1300,7 +1302,7 @@ class FastBreezeStreamingRuntime:
             if repetition_penalty is None
             else float(repetition_penalty)
         )
-        frame_limit = self._frame_cap(max_new_tokens)
+        frame_limit = self.frame_cap(max_new_tokens)
         depth_params = self._sampling_params(self.model.depth_decoder.generation_config)
         chunk_buffer: list[torch.Tensor] = []
         chunk_index = 0

@@ -35,8 +35,12 @@ from breeze_infer.cors import CorsMiddleware, CorsPolicy
 from breeze_infer.errors import install_error_handlers
 from breeze_infer.events import Emitter
 from breeze_infer.gpu import GPU_CLOSE_TIMEOUT_SECONDS, GpuGate, GpuThread
+
+# The shared `gpu.close_failed` reporter, under the name tests/test_api_main.py already uses.
+from breeze_infer.gpu import report_close_failed as _report_close_failed
 from breeze_infer.limits import TCP_USER_TIMEOUT_MS
 from breeze_infer.model_loading import LoadedModel, load_model
+from breeze_infer.request_id import RequestIdMiddleware
 from breeze_infer.routes_health import Readiness, install_health
 from breeze_infer.routes_speech import install_speech
 from breeze_infer.runtime import get_dist_info
@@ -65,15 +69,16 @@ def create_app(components: Components) -> ASGIApp:
     app = FastAPI(title="Breeze TTS", docs_url=None, redoc_url=None, openapi_url=None)
     install_error_handlers(app, components.events)
     install_health(app, components.readiness, components.ws_port)
-    install_speech(
-        app, components, clock=time.perf_counter, new_request_id=lambda: uuid.uuid4().hex
-    )
+    install_speech(app, components, clock=time.perf_counter)
 
     policy = CorsPolicy(origins=components.settings.cors)
     inner: ASGIApp = CorsMiddleware(BodyLimitMiddleware(app), policy, app.router)
     # CORS sits outside the body limit and the app, so even its 413s and 500s carry CORS
     # headers; the version header stays outermost, so CORS's own preflight and 403 responses
     # carry X-Breeze-Version too.
+    # Request ids just inside the version header, so every response below it -- CORS's and
+    # the body limit's own rejections included -- carries `X-Request-Id`.
+    inner = RequestIdMiddleware(inner, new_request_id=lambda: uuid.uuid4().hex)
     return VersionHeaderMiddleware(inner, version=__version__)
 
 
@@ -496,16 +501,6 @@ def _cuda_device(environ: Mapping[str, str]) -> str:
         return "cpu"
     _, _, local_rank = get_dist_info(environ)
     return f"cuda:{local_rank}"
-
-
-def _report_close_failed(events: Emitter, error: BaseException) -> None:
-    """A `gen.close()` error no request saw (its caller was cancelled or gave up waiting)."""
-    events.emit(
-        "gpu.close_failed",
-        level="error",
-        error=repr(error),
-        traceback="".join(traceback.format_exception(error)),
-    )
 
 
 def _gpu_unresponsive(events: Emitter, readiness: Readiness) -> None:

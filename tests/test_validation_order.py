@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import replace
+from functools import partial
 from typing import Any
 
 import httpx
@@ -32,12 +34,13 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
+from breeze_infer.api import _gpu_unresponsive
 from breeze_infer.gpu import GpuGate
 from breeze_infer.limits import MAX_BODY_BYTES
 from breeze_infer.routes_health import Readiness
-from breeze_infer.routes_speech import _serve_speech
+from breeze_infer.routes_speech import CpuTokenizer, _serve_speech
 from models.fast_streaming import NoRoomError
-from tests.fakes import FakeCodec, RecordingEvents
+from tests.fakes import FakeCodec, FakeTokenizer, RecordingEvents
 from tests.test_routes_speech import (  # noqa: F401 -- fixtures reused by name
     SPEECH_PATH,
     _build_components,
@@ -220,9 +223,8 @@ class _RaisingRuntime:
     def max_new_tokens_room(self, *args: Any, **kwargs: Any) -> int:
         return self._inner.max_new_tokens_room(*args, **kwargs)
 
-    def _frame_cap(self, requested: int | None) -> int:
-        # `synthesis.piece_room` reads a piece's cap from the runtime's own rule.
-        return self._inner._frame_cap(requested)
+    def frame_cap(self, requested: int | None) -> int:
+        return self._inner.frame_cap(requested)
 
     def iter_audio_chunks(self, *_args: Any, **_kwargs: Any):
         def _gen():
@@ -283,38 +285,37 @@ def test_other_valueerror_during_priming_stays_a_500_not_400() -> None:
 
 
 def test_503_gpu_unavailable_carries_x_request_id() -> None:
-    """`GpuGate.poison()` makes `try_acquire`/`acquire` raise `GpuUnavailable`, answered
-    by `errors.py`'s own handler *before* `routes_speech.py`'s route body ever runs
-    (`require_ready` succeeds -- the model is ready -- but the gate itself is poisoned).
-    T046 review, finding 8: this response must still carry `X-Request-Id`, sourced from
-    the `_name_request` dependency that now runs ahead of `require_ready`, not from the
-    route body (which never executes for this failure)."""
+    """The production path: a poisoned gate calls `on_poisoned` (`api._gpu_unresponsive`,
+    as `api.main` wires it), which marks the readiness unhealthy, so `require_ready`
+    answers `503 gpu_unavailable` before the route body runs. The request-id middleware
+    stamps that response too (T046 review, finding 8)."""
     readiness = Readiness()
-    components = _build_components(readiness)
+    events = RecordingEvents()
+    components = replace(
+        _build_components(readiness, events=events),
+        gate=GpuGate(on_poisoned=partial(_gpu_unresponsive, events, readiness)),
+    )
     try:
         readiness.mark_ready(_fake_runtime())
         components.gate.poison()
         client = _client_for(components)
 
-        response = client.post(SPEECH_PATH, data={"text": "hello there"})
+        speech = client.post(SPEECH_PATH, data={"text": "hello there"})
+        health = client.get("/health")
 
-        assert response.status_code == 503
-        assert response.json()["code"] == "gpu_unavailable"
-        assert response.headers["x-request-id"]
+        for response in (speech, health):
+            assert response.status_code == 503
+            assert response.json() == {
+                "status": "error",
+                "error": "gpu is not responding",
+                "code": "gpu_unavailable",
+            }
+            assert response.headers["x-request-id"]
+        assert [name for name, _ in events.calls] == ["gpu.close_timeout"]
     finally:
         components.gpu.shutdown()
 
 
-@pytest.mark.xfail(
-    reason=(
-        "the 503 loading body is answered by routes_health.py's own ModelLoading "
-        "handler (_loading_handler), not errors.py's ApiError/GpuUnavailable handlers "
-        "this batch fixed -- routes_health.py is outside this batch's touch list, so "
-        "this documents the gap rather than silently passing over it (T046 review, "
-        "finding 8, remaining scope)."
-    ),
-    strict=True,
-)
 def test_503_loading_carries_x_request_id(client: TestClient) -> None:
     """The model isn't ready at all: `require_ready` itself raises before the route
     body runs. Same finding 8 -- an id must still reach the client."""
@@ -363,14 +364,16 @@ def test_ttfa_ms_is_measured_from_receipt_not_generation_start() -> None:
         from fastapi import FastAPI
 
         from breeze_infer.errors import install_error_handlers
+        from breeze_infer.request_id import RequestIdMiddleware
         from breeze_infer.routes_health import install_health
         from breeze_infer.routes_speech import install_speech
 
         app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
         install_error_handlers(app, events)
         install_health(app, readiness, components.ws_port)
-        install_speech(app, components, clock=clock, new_request_id=lambda: "test-request")
-        client = TestClient(app, raise_server_exceptions=False)
+        install_speech(app, components, clock=clock)
+        wrapped = RequestIdMiddleware(app, new_request_id=lambda: "test-request")
+        client = TestClient(wrapped, raise_server_exceptions=False)
 
         response = client.post(SPEECH_PATH, data={"text": "hello there"})
 
@@ -516,6 +519,7 @@ def test_lease_survives_a_second_cancellation_during_a_slow_resolve_reference() 
                     request_id="test-request",
                     received_at=0.0,
                     clock=lambda: 0.0,
+                    cpu_tokenizer=CpuTokenizer(components.gpu),
                 )
             )
             # Let the coroutine run up to (and block inside) the slow encode: field
@@ -557,6 +561,84 @@ def test_lease_survives_a_second_cancellation_during_a_slow_resolve_reference() 
             with pytest.raises(asyncio.CancelledError):
                 await task
         finally:
+            components.gpu.shutdown()
+
+    asyncio.run(scenario())
+
+
+class _GpuBlockingTokenizer(FakeTokenizer):
+    """Blocks on the GPU thread (so `_prepare_first_piece` hangs there) until `unblock` is
+    set. Its deep copy, the CPU room check's own tokenizer, is a plain `FakeTokenizer`."""
+
+    def __init__(self, reached: threading.Event, unblock: threading.Event) -> None:
+        self._reached = reached
+        self._unblock = unblock
+
+    def __call__(self, text: str, **kwargs: Any) -> Any:
+        if threading.current_thread().name.startswith("breeze-gpu"):
+            self._reached.set()
+            self._unblock.wait(timeout=5.0)
+        return super().__call__(text, **kwargs)
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> FakeTokenizer:
+        return FakeTokenizer()
+
+
+def test_a_cancel_during_prepare_first_piece_keeps_the_gate_until_the_gpu_call_ends() -> None:
+    """A client that disconnects while piece 0 is being prepared on the GPU thread: the
+    request ends as cancelled, but the gate stays held until that GPU call has finished, so
+    the next request never starts behind abandoned work."""
+
+    def gate_is_free(gate: GpuGate) -> bool:
+        probe = gate.try_acquire()
+        if probe is None:
+            return False
+        probe.release()
+        return True
+
+    async def eventually(condition, timeout: float = 5.0) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not condition():
+            if loop.time() > deadline:
+                return False
+            await asyncio.sleep(0.005)
+        return True
+
+    async def scenario() -> None:
+        readiness = Readiness()
+        components = _build_components(readiness)
+        reached, unblock = threading.Event(), threading.Event()
+        try:
+            runtime = _fake_runtime()
+            runtime.tokenizer = _GpuBlockingTokenizer(reached, unblock)
+            readiness.mark_ready(runtime)
+            built = httpx.Request("POST", "http://test/v1/audio/speech", data={"text": "hello"})
+            built.read()
+            task = asyncio.ensure_future(
+                _serve_speech(
+                    _asgi_request(built.content, built.headers["content-type"]),
+                    runtime,
+                    components,
+                    request_id="test-request",
+                    received_at=0.0,
+                    clock=lambda: 0.0,
+                    cpu_tokenizer=CpuTokenizer(components.gpu),
+                )
+            )
+            assert await eventually(reached.is_set), "piece 0 was never prepared"
+
+            task.cancel()
+            await asyncio.sleep(0.05)
+            assert not task.done()  # still waiting for the GPU call
+            assert not gate_is_free(components.gate)
+
+            unblock.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert gate_is_free(components.gate)
+        finally:
+            unblock.set()
             components.gpu.shutdown()
 
     asyncio.run(scenario())
