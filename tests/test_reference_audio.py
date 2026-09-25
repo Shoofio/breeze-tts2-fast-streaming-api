@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import io
 import random
+import shutil
+import subprocess
 import time
 import warnings
 
@@ -27,6 +29,27 @@ from breeze_infer.reference_audio import decode, predicted_frames
 from tests.fakes import CODEC_SAMPLE_RATE, CODEC_SAMPLES_PER_FRAME, codec_frame_count
 
 _SR = 16000
+
+_FFMPEG = shutil.which("ffmpeg")
+requires_ffmpeg = pytest.mark.skipif(_FFMPEG is None, reason="ffmpeg not installed")
+
+
+def _ffmpeg_flac(source_filter: str, *, frame_size: int | None = None, metadata: dict[str, str] | None = None) -> bytes:
+    """A real FLAC produced by piping ffmpeg's own encoder to stdout (``-f flac``
+    to ``-``) -- exactly like a client streaming a live capture, rather than
+    `_flac_with_bogus_total_samples`'s simulation of one. STREAMINFO's
+    ``total_samples`` is left at 0 because ffmpeg can't seek back to fill it in
+    once the pipe is closed (confirmed empirically), which is what puts these
+    fixtures on the same unknown-length path as the hand-built ones above.
+    """
+    cmd = [_FFMPEG, "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", source_filter]
+    if frame_size is not None:
+        cmd += ["-frame_size", str(frame_size)]
+    for key, value in (metadata or {}).items():
+        cmd += ["-metadata", f"{key}={value}"]
+    cmd += ["-f", "flac", "-y", "-"]
+    result = subprocess.run(cmd, capture_output=True, check=True)
+    return result.stdout
 
 
 def _sine(seconds: float, sample_rate: int, channels: int = 1) -> np.ndarray:
@@ -310,6 +333,72 @@ def test_flac_unknown_length_under_minimum_is_audio_too_short_not_invalid_audio(
     assert exc_info.value.message == "ref_audio is too short"
 
 
+@requires_ffmpeg
+def test_flac_unknown_length_with_large_comment_is_accepted() -> None:
+    """1+3 HIGH: a comment block is real metadata, not audio. The plausibility bound
+    must be computed from the file size *after* its metadata, not the whole file --
+    otherwise a large enough tag makes a perfectly ordinary recording look
+    implausibly big for its sample count and gets wrongly rejected."""
+    blob = _ffmpeg_flac(
+        "sine=frequency=220:duration=2:sample_rate=24000",
+        metadata={"comment": "x" * 120_000},
+    )
+
+    audio = decode(blob)
+
+    assert audio.sample_rate == 24000
+    assert audio.duration_seconds == pytest.approx(2.0, abs=1e-6)
+
+
+@requires_ffmpeg
+def test_flac_unknown_length_with_padding_and_tags_is_accepted() -> None:
+    """1+3 HIGH / 6: ffmpeg's own FLAC muxer adds a padding block by default
+    alongside a Vorbis comment block for title/artist/album -- real metadata that
+    must be excluded from the audio-frame size bound. Uses noise (the least
+    compressible, most size-sensitive content) at the smallest allowed sample rate,
+    where the metadata-to-audio ratio is most likely to trip a bound that doesn't
+    account for it."""
+    blob = _ffmpeg_flac(
+        "anoisesrc=color=white:duration=0.08:sample_rate=8000",
+        metadata={"title": "T", "artist": "A", "album": "Alb"},
+    )
+
+    audio = decode(blob)
+
+    assert audio.sample_rate == 8000
+    assert audio.duration_seconds == pytest.approx(0.08, abs=1e-6)
+
+
+@requires_ffmpeg
+@pytest.mark.parametrize("frame_size", [16, 32])
+def test_flac_unknown_length_with_small_frame_size_is_accepted(frame_size: int) -> None:
+    """2 HIGH: many small frames (ffmpeg's -frame_size) means proportionally more
+    frame-header/footer overhead for the same duration. The plausibility bound must
+    scale its overhead allowance with the real frame count -- derived from
+    STREAMINFO's own minimum block size -- rather than a fixed guess, or a stream
+    legitimately encoded this way is wrongly rejected."""
+    blob = _ffmpeg_flac("sine=frequency=220:duration=1:sample_rate=24000", frame_size=frame_size)
+
+    audio = decode(blob)
+
+    assert audio.sample_rate == 24000
+    assert audio.duration_seconds == pytest.approx(1.0, abs=1e-6)
+
+
+@requires_ffmpeg
+def test_flac_unknown_length_under_minimum_wins_over_size_check() -> None:
+    """4: too-short is checked before the plausibility check, so a piped clip that
+    ends up under 80 ms is always audio_too_short -- never invalid_audio, whatever
+    its audio-to-metadata size ratio looks like."""
+    blob = _ffmpeg_flac("sine=frequency=220:duration=0.05:sample_rate=16000")
+
+    with pytest.raises(ApiError) as exc_info:
+        decode(blob)
+    assert exc_info.value.code == "audio_too_short"
+    assert exc_info.value.message == "ref_audio is too short"
+
+
+@requires_ffmpeg
 def test_flac_unknown_length_never_silently_accepts_truncated_corruption() -> None:
     """Randomized mid-stream corruption (64 bytes replaced at a random offset in the
     middle third of the file) must never produce a silently truncated "success".
@@ -317,12 +406,13 @@ def test_flac_unknown_length_never_silently_accepts_truncated_corruption() -> No
     decode with output identical to the clean file, since the corrupted bytes
     happened to land somewhere the decoder tolerates -- but every trial that
     doesn't decode losslessly must be rejected outright, never accepted with a
-    plausible-looking but shorter result. That silent truncation, not "any
-    corruption at all", was the actual bug: an accepted result must always match
-    the clean file's length exactly.
+    plausible-looking but shorter or otherwise different result. That silent
+    truncation, not "any corruption at all", was the actual bug: an accepted
+    result's samples, not just its length or duration, must always match the clean
+    file exactly. Uses a real ffmpeg-piped fixture (6), not the hand-built
+    simulation, for the same reason the size-check fixtures below do.
     """
-    wav = _sine(1.0, _SR)
-    clean_blob = _flac_with_bogus_total_samples(wav, _SR)
+    clean_blob = _ffmpeg_flac("sine=frequency=220:duration=1:sample_rate=16000")
     clean_audio = decode(clean_blob)
 
     rng = random.Random(0)
@@ -337,9 +427,8 @@ def test_flac_unknown_length_never_silently_accepts_truncated_corruption() -> No
             continue
         accepted += 1
         # Accepted only because this particular corruption changed nothing
-        # decodable -- never a truncated fraction of the real content.
-        assert audio.samples.shape[0] == clean_audio.samples.shape[0]
-        assert audio.duration_seconds == pytest.approx(clean_audio.duration_seconds)
+        # decodable -- never a truncated or altered fraction of the real content.
+        assert np.array_equal(audio.samples, clean_audio.samples)
 
     assert accepted + rejected == 150
     assert rejected > 0  # this corruption technique does bite sometimes

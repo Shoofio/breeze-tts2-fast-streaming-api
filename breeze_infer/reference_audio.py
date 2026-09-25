@@ -26,13 +26,22 @@ bounds-checked mono waveform:
    libsndfile raises for it can be the real end of the data -- but the same error
    also fires partway through a stream that libsndfile silently gave up decoding
    after real corruption, producing a plausible-looking but truncated result. Two
-   checks rule that out (`_require_genuine_end`): the underlying byte stream must be
-   almost fully consumed, and -- for FLAC, which always falls back to an
-   uncompressed subframe for data it can't compress -- the compressed size can't be
-   far more than what the samples actually recovered would need uncompressed. Each
-   block is read into a buffer pre-filled with NaN, so even a block that ends in
-   failure loses none of the real samples it did manage to decode before that: the
-   first NaN marks exactly where decoding stopped.
+   checks make that unlikely (`_require_genuine_end`), skipped when the recovered
+   length is already going to be rejected as too short (point 5) regardless: the
+   underlying byte stream must be almost fully consumed, and -- for FLAC, which
+   always falls back to an uncompressed subframe for data it can't compress -- the
+   size of its audio frames (the file size *after* its metadata blocks -- a large
+   comment or padding block must not count against this) can't be far more than an
+   uncompressed encoding of the samples actually recovered would need, at a
+   per-frame overhead bounded by STREAMINFO's own minimum block size. Each block is
+   read into a buffer pre-filled with NaN, so even a block that ends in failure
+   loses none of the real samples it did manage to decode before that: the first
+   NaN marks exactly where decoding stopped. Known limit: a stream cut exactly at a
+   frame boundary -- corruption or truncation that happens to leave what's left a
+   complete, well-formed (if shorter) FLAC stream in its own right -- can't be told
+   apart from a genuinely short recording without an independently known length,
+   and isn't; the checks above catch the much more common case of a cut that lands
+   *inside* a frame or past the metadata it needs to make sense.
 4. A finite-value, then a magnitude check: a float WAV can carry NaN/Inf, or a value
    so large it would overflow when the codec processes it, and soundfile decodes
    either without complaint.
@@ -40,7 +49,9 @@ bounds-checked mono waveform:
    codec frame. `predicted_frames` alone can't express this -- its two nested ceiling
    divisions mean it never reports fewer than 1 frame for any nonzero input -- so the
    minimum is its own exact check, done in integer arithmetic on the native sample
-   count rather than through the (rounding) resample step.
+   count rather than through the (rounding) resample step. This takes priority over
+   point 3's checks: a clip that recovers under the minimum is always audio_too_short,
+   never invalid_audio, whatever its plausibility.
 
 FR-009 and contracts/http-api.md's `ref_audio` row and error messages.
 """
@@ -107,21 +118,26 @@ _SEEK_PAST_REAL_END_CODE = 39
 _END_OF_STREAM_POSITION_MARGIN_BYTES = 64
 
 # FLAC always has a verbatim (uncompressed) fallback for a subframe it can't
-# compress, so a fully-decoded FLAC's compressed size can never be far more than
-# this many bytes per sample, per channel, at its own bit depth -- used as a sanity
-# ceiling on the file size for however many samples were actually recovered
-# (`_require_genuine_end`). Unlisted subtypes fall back to 4 (float/double), the
-# largest real case.
+# compress, so a fully-decoded FLAC's *audio frames* (the file, minus its metadata
+# blocks -- see `_flac_metadata_length_and_min_blocksize`) can never be far more
+# than this many bytes per sample, per channel, at its own bit depth -- used as a
+# sanity ceiling in `_require_genuine_end`. Unlisted subtypes fall back to 4
+# (float/double), the largest real case.
 _FLAC_VERBATIM_BYTES_PER_SAMPLE = {"PCM_S8": 1, "PCM_U8": 1, "PCM_16": 2, "PCM_24": 3, "PCM_32": 4}
 
-# 15%: real per-frame overhead (frame/subframe headers, warmup samples) measured on
-# incompressible 192 kHz stereo noise came to about 0.25%; this leaves wide margin
-# without weakening the check where it matters -- the truncation cases it needs to
-# catch overshoot the ceiling by several times over, not by a few percent.
-_FLAC_SIZE_SLACK_FACTOR = 1.15
-# A fixed allowance for STREAMINFO, Vorbis comment and padding metadata blocks,
-# which don't scale with the audio's duration.
-_FLAC_SIZE_FIXED_OVERHEAD_BYTES = 8_192
+# A per-frame allowance for FLAC frame overhead, added on top of the verbatim
+# sample bytes so the plausibility bound scales with how many frames the audio
+# actually took, not a fixed guess (a stream encoded in many small frames --
+# ffmpeg's -frame_size, say -- has proportionally more header/footer bytes to
+# account for). From the frame format (https://xiph.org/flac/format.html#frame_header):
+# a fixed 4-byte core, up to a 7-byte UTF-8-style frame/sample number, up to 2
+# extra bytes each for an uncoded block size or sample rate, and an 8-bit CRC --
+# 16 bytes in the worst case -- plus a 16-bit (2-byte) frame CRC footer.
+_FLAC_FRAME_HEADER_MAX_BYTES = 16
+_FLAC_FRAME_FOOTER_CRC_BYTES = 2
+# Each channel's own subframe header (type + wasted-bits flag) adds up to about
+# this many bytes; generously rounded rather than derived bit-for-bit.
+_FLAC_SUBFRAME_HEADER_MAX_BYTES_PER_CHANNEL = 2
 
 
 def _max_samples(sample_rate: int) -> int:
@@ -181,6 +197,49 @@ def predicted_frames(duration_samples: int, sample_rate: int) -> int:
     return -(-resampled_length // _CODEC_SAMPLES_PER_FRAME)
 
 
+def _is_too_short(num_samples: int, sample_rate: int) -> bool:
+    """The exact 80 ms minimum (module docstring, point 5): equivalent to
+    `num_samples / sample_rate < 1920 / 24000`, cross-multiplied into integer
+    arithmetic so there's no rounding at the boundary. Shared between `decode`'s own
+    rejection and `_read_untrustworthy`'s early exit, which must agree with it
+    exactly -- a clip this short is always audio_too_short, never invalid_audio,
+    whatever `_require_genuine_end` would have made of it (point 5 takes priority
+    over point 3)."""
+    return num_samples * _CODEC_SAMPLE_RATE < _CODEC_SAMPLES_PER_FRAME * sample_rate
+
+
+def _flac_metadata_length_and_min_blocksize(blob: bytes) -> tuple[int, int]:
+    """Where a FLAC's metadata ends and its audio frames begin, plus STREAMINFO's
+    minimum block size in samples -- so `_require_genuine_end`'s plausibility bound
+    applies only to the audio frames (a large comment or padding block must not
+    count against it) and scales its per-frame overhead allowance with the real
+    frame count instead of a fixed guess.
+
+    Metadata block layout (https://xiph.org/flac/format.html#format_overview): the
+    4-byte `fLaC` magic is followed by one or more blocks, each a 4-byte header (a
+    1-bit last-block flag, a 7-bit block type, a 24-bit big-endian length) then
+    that many bytes of block data. STREAMINFO (type 0) is always first; its own
+    first 2 bytes are the 16-bit minimum block size.
+
+    Falls back to `(0, 0)` -- no metadata skipped, no known block size -- for
+    anything that doesn't look like a well-formed FLAC. That's a defensive fallback
+    only: `sf.SoundFile` has already confirmed the format by the time this runs.
+    """
+    if len(blob) < 4 + 4 + 2 or blob[:4] != b"fLaC":
+        return 0, 0
+
+    min_blocksize = int.from_bytes(blob[8:10], "big")
+    offset = 4
+    while offset + 4 <= len(blob):
+        block_header = blob[offset]
+        is_last = bool(block_header & 0x80)
+        block_length = int.from_bytes(blob[offset + 1 : offset + 4], "big")
+        offset += 4 + block_length
+        if is_last:
+            break
+    return min(offset, len(blob)), min_blocksize
+
+
 def _require_genuine_end(f: sf.SoundFile, raw: io.BytesIO, blob: bytes, filled: int, channels: int) -> None:
     """After a tolerated read failure (module docstring, point 3), rule out the read
     having merely given up on real corruption rather than reached a genuine
@@ -190,10 +249,12 @@ def _require_genuine_end(f: sf.SoundFile, raw: io.BytesIO, blob: bytes, filled: 
     - the underlying byte stream must be almost fully consumed -- a read that failed
       on genuinely bad data partway through can still leave a meaningful amount of
       the blob unread, where a real end always leaves (at most) a tiny remainder;
-    - for FLAC, the compressed size can't be far more than an uncompressed encoding
-      of `filled` samples would need, since FLAC always falls back to a verbatim
-      subframe for data it can't compress -- so a file much bigger than that, for
-      the amount of audio actually recovered, means real data was lost.
+    - for FLAC, the size of the audio frames (the file, minus its metadata blocks)
+      can't be far more than an uncompressed encoding of `filled` samples would
+      need, at a per-frame overhead bounded by STREAMINFO's minimum block size --
+      since FLAC always falls back to a verbatim subframe for data it can't
+      compress, a file whose audio frames are much bigger than that, for the amount
+      of audio actually recovered, means real data was lost.
 
     Raises `ApiError(400, "invalid_audio", ...)` if either check fails.
     """
@@ -201,13 +262,95 @@ def _require_genuine_end(f: sf.SoundFile, raw: io.BytesIO, blob: bytes, filled: 
     if gap > _END_OF_STREAM_POSITION_MARGIN_BYTES:
         raise ApiError(400, "invalid_audio", "could not read ref_audio")
 
-    if f.format == "FLAC":
-        bytes_per_sample = _FLAC_VERBATIM_BYTES_PER_SAMPLE.get(f.subtype, 4)
-        max_plausible_bytes = (
-            filled * channels * bytes_per_sample * _FLAC_SIZE_SLACK_FACTOR + _FLAC_SIZE_FIXED_OVERHEAD_BYTES
-        )
-        if len(blob) > max_plausible_bytes:
-            raise ApiError(400, "invalid_audio", "could not read ref_audio")
+    if f.format != "FLAC":
+        return
+
+    metadata_bytes, min_blocksize = _flac_metadata_length_and_min_blocksize(blob)
+    audio_bytes = max(0, len(blob) - metadata_bytes)
+
+    # `min_blocksize` bounds the true frame count from above (every real frame is
+    # at least this many samples), so this is a safe -- if anything, generous --
+    # estimate of how much per-frame overhead to allow.
+    frame_count = -(-filled // min_blocksize) if min_blocksize > 0 else filled
+    per_frame_overhead_bytes = frame_count * (
+        _FLAC_FRAME_HEADER_MAX_BYTES + _FLAC_FRAME_FOOTER_CRC_BYTES + channels * _FLAC_SUBFRAME_HEADER_MAX_BYTES_PER_CHANNEL
+    )
+    bytes_per_sample = _FLAC_VERBATIM_BYTES_PER_SAMPLE.get(f.subtype, 4)
+    max_plausible_audio_bytes = filled * channels * bytes_per_sample + per_frame_overhead_bytes
+
+    if audio_bytes > max_plausible_audio_bytes:
+        raise ApiError(400, "invalid_audio", "could not read ref_audio")
+
+
+def _downmix_into(mono: np.ndarray, filled: int, chunk: np.ndarray, actual: int) -> None:
+    """`mono[filled:filled+actual] = mean(chunk[:actual], axis=1)`, in float64: two
+    channels near float32's ~3.4e38 max would otherwise overflow a float32 sum
+    before the mean is even taken."""
+    mono[filled : filled + actual] = chunk[:actual].mean(axis=1, dtype=np.float64)
+
+
+def _read_trustworthy(f: sf.SoundFile, mono: np.ndarray, max_samples: int) -> int:
+    """Read a file whose declared length is trustworthy (module docstring, point 3):
+    a plain blockwise read straight into `mono` (owned and preallocated by the
+    caller), no NaN-sentinel bookkeeping -- any read failure here is a hard error
+    (`decode`'s `except RuntimeError`), never tolerated. Returns the number of
+    samples filled.
+    """
+    filled = 0
+    while filled < max_samples:
+        request = min(_READ_BLOCK_FRAMES, max_samples - filled)
+        block = f.read(frames=request, dtype="float32", always_2d=True)
+        actual = block.shape[0]
+        if actual == 0:
+            break
+        _downmix_into(mono, filled, block, actual)
+        filled += actual
+        if actual < request:
+            break  # a normal short read: the true end of a trustworthy-length file
+    return filled
+
+
+def _read_untrustworthy(
+    f: sf.SoundFile, raw: io.BytesIO, blob: bytes, mono: np.ndarray, max_samples: int, channels: int
+) -> int:
+    """Read a file whose declared length can't be trusted (module docstring, point
+    3): the same blockwise read into `mono` (owned and preallocated by the caller),
+    but with the NaN-sentineled recovery buffer -- allocated once here, since only
+    this path ever needs it -- and the tolerant handling of the stream's real end.
+    Returns the number of samples filled.
+    """
+    sample_rate = f.samplerate
+    chunk = np.empty((_READ_BLOCK_FRAMES, channels), dtype=np.float32)
+    filled = 0
+    while filled < max_samples:
+        request = min(_READ_BLOCK_FRAMES, max_samples - filled)
+        # NaN-filled rather than left as-is: a read that fails partway still writes
+        # every sample it did decode into this buffer before raising, and NaN can't
+        # be a real decoded value, so the first NaN row marks exactly where
+        # decoding stopped (`read`'s `out=` returns the array itself on success,
+        # but nothing at all when it raises).
+        view = chunk[:request]
+        view.fill(np.nan)
+        try:
+            result = f.read(frames=request, dtype="float32", always_2d=True, out=view)
+            actual = result.shape[0]
+        except RuntimeError as exc:
+            if getattr(exc, "code", None) != _SEEK_PAST_REAL_END_CODE:
+                raise
+            nan_rows = np.isnan(view).any(axis=1)
+            actual = int(np.argmax(nan_rows)) if nan_rows.any() else view.shape[0]
+            _downmix_into(mono, filled, view, actual)
+            filled += actual
+            if not _is_too_short(filled, sample_rate):
+                _require_genuine_end(f, raw, blob, filled, channels)
+            break
+        if actual == 0:
+            break
+        _downmix_into(mono, filled, view, actual)
+        filled += actual
+        if actual < request:
+            break
+    return filled
 
 
 def _open_and_read(blob: bytes) -> tuple[np.ndarray, int]:
@@ -229,7 +372,6 @@ def _open_and_read(blob: bytes) -> tuple[np.ndarray, int]:
             raise ApiError(400, "invalid_audio", "could not read ref_audio")
 
         sample_rate = f.samplerate
-        channels = f.channels
         max_samples = _max_samples(sample_rate)
         trustworthy_length = 0 <= f.frames < _MAX_PLAUSIBLE_FRAMES
 
@@ -237,35 +379,10 @@ def _open_and_read(blob: bytes) -> tuple[np.ndarray, int]:
             raise ApiError(400, "audio_too_long", "ref_audio is longer than 30 seconds")
 
         mono = np.empty(max_samples, dtype=np.float32)
-        filled = 0
-        while filled < max_samples:
-            request = min(_READ_BLOCK_FRAMES, max_samples - filled)
-            # NaN-filled rather than empty: a read that fails partway still writes
-            # every sample it did decode into this buffer before raising, and NaN
-            # can't be a real decoded value, so the first NaN row marks exactly
-            # where decoding stopped (`read`'s `out=` returns the array itself on
-            # success, but nothing at all when it raises).
-            chunk = np.full((request, channels), np.nan, dtype=np.float32)
-            try:
-                result = f.read(frames=request, dtype="float32", always_2d=True, out=chunk)
-                actual = result.shape[0]
-            except RuntimeError as exc:
-                if trustworthy_length or getattr(exc, "code", None) != _SEEK_PAST_REAL_END_CODE:
-                    raise
-                nan_rows = np.isnan(chunk).any(axis=1)
-                actual = int(np.argmax(nan_rows)) if nan_rows.any() else chunk.shape[0]
-                # float64 accumulation: two channels near float32's ~3.4e38 max would
-                # otherwise overflow a float32 sum before the mean is even taken.
-                mono[filled : filled + actual] = chunk[:actual].mean(axis=1, dtype=np.float64)
-                filled += actual
-                _require_genuine_end(f, raw, blob, filled, channels)
-                break
-            if actual == 0:
-                break
-            mono[filled : filled + actual] = chunk[:actual].mean(axis=1, dtype=np.float64)
-            filled += actual
-            if actual < request:
-                break  # a normal short read: the true end of a trustworthy-length file
+        if trustworthy_length:
+            filled = _read_trustworthy(f, mono, max_samples)
+        else:
+            filled = _read_untrustworthy(f, raw, blob, mono, max_samples, f.channels)
 
     return mono[:filled].copy(), sample_rate  # a copy, not a view into the 30 s buffer
 
@@ -300,10 +417,7 @@ def decode(blob: bytes, *, max_bytes: int = MAX_AUDIO_BYTES) -> DecodedAudio:
     if actual_num_samples >= _max_samples(sample_rate):
         raise ApiError(400, "audio_too_long", "ref_audio is longer than 30 seconds")
 
-    # The exact 80 ms minimum, in integer arithmetic on the native sample count
-    # (cross-multiplied rather than resampling first, so there's no rounding at the
-    # boundary): equivalent to `actual_num_samples / sample_rate < 1920 / 24000`.
-    if actual_num_samples * _CODEC_SAMPLE_RATE < _CODEC_SAMPLES_PER_FRAME * sample_rate:
+    if _is_too_short(actual_num_samples, sample_rate):
         raise ApiError(400, "audio_too_short", "ref_audio is too short")
 
     return DecodedAudio(
