@@ -84,7 +84,7 @@ phases as follows:
   3. Write the GPU name, commit SHA, command lines and medians to
      `specs/003-cpp-compatible-api/research/baseline-2026-09-24.md` (use the actual date).
 - [X] T003 Update `requirements.txt` (R4, plan "Dependency changes"):
-  - Add `websockets>=15`.
+  - Add `websockets>=17.1,<18` (the tested major version; changed from `>=15` after review, 2026-09-24).
   - Pin exactly: `fastapi==0.141.1`, `starlette==1.6.0`, `uvicorn==0.52.4`,
     `python-multipart==0.0.32`.
   - Add `httpx==0.28.1` (test dependency).

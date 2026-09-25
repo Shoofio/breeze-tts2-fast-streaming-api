@@ -66,7 +66,7 @@ body never starts); polling `request.is_disconnected()` (redundant under spec 2.
 
 ## R4. WebSocket transport
 
-**Decision**: Add the **`websockets`** library (>= 15; 17.1 tested) and serve the WebSocket port
+**Decision**: Add the **`websockets`** library (>= 17.1, < 18; 17.1 tested) and serve the WebSocket port
 with its native asyncio server (`websockets.asyncio.server.serve`) on the same event loop as
 uvicorn. Configuration:
 - a socket pre-bound on the configured host only (BC-30);

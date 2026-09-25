@@ -13,7 +13,7 @@ fastapi==0.141.1
 starlette==1.6.0
 uvicorn==0.52.4
 python-multipart==0.0.32
-websockets>=15
+websockets>=17.1,<18
 pytest>=8.0
 ruff>=0.12
 # Test dependency: real-server tests assert on incomplete chunked transfers.

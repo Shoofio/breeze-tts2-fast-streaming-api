@@ -31,7 +31,7 @@ a live test through the SillyTavern TTS UI, the primary real client.
 **Primary Dependencies**:
 - Existing: FastAPI 0.141.1, Starlette 1.6.0, uvicorn 0.52.4 (h11), python-multipart 0.0.32,
   soundfile 0.14 (libsndfile 1.2.2), torch 2.9.1, transformers 4.57.3, qwen-tts 0.1.1.
-- **New: `websockets` ≥ 15** (17.1 tested). See [Dependency changes](#dependency-changes).
+- **New: `websockets` >= 17.1, < 18** (17.1 tested; 17.x needs Python 3.11+). See [Dependency changes](#dependency-changes).
 - The web-stack versions become exact pins, because the abort and disconnect behavior relies on
   their internals (R2, R3).
 
@@ -161,7 +161,7 @@ becomes the composition root only.
 
 | Change | Why | Alternatives considered |
 |---|---|---|
-| **Add `websockets` ≥ 15** | The venv has no WebSocket library, and without one uvicorn answers upgrades with `404`. Its native server gives four things we need: RFC-conformant close codes, a handshake timeout, a `process_request` hook (Origin `403`, `503` while loading or at the connection cap), and aborting a stalled peer when `close_timeout` expires (R4). | `wsproto` drops the connection on protocol errors without a close frame. uvicorn with `websockets-sansio` has no way to evict a stalled peer without `TCP_USER_TIMEOUT`, plus signal and `sys.exit` workarounds. A hand-rolled implementation is where C++'s defects came from. |
+| **Add `websockets` >= 17.1, < 18** | The venv has no WebSocket library, and without one uvicorn answers upgrades with `404`. Its native server gives four things we need: RFC-conformant close codes, a handshake timeout, a `process_request` hook (Origin `403`, `503` while loading or at the connection cap), and aborting a stalled peer when `close_timeout` expires (R4). | `wsproto` drops the connection on protocol errors without a close frame. uvicorn with `websockets-sansio` has no way to evict a stalled peer without `TCP_USER_TIMEOUT`, plus signal and `sys.exit` workarounds. A hand-rolled implementation is where C++'s defects came from. |
 | Pin `fastapi`, `starlette`, `uvicorn`, `python-multipart` exactly | The abort-on-failure and disconnect behavior depends on library internals (R2, R3). A pin makes an upgrade a deliberate change, re-verified by `test_speech_abort.py`. | Floating `>=` pins (a silent regression risk). |
 | Add `httpx` as a test dependency | Real-server tests assert `RemoteProtocolError` on an incomplete chunked transfer. It is installed today only as a transitive dependency. | TestClient (can't observe an incomplete transfer). |
 
