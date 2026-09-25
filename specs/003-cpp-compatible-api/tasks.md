@@ -445,8 +445,9 @@ the GPU smoke test.
   - `__init__` takes the primed first chunk and an async body.
   - `stream_response` wraps each `send` in `asyncio.timeout(HTTP_SEND_TIMEOUT_SECONDS)` and
     `aclose()`s the body in `finally`.
-  - `__call__` runs, in a shielded `finally`: close the generator on the `GpuThread`, release the
-    gate, emit `speech.completed`, `speech.aborted` or `speech.failed`.
+  - `__call__` runs, in a shielded `finally`: `GpuSession.aclose()` (from `gpu.py`: it closes the
+    generator on the `GpuThread`, then releases the lease; don't re-implement that sequence), then
+    emit `speech.completed`, `speech.aborted` or `speech.failed`.
   - An exception after headers propagates, so uvicorn closes without the terminator. **Never use
     `BaseHTTPMiddleware` anywhere in the app.**
 - [ ] T040 [US1] Create `tests/test_speech_abort.py`. It runs a **real uvicorn** on an ephemeral
