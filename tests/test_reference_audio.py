@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 
+import librosa
 import numpy as np
 import pytest
 import soundfile as sf
@@ -20,7 +21,7 @@ import soundfile as sf
 from breeze_infer.errors import ApiError
 from breeze_infer.limits import MAX_REF_SECONDS
 from breeze_infer.reference_audio import decode, predicted_frames
-from tests.fakes import codec_frame_count
+from tests.fakes import CODEC_SAMPLE_RATE, CODEC_SAMPLES_PER_FRAME, codec_frame_count
 
 _SR = 16000
 
@@ -230,3 +231,25 @@ def test_predicted_frames_matches_fake_codec() -> None:
     for sr in sample_rates:
         for n in lengths:
             assert predicted_frames(n, sr) == codec_frame_count(n, sr), (n, sr)
+
+
+def test_predicted_frames_matches_actual_librosa_resample() -> None:
+    """Root-cause test (T021 review 2, finding #5): `test_predicted_frames_matches_fake_codec`
+    above only checks `predicted_frames` against another implementation of the same
+    formula -- two independent wrong implementations could still agree with each other.
+    This instead compares against a real call to `librosa.resample`, mirroring qwen_tts's
+    exact call (`librosa.resample(y=a, orig_sr=int(sr), target_sr=target_sr)`, no explicit
+    `res_type`): librosa's `fix=True` default forces the returned length to exactly
+    `ceil(len(y) * target_sr / orig_sr)` no matter which resampler backend runs, so this
+    checks the framing step and the real resample step together."""
+    sample_rates = (8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000, 176400)
+    lengths = (1, 100, 1920, 1921, 3840, 3841, 44100 * 30)
+    for sr in sample_rates:
+        for n in lengths:
+            wav = np.zeros(n, dtype=np.float32)
+            if sr == CODEC_SAMPLE_RATE:
+                resampled_len = n  # qwen_tts skips the call entirely at this rate too.
+            else:
+                resampled_len = len(librosa.resample(y=wav, orig_sr=sr, target_sr=CODEC_SAMPLE_RATE))
+            expected = -(-resampled_len // CODEC_SAMPLES_PER_FRAME)
+            assert predicted_frames(n, sr) == expected, (n, sr)

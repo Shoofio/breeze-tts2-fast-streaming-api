@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import threading
 
+import librosa
 import numpy as np
 import pytest
 import torch
@@ -13,6 +14,7 @@ import torch
 from models.fast_streaming import FastStreamingChunk
 from tests.fakes import (
     CODEC_CODEBOOK_SIZE,
+    CODEC_SAMPLE_RATE,
     CODEC_SAMPLES_PER_FRAME,
     FakeCodec,
     FakeRuntime,
@@ -90,6 +92,44 @@ def test_no_chunk_is_final_by_default() -> None:
 def test_is_final_on_last_can_simulate_reaching_the_token_limit() -> None:
     chunks = _drain(FakeRuntime(chunks=3, is_final_on_last=True))
     assert [chunk.is_final for chunk in chunks] == [False, False, True]
+
+
+def test_flush_frames_models_the_post_loop_leftover_buffer_chunk() -> None:
+    # The non-fast-codec case: 2 regular (frames_per_chunk=2) chunks, then a piece ends
+    # with exactly 1 frame still buffered -- the real post-loop ``if chunk_buffer:``
+    # flush, not another full frames_per_chunk-sized chunk.
+    chunks = _drain(FakeRuntime(chunks=2, frames_per_chunk=2, flush_frames=1))
+
+    assert len(chunks) == 3
+    flush = chunks[-1]
+    assert flush.codec_frames == 1
+    assert flush.audio.shape == (1 * CODEC_SAMPLES_PER_FRAME,)
+    assert flush.is_final is True
+    assert flush.timing["chunk_index"] == 2
+    assert flush.timing["codec_frames"] == 1
+    assert flush.timing["total_frames"] == 2 * 2 + 1
+    # Never the chunk-0 enrichment, even though this is the only (and so index-0) chunk
+    # when there are no regular chunks at all.
+    assert "ttfa_internal_ms" not in flush.timing
+    assert "prefill_path" not in flush.timing
+
+    only_flush = _drain(FakeRuntime(chunks=0, frames_per_chunk=2, flush_frames=1))
+    assert len(only_flush) == 1
+    assert only_flush[0].timing["chunk_index"] == 0
+    assert "ttfa_internal_ms" not in only_flush[0].timing
+    assert "prefill_path" not in only_flush[0].timing
+
+
+def test_default_frames_let_token_observer_run_with_no_arguments() -> None:
+    # A caller that passes token_observer but no explicit frames= must still get one
+    # observer call per frame the call is going to produce, not silent no-ops.
+    observed: list[torch.Tensor] = []
+    chunks = _drain(
+        FakeRuntime(chunks=2, frames_per_chunk=2, flush_frames=1),
+        token_observer=observed.append,
+    )
+    assert len(chunks) == 3
+    assert len(observed) == 2 * 2 + 1
 
 
 def test_timing_keys_match_the_real_per_chunk_dict() -> None:
@@ -196,13 +236,16 @@ def test_codec_frame_count_matches_the_resample_then_frame_formula() -> None:
     assert codec_frame_count(1920, 24000) == 1
     assert codec_frame_count(2400, 24000) == 2  # 2400 / 1920 = 1.25 -> 2
     assert codec_frame_count(0, 24000) == 0
+    # 48 kHz boundary: exactly 1920 resampled samples is 1 frame; one more costs a whole
+    # extra frame (ceil(3841 * 24000/48000) = 1921 -> ceil(1921/1920) = 2).
+    assert codec_frame_count(3840, 48000) == 1
+    assert codec_frame_count(3841, 48000) == 2
     # librosa's ratio-first rounding (``ratio = float(target)/orig`` computed once, then
     # ``n * ratio``) gives a different sample count than a naive ``n * target / orig``
     # computed the other order, at some rates. 44.1 kHz x 30.0 s is exactly the case the
-    # review flagged: 376 frames, one more than the naive computation's 375.
+    # review flagged: 376 frames, one more than a naive
+    # ``-(-int(44100 * 30 * 24000 / 44100) // 1920)`` (== 375) would give.
     assert codec_frame_count(44100 * 30, 44100) == 376
-    naive_375 = -(-int(44100 * 30 * 24000 / 44100) // 1920)
-    assert naive_375 == 375
     # The same rounding difference shows up at every other rate the review named.
     for sr, expected in ((22050, 376), (11025, 376), (88200, 376), (176400, 376)):
         assert codec_frame_count(sr * 30, sr) == expected
@@ -215,16 +258,41 @@ def test_codec_frame_count_skips_resampling_exactly_at_24khz() -> None:
     assert codec_frame_count(24000 * 30, 24000) == 375  # 720000 / 1920 exactly
 
 
+def test_codec_frame_count_matches_actual_librosa_resample() -> None:
+    """Root-cause test: compares against a real call to ``librosa.resample``, not just
+    another implementation of the same formula (two independent implementations of a
+    wrong formula would still agree with each other). Mirrors qwen_tts's exact call
+    (``librosa.resample(y=a, orig_sr=int(sr), target_sr=target_sr)``, no explicit
+    ``res_type``) -- librosa's ``fix=True`` default forces the returned length to exactly
+    ``ceil(len(y) * target_sr / orig_sr)`` no matter which resampler backend runs, so this
+    is checking the framing step and the real resample step together."""
+    sample_rates = (8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000, 176400)
+    lengths = (1, 100, 1920, 1921, 3840, 3841, 44100 * 30)
+    for sr in sample_rates:
+        for n in lengths:
+            wav = np.zeros(n, dtype=np.float32)
+            if sr == CODEC_SAMPLE_RATE:
+                resampled_len = n  # qwen_tts skips the call entirely at this rate too.
+            else:
+                resampled_len = len(librosa.resample(y=wav, orig_sr=sr, target_sr=CODEC_SAMPLE_RATE))
+            expected = -(-resampled_len // CODEC_SAMPLES_PER_FRAME)
+            assert codec_frame_count(n, sr) == expected, (n, sr)
+
+
 def test_codec_encode_is_deterministic_shaped_and_in_range() -> None:
     codec = FakeCodec()
     wav = np.linspace(-1.0, 1.0, 4800, dtype=np.float32)
 
-    codes_a = codec.encode(wav, 24000)["audio_codes"][0]
+    result_a = codec.encode(wav, 24000)
+    codes_a = result_a["audio_codes"][0]
     codes_b = codec.encode(wav, 24000)["audio_codes"][0]
 
     assert isinstance(codes_a, torch.Tensor)
     assert codes_a.dtype == torch.int64
     assert tuple(codes_a.shape) == (codec_frame_count(4800, 24000), FakeCodec.CODEBOOKS)
+    # Non-contiguous, like the real encode()'s ``code[..., :T].transpose(0, 1)``.
+    assert codes_a.shape[0] > 1  # otherwise a size-1 dim trivially reads as "contiguous"
+    assert not codes_a.is_contiguous()
     assert torch.equal(codes_a, codes_b)
     assert int(codes_a.min()) >= 0
     assert int(codes_a.max()) < CODEC_CODEBOOK_SIZE
@@ -234,6 +302,18 @@ def test_codec_encode_is_deterministic_shaped_and_in_range() -> None:
     different_wav = wav + 1.0
     codes_c = codec.encode(different_wav, 24000)["audio_codes"][0]
     assert not torch.equal(codes_a, codes_c)
+
+
+def test_codec_encode_result_supports_attribute_and_key_access() -> None:
+    # The real Qwen3TTSTokenizerV2EncoderOutput is a transformers ModelOutput, so both
+    # ``result.audio_codes`` and ``result["audio_codes"]`` work; this fake must too.
+    result = FakeCodec().encode(np.zeros(4800, dtype=np.float32), 24000)
+    assert result.audio_codes is result["audio_codes"]
+
+
+def test_codec_encode_raises_on_empty_wav() -> None:
+    with pytest.raises(RuntimeError):
+        FakeCodec().encode(np.zeros(0, dtype=np.float32), 24000)
 
 
 def test_codec_encode_does_not_overflow_over_many_random_wavs() -> None:
