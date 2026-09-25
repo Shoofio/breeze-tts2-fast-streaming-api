@@ -30,6 +30,19 @@ import torch
 from models.fast_streaming import FastStreamingChunk
 
 
+class RecordingEvents:
+    """A small fake for the `events` argument `install_error_handlers`/middleware take: records
+    every emitted event instead of writing anywhere. Shared by test_version_header,
+    test_api_errors and test_body_limit so there's one definition of "a fake event sink" (V6).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def emit(self, name: str, **fields: object) -> None:
+        self.calls.append((name, fields))
+
+
 class FakeTokenizer:
     pad_token_id = 0
     eos_token_id = 1
@@ -131,7 +144,7 @@ def codec_frame_count(num_samples: int, sr: int) -> int:
 
 class FakeCodec:
     """Stands in for the bundled `qwen_tts` audio tokenizer at the point it turns a
-    waveform into codes (`breeze_infer/audio.py:encode_prompt_audio` indexes
+    waveform into codes (`breeze_infer/audio.py:encode_prompt_waveform` indexes
     ``encode(wav, sr)["audio_codes"][0]``, exactly as the real ``Qwen3TTSTokenizer``'s
     dict-like ``EncoderOutput`` is indexed).
 

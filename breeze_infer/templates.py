@@ -4,10 +4,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
-
-from .audio import encode_prompt_audio
 
 AUDIO_TAG = "<|AUDIO|>"
 AUDIO_EOS = "<|audio_eos|>"
@@ -26,6 +25,7 @@ class TemplateSpec:
     build_segments: Callable[[Request], list[Segment]]
     build_negative_segments: Callable[[Request], list[Segment]] | None = None
     build_dual_branches: Callable[[Request], dict[str, list[Segment]]] | None = None
+    reference_audio: bool = False
 
 
 def _speaker_prefix(request: Request) -> str:
@@ -61,13 +61,17 @@ def _ref_audio_segment(
     append_eos: bool = True,
     drop_last_frame: bool = False,
 ) -> Segment:
+    """Reference audio always arrives pre-encoded as ``ref_audio_codes`` (an inline
+    upload, a saved voice's stored codes, or the CLI's own ``--ref-audio`` encode) --
+    there is no path-based variant; see ``breeze_infer.audio.encode_prompt_waveform``.
+    """
     segment: Segment = {
         "type": "audio",
         "append_eos": append_eos,
         "drop_last_frame": drop_last_frame,
     }
-    if request.get("ref_audio_path"):
-        segment["audio_path"] = request["ref_audio_path"]
+    if request.get("ref_audio_codes") is not None:
+        segment["audio_codes"] = request["ref_audio_codes"]
     return segment
 
 
@@ -114,12 +118,42 @@ TEMPLATES: dict[str, TemplateSpec] = {
     ),
     "ref_edit_tata": TemplateSpec(
         name="ref_edit_tata",
-        required_fields=("text", "instruction", "ref_audio_path", "ref_text"),
+        required_fields=("text", "instruction", "ref_text"),
         build_segments=_ref_edit_tata_segments,
         build_negative_segments=_ref_edit_tata_negative_segments,
         build_dual_branches=_ref_edit_tata_dual_branches,
+        reference_audio=True,
     ),
 }
+
+
+def _ref_prefix_segments(request: Request) -> list[Segment]:
+    """The reference-only part of ``ref_edit_tata``, shared by both CFG rows."""
+    prefix = _speaker_prefix(request)
+    return [
+        {"type": "text", "text": f"{prefix}{request['ref_text']}"},
+        _ref_audio_segment(request),
+    ]
+
+
+def split_reference_prefix(
+    request: Request,
+) -> tuple[list[Segment], list[Segment], list[Segment]]:
+    """Split ``ref_edit_tata`` into (prefix, guided suffix, unguided suffix).
+
+    ``prefix + guided`` renders exactly what ``build_segments`` renders, and
+    ``prefix + unguided`` exactly what ``build_negative_segments`` renders, so a
+    prefix processed once can be continued by either suffix.
+    """
+    prefix = _speaker_prefix(request)
+    guided = [
+        {
+            "type": "text",
+            "text": f"{prefix}{INSTRUCTION_BOS}{request['instruction']}{INSTRUCTION_EOS}{request['text']}",
+        }
+    ]
+    unguided = [{"type": "text", "text": f"{prefix}{request['text']}"}]
+    return _ref_prefix_segments(request), guided, unguided
 
 
 def get_template(name: str) -> TemplateSpec:
@@ -131,17 +165,45 @@ def get_template(name: str) -> TemplateSpec:
         ) from exc
 
 
-def _encode_prompt_audio(audio_tokenizer: Any, audio_path: str) -> torch.Tensor:
-    return encode_prompt_audio(audio_tokenizer, audio_path)
-
-
 def _resolve_segment_audio_codes(
     audio_tokenizer: Any, segment: Segment
 ) -> torch.Tensor:
-    audio_path = segment.get("audio_path")
-    if not audio_path:
-        raise ValueError("Audio segment must include audio_path")
-    return _encode_prompt_audio(audio_tokenizer, audio_path)
+    """Reference audio is always pre-encoded before it reaches a template (see
+    ``_ref_audio_segment``), so this only ever normalizes an already-encoded codes
+    array/tensor. ``audio_tokenizer`` is accepted for call-site symmetry with the
+    other segment kinds but isn't used -- nothing here re-encodes audio.
+    """
+    del audio_tokenizer
+    codes = segment.get("audio_codes")
+    if codes is None:
+        raise ValueError("Audio segment must include audio_codes")
+    if isinstance(codes, np.ndarray):
+        codes = torch.from_numpy(np.ascontiguousarray(codes, dtype=np.int16))
+    codes = torch.as_tensor(codes, dtype=torch.int16)
+    if codes.ndim != 2:
+        raise ValueError(
+            f"audio_codes must be 2D [frames, codebooks], got {tuple(codes.shape)}"
+        )
+    return codes.cpu().contiguous()
+
+
+def _missing_fields(request: Request, fields: tuple[str, ...]) -> list[str]:
+    """Required fields that are absent, blank or ``None``.
+
+    ``ref_audio_codes`` never belongs in ``fields``: it's array-valued, and a bare
+    ``bool()`` on a multi-element array raises, so it's checked separately by
+    ``_check_reference_source`` instead of this truthy check.
+    """
+    return [field for field in fields if not request.get(field)]
+
+
+def _check_reference_source(template: TemplateSpec, request: Request) -> None:
+    if not template.reference_audio:
+        return
+    if request.get("ref_audio_codes") is None:
+        raise ValueError(
+            f"Request {request.get('id')} must provide ref_audio_codes"
+        )
 
 
 def _prepare_one(
@@ -271,14 +333,12 @@ def prepare_inputs(
     guidance_scale_ins: float | None,
 ) -> dict[str, torch.Tensor | None | float]:
     for request in requests:
-        missing = []
-        for field in template.required_fields:
-            if not request.get(field):
-                missing.append(field)
+        missing = _missing_fields(request, template.required_fields)
         if missing:
             raise ValueError(
                 f"Request {request.get('id')} missing template fields: {missing}"
             )
+        _check_reference_source(template, request)
 
     positive_segments = [template.build_segments(request) for request in requests]
     inputs = _prepare_segment_batches(
@@ -336,4 +396,58 @@ def prepare_inputs(
             inputs["cfg_negative_input_values"] = negative_inputs["input_values"]
         inputs["cfg_scale"] = guidance_scale
 
+    return inputs
+
+
+def prepare_prefix_inputs(
+    tokenizer: Any,
+    audio_tokenizer: Any,
+    model: Any,
+    request: Request,
+) -> dict[str, torch.Tensor | None]:
+    """Batch-1 inputs for the reference prefix of ``ref_edit_tata`` alone."""
+    template = get_template("ref_edit_tata")
+    missing = _missing_fields(request, ("ref_text",))
+    if missing:
+        raise ValueError(f"Request {request.get('id')} missing {missing[0]}")
+    _check_reference_source(template, request)
+    return _prepare_segment_batches(
+        tokenizer,
+        audio_tokenizer,
+        model.config,
+        model.device,
+        [_ref_prefix_segments(request)],
+    )
+
+
+def prepare_suffix_inputs(
+    tokenizer: Any,
+    audio_tokenizer: Any,
+    model: Any,
+    request: Request,
+    *,
+    guidance_scale: float,
+) -> dict[str, torch.Tensor | None | float]:
+    """Inputs for the part of ``ref_edit_tata`` that follows a cached prefix.
+
+    The result has the same keys as ``prepare_inputs`` for a single-CFG request
+    (``input_ids`` plus ``cfg_negative_*`` when ``guidance_scale != 1``) but
+    carries no audio, so the runtime's branch builder can consume it unchanged.
+    """
+    missing = _missing_fields(request, ("text", "instruction"))
+    if missing:
+        raise ValueError(f"Request {request.get('id')} missing {missing[0]}")
+    _, guided, unguided = split_reference_prefix(request)
+    inputs = _prepare_segment_batches(
+        tokenizer, audio_tokenizer, model.config, model.device, [guided]
+    )
+    if guidance_scale != 1.0:
+        negative = _prepare_segment_batches(
+            tokenizer, audio_tokenizer, model.config, model.device, [unguided]
+        )
+        inputs["cfg_negative_prompt_ids"] = negative["input_ids"]
+        inputs["cfg_negative_prompt_attention_mask"] = negative["attention_mask"]
+        inputs["cfg_negative_text_ids_mask"] = negative["text_ids_mask"]
+        inputs["cfg_negative_text_ids_len"] = negative["text_ids_len"]
+        inputs["cfg_scale"] = guidance_scale
     return inputs

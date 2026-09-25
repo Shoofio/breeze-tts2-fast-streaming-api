@@ -9,6 +9,7 @@ from pathlib import Path
 
 import soundfile as sf
 
+from breeze_infer.audio import encode_prompt_waveform
 from breeze_infer.compile_cache import MANIFEST_NAME, pin_torch_key, resolve_cache_dir
 from breeze_infer.runtime import (
     load_runtime,
@@ -114,7 +115,12 @@ def main() -> None:
     }
     template_name = "tts_instruction"
     if args.ref_audio is not None:
-        request["ref_audio_path"] = str(args.ref_audio)
+        # templates.py only accepts pre-encoded reference codes (no path variant --
+        # see breeze_infer/audio.py and R10), so the CLI encodes the file itself.
+        wav, sample_rate = sf.read(args.ref_audio, always_2d=True, dtype="float32")
+        request["ref_audio_codes"] = encode_prompt_waveform(
+            audio_tokenizer, wav, sample_rate
+        )
         request["ref_text"] = args.ref_text.strip()
         template_name = "ref_edit_tata"
 

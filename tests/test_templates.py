@@ -1,59 +1,122 @@
 from __future__ import annotations
 
 import numpy as np
-import soundfile as sf
+import pytest
 import torch
 
-from breeze_infer.templates import _encode_prompt_audio
-from tests.fakes import FakeCodec, codec_frame_count
+from breeze_infer.templates import (
+    get_template,
+    prepare_inputs,
+    prepare_prefix_inputs,
+    prepare_suffix_inputs,
+    split_reference_prefix,
+)
+from tests.fakes import FakeCodec, FakeTokenizer, fake_model
 
 
-class _FakeTokenizer:
-    pad_token_id = 0
-    eos_token_id = 1
-
-    def __call__(
-        self,
-        text: str,
-        *,
-        add_special_tokens: bool = True,
-        return_tensors: str | None = None,
-    ) -> dict[str, list[int] | torch.Tensor]:
-        del add_special_tokens
-        ids = list(range(2, 2 + len(text)))
-        attention_mask = [1] * len(ids)
-        if return_tensors == "pt":
-            return {
-                "input_ids": torch.tensor([ids], dtype=torch.long),
-                "attention_mask": torch.tensor([attention_mask], dtype=torch.long),
-            }
-        return {"input_ids": ids, "attention_mask": attention_mask}
-
-    def decode(self, input_ids: list[int], *, skip_special_tokens: bool = False) -> str:
-        del skip_special_tokens
-        return "x" * len(input_ids)
+def _reference_request(**overrides):
+    request = {
+        "id": "r1",
+        "text": "hello world",
+        "instruction": "calm",
+        "speaker": "S0",
+        "ref_text": "the transcript",
+    }
+    request.update(overrides)
+    return request
 
 
-def test_encode_prompt_audio_reads_with_soundfile_and_downmixes(tmp_path) -> None:
-    audio_path = tmp_path / "stereo.wav"
-    wav = np.stack(
-        [
-            np.linspace(-0.5, 0.5, 8, dtype=np.float32),
-            np.linspace(0.5, -0.5, 8, dtype=np.float32),
-        ],
-        axis=1,
+def test_ref_edit_tata_uses_pre_encoded_reference_codes() -> None:
+    audio_tokenizer = FakeCodec()
+    codes = np.zeros((7, 16), dtype=np.int16)
+
+    inputs = prepare_inputs(
+        FakeTokenizer(),
+        audio_tokenizer,
+        fake_model(),
+        [_reference_request(ref_audio_codes=codes)],
+        get_template("ref_edit_tata"),
+        guidance_scale=1.0,
+        guidance_scale_ref=None,
+        guidance_scale_ins=None,
     )
-    sf.write(audio_path, wav, 24000)
-    tokenizer = FakeCodec()
 
-    codes = _encode_prompt_audio(tokenizer, str(audio_path))
+    # No call ever reaches the codec: codes handed in are used as-is, never re-encoded.
+    assert audio_tokenizer.encode_calls == 0
+    assert tuple(inputs["input_values"].shape) == (1, 7, 16)
+    placeholder_chars = len("<|AUDIO|>") * 7 + len("<|audio_eos|>")
+    assert int((~inputs["text_ids_mask"]).sum()) == placeholder_chars
 
-    assert isinstance(codes, torch.Tensor)
-    # 8 samples at 24 kHz is a fraction of one 1920-sample codec frame, so this is 1 frame,
-    # not the old fake's hard-coded 4 -- ``codec_frame_count`` is the real formula (also
-    # exercised directly in tests/test_fakes.py).
-    assert tuple(codes.shape) == (codec_frame_count(8, 24000), 16)
-    assert tokenizer.last_sr == 24000
-    assert tokenizer.last_wav is not None
-    assert tokenizer.last_wav.shape == (8,)
-    np.testing.assert_allclose(tokenizer.last_wav, np.mean(wav, axis=1), atol=1e-4)
+
+def test_ref_edit_tata_requires_reference_codes() -> None:
+    with pytest.raises(ValueError, match="ref_audio_codes"):
+        prepare_inputs(
+            FakeTokenizer(),
+            FakeCodec(),
+            fake_model(),
+            [_reference_request()],
+            get_template("ref_edit_tata"),
+            guidance_scale=1.0,
+            guidance_scale_ref=None,
+            guidance_scale_ins=None,
+        )
+
+
+def test_split_reference_prefix_reproduces_both_branches() -> None:
+    template = get_template("ref_edit_tata")
+    request = _reference_request(ref_audio_codes=np.zeros((3, 16), dtype=np.int16))
+
+    prefix, guided, unguided = split_reference_prefix(request)
+
+    assert prefix + guided == template.build_segments(request)
+    assert prefix + unguided == template.build_negative_segments(request)
+    assert prefix[1]["type"] == "audio"
+
+
+def test_prefix_and_suffix_inputs_concatenate_to_the_full_prompt() -> None:
+    tokenizer = FakeTokenizer()
+    audio_tokenizer = FakeCodec()
+    model = fake_model()
+    request = _reference_request(ref_audio_codes=np.ones((5, 16), dtype=np.int16))
+
+    full = prepare_inputs(
+        tokenizer,
+        audio_tokenizer,
+        model,
+        [request],
+        get_template("ref_edit_tata"),
+        guidance_scale=4.0,
+        guidance_scale_ref=None,
+        guidance_scale_ins=None,
+    )
+    prefix = prepare_prefix_inputs(tokenizer, audio_tokenizer, model, request)
+    suffix = prepare_suffix_inputs(
+        tokenizer, audio_tokenizer, model, request, guidance_scale=4.0
+    )
+
+    joined = torch.cat([prefix["input_ids"], suffix["input_ids"]], dim=1)
+    assert torch.equal(joined, full["input_ids"])
+    joined_neg = torch.cat(
+        [prefix["input_ids"], suffix["cfg_negative_prompt_ids"]], dim=1
+    )
+    assert torch.equal(joined_neg, full["cfg_negative_prompt_ids"])
+    assert suffix["input_values"] is None
+    assert torch.equal(prefix["input_values"], full["input_values"])
+    assert suffix["cfg_scale"] == 4.0
+    assert "cfg_negative_prompt_ids" not in prepare_suffix_inputs(
+        tokenizer, audio_tokenizer, model, request, guidance_scale=1.0
+    )
+
+
+def test_prefix_inputs_need_only_the_reference_fields() -> None:
+    request = {
+        "id": "p",
+        "speaker": "S0",
+        "ref_text": "the transcript",
+        "ref_audio_codes": np.zeros((4, 16), dtype=np.int16),
+    }
+
+    prefix = prepare_prefix_inputs(FakeTokenizer(), FakeCodec(), fake_model(), request)
+
+    assert tuple(prefix["input_values"].shape) == (1, 4, 16)
+    assert int(prefix["attention_mask"].sum()) == prefix["input_ids"].shape[1]
