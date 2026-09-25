@@ -208,10 +208,16 @@ On Linux, Triton builds a small helper with `gcc` the first time it populates a 
 
 | Action | Command |
 | --- | --- |
+| Run the server (browser clients) | `scripts/start_breeze.sh --cors http://127.0.0.1:8000` |
+| Unit and integration tests (no GPU) | `.venv/bin/pytest` |
+| GPU tests | `BREEZE_MODEL=<path> .venv/bin/pytest -m gpu` |
+| Lint | `.venv/bin/ruff check .` |
+| Benchmark | `.venv/bin/python -m breeze_infer.bench_api --url http://127.0.0.1:8080` (defaults `--warmup 3 --runs 10`) |
 | SillyTavern live test | `node tests/live/sillytavern/run.mjs <health\|voices\|speech\|full>` |
+| C++ docs example check | `.venv/bin/python -m tests.live.cpp_examples --url http://127.0.0.1:8080` |
 
-More commands are added here as the C++-compatible API work lands (see
-`specs/003-cpp-compatible-api/quickstart.md`).
+See `specs/003-cpp-compatible-api/quickstart.md` for the full walkthrough these commands are
+drawn from.
 
 
 ## License and Responsible Use
