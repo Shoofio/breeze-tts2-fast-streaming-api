@@ -24,6 +24,7 @@ from starlette.routing import Match, Router
 from starlette.types import Scope
 
 from breeze_infer.events import Emitter
+from breeze_infer.gpu import GpuUnavailable
 
 
 class ApiError(Exception):
@@ -95,6 +96,18 @@ _HTTP_EXCEPTION_RESPONSES: dict[int, tuple[str, str]] = {
     404: ("not_found", "not found"),
     405: ("method_not_allowed", "method not allowed"),
     413: ("payload_too_large", "request body is too large"),
+}
+
+# contracts/http-api.md "Busy and loading": the same body `routes_health.py`'s own
+# `_GPU_UNAVAILABLE_BODY` answers `/health` with once `Readiness.mark_unhealthy()` has run.
+# `GpuUnavailable` (`gpu.py`) is the other way a request meets a poisoned GPU: `GpuGate`
+# refuses it directly (`try_acquire`/`acquire`) rather than through `require_ready`, so it
+# needs its own handler here -- kept byte-for-byte the same body, not imported from
+# routes_health.py, since that module's constant is private to it.
+_GPU_UNAVAILABLE_BODY = {
+    "status": "error",
+    "error": "gpu is not responding",
+    "code": "gpu_unavailable",
 }
 
 
@@ -199,6 +212,14 @@ def install_error_handlers(app: FastAPI, events: Emitter) -> None:
     @app.exception_handler(ApiError)
     async def _api_error_handler(_: Request, exc: ApiError) -> JSONResponse:
         return api_error_response(exc)
+
+    @app.exception_handler(GpuUnavailable)
+    async def _gpu_unavailable_handler(_: Request, __: GpuUnavailable) -> JSONResponse:
+        # A poisoned GpuGate (gpu.py): try_acquire/acquire raise this directly, rather than
+        # going through Readiness -- distinct from busy (409), and from routes_health.py's
+        # own GpuUnresponsive (raised by require_ready once Readiness.mark_unhealthy() has
+        # run), but the two are meant to look identical to a client.
+        return JSONResponse(dict(_GPU_UNAVAILABLE_BODY), status_code=503)
 
     @app.exception_handler(FormParserError)
     async def _form_parser_error_handler(

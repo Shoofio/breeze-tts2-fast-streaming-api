@@ -1,63 +1,43 @@
-"""`POST /v1/audio/speech` tests (specs/003-cpp-compatible-api/tasks.md T041/T042).
+"""`POST /v1/audio/speech` tests (specs/003-cpp-compatible-api/tasks.md T041/T042; review-agent
+pass 1 findings 1, 4, 5, 7, 8, 9, 10).
 
-Built through `api.create_app` plus `routes_speech.install_speech`, the same wiring
-`api.py` uses (mirrors `tests/test_health.py`), with `tests/fakes.py`'s GPU-free stand-ins
-at the model edge (`FakeRuntime`, `FakeCodec`, `FakeTokenizer`) -- the Principle V
-deviation `tests/fakes.py`'s own docstring records. `FakeRuntime` itself carries no
+Built through `api.create_app` (which now wires `install_speech` in itself, next to
+`install_health` -- the same wiring `tests/test_health.py` uses), with `tests/fakes.py`'s
+GPU-free stand-ins at the model edge (`FakeRuntime`, `FakeCodec`, `FakeTokenizer`) -- the
+Principle V deviation `tests/fakes.py`'s own docstring records. `FakeRuntime` itself carries no
 `tokenizer`/`model`/`audio_tokenizer` (most of its other consumers never need them), so
 `_fake_runtime` attaches the same fakes `tests/test_synthesis.py` uses directly onto it,
-duck-typing the real `FastBreezeStreamingRuntime`'s own attributes
-(`models/fast_streaming.py`).
+duck-typing the real `FastBreezeStreamingRuntime`'s own attributes (`models/fast_streaming.py`).
 """
 
 from __future__ import annotations
 
 import asyncio
 import io
-import itertools
-import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pytest
 import soundfile as sf
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from breeze_infer import __version__
-from breeze_infer.api import Components
-from breeze_infer.body_limit import BodyLimitMiddleware
-from breeze_infer.cors import CorsMiddleware, CorsPolicy
-from breeze_infer.errors import install_error_handlers
+from breeze_infer.api import Components, create_app
 from breeze_infer.events import Emitter
 from breeze_infer.gpu import GpuGate, GpuThread
-from breeze_infer.routes_health import Readiness, install_health
-from breeze_infer.routes_speech import install_speech
+from breeze_infer.routes_health import Readiness
 from breeze_infer.settings import settings_from_args
-from breeze_infer.version_header import VersionHeaderMiddleware
 from tests.fakes import (
     FakeCodec,
     FakeRuntime,
     FakeStreamingConfig,
     FakeTokenizer,
-    fake_model,
+    RecordingEvents,
+    model_with_codec_facts,
 )
 
 SPEECH_PATH = "/v1/audio/speech"
-
-
-def _model_with_codec_facts() -> Any:
-    """`fake_model()` plus the codec facts `templates._codec_facts` requires
-    (`codec_config.codebook_size`). Duplicated from `tests/test_synthesis.py`'s own
-    helper of the same name and shape: `tests/fakes.py`'s `fake_model()` deliberately
-    leaves this out (another module's own test exercises that omission), so every
-    caller that needs a model `prepare_piece` can actually use adds it locally.
-    """
-    model = fake_model()
-    model.config.codec_config.codebook_size = 2048
-    return model
 
 
 def _fake_runtime(**kwargs: Any) -> FakeRuntime:
@@ -68,17 +48,14 @@ def _fake_runtime(**kwargs: Any) -> FakeRuntime:
     """
     runtime = FakeRuntime(**kwargs)
     runtime.tokenizer = FakeTokenizer()
-    runtime.model = _model_with_codec_facts()
+    runtime.model = model_with_codec_facts()
     runtime.audio_tokenizer = FakeCodec()
     return runtime
 
 
-def _request_ids() -> Callable[[], str]:
-    counter = itertools.count()
-    return lambda: f"req-{next(counter)}"
-
-
-def _build_components(readiness: Readiness, *, split_chars: int | None = None) -> Components:
+def _build_components(
+    readiness: Readiness, *, split_chars: int | None = None, events: Any = None
+) -> Components:
     # The model directory is never opened: nothing loads in these tests (test_health.py's
     # own _components does the same).
     argv = [str(Path(__file__).parent)]
@@ -86,7 +63,7 @@ def _build_components(readiness: Readiness, *, split_chars: int | None = None) -
         argv += ["--split-chars", str(split_chars)]
     return Components(
         settings=settings_from_args(argv),
-        events=Emitter(io.StringIO(), lambda: 0.0),
+        events=events if events is not None else Emitter(io.StringIO(), lambda: 0.0),
         gate=GpuGate(),
         gpu=GpuThread("cpu", lambda _device: None),
         readiness=readiness,
@@ -95,21 +72,23 @@ def _build_components(readiness: Readiness, *, split_chars: int | None = None) -
 
 
 def _client_for(components: Components) -> TestClient:
-    """Builds the app the way `api.create_app` does -- `install_speech` needs the raw
-    FastAPI `app` (for `app.post(...)`), which `create_app` doesn't expose: it returns
-    the fully wrapped ASGI app instead. This mirrors `create_app`'s own steps, with
-    `install_speech` slotted in next to `install_health`, where the main session's own
-    wiring into `api.py` is expected to put it (routes_speech.py's module docstring).
-    """
-    app = FastAPI(title="Breeze TTS", docs_url=None, redoc_url=None, openapi_url=None)
-    install_error_handlers(app, components.events)
-    install_health(app, components.readiness, components.ws_port)
-    install_speech(app, components, clock=time.monotonic, new_request_id=_request_ids())
+    """`api.create_app` now wires `install_speech` in itself (review-agent pass 1, finding
+    9): no more hand-rebuilt app wiring here.
 
-    policy = CorsPolicy(origins=components.settings.cors)
-    inner = CorsMiddleware(BodyLimitMiddleware(app), policy, app.router)
-    wrapped = VersionHeaderMiddleware(inner, version=__version__)
-    return TestClient(wrapped)
+    `raise_server_exceptions=False`: a genuinely unhandled exception (the DONE-with-no-audio
+    and priming-failure cases below) must come back as the 500 response a real client would
+    see (tests/test_api_errors.py and friends use the same flag for the same reason),
+    not re-raised into the test itself by Starlette's TestClient.
+    """
+    return TestClient(create_app(components), raise_server_exceptions=False)
+
+
+def _gate_is_free(components: Components) -> bool:
+    lease = components.gate.try_acquire()
+    if lease is None:
+        return False
+    lease.release()
+    return True
 
 
 def _wav_bytes(seconds: float = 0.5, sample_rate: int = 16000) -> bytes:
@@ -180,6 +159,44 @@ def test_inline_reference_with_a_real_wav_succeeds(ready_client: TestClient) -> 
     assert len(response.content) % 2 == 0
 
 
+# --- request_id: X-Request-Id and the speech.* events (finding 4, 8, 10) ---------------------
+
+
+def test_success_emits_accepted_and_first_audio_and_sets_x_request_id() -> None:
+    readiness = Readiness()
+    events = RecordingEvents()
+    components = _build_components(readiness, events=events)
+    try:
+        runtime = _fake_runtime()
+        readiness.mark_ready(runtime)
+        client = _client_for(components)
+
+        response = client.post(SPEECH_PATH, data={"text": "hello there"})
+
+        assert response.status_code == 200
+        request_id = response.headers["x-request-id"]
+        assert request_id
+
+        accepted = next(fields for name, fields in events.calls if name == "speech.accepted")
+        first_audio = next(
+            fields for name, fields in events.calls if name == "speech.first_audio"
+        )
+        assert accepted["request_id"] == request_id
+        assert accepted["pieces"] == 1
+        assert accepted["reference"] == "none"
+        assert first_audio["request_id"] == request_id
+        assert first_audio["ttfa_ms"] >= 0
+    finally:
+        components.gpu.shutdown()
+
+
+def test_x_request_id_is_present_on_error_responses(ready_client: TestClient) -> None:
+    response = ready_client.post(SPEECH_PATH, data={"text": "hello", "voice_id": "alice"})
+
+    assert response.status_code == 404
+    assert response.headers["x-request-id"]
+
+
 # --- 409 busy --------------------------------------------------------------------------
 
 
@@ -231,6 +248,27 @@ def test_409_busy_while_a_websocket_waiter_is_queued(
         (await task).release()
 
     asyncio.run(main())
+
+
+# --- FR-007: every CPU-only check runs before busy (finding 1) -------------------------------
+
+
+def test_unspeakable_text_is_400_not_409_even_while_the_gate_is_held(
+    ready_client: TestClient, components: Components
+) -> None:
+    """review-agent pass 1, finding 1: split_text's "nothing to speak" check (and any other
+    CPU-only check) must run before try_acquire, so a request that would fail validation
+    anyway never sees 409 just because the gate happens to be held.
+    """
+    lease = components.gate.try_acquire()
+    assert lease is not None
+    try:
+        response = ready_client.post(SPEECH_PATH, data={"text": "..."})
+    finally:
+        lease.release()
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "text is required", "code": "text_required"}
 
 
 # --- piece seeds -------------------------------------------------------------------------
@@ -304,5 +342,70 @@ def test_first_piece_with_no_room_gives_400_text_too_long() -> None:
         assert response.status_code == 400
         assert response.json() == {"error": "text is too long", "code": "text_too_long"}
         assert runtime.calls == []  # generation never started
+    finally:
+        components.gpu.shutdown()
+
+
+# --- the gate is released after every pre-200 failure (finding 10) ---------------------------
+
+
+def test_gate_is_released_after_unspeakable_text_400(
+    ready_client: TestClient, components: Components
+) -> None:
+    response = ready_client.post(SPEECH_PATH, data={"text": "..."})
+
+    assert response.status_code == 400
+    assert _gate_is_free(components)
+
+
+def test_gate_is_released_after_text_too_long_400() -> None:
+    readiness = Readiness()
+    components = _build_components(readiness)
+    try:
+        runtime = _fake_runtime(config=FakeStreamingConfig(max_seq_len=1))
+        readiness.mark_ready(runtime)
+        client = _client_for(components)
+
+        response = client.post(SPEECH_PATH, data={"text": "not enough room at all"})
+
+        assert response.status_code == 400
+        assert _gate_is_free(components)
+    finally:
+        components.gpu.shutdown()
+
+
+def test_gate_is_released_after_a_priming_failure() -> None:
+    # fail_after=0: the runtime raises before yielding any audio -- a genuine priming
+    # failure (500), distinct from the "no audio at all" DONE case below.
+    readiness = Readiness()
+    components = _build_components(readiness)
+    try:
+        runtime = _fake_runtime(fail_after=0)
+        readiness.mark_ready(runtime)
+        client = _client_for(components)
+
+        response = client.post(SPEECH_PATH, data={"text": "hello there"})
+
+        assert response.status_code == 500
+        assert _gate_is_free(components)
+    finally:
+        components.gpu.shutdown()
+
+
+def test_gate_is_released_when_the_first_step_is_done_with_no_audio() -> None:
+    readiness = Readiness()
+    components = _build_components(readiness)
+    try:
+        runtime = _fake_runtime(chunks=0)  # no chunks at all: DONE on the very first step
+        readiness.mark_ready(runtime)
+        client = _client_for(components)
+
+        response = client.post(SPEECH_PATH, data={"text": "hello there"})
+
+        # review-agent pass 1, finding 5: a plain RuntimeError (the unhandled path), so the
+        # contract's "every 500 closes the connection" holds -- not a keep-alive ApiError.
+        assert response.status_code == 500
+        assert response.json() == {"error": "internal error", "code": "internal_error"}
+        assert _gate_is_free(components)
     finally:
         components.gpu.shutdown()

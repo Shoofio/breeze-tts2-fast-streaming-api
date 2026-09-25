@@ -229,6 +229,19 @@ def test_a_stale_lease_cannot_release_the_current_holder() -> None:
 # --- poisoned: a gen.close() never finished, so the GPU can't be trusted again -------------
 
 
+def test_try_acquire_raises_gpu_unavailable_once_poisoned_even_if_free() -> None:
+    """Busy (`None`) and poisoned (`GpuUnavailable`) are different failures for an HTTP
+    caller (`409` vs `503`), so a poisoned-but-unowned gate must not look "free" to
+    `try_acquire` just because nobody holds it."""
+    gate = GpuGate()
+    lease = _hold(gate)
+    lease.poison()
+    lease.release()
+
+    with pytest.raises(GpuUnavailable):
+        gate.try_acquire()
+
+
 def test_a_poisoned_gate_refuses_new_holders_and_fails_queued_waiters() -> None:
     async def main() -> None:
         poisoned: list[str] = []
@@ -242,13 +255,17 @@ def test_a_poisoned_gate_refuses_new_holders_and_fails_queued_waiters() -> None:
         for waiter in waiters:
             with pytest.raises(GpuUnavailable):
                 await waiter
-        assert gate.try_acquire() is None
+        # Poisoned is a different failure from busy (503 gpu_unavailable, not 409 busy), so
+        # try_acquire raises here instead of returning None.
+        with pytest.raises(GpuUnavailable):
+            gate.try_acquire()
         with pytest.raises(GpuUnavailable):
             await gate.acquire()
         assert poisoned == ["poisoned"]
 
         holder.release()  # the stuck close finishing later doesn't reopen the gate
-        assert gate.try_acquire() is None
+        with pytest.raises(GpuUnavailable):
+            gate.try_acquire()
         with pytest.raises(GpuUnavailable):
             await gate.acquire()
 

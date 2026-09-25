@@ -513,7 +513,8 @@ def test_a_close_past_the_timeout_raises_and_keeps_the_gate_until_it_finishes(
             await session.aclose()  # queued behind `hold`, which outlasts the timeout
         # The GPU is still busy: the gate is poisoned, so nobody else gets it, even queued.
         assert poisoned == ["poisoned"]
-        assert gate.try_acquire() is None
+        with pytest.raises(GpuUnavailable):
+            gate.try_acquire()
         with pytest.raises(GpuUnavailable):
             await gate.acquire()
 
@@ -521,7 +522,8 @@ def test_a_close_past_the_timeout_raises_and_keeps_the_gate_until_it_finishes(
         await blocker
         while not reported:  # the close has really run now
             await asyncio.sleep(0.01)
-        assert gate.try_acquire() is None  # and the gate stays poisoned
+        with pytest.raises(GpuUnavailable):  # and the gate stays poisoned
+            gate.try_acquire()
 
     try:
         asyncio.run(asyncio.wait_for(main(), TIMEOUT))

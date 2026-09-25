@@ -61,9 +61,11 @@ class GpuGate:
     owner, no live waiter exists. So "owned" alone answers `try_acquire`, and it already covers
     "a waiter is pending".
 
-    Poisoned (after a `GpuCloseTimeout`), it refuses everyone for good: `try_acquire` returns
-    None, `acquire` raises `GpuUnavailable`, and queued waiters fail with it. Recovery is a
-    restart: `on_poisoned` (injected; production marks `/health` unhealthy) is called once.
+    Poisoned (after a `GpuCloseTimeout`), it refuses everyone for good: `try_acquire` and
+    `acquire` both raise `GpuUnavailable` (busy and poisoned are different failures for an
+    HTTP caller -- `409` vs `503` -- so `None` alone can't mean both any more), and queued
+    waiters fail with it too. Recovery is a restart: `on_poisoned` (injected; production
+    marks `/health` unhealthy) is called once.
     """
 
     def __init__(self, on_poisoned: Callable[[], None] | None = None) -> None:
@@ -75,8 +77,14 @@ class GpuGate:
         self._waiters: deque[asyncio.Future[GpuLease]] = deque()
 
     def try_acquire(self) -> GpuLease | None:
-        """Take the gate if it is free right now, else None. Never waits."""
-        if self._owner is not None or self._poisoned:
+        """Take the gate if it is free right now, else `None` (busy). Raises
+        `GpuUnavailable` if the gate is poisoned: that is a different failure from busy (a
+        caller answers it `503 gpu_unavailable`, not `409 busy`), so `None` can't mean both.
+        Never waits.
+        """
+        if self._poisoned:
+            raise GpuUnavailable("the GPU stopped responding")
+        if self._owner is not None:
             return None
         self._owner = GpuLease(self)
         return self._owner
@@ -90,10 +98,9 @@ class GpuGate:
         between the check and joining the queue; with a separate query, any `await` the caller
         made in between (e.g. sending `queued`) could make the answer stale. It must not await.
 
-        Raises `GpuUnavailable` if the gate is poisoned, now or while waiting.
+        Raises `GpuUnavailable` if the gate is poisoned, now or while waiting -- the "now" case
+        comes straight from `try_acquire`, which raises the same way.
         """
-        if self._poisoned:
-            raise GpuUnavailable("the GPU stopped responding")
         lease = self.try_acquire()
         if lease is not None:
             return lease
