@@ -25,10 +25,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from starlette.responses import Response
-from starlette.routing import Match, Router
+from starlette.routing import Router
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from breeze_infer.errors import ApiError, api_error_response
+from breeze_infer.errors import (
+    ApiError,
+    api_error_response,
+    http_status_error,
+    route_methods_for_path,
+)
 from breeze_infer.origins import canonical_origin
 
 # Every method a disallowed cross-origin request is *not* blocked for: GET/HEAD can't write or
@@ -38,12 +43,14 @@ _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _MAX_AGE = b"86400"
 _EXPOSE_HEADERS = b"X-Sample-Rate, X-Sample-Format, X-Breeze-Version"
 
-# Fixed (status, code, message) triples this middleware itself can answer with. Built through
-# `errors.api_error_response` (review issue 7) rather than importing errors.py's private
-# status-code table, so a client sees a response built exactly the same way whether Starlette's
-# own routing or this middleware produced it -- without reaching into that module's internals.
-_NOT_FOUND = (404, "not_found", "not found")
-_METHOD_NOT_ALLOWED = (405, "method_not_allowed", "method not allowed")
+# Fixed (status, code, message) triples this middleware itself can answer with. 404/405 are built
+# from `errors.http_status_error` (review-agent final pass, issue 8) rather than copied as string
+# literals, so a client sees exactly the same wording whether Starlette's own routing or this
+# middleware's own preflight handling produced the response. 403 has no entry there: it isn't a
+# generic "no route"/"wrong method" status, so `errors.py`'s table doesn't cover it -- CORS is the
+# only place `origin_not_allowed` means anything.
+_NOT_FOUND = (404, *http_status_error(404))
+_METHOD_NOT_ALLOWED = (405, *http_status_error(405))
 _ORIGIN_NOT_ALLOWED = (403, "origin_not_allowed", "origin not allowed")
 
 
@@ -71,13 +78,19 @@ def origin_allowed(policy: CorsPolicy, origin: str | None) -> bool:
     """Whether ``origin`` (an ``Origin`` header value, or ``None`` if the header is absent) may
     be served.
 
+    ``policy.enabled`` is checked first (review-agent final pass, issue 7): with CORS off there
+    is no origin any request could match, so there's nothing to gain by even looking at
+    ``origin``, let alone canonicalizing it.
+
     A well-behaved browser already sends a lowercase scheme and host with no default port, which
-    is exactly the form ``settings.py`` normalizes the allowlist to -- checked first, as a fast
+    is exactly the form ``settings.py`` normalizes the allowlist to -- checked next, as a fast
     path (review issue c8) that avoids canonicalizing on every request in the common case. Only
     when that exact match fails is ``origin`` run through ``canonical_origin`` too, so a redundant
     default port or a stray uppercase letter still matches. A malformed ``origin`` (never sent by
     a real browser) canonicalizes to nothing and is simply treated as not allowed, not raised.
     """
+    if not policy.enabled:
+        return False
     if origin is None:
         return False
     if policy.wildcard:
@@ -144,47 +157,6 @@ def _header(scope: Scope, name: bytes) -> str | None:
     return None
 
 
-def _route_methods(router: Router, scope: Scope) -> set[str] | None:
-    """The union of the declared methods of every route matching ``scope``'s path -- whatever
-    ``route.methods`` actually contains, with no assumption here about what that is. (It is
-    *not* safe to assume ``HEAD`` comes along with ``GET``: base Starlette ``Route.__init__``
-    adds it automatically, but FastAPI's own ``APIRoute`` -- what ``@app.get()`` etc. actually
-    build -- does not; ``/health`` has both only because ``routes_health.py`` lists them both
-    explicitly.) Returns ``None`` if no route matches the path at all.
-
-    FastAPI registers ``@app.get(path)``/``@app.post(path)`` on the same path as two separate
-    ``Route`` objects, not one route with two methods (review issue HIGH-1), so every matching
-    route contributes to the union -- returning only the first one found silently hid the other
-    routes' methods from a preflight. ``Route.matches`` returns ``Match.NONE`` only when the
-    *path* doesn't match; a path match with the "wrong" method (here, every real route, since none
-    of them declare ``OPTIONS`` themselves) comes back as ``Match.PARTIAL`` -- either is a match
-    for our purposes. Not every matched entry is a plain ``Route`` with a ``.methods`` set (e.g. a
-    ``Mount`` has none at all); such an entry is skipped rather than crashing on a bare
-    ``route.methods`` access, and contributes nothing to the union (review issue 5).
-    """
-    methods: set[str] = set()
-    found = False
-    for route in router.routes:
-        match, _ = route.matches(scope)
-        if match is Match.NONE:
-            continue
-        route_methods = getattr(route, "methods", None)
-        if route_methods is None:
-            continue
-        found = True
-        methods |= set(route_methods)
-    return methods if found else None
-
-
-def _error_response(
-    status: int, code: str, message: str, headers: list[tuple[bytes, bytes]]
-) -> Response:
-    response = api_error_response(ApiError(status, code, message))
-    for name, value in headers:
-        response.headers[name.decode("latin-1")] = value.decode("latin-1")
-    return response
-
-
 class CorsMiddleware:
     """Pure-ASGI CORS: preflight, ``403`` for a disallowed cross-origin write, and response
     headers on everything else, including error and streamed responses.
@@ -248,23 +220,32 @@ class CorsMiddleware:
             await self._reject(scope, receive, send, origin, allowed, *_ORIGIN_NOT_ALLOWED)
             return
 
-        route_methods = _route_methods(self.router, scope)
-        if route_methods is None:
+        matched, route_methods = route_methods_for_path(self.router, scope)
+        if not matched:
             await self._reject(scope, receive, send, origin, allowed, *_NOT_FOUND)
             return
-        if requested_method.upper() not in route_methods:
-            headers = response_headers(self.policy, origin, allowed)
-            # The matched route's own methods, same as a real wrong-method 405 would carry
+        requested = requested_method.upper()
+        # An empty `route_methods` with `matched` True means a Mount, or a Route registered with
+        # `methods=None`, matched -- its sub-app decides its own methods, which this function
+        # can't see, so the requested method is let through rather than rejected against an
+        # allowlist that isn't really one (review-agent final pass, issue 6).
+        if route_methods and requested not in route_methods:
+            # The matched routes' own methods, same as a real wrong-method 405 would carry
             # (review issue 3) -- not "+ OPTIONS": Allow describes what the *resource* supports,
             # and OPTIONS is how you ask, not a method the resource itself implements.
-            headers.append((b"allow", ", ".join(sorted(route_methods)).encode("latin-1")))
-            status, code, message = _METHOD_NOT_ALLOWED
-            await _error_response(status, code, message, headers)(scope, receive, send)
+            allow = ", ".join(sorted(route_methods)).encode("latin-1")
+            await self._reject(
+                scope, receive, send, origin, allowed, *_METHOD_NOT_ALLOWED,
+                extra_headers=[(b"allow", allow)],
+            )
             return
 
         requested_headers = _header(scope, b"access-control-request-headers")
+        # Nothing to enumerate for the any-method case beyond the one method this preflight
+        # actually asked about (review-agent final pass, issue 6).
+        effective_methods = route_methods or {requested}
         headers = response_headers(self.policy, origin, allowed) + preflight_headers(
-            route_methods, requested_headers
+            effective_methods, requested_headers
         )
         response = Response(status_code=204, headers=_as_str_headers(headers))
         await response(scope, receive, send)
@@ -279,9 +260,16 @@ class CorsMiddleware:
         status: int,
         code: str,
         message: str,
+        extra_headers: list[tuple[bytes, bytes]] = (),
     ) -> None:
-        headers = response_headers(self.policy, origin, allowed)
-        await _error_response(status, code, message, headers)(scope, receive, send)
+        # Built once here (review-agent final pass, issue 9), so every rejection this middleware
+        # sends -- a disallowed origin's 403, preflight's own 404/405 -- goes through the same
+        # header-assembly path instead of each caller repeating it.
+        headers = _as_str_headers(response_headers(self.policy, origin, allowed) + list(extra_headers))
+        response = api_error_response(ApiError(status, code, message))
+        for name, value in headers.items():
+            response.headers[name] = value
+        await response(scope, receive, send)
 
     def _wrap_send(self, send: Send, origin: str | None, allowed: bool) -> Send:
         extra = response_headers(self.policy, origin, allowed)

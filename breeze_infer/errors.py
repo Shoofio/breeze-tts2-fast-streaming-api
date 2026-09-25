@@ -19,6 +19,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from python_multipart.exceptions import FormParserError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match, Router
+from starlette.types import Scope
 
 from breeze_infer.events import Emitter
 
@@ -43,6 +45,16 @@ class ApiError(Exception):
         self.status = status
         self.code = code
         self.message = message
+
+
+class StreamAborted(Exception):
+    """A streamed response ended abnormally after its headers were sent (streaming.py).
+
+    Raised only so uvicorn drops the connection without the chunked terminator (research.md
+    R2); the original error is its `__cause__`. The response has already emitted its outcome
+    event, and the headers are out, so no error response can be sent either: the catch-all
+    handler below must neither answer nor report it a second time.
+    """
 
 
 def _envelope(message: str, code: str) -> dict[str, str]:
@@ -78,12 +90,70 @@ _HTTP_EXCEPTION_RESPONSES: dict[int, tuple[str, str]] = {
 }
 
 
+def http_status_error(status: int) -> tuple[str, str]:
+    """The fixed ``(code, message)`` pair this codebase uses for a bare HTTP ``status`` such as
+    ``404``/``405`` -- the same wording ``_http_exception_handler`` below gives Starlette's own
+    "no route"/"wrong method" responses.
+
+    Public so another module that itself needs to build one of these exact responses -- today,
+    ``cors.py``'s preflight handling, which answers its own ``404``/``405`` when a path doesn't
+    exist or a route doesn't support the requested method -- reuses this wording instead of
+    copying the literal strings (review-agent final pass, issue 8). Raises ``KeyError`` for a
+    status with no fixed wording here; unlike the handler below, there is no sensible "internal
+    error" fallback for a caller that asked for a status this table was never meant to cover.
+    """
+    return _HTTP_EXCEPTION_RESPONSES[status]
+
+
+def route_methods_for_path(router: Router, scope: Scope) -> tuple[bool, set[str]]:
+    """The union of the declared methods of every route matching ``scope``'s path.
+
+    Returns ``(True, methods)`` when at least one route matches the path, ``(False, set())`` when
+    none does. ``methods`` is the union of every matched route's own ``.methods`` -- whatever that
+    actually contains, with no assumption here about what it is (it is *not* safe to assume
+    ``HEAD`` comes along with ``GET``: base Starlette ``Route.__init__`` adds it automatically,
+    but FastAPI's own ``APIRoute`` -- what ``@app.get()`` etc. actually build -- does not). FastAPI
+    registers ``@app.get(path)``/``@app.post(path)`` on the same path as two separate ``Route``
+    objects, not one route with two methods, so every matching route must contribute -- both here
+    and in ``_http_exception_handler``'s own ``405`` below, which otherwise only sees Starlette's
+    own ``Router.app`` keeping just the *first* ``Match.PARTIAL`` route it finds (review-agent
+    final pass, issue 4).
+
+    ``Route.matches`` returns ``Match.NONE`` only when the *path* doesn't match; a path match with
+    the "wrong" method comes back as ``Match.PARTIAL`` -- either counts as a match here. Not every
+    matched entry is a plain ``Route`` with a ``.methods`` set: a ``Mount`` has none at all, and
+    neither does a ``Route`` registered with ``methods=None`` (a raw ASGI sub-app, meaning "the
+    sub-app decides"). Such an entry is skipped rather than crashing on a bare ``route.methods``
+    access (review-agent second-to-last pass, issue 5) -- and makes the whole result ``methods ==
+    set()`` even if other matched routes *do* enumerate methods, since callers must treat an
+    empty-but-matched result as "any method is allowed here", not as an empty allowlist to reject
+    everything against (review-agent final pass, issue 6): there's no way to know a Mount's own
+    sub-app doesn't handle a method this function can't see.
+    """
+    matched = False
+    any_method = False
+    methods: set[str] = set()
+    for route in router.routes:
+        match, _ = route.matches(scope)
+        if match is Match.NONE:
+            continue
+        matched = True
+        route_methods = getattr(route, "methods", None)
+        if route_methods is None:
+            any_method = True
+            continue
+        methods |= set(route_methods)
+    if not matched:
+        return False, set()
+    return True, (set() if any_method else methods)
+
+
 def install_error_handlers(app: FastAPI, events: Emitter) -> None:
     """Register every exception handler the contract needs (contracts/http-api.md)."""
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_exception_handler(
-        _: Request, exc: StarletteHTTPException
+        request: Request, exc: StarletteHTTPException
     ) -> JSONResponse:
         # No route matched, wrong method, and Starlette's own multipart limits all raise this
         # (never `ApiError`), each carrying whatever `headers` the raiser set -- e.g. a 405's
@@ -95,8 +165,16 @@ def install_error_handlers(app: FastAPI, events: Emitter) -> None:
                 _envelope("internal error", "internal_error"), status_code=500, headers=exc.headers
             )
         code, message = mapped
+        headers = exc.headers
+        if exc.status_code == 405:
+            # Starlette's own `Route.handle` set `exc.headers["Allow"]` from just the first
+            # matching route it found (review issue 4) -- recomputed here as the union across
+            # every route that matches this path, the same way `cors.py`'s preflight does.
+            matched, methods = route_methods_for_path(request.app.router, request.scope)
+            if matched and methods:
+                headers = {**(headers or {}), "Allow": ", ".join(sorted(methods))}
         return JSONResponse(
-            _envelope(message, code), status_code=exc.status_code, headers=exc.headers
+            _envelope(message, code), status_code=exc.status_code, headers=headers
         )
 
     @app.exception_handler(ApiError)
@@ -135,6 +213,10 @@ def install_error_handlers(app: FastAPI, events: Emitter) -> None:
         # in the structured event log via repr(). Starlette's ServerErrorMiddleware
         # re-raises after this response is sent, so uvicorn also prints a traceback;
         # that duplicate is intended.
+        if isinstance(exc, StreamAborted):
+            # ServerErrorMiddleware only sends this if the response hasn't started, and a
+            # StreamAborted always comes after it has: this response is never sent.
+            return JSONResponse(_envelope("internal error", "internal_error"), status_code=500)
         request_id = getattr(request.state, "request_id", None)
         if not request_id:
             request_id = f"api-{uuid.uuid4().hex}"

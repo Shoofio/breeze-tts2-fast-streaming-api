@@ -241,6 +241,33 @@ def test_bc_18_pydantic_validation_error_is_400_invalid_field() -> None:
     assert response.json() == {"error": "invalid request", "code": "invalid_field"}
 
 
+def test_wrong_method_on_a_split_route_lists_the_union_of_every_matching_route_s_methods() -> None:
+    """review issue 4 (CORS final review): FastAPI registers `@app.get(path)`/`@app.post(path)`
+    on the same path as two separate `Route` objects, not one route with two methods. Starlette's
+    own `Route.handle` only reports the *first* matching route's own `Allow` header
+    (`starlette/routing.py`'s `Router.app` keeps just the first `Match.PARTIAL` route), silently
+    hiding the other route's method; the handler must recompute `Allow` as the union across every
+    route matching the path -- the same `route_methods_for_path` helper `cors.py`'s preflight
+    handling uses (`breeze_infer/errors.py`), so both give the same answer for the same path.
+    """
+    app = _app()
+
+    @app.get("/v1/voices")
+    async def list_voices() -> dict:
+        return {}
+
+    @app.post("/v1/voices")
+    async def create_voice() -> dict:
+        return {}
+
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.put("/v1/voices")
+
+    assert response.status_code == 405
+    assert response.json() == {"error": "method not allowed", "code": "method_not_allowed"}
+    assert set(response.headers["allow"].split(", ")) == {"GET", "POST"}
+
+
 def test_bc_18_every_error_response_is_application_json() -> None:
     for response in (
         _client().get("/boom"),

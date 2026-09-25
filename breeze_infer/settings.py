@@ -112,8 +112,10 @@ def _parse_cors_origins(value: str | None) -> tuple[str, ...]:
         return ()
     raw_entries = [entry.strip() for entry in value.split(",") if entry.strip()]
     if not raw_entries:
-        # An empty allowlist would silently mean "CORS off" despite the flag.
-        raise ValueError("--cors was given an empty origin list")
+        # An empty allowlist would silently mean "CORS off" despite the flag. No "--cors" here:
+        # `settings_from_args` prepends the flag name once, uniformly, for every rejection this
+        # function raises (review-agent final pass, issue 3).
+        raise ValueError("was given an empty origin list")
     if "*" in raw_entries:
         if any(entry != "*" for entry in raw_entries):
             raise ValueError("'*' can't be combined with other origins")
@@ -283,7 +285,11 @@ def settings_from_args(argv: Sequence[str] | None = None) -> Settings:
     try:
         cors = _parse_cors_origins(args.cors)
     except ValueError as exc:
-        parser.error(str(exc))
+        # `_parse_cors_origins`/`canonical_origin` (origins.py) keep their own messages neutral
+        # about which flag they're validating -- `canonical_origin` is also run on every request's
+        # incoming `Origin` header, where "--cors" would be meaningless -- so this is the one place
+        # that actually knows the value came from `--cors` (review-agent final pass, issue 3).
+        parser.error(f"--cors: {exc}")
 
     return Settings(
         model_path=args.model_path,

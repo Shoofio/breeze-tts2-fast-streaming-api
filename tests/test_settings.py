@@ -521,3 +521,85 @@ def test_cors_origin_with_empty_query_or_fragment_rejected(
     with pytest.raises(SystemExit):
         settings_from_args([str(tmp_path), "--cors", entry])
     assert entry in capsys.readouterr().err
+
+
+# --------------------------------------------------- review-agent final pass (fuzzed 1M inputs)
+
+
+def test_cors_bracketed_ipvfuture_without_a_colon_is_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue 1: `[v1.example]` has no ':' left once brackets are stripped (unlike
+    `[v1.fe80::1]`), so a check keyed on "is there a ':' in the stripped host" let it slip
+    through as the plain hostname `v1.example`. Anything inside brackets must be validated as an
+    IP literal, never reinterpreted as an ordinary hostname."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "http://[v1.example]"])
+    assert "IPvFuture" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "https://evil.example.2130706433.",
+        "http://0x7f000001.",
+        "http://evil.0x",
+        "http://0x",
+    ],
+)
+def test_cors_numeric_or_hex_last_label_edge_cases_rejected(
+    tmp_path: Path, entry: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue 2: a trailing '.' (FQDN absolute-name syntax) left the last label empty after
+    `rsplit(".", 1)`, silently bypassing the numeric/hex check entirely (`"...2130706433."` was
+    accepted); and the hex check required at least one digit after `"0x"`, letting the bare label
+    `"0x"` itself through."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", entry])
+    assert "numeric" in capsys.readouterr().err
+
+
+def test_cors_origin_error_is_prefixed_with_the_flag_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue 3: `canonical_origin`'s own messages are deliberately flag-agnostic (it's also used
+    on the request path, where "--cors" would be meaningless); `settings.py` is the one place
+    that knows this value came from `--cors`, so it's the one that must say so."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "ftp://a.example"])
+    err = capsys.readouterr().err
+    assert "--cors: " in err
+    assert "ftp://a.example" in err
+
+
+@pytest.mark.parametrize("entry", ["http://a.example:", "http://[::1]:"])
+def test_cors_origin_with_empty_port_rejected(
+    tmp_path: Path, entry: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue 5: `urlsplit(...).port` silently returns `None` for a trailing ':' with nothing
+    after it -- indistinguishable from no port at all -- rather than raising."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", entry])
+    assert "port" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("entry", ["http://a.example:0080", "http://[::1]:0080"])
+def test_cors_origin_port_with_leading_zero_rejected(
+    tmp_path: Path, entry: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue 5: `urlsplit(...).port` is an `int`, so `"0080"` and `"80"` are indistinguishable by
+    the time this module would see them -- silently normalizing away a leading zero that a real
+    browser's `Origin` header would never carry in the first place."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", entry])
+    assert "leading zero" in capsys.readouterr().err
+
+
+def test_cors_c1_control_character_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue 10: the control-character check only ever covered C0 (0x00-0x1F) and DEL (0x7F);
+    a C1 control (0x80-0x9F, also Unicode category "Cc") must be rejected the same way."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "https://a\x80b.example"])
+    assert "control characters or whitespace" in capsys.readouterr().err

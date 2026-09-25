@@ -28,9 +28,10 @@ from breeze_infer.body_limit import BodyLimitMiddleware
 from breeze_infer.cors import (
     CorsMiddleware,
     CorsPolicy,
-    _route_methods,
+    origin_allowed,
     preflight_headers,
 )
+from breeze_infer.errors import http_status_error, route_methods_for_path
 from breeze_infer.events import Emitter
 from breeze_infer.gpu import GpuGate, GpuThread
 from breeze_infer.limits import MAX_BODY_BYTES
@@ -362,23 +363,73 @@ def test_preflight_without_origin_is_not_a_preflight(
     assert "access-control-max-age" not in response.headers
 
 
-def test_route_methods_skips_a_route_with_no_methods_attribute() -> None:
+def test_route_methods_for_path_does_not_crash_on_a_route_with_no_methods_attribute() -> None:
     """review issue 5: a `Mount` (e.g. for static files) has no `.methods` attribute at all;
-    `_route_methods` must use `getattr(route, "methods", None)` and skip it, rather than
-    crashing on a bare `route.methods` access.
+    `route_methods_for_path` (shared with `errors.py`'s 405 handler, review issue 4) must use
+    `getattr(route, "methods", None)` rather than crashing on a bare `route.methods` access.
     """
-
-    async def _endpoint(request: object) -> None:
-        del request
 
     async def _sub_app(scope: object, receive: object, send: object) -> None:
         del scope, receive, send
 
     router = FastAPI().router
-    router.routes = [Mount("/static", app=_sub_app), Route("/static/thing", _endpoint, methods=["GET"])]
+    router.routes = [Mount("/static", app=_sub_app)]
     scope = {"type": "http", "method": "OPTIONS", "path": "/static/thing", "headers": []}
 
-    assert _route_methods(router, scope) == {"GET", "HEAD"}
+    matched, methods = route_methods_for_path(router, scope)
+
+    assert matched is True
+    assert methods == set()
+
+
+def test_route_methods_for_path_no_match_is_not_matched() -> None:
+    router = FastAPI().router
+    router.routes = [Route("/health", _noop_endpoint, methods=["GET"])]
+    scope = {"type": "http", "method": "OPTIONS", "path": "/nope", "headers": []}
+
+    assert route_methods_for_path(router, scope) == (False, set())
+
+
+def test_preflight_to_a_mounted_path_allows_any_method_instead_of_404(
+    make_client: Callable[..., TestClient],
+) -> None:
+    """final review issue 6: a `Mount`'s sub-app decides its own methods; a path only a `Mount`
+    matches must not come back `404` from preflight, and the requested method must be let
+    through (not `405`) since there's no enumerable method list to reject it against.
+    """
+    app = FastAPI()
+
+    async def _sub_app(scope: object, receive: object, send: object) -> None:
+        del scope, receive, send
+
+    app.router.routes.append(Mount("/static", app=_sub_app))
+    client = _wrapped(app, CorsPolicy((GOOD_ORIGIN,)))
+
+    response = client.options(
+        "/static/thing",
+        headers={"Origin": GOOD_ORIGIN, "Access-Control-Request-Method": "PUT"},
+    )
+
+    assert response.status_code == 204
+    assert "PUT" in response.headers["access-control-allow-methods"].split(", ")
+
+
+def test_origin_allowed_returns_false_immediately_when_cors_is_off() -> None:
+    """final review issue 7: checked before even looking at `origin` -- with CORS off there is
+    nothing any origin could match, so there's no reason to canonicalize it first."""
+    assert origin_allowed(CorsPolicy(()), "not a valid origin at all") is False
+    assert origin_allowed(CorsPolicy(()), None) is False
+
+
+def test_http_status_error_supplies_the_wording_cors_reuses() -> None:
+    """final review issue 8: `cors.py`'s own `404`/`405` no longer copy `errors.py`'s wording as
+    string literals -- they're built from this public function instead."""
+    assert http_status_error(404) == ("not_found", "not found")
+    assert http_status_error(405) == ("method_not_allowed", "method not allowed")
+
+
+def _noop_endpoint(request: object) -> None:
+    del request
 
 
 @pytest.mark.parametrize("method", ["PUT", "PATCH"])
