@@ -611,11 +611,49 @@ def test_serve_raising_during_the_load_hard_exits_non_zero_with_the_traceback(
     stderr = capsys.readouterr().err
     assert "Traceback" in stderr
     assert "RuntimeError: uvicorn broke" in stderr
-    crashed = _events(sink)[-1]
-    assert (crashed["event"], crashed["level"]) == ("server.stopping", "error")
-    assert crashed["reason"] == "serve raised"
+    [crashed] = _stopping_events(sink)  # one event, not a warning plus an error
+    assert (crashed["level"], crashed["reason"]) == ("error", "serve raised")
+    assert crashed["hard_exit_reason"] == "load in progress"
     assert "uvicorn broke" in crashed["error"]
     assert "RuntimeError" in crashed["traceback"]
+
+
+def _stopping_events(sink: io.StringIO) -> list[dict[str, Any]]:
+    return [event for event in _events(sink) if event["event"] == "server.stopping"]
+
+
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_failing_gpu_stop_cannot_hide_the_crash(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sink = io.StringIO()
+    components = _components(sink)
+    outcome = ServeOutcome()
+
+    async def broken_main_loop(self: Any) -> None:
+        raise RuntimeError("uvicorn broke")
+
+    async def broken_stop_gpu(*args: Any) -> None:
+        outcome.hard_exit = True  # decided, then failed before reporting anything
+        raise OSError("stop broke")
+
+    monkeypatch.setattr(api._Server, "main_loop", broken_main_loop)
+    monkeypatch.setattr(api, "_stop_gpu", broken_stop_gpu)
+
+    async def scenario() -> None:
+        app = create_app(components)
+        await serve(components, app, [_bind_one("127.0.0.1", 0)], _loaded, outcome)
+
+    try:
+        with pytest.raises(OSError, match="stop broke"):
+            asyncio.run(asyncio.wait_for(scenario(), 10))
+    finally:
+        components.gpu.shutdown()
+    assert outcome == ServeOutcome(1, hard_exit=True)
+    assert "RuntimeError: uvicorn broke" in capsys.readouterr().err
+    [crashed] = _stopping_events(sink)
+    assert (crashed["level"], crashed["reason"]) == ("error", "serve raised")
+    assert "uvicorn broke" in crashed["error"]
 
 
 @posix_only
@@ -656,8 +694,9 @@ def test_serve_raising_with_a_stuck_drain_keeps_ex_software(
         components.gpu.shutdown()
     assert outcome == ServeOutcome(70, hard_exit=True)
     assert "RuntimeError: uvicorn broke" in capsys.readouterr().err
-    reasons = [event.get("reason") for event in _events(sink)]
-    assert reasons[-2:] == ["gpu drain timed out", "serve raised"]
+    [crashed] = _stopping_events(sink)
+    assert (crashed["level"], crashed["reason"]) == ("error", "serve raised")
+    assert crashed["hard_exit_reason"] == "gpu drain timed out"
 
 
 def test_hard_exit_survives_a_broken_stdout(monkeypatch: pytest.MonkeyPatch) -> None:

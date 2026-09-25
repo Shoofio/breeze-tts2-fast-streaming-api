@@ -332,9 +332,21 @@ async def serve(
             raise
         finally:
             serving = False
-            await _stop_gpu(components, server, loading, drain_interrupted, outcome)
-            if crash is not None and outcome.hard_exit:
-                _report_crash(components.events, crash, outcome)
+            hard_exit_reason: str | None = None
+            try:
+                hard_exit_reason = await _stop_gpu(
+                    components, server, loading, drain_interrupted, outcome
+                )
+            finally:
+                # In a `finally` of its own, so a failing _stop_gpu can't hide the crash. One
+                # `server.stopping` either way: the crash (level error) carries the hard-exit
+                # reason, rather than a warning followed by an error.
+                if crash is not None:
+                    _report_crash(components.events, crash, outcome, hard_exit_reason)
+                elif hard_exit_reason is not None:
+                    components.events.emit(
+                        "server.stopping", level="warning", reason=hard_exit_reason
+                    )
     finally:
         # Only now that the hard-exit decision is made: until then a signal must still reach
         # `on_signal`.
@@ -343,21 +355,29 @@ async def serve(
             _ignore_sigint()
 
 
-def _report_crash(events: Emitter, exc: BaseException, outcome: ServeOutcome) -> None:
-    """serve() is raising, but `main()` will hard-exit, and `os._exit` would swallow the
-    exception: no traceback, and a crash that looks like a clean stop to Docker or Kubernetes.
-    So report it here and make the exit code non-zero (keeping `EXIT_GPU_STUCK`)."""
+def _report_crash(
+    events: Emitter,
+    exc: BaseException,
+    outcome: ServeOutcome,
+    hard_exit_reason: str | None,
+) -> None:
+    """serve() is raising: the one `server.stopping` event, at level error.
+
+    On a hard exit `os._exit` would also swallow the exception: no traceback, and a crash
+    that looks like a clean stop to Docker or Kubernetes. So then the traceback goes to stderr
+    too and the exit code is made non-zero (keeping `EXIT_GPU_STUCK`). Without a hard exit the
+    exception propagates and Python prints it and exits 1 as usual.
+    """
+    trace = "".join(traceback.format_exception(exc))
+    fields: dict[str, Any] = {"error": repr(exc), "traceback": trace}
+    if hard_exit_reason is not None:
+        fields["hard_exit_reason"] = hard_exit_reason
+    events.emit("server.stopping", level="error", reason="serve raised", **fields)
+    if not outcome.hard_exit:
+        return
     if outcome.exit_code == 0:
         outcome.exit_code = 1
-    trace = "".join(traceback.format_exception(exc))
-    events.emit(
-        "server.stopping",
-        level="error",
-        reason="serve raised",
-        error=repr(exc),
-        traceback=trace,
-    )
-    # stderr as well, where an uncaught exception's traceback would normally have gone.
+    # stderr, where an uncaught exception's traceback would normally have gone.
     with contextlib.suppress(Exception):
         sys.stderr.write(trace)
         sys.stderr.flush()
@@ -369,20 +389,18 @@ async def _stop_gpu(
     loading: asyncio.Task[bool],
     drain_interrupted: asyncio.Event,
     outcome: ServeOutcome,
-) -> None:
+) -> str | None:
     """Wind the GPU down once uvicorn has stopped: every generation closed on the GPU thread,
     then the thread stopped. Bounded by `GPU_DRAIN_SECONDS` and cut short by a signal; either
     of those, or a model load still running (it can't be interrupted), sets `hard_exit`.
+    Returns why it hard-exits (None if not); `serve()` reports it.
     """
     load_failed = loading.done() and not loading.cancelled() and not loading.result()
     outcome.exit_code = 1 if load_failed else 0
     if not loading.done():
         loading.cancel()
         outcome.hard_exit = True
-        components.events.emit(
-            "server.stopping", level="warning", reason="load in progress"
-        )
-        return
+        return "load in progress"
 
     drain = asyncio.create_task(_drain_gpu(components, server))
     interrupted = asyncio.create_task(drain_interrupted.wait())
@@ -392,15 +410,12 @@ async def _stop_gpu(
         # The drain is abandoned, not awaited: the process is about to end.
         drain.cancel()
         outcome.hard_exit = True
-        components.events.emit(
-            "server.stopping", level="warning", reason="signal during drain"
-        )
-    elif not drain.result():
+        return "signal during drain"
+    if not drain.result():
         outcome.exit_code = EXIT_GPU_STUCK
         outcome.hard_exit = True
-        components.events.emit(
-            "server.stopping", level="warning", reason="gpu drain timed out"
-        )
+        return "gpu drain timed out"
+    return None
 
 
 async def _drain_gpu(components: Components, server: uvicorn.Server) -> bool:
