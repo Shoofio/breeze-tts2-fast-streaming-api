@@ -586,7 +586,7 @@ and `test_bc_46` tests.
 
 ### Tests (write first)
 
-- [ ] T050 [P] [US3] Create `tests/test_long_text.py` (`FakeRuntime`), porting the matching `A:`
+- [X] T050 [P] [US3] Create `tests/test_long_text.py` (`FakeRuntime`), porting the matching `A:`
   anchoring cases from `A:tests/test_api_speech.py` (~462–494):
   - `test_first_piece_anchors_every_later_piece`;
   - the anchor skips all-pad frames, and there's no anchor when piece 0 produced 0 frames;
@@ -605,7 +605,7 @@ and `test_bc_46` tests.
 
 ### Implementation
 
-- [ ] T052 [US3] Extend `breeze_infer/synthesis.py`:
+- [X] T052 [US3] Extend `breeze_infer/synthesis.py`:
   - `anchor_codes(frames, pad_id)`: port `A:api.py` ~1002–1010, dropping all-pad frames;
   - anchor after piece 0 succeeds with at least one frame;
   - `piece_room(...)` using `max_new_tokens_room`;
@@ -613,7 +613,7 @@ and `test_bc_46` tests.
   - no room for piece 0 raises `ApiError(400, text_too_long)` before streaming; no room for a later
     piece raises, which aborts the stream;
   - a partial room clamps and emits `speech.piece_clamped`.
-- [ ] T053 [US3] Update `breeze_infer/routes_speech.py`:
+- [X] T053 [US3] Update `breeze_infer/routes_speech.py`:
   - use `split_text(text, budget=split_chars, first_budget=ANCHOR_CHARS if no reference else 0)`;
   - check the first piece's room on the CPU before `try_acquire` (predicted reference frames plus
     tokenized text via `_prefill_plan`);

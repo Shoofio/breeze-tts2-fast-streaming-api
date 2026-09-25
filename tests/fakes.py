@@ -237,16 +237,16 @@ class FakeCodec:
     SAMPLES_PER_FRAME = CODEC_SAMPLES_PER_FRAME
     CODEBOOKS = CODEC_CODEBOOKS
     CODEBOOK_SIZE = CODEC_CODEBOOK_SIZE
-    # The one field `breeze_infer.synthesis.codec_samples_per_frame` reads off a loaded
-    # audio tokenizer's own config (``Qwen3TTSTokenizerV2Config.decode_upsample_rate``) --
-    # same value as SAMPLES_PER_FRAME above, just exposed the way the real object does
-    # (``audio_tokenizer.config.decode_upsample_rate``, not a class attribute).
-    config = SimpleNamespace(decode_upsample_rate=CODEC_SAMPLES_PER_FRAME)
-
     def __init__(self) -> None:
         self.encode_calls = 0
         self.last_wav: np.ndarray | None = None
         self.last_sr: int | None = None
+
+    def get_decode_upsample_rate(self) -> int:
+        """The real wrapper's accessor (``Qwen3TTSTokenizer.get_decode_upsample_rate``),
+        which `breeze_infer.synthesis.codec_samples_per_frame` reads: waveform samples per
+        codec frame, the same value as SAMPLES_PER_FRAME."""
+        return self.SAMPLES_PER_FRAME
 
     def encode(
         self, wav: np.ndarray, sr: int, return_dict: bool = True

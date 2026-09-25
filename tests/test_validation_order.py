@@ -220,6 +220,10 @@ class _RaisingRuntime:
     def max_new_tokens_room(self, *args: Any, **kwargs: Any) -> int:
         return self._inner.max_new_tokens_room(*args, **kwargs)
 
+    def _frame_cap(self, requested: int | None) -> int:
+        # `synthesis.piece_room` reads a piece's cap from the runtime's own rule.
+        return self._inner._frame_cap(requested)
+
     def iter_audio_chunks(self, *_args: Any, **_kwargs: Any):
         def _gen():
             raise self._error

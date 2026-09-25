@@ -1,12 +1,12 @@
 """Per-piece synthesis: reference resolution, prompt preparation and PCM streaming.
 
-specs/003-cpp-compatible-api/tasks.md T038, the single-reference part (data-model.md
-"Reference", "Piece"). Only ``NoReference`` and ``InlineRef`` (`breeze_infer/http_fields.py`
-`ReferenceSpec`) are resolved here; ``VoiceRef`` is a documented stub until T066 wires the
-voice registry and its cached-KV prefix path. Multi-piece concerns -- anchoring a
-no-reference request's first piece onto its own audio, and clamping a piece to the room
-`FastBreezeStreamingRuntime.max_new_tokens_room` reports -- are T052's job, not this
-module's yet.
+specs/003-cpp-compatible-api/tasks.md T038 and T052 (data-model.md "Reference", "Piece").
+Only ``NoReference`` and ``InlineRef`` (`breeze_infer/http_fields.py` `ReferenceSpec`) are
+resolved here; ``VoiceRef`` is a documented stub until T066 wires the voice registry and its
+cached-KV prefix path. For long text, `anchor_codes` turns a no-reference request's piece 0
+into the reference for every later piece, and `piece_room`/`piece_frame_limit` size each
+piece against the room `FastBreezeStreamingRuntime.max_new_tokens_room` reports (clamping or
+refusing it). The piece loop itself is `routes_speech._iter_pieces`.
 
 Nothing here reads ``app.state``: every dependency (the tokenizer, the model, the audio
 tokenizer, the GPU thread) is passed in by the caller (`breeze_infer/routes_speech.py`).
@@ -14,15 +14,18 @@ tokenizer, the GPU thread) is passed in by the caller (`breeze_infer/routes_spee
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import torch
 
 from breeze_infer.audio import encode_prompt_waveform, pcm16
 from breeze_infer.http_fields import InlineRef, NoReference, ReferenceSpec, VoiceRef
 from breeze_infer.templates import get_template, prepare_inputs
+from models.fast_streaming import NoRoomError
 
 if TYPE_CHECKING:
     from breeze_infer.reference_audio import DecodedAudio
@@ -96,6 +99,48 @@ async def resolve_reference(
     raise TypeError(f"unknown reference spec: {spec!r}")
 
 
+def anchor_codes(frames: list[Any], pad_id: int) -> Any | None:
+    """The codes piece 0 leaves behind as every later piece's reference, or ``None``.
+
+    ``frames`` are the frames `iter_audio_chunks` handed its ``token_observer``, one 1-D
+    tensor of every codebook's code per generated frame, pad frames included. The runtime
+    decodes only frames that are not all-pad (``_frame_flags``: ``(frame ==
+    codebook_pad_token_id).all()``), and C++ ``generate_chunk`` keeps the same ones, so the
+    anchor is exactly the audio piece 0 produced. A frame with only some codebooks at the pad
+    id is kept, as both of those keep it. An EOS ends the loop before it becomes a frame, so
+    there is none to drop. Ported from ``A:api.py`` ``_anchor_codes`` (~1002-1010).
+
+    ``None`` when nothing is left (piece 0 produced zero non-pad frames): there is no audio
+    to anchor on, so the later pieces stay voice design (data-model.md "Reference").
+    """
+    if not frames:
+        return None
+    stacked = torch.stack(frames)
+    kept = stacked[~(stacked == pad_id).all(dim=1)]
+    if kept.shape[0] == 0:
+        return None
+    return kept.to(device="cpu", dtype=torch.int16)
+
+
+def stand_in_reference(spec: ReferenceSpec, predicted_frames: int | None, codebooks: int) -> Reference:
+    """A reference with the shape ``resolve_reference`` will give, before the codec has run.
+
+    Used only to size piece 0's prompt for its room check before the GPU gate is taken
+    (FR-007: a ``400`` comes before ``409 busy``). An ``InlineRef`` becomes zero codes of
+    its *predicted* frame count (`reference_audio.predicted_frames`): a prompt's length
+    depends on how many frames the reference has, never on their values. ``codebooks`` is
+    the model's ``num_codebooks``, the width `templates.py` checks reference codes against.
+    """
+    if isinstance(spec, NoReference):
+        return NoRef()
+    if isinstance(spec, InlineRef):
+        if predicted_frames is None:
+            raise ValueError("InlineRef requires its predicted frame count")
+        codes = torch.zeros((predicted_frames, codebooks), dtype=torch.int16)
+        return CodesRef(codes=codes, ref_text=spec.ref_text)
+    raise TypeError(f"no stand-in for reference spec: {spec!r}")
+
+
 def piece_seed(seed: int, index: int) -> int:
     """data-model.md "Piece": piece ``index``'s seed, wrapped to the runtime's uint32."""
     return (seed + index) & 0xFFFFFFFF
@@ -143,6 +188,84 @@ def prepare_piece(
     )
 
 
+# --- Room (data-model.md "Piece"; FR-036a, BC-47) -----------------------------------------
+
+
+@dataclass(frozen=True)
+class PieceRoom:
+    """How many frames one piece may generate.
+
+    ``cap`` is what the request allows: its ``max_new_tokens``, or the model default,
+    clamped to the server ceiling. ``room`` is what the piece will really get:
+    ``min(cap, frames the context leaves after its prompt)``; ``<= 0`` means none.
+    """
+
+    cap: int
+    room: int
+
+
+def piece_room(runtime: Any, inputs: dict[str, Any], requested: int | None) -> PieceRoom:
+    """``inputs``' room, from the runtime's own estimate (`max_new_tokens_room`, which shares
+    ``_prefill_plan`` with the decode loop, so it stops exactly where the loop would).
+
+    The cap comes from the runtime's ``_frame_cap``, the one place that resolves ``None`` to
+    the model default and applies the ceiling; re-deriving it here would be a second copy of
+    that rule to keep in step.
+    """
+    return PieceRoom(
+        cap=runtime._frame_cap(requested),
+        room=runtime.max_new_tokens_room(requested, inputs),
+    )
+
+
+def predicted_room(
+    runtime: Any,
+    reference: Reference,
+    text: str,
+    instruction: str,
+    cfg_scale: float,
+    requested: int | None,
+) -> PieceRoom:
+    """Piece 0's room, computed on the CPU before the GPU gate is taken.
+
+    Builds the piece's inputs exactly as `prepare_piece` does, but on the CPU (a view of the
+    model with only its ``config`` and ``device="cpu"``, the two attributes
+    `templates.prepare_inputs` reads), so this needs neither the GPU thread nor the gate.
+    ``reference`` is `stand_in_reference`'s result, so the prompt has the length the real
+    one will have. The route still checks the real inputs on the GPU thread afterwards, in
+    case the codec's frame count differs from the prediction.
+    """
+    cpu_model = SimpleNamespace(config=runtime.model.config, device="cpu")
+    inputs = prepare_piece(runtime.tokenizer, cpu_model, reference, text, instruction, cfg_scale)
+    return piece_room(runtime, inputs, requested)
+
+
+def piece_frame_limit(room: PieceRoom, events: Any, *, request_id: str, piece_index: int) -> int:
+    """The ``max_new_tokens`` to generate a piece with, or ``NoRoomError`` if it has no room.
+
+    A room below the cap clamps the piece: it is generated up to the room and ends
+    normally, as reaching ``max_new_tokens`` does, and ``speech.piece_clamped`` records it
+    (FR-036a). Passing the room as ``max_new_tokens`` (rather than letting the context stop
+    the loop) makes the runtime mark the last chunk final, as at any other token limit.
+
+    No room at all raises. For piece 0 the route has already turned that into ``400
+    text_too_long`` before streaming; for a later piece the ``200`` is already out, so the
+    exception aborts the stream (FR-013, BC-47).
+    """
+    if room.room <= 0:
+        raise NoRoomError(f"piece {piece_index} leaves no room to generate")
+    if room.room < room.cap:
+        events.emit(
+            "speech.piece_clamped",
+            level="warning",
+            request_id=request_id,
+            piece_index=piece_index,
+            requested=room.cap,
+            room=room.room,
+        )
+    return room.room
+
+
 # --- PCM ramp (contracts/http-api.md "Splitting": "chunks grow from --chunk-first to
 # --chunk-max codec frames") ----------------------------------------------------------
 
@@ -151,18 +274,26 @@ def codec_samples_per_frame(runtime: Any) -> int:
     """The codec's frame size in samples (qwen-tts's ``decode_upsample_rate``): 1,920 on
     the bundled checkpoint, for a 12.5 fps frame rate at the 24 kHz output.
 
-    Read off the already-loaded audio tokenizer's own config
-    (``runtime.audio_tokenizer.config.decode_upsample_rate``, a live
-    ``Qwen3TTSTokenizerV2Config`` attribute -- ``FastBreezeStreamingRuntime`` keeps the
-    loaded tokenizer at ``self.audio_tokenizer``), not from ``config.json`` on disk: that
-    is where ``breeze_infer.audio``'s codec-identity fingerprint reads the same field
-    from (``_TOP_LEVEL_IDENTITY_FIELDS``), but a caller preparing to stream a piece
-    already has the runtime, not a checkpoint path. The route calls this once per request
-    (or once at startup) and passes the result as ``generate_piece``'s
+    Read through the loaded audio tokenizer's own accessor,
+    ``runtime.audio_tokenizer.get_decode_upsample_rate()`` (``qwen_tts``'s
+    ``Qwen3TTSTokenizer`` wrapper, which asks its codec model;
+    ``FastBreezeStreamingRuntime`` keeps the wrapper at ``self.audio_tokenizer``). Not
+    ``audio_tokenizer.config``: the wrapper sets that only in ``from_pretrained`` and leaves
+    it ``None`` otherwise. Not ``config.json`` on disk either: the caller has the runtime,
+    not a checkpoint path. There is no fallback value: a tokenizer without the accessor
+    raises, since a guessed frame size would silently mis-size every PCM flush.
+
+    The route calls this once per request and passes the result as ``generate_piece``'s
     ``samples_per_frame`` (review finding #10) -- it is not called inside
     ``generate_piece`` itself, so a piece's hot loop never re-reads it.
     """
-    return int(runtime.audio_tokenizer.config.decode_upsample_rate)
+    accessor = getattr(runtime.audio_tokenizer, "get_decode_upsample_rate", None)
+    if accessor is None:
+        raise TypeError(
+            "the audio tokenizer has no get_decode_upsample_rate(); cannot tell the "
+            f"codec's samples per frame ({type(runtime.audio_tokenizer).__name__})"
+        )
+    return int(accessor())
 
 
 def ramp_pcm(
@@ -229,6 +360,7 @@ def generate_piece(
     top_p: float | None = None,
     repetition_penalty: float | None = None,
     max_new_tokens: int | None = None,
+    token_observer: Callable[[Any], None] | None = None,
 ) -> Iterator[bytes]:
     """One piece's PCM bytes, a sync generator the route steps on the GPU thread.
 
@@ -242,6 +374,10 @@ def generate_piece(
     the caller passes ``codec_samples_per_frame(runtime)`` (above), computed once per
     request rather than re-read on every piece.
 
+    ``token_observer`` is passed straight to the runtime, which calls it with every
+    generated frame (pad frames included); the route uses it to collect piece 0's frames
+    for `anchor_codes`.
+
     ``chunks.close()`` always runs, even if this generator itself is closed early (a
     client disconnect closes the piece's `breeze_infer.gpu.GpuSession`, which closes this
     generator, which then closes ``chunks`` here) -- the runtime's own generator must be
@@ -252,6 +388,7 @@ def generate_piece(
         inputs,
         request_id=request_id,
         seed=seed,
+        token_observer=token_observer,
         prefix=prefix,
         temperature=temperature,
         top_k=top_k,

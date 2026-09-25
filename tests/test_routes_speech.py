@@ -21,6 +21,7 @@ from typing import Any
 import numpy as np
 import pytest
 import soundfile as sf
+import torch
 from fastapi.testclient import TestClient
 
 from breeze_infer.api import Components, create_app
@@ -276,18 +277,24 @@ def test_unspeakable_text_is_400_not_409_even_while_the_gate_is_held(
 
 def test_piece_seeds_increment_per_piece() -> None:
     readiness = Readiness()
-    components = _build_components(readiness, split_chars=15)
+    components = _build_components(readiness, split_chars=100)
     try:
-        runtime = _fake_runtime(chunks=1)
+        # A frame with every codebook, since piece 0's frames anchor the later pieces.
+        runtime = _fake_runtime(chunks=1, frames=[torch.full((16,), 5)])
         readiness.mark_ready(runtime)
         client = _client_for(components)
 
-        # Each sentence is well under the 15-char budget on its own, but any two combined
-        # are over it, so text_split.py packs them into exactly 3 pieces (see the route's
-        # own docstring on how piece 0's inputs vs. later pieces' are built).
+        # Each sentence is over the 100-char budget and, with any other, over piece 0's
+        # 200-char opening budget too, so text_split.py makes exactly 3 pieces (see the
+        # route's own docstring on how piece 0's inputs vs. later pieces' are built).
+        sentence = (
+            "This sentence is long enough on its own to go past the budget of a piece, "
+            "which is one hundred characters."
+        )
+        assert len(sentence) > 100
         response = client.post(
             SPEECH_PATH,
-            data={"text": "Hi there. Go now yes. See you soon.", "seed": "100"},
+            data={"text": " ".join([sentence] * 3), "seed": "100"},
         )
 
         assert response.status_code == 200

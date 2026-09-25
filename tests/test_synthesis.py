@@ -451,7 +451,16 @@ def test_generate_piece_requires_samples_per_frame() -> None:
         generate_piece(FakeRuntime(chunks=1), {}, request_id="r", seed=1, chunk_first=1, chunk_max=25)
 
 
-def test_codec_samples_per_frame_reads_the_audio_tokenizers_config() -> None:
+def test_codec_samples_per_frame_uses_the_audio_tokenizers_accessor() -> None:
     runtime = SimpleNamespace(audio_tokenizer=FakeCodec())
 
     assert codec_samples_per_frame(runtime) == CODEC_SAMPLES_PER_FRAME
+
+
+def test_codec_samples_per_frame_without_the_accessor_raises() -> None:
+    # No fallback: the real wrapper's `config` is None unless built by from_pretrained, and
+    # a guessed frame size would mis-size every PCM flush.
+    runtime = SimpleNamespace(audio_tokenizer=SimpleNamespace(config=None))
+
+    with pytest.raises(TypeError, match="get_decode_upsample_rate"):
+        codec_samples_per_frame(runtime)

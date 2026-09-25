@@ -21,6 +21,9 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
    the stub lookup);
 5. an `InlineRef`'s bytes are decoded (`reference_audio.decode`) on a worker thread
    (`asyncio.to_thread`), never the event loop -- libsndfile's decode is blocking CPU work;
+5a. piece 0's room is checked on the CPU, also on a worker thread (`_check_first_piece_room`:
+   its tokenized text plus the reference's *predicted* frames), so "no room" is a `400
+   text_too_long` even while the GPU is busy -- the "first piece has no room" half of BC-47;
 6. `gate.try_acquire()`, else `409 busy` -- or `GpuUnavailable` if the gate is poisoned,
    which propagates past this route to `errors.py`'s own handler (`503 gpu_unavailable`);
 7. reference resolution and piece 0's preparation run on the `GpuThread` (`synthesis.py`),
@@ -28,14 +31,13 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
    release the lease while that GPU-thread call is still actually running -- the executor is
    single-threaded, but releasing early would still tell the next request "free" while our
    own abandoned work is still really queued ahead of it;
-8. piece 0's room (`FastBreezeStreamingRuntime.max_new_tokens_room`, checked once, on the
-   `GpuThread`, right after its inputs are built) decides `400 text_too_long` before any
-   generation starts -- the "first piece has no room" half of BC-47. A later piece's own room
-   isn't checked this way yet (T052/T053, deferred): if priming happens to run past piece 0
-   within one step (e.g. an all-pad piece 0), the runtime's own "no room" `ValueError` is
-   still mapped to `400 text_too_long` here rather than an opaque `500`; the same failure
-   *after* streaming has started already ends the stream abnormally through the ordinary
-   exception path (streaming.py), which needs no change;
+8. piece 0's room is checked again on the `GpuThread`, on its real inputs, right after they are
+   built (`FastBreezeStreamingRuntime.max_new_tokens_room`): the backstop for a codec whose
+   frame count differs from 5a's prediction. Every later piece is prepared and sized on the
+   `GpuThread` inside the body (`_iter_pieces`); one with no room raises `NoRoomError`, which
+   ends a started stream abnormally through the ordinary exception path (streaming.py) -- the
+   "later piece" half of BC-47 -- or, if priming ran past piece 0 within one step (piece 0
+   yielded no audio), is still mapped to `400 text_too_long` here;
 9. the first audio chunk is primed (`GpuSession.step()`) before the `200` is even chosen
    (R2/R3, BC-17): `DONE` on this first step means the whole request produced no audio. That
    is a `500`, but raised as a plain exception (not `ApiError`) so it takes the *unhandled*
@@ -87,16 +89,25 @@ from breeze_infer.http_fields import (
     parse_speech,
     read_fields,
 )
+from breeze_infer.limits import ANCHOR_CHARS
 from breeze_infer.routes_health import Readiness
 from breeze_infer.settings import Settings
 from breeze_infer.streaming import SpeechResponse
 from breeze_infer.synthesis import (
     CodesRef,
+    NoRef,
+    PieceRoom,
+    Reference,
+    anchor_codes,
     codec_samples_per_frame,
     generate_piece,
+    piece_frame_limit,
+    piece_room,
     piece_seed,
+    predicted_room,
     prepare_piece,
     resolve_reference,
+    stand_in_reference,
 )
 from breeze_infer.text_split import split_text
 from models.fast_streaming import NoRoomError
@@ -155,15 +166,48 @@ def _check_frame_prediction(
     )
 
 
+async def _check_first_piece_room(
+    runtime: Any,
+    request: SpeechRequest,
+    text: str,
+    decoded_audio: reference_audio.DecodedAudio | None,
+) -> None:
+    """`400 text_too_long` if piece 0 has no room, decided before the GPU gate is taken.
+
+    FR-007 puts every `400` before `409 busy`, so this can't wait for the codec: an inline
+    reference is sized by its *predicted* frame count (`stand_in_reference`), and the inputs
+    are built on the CPU (`predicted_room`). It runs on a worker thread, not the event loop,
+    because tokenizing a long piece is blocking CPU work. The real inputs are checked again
+    on the GPU thread once the reference is encoded (`_prepare_first_piece`), which covers a
+    codec whose frame count differs from the prediction.
+    """
+    stand_in = stand_in_reference(
+        request.reference,
+        None if decoded_audio is None else decoded_audio.predicted_frames,
+        int(runtime.model.config.num_codebooks),
+    )
+    room = await asyncio.to_thread(
+        predicted_room,
+        runtime,
+        stand_in,
+        text,
+        request.instruction,
+        request.cfg_scale,
+        request.max_new_tokens,
+    )
+    if room.room <= 0:
+        raise ApiError(400, "text_too_long", "text is too long")
+
+
 def _prepare_first_piece(
-    runtime: Any, reference: Any, text: str, request: SpeechRequest
-) -> tuple[dict[str, Any], int]:
+    runtime: Any, reference: Reference, text: str, request: SpeechRequest
+) -> tuple[dict[str, Any], PieceRoom]:
     """Piece 0's model inputs, and the frame room the runtime has for them. GPU-thread only:
     `prepare_piece` touches the tokenizer and model, `max_new_tokens_room` touches `inputs`'
     tensors.
 
-    Returns the inputs alongside the room so `_iter_pieces` can reuse them instead of
-    building piece 0 twice, and so the route can turn `room <= 0` into `400 text_too_long`
+    Returns the inputs alongside the room so `_iter_pieces` can reuse both instead of
+    building piece 0 twice, and so the route can turn no room into `400 text_too_long`
     before any generation starts -- without inspecting the runtime's own `ValueError`
     messages (`max_new_tokens_room` raises that only for a genuinely bad override, e.g. a
     non-finite `temperature`, which is a `500`, not this).
@@ -171,8 +215,7 @@ def _prepare_first_piece(
     inputs = prepare_piece(
         runtime.tokenizer, runtime.model, reference, text, request.instruction, request.cfg_scale
     )
-    room = runtime.max_new_tokens_room(request.max_new_tokens, inputs)
-    return inputs, room
+    return inputs, piece_room(runtime, inputs, request.max_new_tokens)
 
 
 
@@ -186,11 +229,12 @@ _PCM_BYTES_PER_SAMPLE = 2  # s16le
 
 def _iter_pieces(
     runtime: Any,
-    reference: Any,
+    reference: Reference,
     pieces: list[str],
     request: SpeechRequest,
     request_id: str,
     first_inputs: dict[str, Any],
+    first_room: PieceRoom,
     events: Emitter,
     *,
     chunk_first: int,
@@ -213,12 +257,22 @@ def _iter_pieces(
     multi-piece GPU test can otherwise only see the whole request succeeded, not that
     *every* piece actually produced audio, since a silently empty later piece would still
     leave the overall stream non-empty.
+
+    Each piece is sized against its own room (`piece_frame_limit`): a partial room clamps
+    it, and no room raises `NoRoomError`, which aborts the stream once the `200` is out
+    (BC-47). With no reference, piece 0's frames are collected through the runtime's
+    `token_observer` and, once piece 0 has finished, become every later piece's reference
+    together with its text (`anchor_codes`). Only piece 0 can anchor (data-model.md
+    "Reference"): if it produced no non-pad frame, the later pieces stay voice design. A
+    cancelled or failed piece 0 never reaches the anchoring step at all.
     """
+    anchoring = isinstance(reference, NoRef) and len(pieces) > 1
+    pad_id = int(runtime.model.config.codebook_pad_token_id)
     for index, text in enumerate(pieces):
-        inputs = (
-            first_inputs
-            if index == 0
-            else prepare_piece(
+        if index == 0:
+            inputs, room = first_inputs, first_room
+        else:
+            inputs = prepare_piece(
                 runtime.tokenizer,
                 runtime.model,
                 reference,
@@ -226,7 +280,11 @@ def _iter_pieces(
                 request.instruction,
                 request.cfg_scale,
             )
+            room = piece_room(runtime, inputs, request.max_new_tokens)
+        max_new_tokens = piece_frame_limit(
+            room, events, request_id=request_id, piece_index=index
         )
+        frames: list[Any] | None = [] if anchoring and index == 0 else None
         piece_bytes = 0
         for chunk in generate_piece(
             runtime,
@@ -240,14 +298,21 @@ def _iter_pieces(
             top_k=request.top_k,
             top_p=request.top_p,
             repetition_penalty=request.repetition_penalty,
-            max_new_tokens=request.max_new_tokens,
+            max_new_tokens=max_new_tokens,
+            token_observer=None if frames is None else frames.append,
         ):
             piece_bytes += len(chunk)
             yield chunk
-        frames = piece_bytes // _PCM_BYTES_PER_SAMPLE // samples_per_frame
         events.emit(
-            "speech.piece_done", request_id=request_id, piece_index=index, frames=frames
+            "speech.piece_done",
+            request_id=request_id,
+            piece_index=index,
+            frames=piece_bytes // _PCM_BYTES_PER_SAMPLE // samples_per_frame,
         )
+        if frames is not None:
+            codes = anchor_codes(frames, pad_id)
+            if codes is not None:
+                reference = CodesRef(codes=codes, ref_text=text)
 
 
 async def _rest_of_audio(session: GpuSession[bytes]) -> AsyncGenerator[bytes, None]:
@@ -283,7 +348,12 @@ async def _serve_speech(
     # split_text also drops units with no letter or digit to speak (text_split.py's
     # _speakable) -- text like "..." clears text_required but leaves nothing to
     # synthesize.
-    pieces = split_text(request.text, budget=request.split_chars)
+    #
+    # With no reference, piece 0 is packed against the soft opening budget (US3 scenario 1):
+    # it becomes the anchor for every later piece, so it should be short enough for a quick
+    # first audio. A reference already fixes the voice, so there is no opening piece.
+    first_budget = ANCHOR_CHARS if isinstance(request.reference, NoReference) else 0
+    pieces = split_text(request.text, budget=request.split_chars, first_budget=first_budget)
     if not pieces:
         raise ApiError(400, "text_required", "text is required")
 
@@ -297,6 +367,8 @@ async def _serve_speech(
         decoded_audio = await asyncio.to_thread(
             reference_audio.decode, request.reference.audio_bytes
         )
+
+    await _check_first_piece_room(runtime, request, pieces[0], decoded_audio)
 
     # None means busy (409); a poisoned gate raises GpuUnavailable instead (gpu.py), which
     # propagates straight past this route to errors.py's own handler (503 gpu_unavailable).
@@ -324,9 +396,9 @@ async def _serve_speech(
         gpu_task = asyncio.ensure_future(
             components.gpu.run(_prepare_first_piece, runtime, reference, pieces[0], request)
         )
-        first_inputs, room = await asyncio.shield(gpu_task)
+        first_inputs, first_room = await asyncio.shield(gpu_task)
         gpu_task = None
-        if room <= 0:
+        if first_room.room <= 0:
             raise ApiError(400, "text_too_long", "text is too long")
 
         components.events.emit(
@@ -343,6 +415,7 @@ async def _serve_speech(
             request,
             request_id,
             first_inputs,
+            first_room,
             components.events,
             chunk_first=components.settings.chunk_first,
             chunk_max=components.settings.chunk_max,
@@ -353,10 +426,10 @@ async def _serve_speech(
         try:
             first_chunk = await session.step()
         except NoRoomError as error:
-            # T052/T053 (deferred): a later piece's own room check and clamp aren't built
-            # yet, so this is reached only if priming ran past piece 0 within a single step
-            # (e.g. an all-pad piece 0) and the next piece has no room. Still a text-too-long
-            # failure, not an opaque 500, until that phase gives it a proper pre-check.
+            # Piece 0's room was checked above, so this is a later piece with no room
+            # (`piece_frame_limit`) reached while priming, i.e. before the `200`: priming runs
+            # past piece 0 within one step only if piece 0 yielded no audio at all. With no
+            # response started yet, it is still a `400 text_too_long`, not an aborted stream.
             #
             # Only `NoRoomError` maps to this `400` (T046 review, finding 1): the runtime's
             # `iter_audio_chunks` also raises a plain `ValueError` for a genuinely invalid
