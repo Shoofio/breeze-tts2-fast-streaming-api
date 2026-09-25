@@ -199,8 +199,9 @@ phases as follows:
 - [X] T017 *(Opus)* Create `breeze_infer/gpu.py` `GpuGate` (R14): asyncio only, used only on the
   event loop.
   - `try_acquire() -> bool` is false when the gate is held or any waiter is pending.
-  - `async acquire()` returns a flag saying whether it had to wait, so the caller can send
-    `queued`.
+  - `async acquire(on_wait)` calls `on_wait` synchronously just before it blocks, and only if it
+    blocks, so the caller can enqueue `queued` before waiting (changed after review: a returned
+    flag arrives only after the wait).
   - `release()` hands the gate directly to the next non-cancelled waiter.
 
   `tests/test_gpu_gate.py` covers try/acquire, handoff order, a cancelled waiter being skipped, and

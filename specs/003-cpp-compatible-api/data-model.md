@@ -198,7 +198,7 @@ Other files in the directory:
 |---|---|
 | `epoch` | Incremented by `cancel`, by `start` with pending work, and on disconnect |
 | `config` | Snapshot from `start`: reference, instruction, cfg, seed, sampling, `split_chars`. `instruction` is mutable via the `instruction` message and read when each piece starts |
-| `buffer` | Pending text: weighted length ≤ budget unless unpunctuated; total characters ≤ 10,000 |
+| `buffer` | Pending text: weighted length ≤ budget while it has a clause mark or space to cut at, otherwise ≤ 2 × budget; total characters ≤ 10,000 |
 | `opening_pending` | True while there is no reference and no anchor yet (and none queued) |
 | `anchor` | Reference built from piece 0 |
 | `piece_index` | Resets at `start` |
@@ -232,9 +232,12 @@ is the client message type that caused it. The full code catalog is in
 JSON lines produced by `Emitter(sink, clock).emit(name, *, level="info", **fields)`. The sink and
 clock are injected at construction (no module-level global emitter); `level` is one of `debug`,
 `info`, `warning`, `error`. A field that collides with a reserved key (`ts`, `event_schema`,
-`event`, `level`) or an invalid `level` raises `ValueError`; a field value that can't be
-serialised (NaN/inf, an unencodable type) does not raise — the line written is an
-`event.invalid` record instead, so one bad field never breaks the request emitting it.
+`event`) or an invalid `level` raises `ValueError`; `level` itself is keyword-only, so a field
+named `level` can never collide with it. A field value that can't be serialised (NaN/inf, an
+unencodable type, or anything else that blows up mid-serialisation) does not raise — the line
+written is an `event.invalid` record instead (`level="warning"`, keeping `event_schema`, `ts`,
+any of `request_id`/`session_id`/`piece_index` that were present, and a `fields` list of the
+offending record's field names), so one bad field never breaks the request emitting it.
 
 - Every request event carries `request_id`; WebSocket events also carry `session_id` and
   `piece_index`.

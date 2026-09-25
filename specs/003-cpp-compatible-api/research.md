@@ -340,7 +340,9 @@ only in our own format; re-encoding isn't required); C++ `.breeze` (rejected by 
 - **`GpuGate`:** an asyncio gate used only on the event loop.
   - `try_acquire()` is for HTTP. It fails if the gate is held *or* a WebSocket piece is waiting;
     the caller then answers `409 busy`.
-  - `await acquire()` is for WebSocket pieces; the caller sends `queued` first when it has to wait.
+  - `await acquire(on_wait=...)` is for WebSocket pieces. `on_wait` runs synchronously just before
+    the call blocks, and only if it will block, so the worker can enqueue `queued` ahead of the
+    wait. A returned flag would arrive too late: after the wait.
   - `release()` hands the gate directly to the next waiter.
 - **`GpuThread`:** a single-thread executor that runs *all* CUDA work: model load and warmup
   (in the background, so `/health` shows `503 loading`), reference encode, prefix builds,

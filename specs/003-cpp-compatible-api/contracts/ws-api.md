@@ -77,7 +77,7 @@ escapes work (BC-32). Rules for every message:
 | `cancel` | — | Discards buffered text and queued pieces, stops the piece in flight, replaces a pending `done`, and replies with one `cancelled`, even when idle (BC-35). |
 
 **`start` details**
-- `split_chars` is 0–10,000. `0` means no length splitting (sentence ends only); absent means the
+- `split_chars` is 0–10,000. `0` means no length limit: each drain's ready text becomes one piece; absent means the
   server default. A negative value gets `invalid_field` (BC-38).
 - `start` is rejected with an `error`, leaving the previous session unchanged, when:
   - `voice_id` is unknown (`unknown_voice`, `unknown voice_id`);
@@ -85,7 +85,9 @@ escapes work (BC-32). Rules for every message:
 
 **`text` details**
 - A sentence end at the very end of the buffer waits for more text, `flush` or `end` (BC-39).
-- Unpunctuated text is cut at a clause mark, a space, or the budget, so the buffer stays bounded.
+- Text over the budget is cut at its last clause mark or space. A run with no such break at all
+  (for example CJK without punctuation) is hard-cut once it weighs more than 2 × the budget. The
+  buffer stays bounded either way.
 - If the buffer plus the new text would exceed 10,000 characters, the server sends
   `error{code: text_too_long}` and does not append the text (BC-40).
 - Control characters are rejected with `invalid_field` (BC-46).
