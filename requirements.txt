@@ -4,8 +4,14 @@ qwen-tts==0.1.1
 transformers==4.57.3
 numpy>=2.0
 soundfile>=0.13
-fastapi>=0.115
-uvicorn>=0.30
-python-multipart>=0.0.18
+# The web stack is pinned exactly: abort-on-failure and disconnect handling
+# rely on library internals (specs/003-cpp-compatible-api research R2, R3).
+fastapi==0.141.1
+starlette==1.6.0
+uvicorn==0.52.4
+python-multipart==0.0.32
+websockets>=15
 pytest>=8.0
 ruff>=0.12
+# Test dependency: real-server tests assert on incomplete chunked transfers.
+httpx==0.28.1
