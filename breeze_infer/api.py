@@ -44,7 +44,7 @@ from breeze_infer.limits import TCP_USER_TIMEOUT_MS
 from breeze_infer.model_loading import LoadedModel, load_model
 from breeze_infer.request_id import RequestIdMiddleware
 from breeze_infer.routes_health import Readiness, install_health
-from breeze_infer.routes_speech import install_speech
+from breeze_infer.routes_speech import CpuTokenizer, install_speech
 from breeze_infer.runtime import get_dist_info
 from breeze_infer.settings import Settings, settings_from_args
 from breeze_infer.streaming import ClientAbortLogFilter
@@ -61,6 +61,8 @@ class Components:
     gpu: GpuThread
     readiness: Readiness
     ws_port: Callable[[], int]
+    # Empty until the model load installs its tokenizer copy (`load_in_background`).
+    cpu_tokenizer: CpuTokenizer = field(default_factory=CpuTokenizer)
 
 
 def create_app(components: Components) -> ASGIApp:
@@ -249,6 +251,8 @@ async def load_in_background(
     """
     try:
         loaded = await components.gpu.run(load)
+        # Before `mark_ready`: the first request the server admits may need it.
+        components.cpu_tokenizer.install(loaded.cpu_tokenizer)
         components.readiness.mark_ready(loaded.runtime)
         components.events.emit(
             "model.loaded", sample_rate=int(loaded.runtime.sample_rate), **loaded.report

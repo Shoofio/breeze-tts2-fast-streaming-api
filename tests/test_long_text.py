@@ -169,6 +169,31 @@ def test_first_piece_anchors_every_later_piece(
     assert all(call["observed"] is False for call in runtime.calls[1:])
 
 
+def test_later_pieces_are_prepared_one_at_a_time_as_the_stream_reaches_them(
+    envs: list[Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The anchor's room check runs before piece 1, but no later piece's model inputs are
+    built (or kept) ahead of time: each is prepared once, when the loop gets to it."""
+    runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(6), _frame(7)])
+    started_before: list[tuple[str, int]] = []
+
+    def spy(tokenizer, model, reference, text, instruction, cfg_scale):
+        started_before.append((text, len(runtime.calls)))
+        return prepare_piece(tokenizer, model, reference, text, instruction, cfg_scale)
+
+    monkeypatch.setattr(routes_speech, "prepare_piece", spy)
+    env = _env(envs, runtime, split_chars=100)
+    pieces = _no_reference_pieces(SENTENCES, 100)
+    assert len(pieces) >= 3
+
+    response = env.speak(text=SENTENCES)
+
+    assert response.status_code == 200
+    assert _events(env.events, "speech.anchor_skipped") == []
+    # Piece i is prepared once, after the i pieces before it have started generating.
+    assert started_before == [(text, index) for index, text in enumerate(pieces)]
+
+
 def test_no_anchor_when_piece_0_produced_no_frames(
     envs: list[Env], prepared: list[dict[str, Any]]
 ) -> None:

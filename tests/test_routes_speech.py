@@ -15,8 +15,12 @@ from __future__ import annotations
 import asyncio
 import io
 import threading
+import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -26,10 +30,12 @@ import torch
 from fastapi.testclient import TestClient
 
 from breeze_infer import routes_speech
-from breeze_infer.api import Components, create_app
+from breeze_infer.api import Components, create_app, load_in_background
 from breeze_infer.events import Emitter
 from breeze_infer.gpu import GpuCloseTimeout, GpuGate, GpuSession, GpuThread
+from breeze_infer.model_loading import LoadedModel
 from breeze_infer.routes_health import Readiness
+from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.settings import settings_from_args
 from tests.fakes import (
     FakeCodec,
@@ -71,6 +77,9 @@ def _build_components(
         gpu=GpuThread("cpu", lambda _device: None),
         readiness=readiness,
         ws_port=lambda: 0,
+        # What the model load installs: its own copy of the runtime's tokenizer. A plain
+        # `FakeTokenizer` holds no state, so a fresh one is as good as a copy.
+        cpu_tokenizer=CpuTokenizer(FakeTokenizer()),
     )
 
 
@@ -440,13 +449,15 @@ class _ThreadRecordingTokenizer(FakeTokenizer):
         return copied
 
 
-def test_the_cpu_room_check_never_uses_the_gpu_threads_tokenizer() -> None:
+def test_the_cpu_room_check_uses_the_copy_made_at_load_never_the_gpu_threads() -> None:
     readiness = Readiness()
     components = _build_components(readiness)
     try:
         runtime = _fake_runtime()
         tokenizer = _ThreadRecordingTokenizer()
         runtime.tokenizer = tokenizer
+        cpu_copy = _ThreadRecordingTokenizer()
+        components.cpu_tokenizer.install(cpu_copy)
         readiness.mark_ready(runtime)
         client = _client_for(components)
 
@@ -455,11 +466,125 @@ def test_the_cpu_room_check_never_uses_the_gpu_threads_tokenizer() -> None:
 
         assert tokenizer.threads
         assert all(name.startswith("breeze-gpu") for name in tokenizer.threads)
-        [copied] = tokenizer.copies  # copied once, then reused
-        assert copied.threads
-        assert not any(name.startswith("breeze-gpu") for name in copied.threads)
+        assert tokenizer.copies == []  # no request copies it: the load already did
+        assert cpu_copy.threads
+        assert not any(name.startswith("breeze-gpu") for name in cpu_copy.threads)
     finally:
         components.gpu.shutdown()
+
+
+class _OverlapDetectingTokenizer(FakeTokenizer):
+    """Records whether two threads were ever inside it at once (a HF fast tokenizer's
+    "Already borrowed"), holding each call open long enough for a second to arrive."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._inside = 0
+        self.overlapped = False
+        self.calls = 0
+
+    def __call__(self, text: str, **kwargs: Any) -> Any:
+        with self._lock:
+            self._inside += 1
+            self.calls += 1
+            self.overlapped |= self._inside > 1
+        try:
+            time.sleep(0.02)
+            return super().__call__(text, **kwargs)
+        finally:
+            with self._lock:
+                self._inside -= 1
+
+
+def test_concurrent_cpu_room_checks_are_serialized() -> None:
+    """Two requests at once both run their CPU room check on worker threads, before the busy
+    check, against the one CPU copy: they must take turns on it."""
+    readiness = Readiness()
+    components = _build_components(readiness)
+    try:
+        cpu_copy = _OverlapDetectingTokenizer()
+        components.cpu_tokenizer.install(cpu_copy)
+        readiness.mark_ready(_fake_runtime())
+        client = _client_for(components)
+        start = threading.Barrier(4)
+
+        def post(_: int) -> int:
+            start.wait()
+            return client.post(SPEECH_PATH, data={"text": "hello there"}).status_code
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            statuses = list(pool.map(post, range(4)))
+
+        assert set(statuses) <= {200, 409}  # never a 500 from a shared tokenizer
+        assert cpu_copy.calls >= 4
+        assert not cpu_copy.overlapped
+    finally:
+        components.gpu.shutdown()
+
+
+def test_the_model_load_copies_the_tokenizer_on_the_gpu_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The copy is made while loading, so no request ever waits for it on the GPU thread."""
+    from breeze_infer import model_loading
+
+    tokenizer = _ThreadRecordingTokenizer()
+    copied_on: list[str] = []
+    original_deepcopy = model_loading.copy.deepcopy
+
+    def recording_deepcopy(value: Any) -> Any:
+        copied_on.append(threading.current_thread().name)
+        return original_deepcopy(value)
+
+    monkeypatch.setattr(
+        model_loading, "configure_compile_cache", lambda *_args: (Path("cache"), "hit")
+    )
+    monkeypatch.setattr(
+        model_loading, "load_runtime", lambda *_args, **_kwargs: (tokenizer, object(), object())
+    )
+    monkeypatch.setattr(model_loading, "update_generation_config_for_breeze", lambda _model: None)
+    monkeypatch.setattr(
+        model_loading,
+        "FastBreezeStreamingRuntime",
+        lambda *_args, **_kwargs: SimpleNamespace(fast_enabled=False, tokenizer=tokenizer),
+    )
+    monkeypatch.setattr(model_loading.copy, "deepcopy", recording_deepcopy)
+    settings = settings_from_args([str(Path(__file__).parent)])
+    gpu = GpuThread("cpu", lambda _device: None)
+    try:
+        load = partial(model_loading.load_model, settings, "cpu", {})
+        loaded = asyncio.run(gpu.run(load))
+    finally:
+        gpu.shutdown()
+
+    [copied] = tokenizer.copies
+    assert loaded.cpu_tokenizer is copied
+    assert len(copied_on) == 1 and copied_on[0].startswith("breeze-gpu")
+
+
+def test_the_cpu_copy_is_installed_before_the_server_reports_ready() -> None:
+    readiness = Readiness()
+    components = _build_components(readiness)
+    runtime = _fake_runtime()
+    cpu_copy = FakeTokenizer()
+    seen_at_ready: list[bool] = []
+    original_mark_ready = readiness.mark_ready
+
+    def mark_ready(ready_runtime: Any) -> None:
+        with components.cpu_tokenizer.borrow() as installed:
+            seen_at_ready.append(installed is cpu_copy)
+        original_mark_ready(ready_runtime)
+
+    readiness.mark_ready = mark_ready  # type: ignore[method-assign]
+    server = SimpleNamespace(should_exit=False)
+    try:
+        loaded = LoadedModel(runtime=runtime, report={}, cpu_tokenizer=cpu_copy)
+        assert asyncio.run(load_in_background(components, lambda: loaded, server))
+    finally:
+        components.gpu.shutdown()
+
+    assert seen_at_ready == [True]
+    assert readiness.runtime is runtime
 
 
 # --- events: frame prediction, pieces ---------------------------------------------------------

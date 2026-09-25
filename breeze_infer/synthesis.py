@@ -227,19 +227,26 @@ def predicted_room(
     cfg_scale: float,
     requested: int | None,
 ) -> PieceRoom:
-    """Piece 0's room, computed on the CPU before the GPU gate is taken.
+    """A piece's room, computed from inputs built on the CPU and then dropped.
+
+    The speech route uses it for piece 0 before the GPU gate is taken, and for every later
+    piece when deciding whether piece 0 can anchor them (`routes_speech`).
 
     Builds the piece's inputs exactly as `prepare_piece` does, but on the CPU (a view of the
     model with only its ``config`` and ``device="cpu"``, the two attributes
-    `templates.prepare_inputs` reads), so this needs neither the GPU thread nor the gate.
+    `templates.prepare_inputs` reads), so this needs neither the GPU thread nor the gate, and
+    leaves no tensor on the device.
     That view is safe exactly as long as templates read nothing else from the model: any
     other attribute is an AttributeError here, and
     `tests/test_synthesis.py::test_predicted_room_matches_the_room_of_the_real_inputs` runs
     every template branch through it to catch that.
-    ``reference`` is `stand_in_reference`'s result, so the prompt has the length the real
-    one will have. ``tokenizer`` must not be the one the GPU thread uses (``runtime.tokenizer``):
-    this runs on another thread at the same time (`routes_speech.CpuTokenizer`). The route still checks the real inputs on the GPU thread afterwards, in
-    case the codec's frame count differs from the prediction.
+    For piece 0, ``reference`` is `stand_in_reference`'s result, so the prompt has the length
+    the real one will have, and the route still checks the real inputs on the GPU thread
+    afterwards, in case the codec's frame count differs from the prediction.
+
+    ``tokenizer`` must be one no other thread is using at the same time: off the GPU thread,
+    the route's own copy (`routes_speech.CpuTokenizer`), never ``runtime.tokenizer``; on the
+    GPU thread, ``runtime.tokenizer`` itself.
     """
     cpu_model = SimpleNamespace(config=runtime.model.config, device="cpu")
     inputs = prepare_piece(tokenizer, cpu_model, reference, text, instruction, cfg_scale)

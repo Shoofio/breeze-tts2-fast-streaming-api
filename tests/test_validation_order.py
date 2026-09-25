@@ -34,11 +34,12 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
+from breeze_infer import routes_speech
 from breeze_infer.api import _gpu_unresponsive
-from breeze_infer.gpu import GpuGate
+from breeze_infer.gpu import GpuCloseTimeout, GpuGate, GpuSession
 from breeze_infer.limits import MAX_BODY_BYTES
 from breeze_infer.routes_health import Readiness
-from breeze_infer.routes_speech import CpuTokenizer, _serve_speech
+from breeze_infer.routes_speech import _serve_speech
 from models.fast_streaming import NoRoomError
 from tests.fakes import FakeCodec, FakeTokenizer, RecordingEvents
 from tests.test_routes_speech import (  # noqa: F401 -- fixtures reused by name
@@ -46,12 +47,14 @@ from tests.test_routes_speech import (  # noqa: F401 -- fixtures reused by name
     _build_components,
     _client_for,
     _fake_runtime,
+    _gate_is_free,
     _wav_bytes,
     client,
     components,
     readiness,
     ready_client,
 )
+from tests.test_speech_abort import eventually
 
 # --- BC-07: an invalid request while busy gets its validation error, not 409 -------
 
@@ -456,6 +459,26 @@ def _asgi_request(body: bytes, content_type: str) -> Request:
     return Request(scope, receive)
 
 
+def _text_request(text: str) -> Request:
+    built = httpx.Request("POST", "http://test/v1/audio/speech", data={"text": text})
+    built.read()
+    return _asgi_request(built.content, built.headers["content-type"])
+
+
+def _serve(http_request: Request, runtime: Any, components: Any) -> asyncio.Task[Any]:
+    """`_serve_speech` as its own task, so a test can cancel it where it likes."""
+    return asyncio.ensure_future(
+        _serve_speech(
+            http_request,
+            runtime,
+            components,
+            request_id="test-request",
+            received_at=0.0,
+            clock=lambda: 0.0,
+        )
+    )
+
+
 class _SlowCodec(FakeCodec):
     """A `FakeCodec` whose `encode()` blocks on a `threading.Event` first -- lets a
     test hold `resolve_reference`'s GPU-thread call open for as long as it likes,
@@ -480,25 +503,6 @@ def test_lease_survives_a_second_cancellation_during_a_slow_resolve_reference() 
     regardless of how many times this coroutine itself was cancelled meanwhile.
     """
 
-    async def _gate_is_busy(gate: GpuGate) -> bool:
-        # `try_acquire()` *takes* the gate when it succeeds (it's a real acquire, not a
-        # peek), so a probe that finds it free must hand it straight back -- otherwise
-        # this check would itself be the thing holding the gate.
-        probe = gate.try_acquire()
-        if probe is None:
-            return True
-        probe.release()
-        return False
-
-    async def _wait_until(predicate, *, timeout: float = 5.0, interval: float = 0.005) -> bool:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while loop.time() < deadline:
-            if await predicate():
-                return True
-            await asyncio.sleep(interval)
-        return False
-
     async def scenario() -> None:
         readiness = Readiness()
         components = _build_components(readiness)
@@ -511,27 +515,14 @@ def test_lease_survives_a_second_cancellation_during_a_slow_resolve_reference() 
             body, content_type = _multipart_request("hello there", "a transcript", _wav_bytes())
             http_request = _asgi_request(body, content_type)
 
-            task = asyncio.ensure_future(
-                _serve_speech(
-                    http_request,
-                    runtime,
-                    components,
-                    request_id="test-request",
-                    received_at=0.0,
-                    clock=lambda: 0.0,
-                    cpu_tokenizer=CpuTokenizer(components.gpu),
-                )
-            )
+            task = _serve(http_request, runtime, components)
             # Let the coroutine run up to (and block inside) the slow encode: field
             # parsing and the real wav decode (asyncio.to_thread) both cross a real OS
             # thread boundary, which needs real wall-clock time to resolve, not just
             # event-loop yields -- so this polls with real (short) sleeps rather than
             # counting a fixed number of `asyncio.sleep(0)` turns.
-            assert await _wait_until(lambda: _gate_is_busy(components.gate)), (
-                "gate never became busy -- did _serve_speech fail before try_acquire?"
-                f" task done={task.done()}"
-                + (f" exception={task.exception()!r}" if task.done() and not task.cancelled() else "")
-            )
+            await eventually(lambda: task.done() or not _gate_is_free(components))
+            assert not task.done(), f"_serve_speech ended before try_acquire: {task!r}"
 
             task.cancel()
             await asyncio.sleep(0)  # enters the except block, starts awaiting the shield
@@ -541,25 +532,15 @@ def test_lease_survives_a_second_cancellation_during_a_slow_resolve_reference() 
 
             # The GPU call is still blocked (unblock isn't set yet): the gate must still
             # be held, whatever became of `task` itself.
-            assert await _gate_is_busy(components.gate), "gate freed before the GPU call finished"
+            assert not _gate_is_free(components), "gate freed before the GPU call finished"
 
             unblock.set()  # let the blocked encode() finish on the GPU thread
 
-            async def _gate_is_free() -> bool:
-                probe = components.gate.try_acquire()
-                if probe is None:
-                    return False
-                probe.release()
-                return True
-
-            freed = await _wait_until(_gate_is_free)
-            assert freed, "gate never freed after the GPU call finished"
-            lease = components.gate.try_acquire()
-            assert lease is not None
-            lease.release()
-
+            await eventually(lambda: _gate_is_free(components))
             with pytest.raises(asyncio.CancelledError):
                 await task
+            # Two cancels, one undone by `_outlast`: the task's count is the first one's.
+            assert task.cancelling() == 1
         finally:
             components.gpu.shutdown()
 
@@ -589,22 +570,6 @@ def test_a_cancel_during_prepare_first_piece_keeps_the_gate_until_the_gpu_call_e
     request ends as cancelled, but the gate stays held until that GPU call has finished, so
     the next request never starts behind abandoned work."""
 
-    def gate_is_free(gate: GpuGate) -> bool:
-        probe = gate.try_acquire()
-        if probe is None:
-            return False
-        probe.release()
-        return True
-
-    async def eventually(condition, timeout: float = 5.0) -> bool:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while not condition():
-            if loop.time() > deadline:
-                return False
-            await asyncio.sleep(0.005)
-        return True
-
     async def scenario() -> None:
         readiness = Readiness()
         components = _build_components(readiness)
@@ -613,32 +578,183 @@ def test_a_cancel_during_prepare_first_piece_keeps_the_gate_until_the_gpu_call_e
             runtime = _fake_runtime()
             runtime.tokenizer = _GpuBlockingTokenizer(reached, unblock)
             readiness.mark_ready(runtime)
-            built = httpx.Request("POST", "http://test/v1/audio/speech", data={"text": "hello"})
-            built.read()
-            task = asyncio.ensure_future(
-                _serve_speech(
-                    _asgi_request(built.content, built.headers["content-type"]),
-                    runtime,
-                    components,
-                    request_id="test-request",
-                    received_at=0.0,
-                    clock=lambda: 0.0,
-                    cpu_tokenizer=CpuTokenizer(components.gpu),
-                )
-            )
-            assert await eventually(reached.is_set), "piece 0 was never prepared"
+            task = _serve(_text_request("hello"), runtime, components)
+            await eventually(reached.is_set)
 
             task.cancel()
             await asyncio.sleep(0.05)
             assert not task.done()  # still waiting for the GPU call
-            assert not gate_is_free(components.gate)
+            assert not _gate_is_free(components)
 
             unblock.set()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert gate_is_free(components.gate)
+            assert _gate_is_free(components)
         finally:
             unblock.set()
+            components.gpu.shutdown()
+
+    asyncio.run(scenario())
+
+
+# --- a cancel during cleanup: only a cancel in flight is undone (review 27 #2, #5, #6) --------
+
+
+def _session_holding_its_close(
+    entered: asyncio.Event, *, then_times_out: bool
+) -> type[GpuSession[Any]]:
+    """A `GpuSession` whose `aclose()` closes for real (the gate is released) and then waits
+    to be cancelled, so a test can cancel the request exactly while it is closing. With
+    `then_times_out`, the cancel comes out as `gpu.wait_closed` reports a close that is still
+    running when its deadline passes: `GpuCloseTimeout` raised `from` the cancellation."""
+
+    class _HeldCloseSession(GpuSession[Any]):
+        async def aclose(self) -> None:
+            await super().aclose()
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as cancelled:
+                if then_times_out:
+                    raise GpuCloseTimeout("still closing") from cancelled
+                raise
+
+    return _HeldCloseSession
+
+
+@pytest.mark.parametrize("then_times_out", [False, True], ids=["cancelled", "close-timeout"])
+@pytest.mark.parametrize(
+    ("error", "reported"),
+    [
+        (NoRoomError("no room while priming"), False),  # a 400 text_too_long in flight
+        (RuntimeError("priming broke"), True),  # a 500 in flight
+    ],
+    ids=["400", "500"],
+)
+def test_a_cancel_while_closing_after_a_failure_wins(
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    reported: bool,
+    then_times_out: bool,
+) -> None:
+    """The request failed on its own, and the client goes away while the session closes:
+    the cancellation propagates (timeouts and task groups depend on seeing it), with the
+    task's count left at that one cancel. A 500 is still reported as `request.failed`, the
+    event errors.py would have emitted for it; a 400 is a client error, never logged."""
+
+    async def scenario() -> None:
+        entered = asyncio.Event()
+        monkeypatch.setattr(
+            routes_speech,
+            "GpuSession",
+            _session_holding_its_close(entered, then_times_out=then_times_out),
+        )
+        readiness = Readiness()
+        events = RecordingEvents()
+        components = _build_components(readiness, events=events)
+        try:
+            runtime = _RaisingRuntime(_fake_runtime(), error)
+            readiness.mark_ready(runtime)
+            task = _serve(_text_request("hello there"), runtime, components)
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert task.cancelling() == 1
+            failed = [fields for name, fields in events.calls if name == "request.failed"]
+            if reported:
+                [event] = failed
+                assert event["request_id"] == "test-request"
+                assert "priming broke" in str(event["error"])
+            else:
+                assert failed == []
+            assert [name for name, _ in events.calls if name == "gpu.close_failed"] == []
+            assert _gate_is_free(components)
+        finally:
+            components.gpu.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("then_times_out", [False, True], ids=["cancelled", "close-timeout"])
+def test_a_cancel_while_closing_after_no_audio_wins(
+    monkeypatch: pytest.MonkeyPatch, then_times_out: bool
+) -> None:
+    """The DONE branch: "no audio" is already reported as `speech.failed` before the close,
+    and a cancel during the close still propagates instead of that 500."""
+
+    async def scenario() -> None:
+        entered = asyncio.Event()
+        monkeypatch.setattr(
+            routes_speech,
+            "GpuSession",
+            _session_holding_its_close(entered, then_times_out=then_times_out),
+        )
+        readiness = Readiness()
+        events = RecordingEvents()
+        components = _build_components(readiness, events=events)
+        try:
+            runtime = _fake_runtime(chunks=0)
+            readiness.mark_ready(runtime)
+            task = _serve(_text_request("hello there"), runtime, components)
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert task.cancelling() == 1
+            assert [f["reason"] for name, f in events.calls if name == "speech.failed"] == [
+                "no_audio"
+            ]
+            [failed] = [f for name, f in events.calls if name == "request.failed"]
+            assert "no audio" in str(failed["error"])
+        finally:
+            components.gpu.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("then_times_out", [False, True], ids=["cancelled", "close-timeout"])
+def test_a_second_cancel_while_closing_after_a_cancel_is_undone(
+    monkeypatch: pytest.MonkeyPatch, then_times_out: bool
+) -> None:
+    """The client went away while piece 0 was priming, and a second cancel arrives while the
+    session closes: the first cancellation is the one raised, and the second is undone, so the
+    task's count stays at one -- a stale count would make a later `asyncio.timeout` expiry
+    raise `CancelledError` instead of `TimeoutError`."""
+
+    async def scenario() -> None:
+        entered = asyncio.Event()
+        monkeypatch.setattr(
+            routes_speech,
+            "GpuSession",
+            _session_holding_its_close(entered, then_times_out=then_times_out),
+        )
+        readiness = Readiness()
+        events = RecordingEvents()
+        components = _build_components(readiness, events=events)
+        priming, primed = threading.Event(), threading.Event()
+        try:
+            runtime = _fake_runtime(gate=primed, gate_at=0, gate_reached=priming)
+            readiness.mark_ready(runtime)
+            task = _serve(_text_request("hello there"), runtime, components)
+            await eventually(priming.is_set)
+
+            task.cancel()  # while the first step runs on the GPU thread
+            primed.set()  # let it finish, so the session's close can run
+            await asyncio.wait_for(entered.wait(), timeout=5.0)
+            task.cancel()  # while closing
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert task.cancelling() == 1
+            assert [name for name, _ in events.calls if name == "request.failed"] == []
+            assert _gate_is_free(components)
+        finally:
+            primed.set()
             components.gpu.shutdown()
 
     asyncio.run(scenario())

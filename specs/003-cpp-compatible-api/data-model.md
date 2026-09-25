@@ -144,12 +144,16 @@ skipped, with `speech.anchor_skipped` (`piece_index` 0, `reason`), when:
 - `no_room`: with the anchor as its reference, some later piece would have less than
   `MIN_SUFFIX_FRAMES` (12) frames of context room (a room limited by the piece's own cap doesn't
   count). The anchor is never trimmed to fit: its codes must stay paired with its text.
+  This is decided once piece 0 has finished and before piece 1 starts, by sizing every later
+  piece's prompt with the anchor on the CPU; those prompts are not kept.
 
 A skipped anchor leaves the later pieces as voice design.
 
 ## Piece
 
 `(index, text, seed = (request_seed + index) & 0xFFFFFFFF)`.
+- Its model inputs are built on the GPU thread when the stream reaches it, not ahead of time, and
+  are not kept once it has been generated.
 - Its token cap is `min(max_new_tokens or 750, room)`.
 - A room of 0 fails: `400 text_too_long` for piece 0 before streaming, or an aborted stream for a
   later piece.
