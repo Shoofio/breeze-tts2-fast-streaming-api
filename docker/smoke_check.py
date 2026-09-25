@@ -9,10 +9,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+import fastapi
 import flash_attn
+import python_multipart
 import qwen_tts
+import starlette
 import torch
 import transformers
+import uvicorn
+import websockets
 
 from models.fast_streaming import FastStreamingConfig
 from models.warmup_profile import load_warmup_profile
@@ -22,8 +27,7 @@ EXPECTED = {
     "transformers": "4.57.3",
     "qwen-tts": "0.1.1",
     "flash-attn": "2.8.3",
-    # The web stack is pinned because stream-abort and disconnect handling
-    # depend on its internals; a reinstall must not silently change it.
+    # Mirrors the exact web-stack pins in requirements.txt.
     "fastapi": "0.141.1",
     "starlette": "1.6.0",
     "uvicorn": "0.52.4",
@@ -32,7 +36,10 @@ EXPECTED = {
 
 
 def main() -> None:
-    imported_modules = (flash_attn, qwen_tts, torch, transformers)
+    imported_modules = (
+        fastapi, flash_attn, python_multipart, qwen_tts, starlette, torch,
+        transformers, uvicorn, websockets,
+    )
     if not all(imported_modules):
         raise RuntimeError("one or more required modules failed to import")
     versions = {name: importlib.metadata.version(name) for name in EXPECTED}

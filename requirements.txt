@@ -6,8 +6,9 @@ numpy>=2.0
 soundfile>=0.13
 # The web stack is pinned exactly because abort-on-failure and disconnect
 # handling rely on its internals (specs/003-cpp-compatible-api research R2, R3).
-# Transitive dependencies (anyio, h11) still float; test_speech_abort.py is
-# the guard. docker/smoke_check.py checks these pins in the image.
+# Transitive dependencies (anyio, h11) still float, and uvicorn must run with
+# h11 (not httptools); the abort test planned in T040 will guard this.
+# docker/smoke_check.py checks these pins in the image.
 fastapi==0.141.1
 starlette==1.6.0
 uvicorn==0.52.4
