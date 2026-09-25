@@ -21,6 +21,7 @@ from breeze_infer.reference_audio import DecodedAudio
 from breeze_infer.synthesis import (
     CodesRef,
     NoRef,
+    codec_samples_per_frame,
     generate_piece,
     piece_seed,
     prepare_piece,
@@ -215,6 +216,7 @@ def test_inline_reference_is_encoded_once_and_reused_across_pieces_and_cfg_rows(
                 seed=piece_seed(0, index),
                 chunk_first=1,
                 chunk_max=25,
+                samples_per_frame=CODEC_SAMPLES_PER_FRAME,
             )
         )
         assert runtime.calls[index]["inputs"] is inputs
@@ -334,6 +336,7 @@ def test_generate_piece_passes_the_seed_and_overrides_to_the_runtime() -> None:
             seed=piece_seed(42, 2),
             chunk_first=1,
             chunk_max=25,
+            samples_per_frame=CODEC_SAMPLES_PER_FRAME,
             temperature=0.5,
             top_k=10,
             top_p=0.8,
@@ -361,7 +364,17 @@ def test_generate_piece_passes_the_seed_and_overrides_to_the_runtime() -> None:
 
 def test_generate_piece_overrides_default_to_none() -> None:
     runtime = FakeRuntime(chunks=1)
-    list(generate_piece(runtime, {}, request_id="r", seed=1, chunk_first=1, chunk_max=25))
+    list(
+        generate_piece(
+            runtime,
+            {},
+            request_id="r",
+            seed=1,
+            chunk_first=1,
+            chunk_max=25,
+            samples_per_frame=CODEC_SAMPLES_PER_FRAME,
+        )
+    )
 
     call = runtime.calls[0]
     for name in ("temperature", "top_k", "top_p", "repetition_penalty", "max_new_tokens"):
@@ -370,7 +383,15 @@ def test_generate_piece_overrides_default_to_none() -> None:
 
 def test_generate_piece_ramps_growing_pcm_chunks() -> None:
     runtime = FakeRuntime(chunks=20, frames_per_chunk=1)
-    gen = generate_piece(runtime, {}, request_id="r", seed=1, chunk_first=1, chunk_max=5)
+    gen = generate_piece(
+        runtime,
+        {},
+        request_id="r",
+        seed=1,
+        chunk_first=1,
+        chunk_max=5,
+        samples_per_frame=CODEC_SAMPLES_PER_FRAME,
+    )
 
     flushes = list(gen)
     sizes = [_frame_count(flush) for flush in flushes]
@@ -384,7 +405,15 @@ def test_generate_piece_close_propagates_to_the_runtime_generator() -> None:
     # A client disconnect closes the piece's GpuSession, which closes this generator --
     # that must reach the runtime's own generator so it releases whatever it holds.
     runtime = FakeRuntime(chunks=10, frames_per_chunk=1)
-    gen = generate_piece(runtime, {}, request_id="r", seed=1, chunk_first=1, chunk_max=25)
+    gen = generate_piece(
+        runtime,
+        {},
+        request_id="r",
+        seed=1,
+        chunk_first=1,
+        chunk_max=25,
+        samples_per_frame=CODEC_SAMPLES_PER_FRAME,
+    )
 
     next(gen)  # pull the first PCM flush; the runtime generator is now mid-piece
     assert runtime.closed == 0
@@ -401,8 +430,28 @@ def test_generate_piece_carries_the_prefix_through() -> None:
     prefix_stub = SimpleNamespace(prefix_len=64)
     list(
         generate_piece(
-            runtime, {}, request_id="r", seed=1, chunk_first=1, chunk_max=25, prefix=prefix_stub
+            runtime,
+            {},
+            request_id="r",
+            seed=1,
+            chunk_first=1,
+            chunk_max=25,
+            samples_per_frame=CODEC_SAMPLES_PER_FRAME,
+            prefix=prefix_stub,
         )
     )
 
     assert runtime.calls[0]["prefix"] is prefix_stub
+
+
+def test_generate_piece_requires_samples_per_frame() -> None:
+    # No default and no fallback (review finding #10): omitting it is a TypeError at the
+    # call site, not a silently-wrong ramp.
+    with pytest.raises(TypeError):
+        generate_piece(FakeRuntime(chunks=1), {}, request_id="r", seed=1, chunk_first=1, chunk_max=25)
+
+
+def test_codec_samples_per_frame_reads_the_audio_tokenizers_config() -> None:
+    runtime = SimpleNamespace(audio_tokenizer=FakeCodec())
+
+    assert codec_samples_per_frame(runtime) == CODEC_SAMPLES_PER_FRAME

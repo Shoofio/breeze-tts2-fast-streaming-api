@@ -237,6 +237,11 @@ class FakeCodec:
     SAMPLES_PER_FRAME = CODEC_SAMPLES_PER_FRAME
     CODEBOOKS = CODEC_CODEBOOKS
     CODEBOOK_SIZE = CODEC_CODEBOOK_SIZE
+    # The one field `breeze_infer.synthesis.codec_samples_per_frame` reads off a loaded
+    # audio tokenizer's own config (``Qwen3TTSTokenizerV2Config.decode_upsample_rate``) --
+    # same value as SAMPLES_PER_FRAME above, just exposed the way the real object does
+    # (``audio_tokenizer.config.decode_upsample_rate``, not a class attribute).
+    config = SimpleNamespace(decode_upsample_rate=CODEC_SAMPLES_PER_FRAME)
 
     def __init__(self) -> None:
         self.encode_calls = 0
@@ -351,9 +356,10 @@ class FakeRuntime:
       *before* those frames are observed). Any frames left over after the last chunk (e.g.
       an all-pad piece with ``chunks=0`` and no ``flush_frames``, or trailing pad frames
       after the last decoded chunk) are still observed once the loop ends, since the real
-      loop calls ``token_observer`` on pad frames too — only ``should_decode_codec_frame``
-      frames feed the audio buffer. ``frames`` defaults to one dummy tensor per frame this
-      call is going to observe (``chunks * frames_per_chunk + (flush_frames or 0)``), so
+      loop calls ``token_observer`` on pad frames too — only frames ``_frame_flags`` marks
+      as not a terminal pad feed the audio buffer. ``frames`` defaults to one dummy
+      tensor per frame this call is going to observe
+      (``chunks * frames_per_chunk + (flush_frames or 0)``), so
       ``token_observer`` is exercised with no arguments beyond it, rather than silently
       observing nothing because the caller forgot to size a ``frames=`` list to match.
 
@@ -519,8 +525,22 @@ class FakeRuntime:
         default, bucketed only when ``self.config.fast_backbone_prefill`` is set (review
         finding #2 -- the real ``_prefill_plan`` only pads when the fast backbone-prefill
         path is on, ``FastStreamingConfig.fast_backbone_prefill`` default ``False``; this
-        used to bucket unconditionally, which is backwards from the real default)."""
-        from models.fast_streaming import _PREFILL_TOKEN_GRANULARITY, _branch_shape
+        used to bucket unconditionally, which is backwards from the real default).
+
+        With the flag on, the bucketed length still falls back to the exact length
+        whenever bucketing would leave less than ``MIN_SUFFIX_FRAMES`` (12) of room --
+        not only when it would overflow ``max_seq_len`` outright (review finding #4,
+        f021d7b's real ``_prefill_plan``): padding a short suffix up to its bucket could
+        otherwise eat most of a registered prefix's promised room, so the graph path is
+        abandoned a bit before the hard overflow point, and every longer prompt after
+        that point stays eager too (keeps room monotonic in prompt length -- see the
+        real docstring).
+        """
+        from models.fast_streaming import (
+            _PREFILL_TOKEN_GRANULARITY,
+            MIN_SUFFIX_FRAMES,
+            _branch_shape,
+        )
 
         seq_len = _branch_shape(inputs).seq_len
         exact_len = prefix_len + seq_len
@@ -530,8 +550,10 @@ class FakeRuntime:
             prefix_len
             + -(-seq_len // _PREFILL_TOKEN_GRANULARITY) * _PREFILL_TOKEN_GRANULARITY
         )
-        prefill_len = bucketed_len if bucketed_len <= self.config.max_seq_len else exact_len
-        return self.config.max_seq_len - prefill_len - 1
+        bucketed_room = self.config.max_seq_len - bucketed_len - 1
+        if bucketed_room < MIN_SUFFIX_FRAMES:
+            return self.config.max_seq_len - exact_len - 1
+        return bucketed_room
 
     def iter_audio_chunks(
         self,
@@ -549,7 +571,11 @@ class FakeRuntime:
     ) -> Iterator[FastStreamingChunk]:
         # Lazy: models.fast_streaming (cudagraph submodules) is slow to import, and most
         # of tests/fakes.py's own consumers never call this method (finding #8).
-        from models.fast_streaming import FastStreamingChunk, _require_valid_overrides
+        from models.fast_streaming import (
+            FastStreamingChunk,
+            NoRoomError,
+            _require_valid_overrides,
+        )
 
         # Validated -- and, like the real generator, only once the caller starts
         # iterating, not at call time -- with the exact same rules the real runtime
@@ -579,8 +605,13 @@ class FakeRuntime:
         if "attention_mask" in inputs:
             limit = self.max_new_tokens_room(max_new_tokens, inputs, prefix_len=prefix_len)
             if limit <= 0:
-                # The real runtime's message, so tests match on the same text.
-                raise ValueError(
+                # The real runtime's own exception type (not a bare ValueError), so a
+                # route that maps NoRoomError specifically to 400 text_too_long (and
+                # leaves every other ValueError as an unhandled 500 -- T046 review,
+                # finding 1) gets the same 400 here that the real runtime would give.
+                # The message text still matches the real one, so tests matching on it
+                # keep working unchanged.
+                raise NoRoomError(
                     "prompt leaves no room to generate in the "
                     f"{self.config.max_seq_len}-token context"
                 )

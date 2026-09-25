@@ -216,6 +216,34 @@ def test_context_room_is_exact_by_default_and_bucketed_only_when_configured() ->
     assert bucketed.max_new_tokens_room(1500, inputs) == 256 - 128 - 1  # padded to 128
 
 
+def test_context_room_falls_back_to_exact_when_bucketing_leaves_too_little_suffix_room() -> None:
+    # review finding #4 (f021d7b's real _prefill_plan): with the flag on, the bucketed
+    # length is abandoned in favor of the exact length not just when it would overflow
+    # max_seq_len outright, but already once the bucketed room drops under
+    # MIN_SUFFIX_FRAMES (12) -- 100 tokens pad to 128, which equals max_seq_len itself,
+    # leaving a bucketed room of -1 (well under 12), so this must fall back to the exact
+    # length (100) instead: 128 - 100 - 1 = 27.
+    runtime = FakeRuntime(config=FakeStreamingConfig(max_seq_len=128, fast_backbone_prefill=True))
+
+    assert runtime.max_new_tokens_room(1500, _room_inputs(100)) == 27
+
+
+def test_context_room_is_monotonic_across_the_bucket_fallback_boundary() -> None:
+    # The real _prefill_plan's own promise: once bucketing is abandoned for a prompt,
+    # every longer prompt stays on the exact-length (eager) path too, so room never goes
+    # back up as the prompt grows -- checked here across a range that crosses the
+    # boundary between "bucketed room still >= MIN_SUFFIX_FRAMES" (seq 90-96) and
+    # "falls back to exact" (seq 97 on).
+    runtime = FakeRuntime(config=FakeStreamingConfig(max_seq_len=128, fast_backbone_prefill=True))
+
+    rooms = [
+        runtime.max_new_tokens_room(1500, _room_inputs(seq_len)) for seq_len in range(80, 117)
+    ]
+
+    assert rooms == sorted(rooms, reverse=True)  # non-increasing throughout
+    assert rooms != sorted(rooms)  # sanity: not trivially constant either
+
+
 def test_iter_audio_chunks_raises_like_the_real_runtime_when_there_is_no_room() -> None:
     runtime = FakeRuntime(chunks=1, config=FakeStreamingConfig(max_seq_len=128))
     # 127 tokens, exact length (the default): room 128 - 127 - 1 = 0.

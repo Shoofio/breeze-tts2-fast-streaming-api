@@ -146,13 +146,23 @@ def prepare_piece(
 # --- PCM ramp (contracts/http-api.md "Splitting": "chunks grow from --chunk-first to
 # --chunk-max codec frames") ----------------------------------------------------------
 
-# The bundled codec's frame size (qwen-tts's Mimi decoder upsample product /
-# "decode_upsample_rate"): 1,920 samples per 12.5 fps frame at the 24 kHz output the
-# checkpoint uses. Neither `FastBreezeStreamingRuntime` nor `FakeRuntime` expose this as
-# an attribute today, so `generate_piece` falls back to this constant; it still prefers
-# `runtime.samples_per_frame` first, so a future runtime that does expose it is used
-# automatically (review finding #8).
-_CODEC_SAMPLES_PER_FRAME = 1920
+
+def codec_samples_per_frame(runtime: Any) -> int:
+    """The codec's frame size in samples (qwen-tts's ``decode_upsample_rate``): 1,920 on
+    the bundled checkpoint, for a 12.5 fps frame rate at the 24 kHz output.
+
+    Read off the already-loaded audio tokenizer's own config
+    (``runtime.audio_tokenizer.config.decode_upsample_rate``, a live
+    ``Qwen3TTSTokenizerV2Config`` attribute -- ``FastBreezeStreamingRuntime`` keeps the
+    loaded tokenizer at ``self.audio_tokenizer``), not from ``config.json`` on disk: that
+    is where ``breeze_infer.audio``'s codec-identity fingerprint reads the same field
+    from (``_TOP_LEVEL_IDENTITY_FIELDS``), but a caller preparing to stream a piece
+    already has the runtime, not a checkpoint path. The route calls this once per request
+    (or once at startup) and passes the result as ``generate_piece``'s
+    ``samples_per_frame`` (review finding #10) -- it is not called inside
+    ``generate_piece`` itself, so a piece's hot loop never re-reads it.
+    """
+    return int(runtime.audio_tokenizer.config.decode_upsample_rate)
 
 
 def ramp_pcm(
@@ -212,6 +222,7 @@ def generate_piece(
     seed: int,
     chunk_first: int,
     chunk_max: int,
+    samples_per_frame: int,
     prefix: Any | None = None,
     temperature: float | None = None,
     top_k: int | None = None,
@@ -226,6 +237,10 @@ def generate_piece(
     ready, so a single step never does more GPU work than one flush needs. The sampling
     overrides are the `SpeechRequest`'s own (``None`` means the runtime's default); the
     caller passes ``piece_seed(request.seed, index)`` for ``seed``.
+
+    ``samples_per_frame`` is required, not defaulted or inferred (review finding #10):
+    the caller passes ``codec_samples_per_frame(runtime)`` (above), computed once per
+    request rather than re-read on every piece.
 
     ``chunks.close()`` always runs, even if this generator itself is closed early (a
     client disconnect closes the piece's `breeze_infer.gpu.GpuSession`, which closes this
@@ -244,7 +259,6 @@ def generate_piece(
         repetition_penalty=repetition_penalty,
         max_new_tokens=max_new_tokens,
     )
-    samples_per_frame = getattr(runtime, "samples_per_frame", _CODEC_SAMPLES_PER_FRAME)
     try:
         yield from ramp_pcm(chunks, chunk_first, chunk_max, samples_per_frame)
     finally:
