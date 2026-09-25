@@ -556,7 +556,10 @@ and `test_bc_46` tests.
 
 - [X] T048 [US2] Complete `breeze_infer/http_fields.py`:
   - the strict number grammar from contracts/http-api.md, with ranges;
-  - duplicate detection (`getlist` over the form and the query, and their key intersection);
+  - duplicate detection (`_check_no_duplicate_names`: every raw name seen on the wire, file
+    parts included, counted across the query string and the body combined -- stricter than
+    `getlist` plus a key intersection, since it also catches a name repeated within a single
+    source, not just one split across both);
   - length limits and the control-character rule;
   - `ReferenceSpec` checks in order: `reference_conflict`, then `ref_text_required`, then
     `reference_required`;

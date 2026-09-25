@@ -420,6 +420,42 @@ def test_ref_audio_in_the_query_string_gets_400(tmp_path: Path) -> None:
     }
 
 
+# T048 post-final review findings #4/#7: `ref_audio` in the query string is knowable
+# without ever touching the body, so it's rejected before the body's content type is even
+# sniffed -- not shadowed by a body-shaped problem (a bad content type, a rejected charset)
+# that was only ever going to be a distraction from the query's own, already-certain error.
+
+
+def test_ref_audio_in_query_wins_over_an_unsupported_content_type(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech",
+        content=b"irrelevant body",
+        headers={"content-type": "text/plain"},
+        params={"ref_audio": "not a file"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio must be a file part",
+        "code": "invalid_field",
+    }
+
+
+def test_ref_audio_in_query_wins_over_a_rejected_body_charset(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech",
+        content=b"text=hi",
+        headers={"content-type": "application/x-www-form-urlencoded; charset=iso-8859-1"},
+        params={"ref_audio": "not a file"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio must be a file part",
+        "code": "invalid_field",
+    }
+
+
 # finding #3: FORM_MAX_PART_SIZE is derived so a full-length CJK/emoji text field's
 # percent-encoded urlencoded form fits.
 
@@ -1404,6 +1440,80 @@ def test_decimal_boundary_value_with_a_padded_exponent_is_accepted(tmp_path: Pat
     assert response.json()["temperature"] == 10.0
 
 
+# T048 post-final review finding #1: cfg_scale has no `_is_zero_literal` pre-check the way
+# the optional sampling fields do (0 is an ordinary in-range value for it, not a "use the
+# default" sentinel) -- so, unlike `test_decimal_zero_with_huge_exponent_still_means_the_
+# default` above (which never reaches `Decimal` at all), these literals actually reach
+# `_check_decimal_range`'s `except InvalidOperation` branch and must still resolve to the
+# value C++'s strtod would give.
+
+
+@pytest.mark.parametrize(
+    "literal", ["0e1000000000000000000", "0e-999999999999999999999"],
+    ids=["huge-positive-exponent", "huge-negative-exponent"],
+)
+def test_cfg_scale_unrepresentable_zero_is_accepted(tmp_path: Path, literal: str) -> None:
+    """A zero mantissa with an exponent `Decimal` can't represent is still exactly zero --
+    in range for `cfg_scale` (`[0, 100]`) -- regardless of which direction the unrepresentable
+    exponent points."""
+    response = _client(tmp_path).post("/speech", data={"text": "hi", "cfg_scale": literal})
+
+    assert response.status_code == 200
+    assert response.json()["cfg_scale"] == 0.0
+
+
+def test_cfg_scale_tiny_value_with_unrepresentable_exponent_is_accepted(
+    tmp_path: Path,
+) -> None:
+    """A *nonzero* mantissa with a huge negative exponent -- `Decimal` can't represent the
+    literal, but `float(literal)` still underflows to exactly `0.0`, same as C++'s strtod --
+    is in range for `cfg_scale` (0 inclusive), unlike the representable-underflow case
+    (`test_underflowing_nonzero_literal_is_400_not_default`), which is a different field's
+    range rule (temperature's `(0, 10]` excludes 0), not a different code path."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "cfg_scale": "1e-999999999999999999999"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cfg_scale"] == 0.0
+
+
+def test_cfg_scale_huge_positive_exponent_with_nonzero_mantissa_gets_400(
+    tmp_path: Path,
+) -> None:
+    """A nonzero mantissa with a huge *positive* exponent overflows towards infinity, never
+    in range for any of this contract's (finite) upper bounds -- the same literal
+    `test_bc_01_decimal_with_huge_exponent_gets_400` already covers, named here to sit next
+    to the rest of this InvalidOperation-reaching group."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "cfg_scale": "1e1000000000000000000"}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+
+
+@pytest.mark.parametrize(
+    "literal", ["1e-999999999999999999999", "1e1000000000000000000"],
+    ids=["huge-negative-exponent", "huge-positive-exponent"],
+)
+def test_temperature_unrepresentable_exponent_gets_400(tmp_path: Path, literal: str) -> None:
+    """The same `except InvalidOperation` fallback, exercised for an *optional* field:
+    unlike `test_decimal_zero_with_huge_exponent_still_means_the_default` (a zero mantissa,
+    caught by `_is_zero_literal` before `Decimal` is ever involved), a nonzero mantissa still
+    reaches `_check_decimal_range` and actually raises `InvalidOperation` -- and, for
+    temperature (`(0, 10]`, 0 excluded), both directions land outside the range: the tiny
+    literal underflows to `0.0`, which fails the low-exclusive bound the same way
+    `1e-400` already does; the huge literal overflows to infinity, which fails the high
+    bound."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "temperature": literal}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+
+
 def test_bc_01_leading_zeros_dont_count_against_the_digit_cap(tmp_path: Path) -> None:
     """The integer literal digit cap (test_bc_01_integer_longer_than_20_digits_gets_400)
     counts significant digits, not raw digits on the wire -- a value padded with leading
@@ -1479,6 +1589,43 @@ def test_bc_08_three_ref_audio_file_parts_get_400(tmp_path: Path) -> None:
         f"--{boundary}\r\n"
         'Content-Disposition: form-data; name="text"\r\n\r\n'
         "hi\r\n" + part(1) + part(2) + part(3) + f"--{boundary}--\r\n"
+    ).encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio was given more than once",
+        "code": "duplicate_field",
+    }
+
+
+def test_bc_08_five_ref_audio_file_parts_still_get_duplicate_field(tmp_path: Path) -> None:
+    """T048 post-final review finding #5: five `ref_audio` file parts is one past
+    `FORM_MAX_FILES` (4) -- Starlette's own parser refuses to hand back that many file parts
+    at all, raising `MultiPartException("Too many files...")` before BC-08's own duplicate
+    pass ever gets raw items to count. `_parse_multipart_form` maps that specific exception
+    back to `duplicate_field` when every file part involved (the four it already parsed, plus
+    the fifth that tripped the limit) is named `ref_audio` -- rather than leaving the client
+    with the generic parser error, which wouldn't name the field at all."""
+    boundary = "xxxxBOUNDARYxxxx"
+
+    def part(n: int) -> str:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="ref_audio"; filename="{n}.wav"\r\n'
+            "Content-Type: audio/wav\r\n\r\n"
+            f"file bytes {n}\r\n"
+        )
+
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="text"\r\n\r\n'
+        "hi\r\n" + part(1) + part(2) + part(3) + part(4) + part(5) + f"--{boundary}--\r\n"
     ).encode("ascii")
 
     response = _client(tmp_path).post(
@@ -1593,16 +1740,42 @@ def test_bc_01_integer_literal_over_4300_raw_digits_doesnt_crash(tmp_path: Path)
     assert response.json()["seed"] == 1
 
 
-def test_bc_08_duplicate_pass_runs_before_ref_audio_as_text_check(tmp_path: Path) -> None:
-    """BC-08: the duplicate-field pass runs first, over the raw query and body keys, before
-    any per-field check -- including `ref_audio`-as-text, which would otherwise fire first
-    and hide an unrelated duplicated `seed` in the body. The C++ server checked neither
-    duplicates nor `ref_audio`'s shape this strictly at all."""
+def test_ref_audio_in_query_wins_over_an_unrelated_body_only_duplicate(
+    tmp_path: Path,
+) -> None:
+    """T048 post-final review findings #4/#7: this used to be `duplicate_field` (BC-08's
+    combined query+body pass ran before `ref_audio`-as-text, in every branch) -- but
+    reaching that combined pass at all means the body has already been read and parsed,
+    which is exactly what `ref_audio` in the query must be rejected *before*, per
+    findings #4/#7 above. Query-only checks run first now, so a `ref_audio` already known to
+    be wrong from the query string alone is reported even when the body, once parsed, turns
+    out to have its own, unrelated problem."""
     response = _client(tmp_path).post(
         "/speech",
         content=b"seed=1&seed=2",
         headers={"content-type": "application/x-www-form-urlencoded"},
         params={"ref_audio": "x"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio must be a file part",
+        "code": "invalid_field",
+    }
+
+
+def test_bc_08_duplicate_pass_still_runs_before_ref_audio_as_text_check_within_the_body(
+    tmp_path: Path,
+) -> None:
+    """BC-08's duplicate pass still runs before the ref_audio-as-text check for whatever a
+    single body branch produces -- both `ref_audio` (as text) and the duplicated `seed` are
+    in the body here, not split across the query and the body, so there's no query-only
+    check to short-circuit first; the combined duplicate check (run once per branch) still
+    wins over that same branch's own `_reject_ref_audio_text` call."""
+    response = _client(tmp_path).post(
+        "/speech",
+        content=b"ref_audio=x&seed=1&seed=2",
+        headers={"content-type": "application/x-www-form-urlencoded"},
     )
 
     assert response.status_code == 400

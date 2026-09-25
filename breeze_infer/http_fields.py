@@ -5,11 +5,16 @@ instruction means the default), BC-10 (missing/blank text is `400 text_required`
 FR-006's `0` -> `None` for the sampling fields. T048 (contracts/http-api.md, data-model.md
 `SpeechRequest`) completes it: the strict ASCII-only number grammar with ranges (T048's
 `_INT_LITERAL`/`_DECIMAL_LITERAL` below), duplicate-field detection (BC-08,
-`_check_no_duplicate_names`, run first in `read_fields`, over the raw names from the query
-string and the body combined, before any other check -- including `_reject_ref_audio_text`
-and `_split_multipart_fields`'s own file-vs-text check -- ever runs), length limits and the
-control-character rule (BC-05, BC-46), and the full `reference_conflict` /
-`ref_text_required` / `reference_required` ordering (`_build_reference`). `Fields` itself
+`_check_no_duplicate_names`), length limits and the control-character rule (BC-05, BC-46),
+and the full `reference_conflict` / `ref_text_required` / `reference_required` ordering
+(`_build_reference`). `read_fields` runs its query-only checks -- a duplicate wholly within
+the query string, and `ref_audio` given as a query parameter (`_reject_ref_audio_text`) --
+before the request's content type is even sniffed, so a rejected content type, an
+unsupported charset, or a large multipart parse can never surface their own error ahead of
+one already knowable from the query string alone (T048 post-final review findings #4/#7).
+Each body branch then runs its own combined duplicate check (the query's names plus that
+branch's) and its own ref_audio-as-text check, once, before any other per-field check --
+`_split_multipart_fields`'s own file-vs-text check included -- ever runs. `Fields` itself
 keeps the form and the query string as separate multi-dicts so `_first` can read "the one
 value" from either source without needing to merge them first -- by the time `Fields` is
 built, `_check_no_duplicate_names` has already ruled out either one holding more than one
@@ -89,15 +94,21 @@ DEFAULT_SEED = 42
 
 # The limits passed to the multipart parser, and to _urlencoded_pairs_sync by hand
 # (research.md R6). Letting Starlette's own parser accept a few file parts, not just one, is
-# what lets `_split_multipart_fields` below tell "a second (or third) ref_audio file"
-# (400 duplicate_field) apart from "too many files" (Starlette's own generic
-# MultiPartException, mapped to a plain 400 invalid_field): with max_files still 1, any
-# file past the first would never reach this module's own code to be told apart from
-# anything, and would surface as the generic error instead of naming ref_audio specifically.
-# 4 is enough headroom for a client that sends a handful of duplicates by mistake (or to
-# probe for this); a client sending many more than that gets the generic error instead --
-# `FORM_MAX_FILES` still exists to bound how much of this parsing work a single request can
-# ask Starlette to do at all.
+# what lets `read_fields`'s own BC-08 pass (`_check_no_duplicate_names`, run over
+# `form.multi_items()` -- `_split_multipart_fields` no longer tells duplicates apart itself;
+# BC-08 has already ruled a repeated name out by the time it's called) see "a second (or
+# third) ref_audio file" for itself, rather than Starlette's own parser refusing to hand back
+# that many file parts at all: with max_files still 1, any file past the first would never
+# reach this module's own code to be told apart from anything, and would surface as the
+# generic parser error instead of naming ref_audio specifically. 4 is enough headroom for a
+# client that sends a handful of duplicates by mistake (or to probe for this); a client
+# sending *more* than that trips Starlette's own file-count limit before parsing even
+# finishes -- `_parse_multipart_form` maps that specific `MultiPartException` back to
+# `duplicate_field` when it can tell every file part involved was named `ref_audio` (T048
+# post-final review finding #5), and falls back to the generic error otherwise, since the
+# exception itself carries no field name to be more specific with. `FORM_MAX_FILES` still
+# exists to bound how much of this parsing work a single request can ask Starlette to do at
+# all.
 FORM_MAX_FILES = 4
 FORM_MAX_FIELDS = 32
 # T037 review 1 finding #3, review 2 finding #4: a 4-byte UTF-8 code point (an emoji, or a
@@ -152,24 +163,37 @@ async def read_fields(request: Request) -> Fields:
     finding #5), from `request.scope["query_string"]` -- the raw wire bytes, not
     `request.query_params` (Starlette's own lenient parse).
 
+    Two checks need nothing from the body at all -- a duplicate wholly within the query
+    string, and `ref_audio` given as a query parameter -- so they run first, before the
+    request's content type is even sniffed (T048 post-final review findings #4/#7). Without
+    this, a rejected content type, an unsupported charset, or a large multipart file being
+    spooled to disk could each surface their own error ahead of a `ref_audio` that was
+    always going to be rejected regardless of what the body turned out to hold:
+    `?ref_audio=x` with a `text/plain` body used to get the content-type error instead of
+    `ref_audio must be a file part`; the same query with a declared-latin-1 urlencoded body
+    used to get "must be UTF-8" instead; and a large multipart file used to be parsed and
+    spooled before a query-only `ref_audio` was ever rejected.
+
     Routes on the request's declared media type: `multipart/form-data` and
     `application/x-www-form-urlencoded` are parsed as the module docstring describes;
     anything else is `400 invalid_field` *unless* the body is empty -- a query-only request
     with no body has no content type worth trusting, and still has to work (review 1
     finding #7, review 2 finding #8).
 
-    BC-08's duplicate-field check (`_check_no_duplicate_names`) runs first in every branch
-    below, over the raw names from the query string and the body combined -- before
-    `_reject_ref_audio_text`, `_split_multipart_fields`'s own file-vs-text check, or any
-    check in `parse_speech` ever runs. A request whose `text` happens to be too long but
-    whose unrelated `seed` is duplicated must still get `duplicate_field`, not
-    `text_too_long`; a `ref_audio` given as text in the query string alongside an unrelated
-    duplicated `seed` in the body must still get `duplicate_field`, not `ref_audio must be a
-    file part` -- neither holds unless every name is checked before any single one's own
-    syntax is.
+    Each branch below then produces its own `(names, pairs)` from the body, and runs BC-08's
+    duplicate check once more, combined with the query's own names (`_check_no_duplicate_names`)
+    -- this is what catches a name repeated *across* the query and the body, not just within
+    one source alone -- followed by that branch's own ref_audio-as-text check
+    (`_reject_ref_audio_text`, for urlencoded and the no-body case; multipart's own per-part
+    type check in `_split_multipart_fields` does the equivalent job in wire order, review 2
+    finding #3). Both run before any other per-field check, `parse_speech`'s included: a
+    request whose `text` happens to be too long but whose unrelated `seed` is duplicated
+    across the query and the body must still get `duplicate_field`, not `text_too_long`.
     """
     query_pairs = await _parse_urlencoded_bytes(request.scope["query_string"])
     query_names = [name for name, _ in query_pairs]
+    _check_no_duplicate_names(query_names)
+    _reject_ref_audio_text(query_pairs)
 
     media_type, charset = _content_type(request)
     if media_type == "multipart/form-data":
@@ -177,7 +201,6 @@ async def read_fields(request: Request) -> Fields:
         try:
             raw_items = list(form.multi_items())
             _check_no_duplicate_names(query_names + [name for name, _ in raw_items])
-            _reject_ref_audio_text(query_pairs)
             pairs, ref_audio_part = _split_multipart_fields(raw_items)
             ref_audio = await _read_ref_audio_bytes(ref_audio_part)
         finally:
@@ -191,7 +214,6 @@ async def read_fields(request: Request) -> Fields:
         body = await request.body()  # already bounded by BodyLimitMiddleware
         pairs = await _parse_urlencoded_bytes(body)
         _check_no_duplicate_names(query_names + [name for name, _ in pairs])
-        _reject_ref_audio_text(query_pairs)
         _reject_ref_audio_text(pairs)
         ref_audio = None
     else:
@@ -202,9 +224,10 @@ async def read_fields(request: Request) -> Fields:
                 "content type must be multipart/form-data or "
                 "application/x-www-form-urlencoded",
             )
+        # The query-only checks above already covered everything there is to check here --
+        # the body is empty, so there are no more names to combine and no body-side
+        # ref_audio-as-text to reject.
         pairs, ref_audio = [], None
-        _check_no_duplicate_names(query_names)
-        _reject_ref_audio_text(query_pairs)
 
     return Fields(form=QueryParams(pairs), query=QueryParams(query_pairs), ref_audio=ref_audio)
 
@@ -353,6 +376,13 @@ async def _parse_multipart_form(request: Request) -> FormData:
     name from both the query string and this form, before any of that per-field validation
     (`_split_multipart_fields`) runs. The caller owns `form`'s lifetime (`await
     form.close()`), same as before.
+
+    A `MultiPartException` raised for hitting `FORM_MAX_FILES` -- more file parts than the
+    parser will even hand back -- never reaches that BC-08 pass at all, so a client sending
+    five or more `ref_audio` file parts would otherwise get the generic "could not parse"
+    error instead of naming the field (T048 post-final review finding #5, see the
+    `FORM_MAX_FILES` comment above). `_is_too_many_ref_audio_files` below is what tells that
+    specific case apart from every other reason parsing could fail.
     """
     parser = _StrictMultiPartParser(
         request.headers,
@@ -364,23 +394,49 @@ async def _parse_multipart_form(request: Request) -> FormData:
     try:
         return await parser.parse()
     except MultiPartException as exc:
+        if _is_too_many_ref_audio_files(parser, exc):
+            raise ApiError(
+                400, "duplicate_field", "ref_audio was given more than once"
+            ) from exc
         raise ApiError(400, "invalid_field", "could not parse the request body") from exc
+
+
+def _is_too_many_ref_audio_files(parser: _StrictMultiPartParser, exc: MultiPartException) -> bool:
+    """Whether `exc` is `MultiPartParser.on_headers_finished`'s own "Too many files..."
+    (`starlette/formparsers.py`), tripped by a run of `ref_audio` file parts specifically,
+    rather than any other reason parsing could fail (a field genuinely too large, too many
+    *fields* rather than files, a malformed boundary -- `MultiPartException` carries no error
+    code of its own, so the message text is the only way to tell those apart).
+
+    By the time that exception is raised, `on_headers_finished` has already set
+    `parser._current_part.field_name` to the part that tipped the count over -- read here,
+    after the fact, since it's still a plain attribute on `parser`, unaffected by the
+    exception having propagated -- and every earlier file part has already run through
+    `on_part_end` into `parser.items`. Both are checked so this is only true when *every*
+    file part involved, not just the one that tripped the limit, was named `ref_audio`: a
+    client that pads `FORM_MAX_FILES` worth of unrelated file parts with one `ref_audio` file
+    as the last one didn't give `ref_audio` more than once, and must keep the generic error.
+    """
+    if not str(exc).startswith("Too many files"):
+        return False
+    if parser._current_part.field_name != "ref_audio":
+        return False
+    file_names = (name for name, value in parser.items if isinstance(value, UploadFile))
+    return all(name == "ref_audio" for name in file_names)
 
 
 def _split_multipart_fields(
     raw_items: list[tuple[str, str | UploadFile]],
 ) -> tuple[list[tuple[str, str]], UploadFile | None]:
-    """One pass over every part, in wire order (review 2 finding #3): every `ref_audio`
-    entry must be a file, checked as it's encountered, not just the *last* one --
-    `form.get("ref_audio")` alone would miss an earlier, invalid text `ref_audio` sent
-    before a later, valid file part under the same name. Every other field must be text
-    (review 1 finding #1): a file part sent under any other field name is rejected outright.
+    """Split `raw_items` into ordinary text fields and (at most one) `ref_audio` file part.
 
-    A *second* `ref_audio` part -- file or text -- never reaches this loop at all: BC-08's
-    duplicate-field pass (`_check_no_duplicate_names`, run by `read_fields` before this is
-    ever called) already rejects any name given more than once, `ref_audio` included, as
-    `400 duplicate_field`. This only has to tell a single `ref_audio` part's type apart from
-    every other field's.
+    By the time `read_fields` calls this, BC-08's duplicate-field pass
+    (`_check_no_duplicate_names`) has already rejected any name given more than once --
+    `ref_audio` included -- as `400 duplicate_field` (T048 post-final review finding #6: a
+    *second* `ref_audio` part, file or text, never reaches this loop at all). So this is a
+    single pass over parts already known to have at most one of any given name: the one
+    `ref_audio` part, if there is one, must be a file; every other part must be text (review
+    1 finding #1) -- a file part sent under any other field name is rejected outright.
     """
     pairs: list[tuple[str, str]] = []
     ref_audio_part: UploadFile | None = None
@@ -452,9 +508,13 @@ def _first(fields: Fields, name: str) -> str | None:
 # here should be stricter than the contract itself. A literal with an exponent
 # `decimal.Decimal`'s default context can't represent (`Emax`/`Emin`, roughly +/-999999) --
 # e.g. `Decimal("1e1000000000000000000")` -- is instead handled by `_check_decimal_range`
-# below, which catches `decimal.InvalidOperation` directly; `_is_zero_literal` separately
-# means a literal like `0e99999` is still just the zero sentinel, never reaching `Decimal`
-# construction for its enormous exponent at all.
+# below, which catches `decimal.InvalidOperation` directly and falls back to the
+# already-parsed `float` (T048 post-final review finding #1). For the optional sampling fields,
+# `_is_zero_literal` means a zero-mantissa literal like `0e99999` never reaches `Decimal`
+# construction at all -- but that's *not* true of every numeric field: `cfg_scale` has no
+# such pre-check (0 is an ordinary in-range value for it, not a "use the default" sentinel),
+# so `cfg_scale=0e1000000000000000000` genuinely does reach, and overflow, `Decimal`'s
+# context, and relies on `_check_decimal_range`'s fallback to still be judged correctly.
 _INT_LITERAL = re.compile(r"[+-]?\d+", re.ASCII)
 _DECIMAL_LITERAL = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", re.ASCII)
 
@@ -568,22 +628,38 @@ def _check_decimal_range(
     own range check, aligned to this same table, would then raise on that stored `0.0` after
     the busy check -- a `500` this validation exists to prevent). So both the exact `Decimal`
     check and the ordinary `float` check must pass; either one failing is out of range. (A
-    separate `math.isfinite(value)` guard isn't needed alongside them: `_DECIMAL_LITERAL`'s
-    4-digit exponent cap keeps `Decimal(literal)` from ever overflowing its own context, and
-    an overflowed `float` -- `value == inf` -- already fails the plain `value <= float_high`
-    comparison in `float_in_range` on its own, no special-casing required.)
+    separate `math.isfinite(value)` guard isn't needed alongside them: an overflowed `float`
+    -- `value == inf` -- already fails the plain `value <= float_high` comparison in
+    `float_in_range` on its own, no special-casing required.)
 
-    `Decimal(literal)` is guarded by its own `try`/`except` as a safety net alongside the
-    grammar's exponent cap, not instead of it: the cap is what keeps a real request from
-    ever reaching this with an exponent `Decimal` can't represent, but `Decimal`'s own
-    string grammar isn't byte-for-byte identical to this module's, so catching
-    `InvalidOperation` here means no future gap between the two can turn into an unhandled
-    `500` either.
+    `Decimal(literal)` construction is guarded by `try`/`except InvalidOperation` as the
+    *primary* handling for a literal the grammar accepts but `Decimal`'s own default context
+    can't represent (`Emax`/`Emin`, roughly +/-999999) -- e.g.
+    `cfg_scale=0e1000000000000000000` -- not a safety net alongside some other cap: the
+    grammar's exponent cap was removed (see the DECISION above `_INT_LITERAL`), so this is
+    now how such a literal is actually handled, for every numeric field this function
+    guards. `cfg_scale` in particular never runs `_is_zero_literal` first the way the
+    optional sampling fields do (0 is an ordinary in-range value for it, not a "use the
+    default" sentinel), so a zero-mantissa literal with an unrepresentable exponent reaches
+    here, not just a nonzero one (T048 post-final review finding #1).
+
+    On that exception, `decimal_value` falls back to `Decimal(value)` -- the already-parsed
+    `float`, not a second attempt at the literal string. A mantissa of all zeros, or an
+    exponent too far negative, underflows `float` to exactly `0.0` in any radix, C++'s
+    strtod included, so it's treated the same as the literal `"0"` would be -- this field's
+    own range rule then decides whether 0 is in range, exactly as it would for any other
+    value (`cfg_scale`'s `[0, 100]` accepts it; a sampling field that reaches this at all
+    with a *nonzero* mantissa, like `temperature`'s `(0, 10]`, rejects it, the same as it
+    rejects a representable underflow such as `1e-400`). An exponent too far *positive* with
+    a nonzero mantissa only ever overflows `float` towards infinity, which is never inside
+    any of this contract's (all finite) upper bounds, so `Decimal(value)` is `Decimal(inf)`
+    (or `-inf`) there, and the ordinary bound comparison below rejects it unconditionally,
+    with no special-casing needed for either direction.
     """
     try:
         decimal_value = Decimal(literal)
     except InvalidOperation:
-        raise ApiError(400, "invalid_field", f"{field} must be {rule}") from None
+        decimal_value = Decimal(value)
     low_bound = Decimal(low)
     high_bound = Decimal(high)
     decimal_in_range = (
