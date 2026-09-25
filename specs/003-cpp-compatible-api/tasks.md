@@ -260,7 +260,7 @@ phases as follows:
   Also add `FakeCodec` (`encode(wav, sr)` gives deterministic codes; the frame count follows the
   same formula as the prediction in T036). Add a docstring citing the Principle V deviation in
   plan.md Complexity Tracking.
-- [ ] T022 *(Opus)* Rewrite `breeze_infer/api.py` as the composition root only (Constitution III;
+- [X] T022 *(Opus)* Rewrite `breeze_infer/api.py` as the composition root only (Constitution III;
   R3, R5, R14):
   - `main(argv)`: build `Settings`, then `Events`, `GpuGate`, `GpuThread` and a `Readiness` holder,
     then `create_app(components)`.
@@ -274,7 +274,7 @@ phases as follows:
     `print`s, and `MAX_*` duplicates (use `limits.py`).
   - Delete `tests/test_api.py`.
   - Keep `python -m breeze_infer.api` working.
-- [ ] T023 Create `breeze_infer/routes_health.py` (contracts/http-api.md `GET /health`):
+- [X] T023 Create `breeze_infer/routes_health.py` (contracts/http-api.md `GET /health`):
   - `GET`/`HEAD` return `200` with exactly `{"status","sample_rate","ws_port"}`. `ws_port` comes
     from an injected provider, which returns 0 until Phase 8.
   - While loading, the body is `503 {"status":"loading","error":"model is loading","code":"loading"}`.
@@ -290,7 +290,7 @@ phases as follows:
   - `scripts/start_breeze.ps1`: `-Port 8080`, and new `-Cors` and `-WsPort` parameters.
   - `docker/run.sh`: publish `8080:8080` and `8081:8081` and pass `--port 8080`.
   - `docker/README.md` if it mentions 7860.
-- [ ] T025 [P] Set `breeze_infer/__init__.py` `__version__ = "2.0.0.dev1"`. Create
+- [X] T025 [P] Set `breeze_infer/__init__.py` `__version__ = "2.0.0.dev1"`. Create
   `breeze_infer/version_header.py`, a pure-ASGI middleware that adds
   `X-Breeze-Version: <__version__>` to every HTTP response start message (FR-037a). Wire it in
   `api.py` as the outermost layer, so CORS's own preflight and `403` responses carry it too (changed

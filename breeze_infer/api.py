@@ -1,367 +1,240 @@
-"""Thin streaming API over the PyTorch Breeze inference runtime."""
+"""Composition root: settings, then components, then the HTTP server (Constitution III).
+
+This is the only module that reads the process environment, the clock or stdout, and the only
+one that knows about signals and sockets. Everything else gets what it needs passed in.
+
+Run with `python -m breeze_infer.api <model> [flags]`.
+"""
 
 from __future__ import annotations
 
-import argparse
-import hashlib
+import asyncio
+import contextlib
 import os
-import tempfile
-import threading
-import uuid
-from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
-from pathlib import Path
-from typing import Any
+import signal
+import socket
+import sys
+import time
+import traceback
+from collections.abc import Callable, MutableMapping, Sequence
+from dataclasses import dataclass
+from functools import partial
 
-import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+import torch
+import uvicorn
+from fastapi import FastAPI
+from starlette.types import ASGIApp
 
-from breeze_infer.compile_cache import MANIFEST_NAME, pin_torch_key, resolve_cache_dir
-from breeze_infer.runtime import (
-    load_runtime,
-    resolve_device,
-    set_all_seeds,
-    update_generation_config_for_breeze,
-)
-from breeze_infer.templates import get_template, prepare_inputs
-from models.fast_streaming import (
-    FastBreezeStreamingRuntime,
-    FastStreamingChunk,
-    FastStreamingConfig,
-)
-from models.warmup_profile import load_warmup_profile
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-FAST_CONFIG = REPO_ROOT / "configs" / "fast.json"
-DEFAULT_CFG_SCALE = 1.0
-MAX_NEW_TOKENS = 1500
-MAX_SEQ_LEN = 2048
-REPETITION_PENALTY = 1.1
-OPTIONAL_AUDIO_FILE = File(None)
+from breeze_infer import __version__
+from breeze_infer.body_limit import BodyLimitMiddleware
+from breeze_infer.errors import install_error_handlers
+from breeze_infer.events import Emitter
+from breeze_infer.gpu import GpuGate, GpuThread
+from breeze_infer.limits import TCP_USER_TIMEOUT_MS
+from breeze_infer.model_loading import LoadedModel, load_model
+from breeze_infer.routes_health import Readiness, install_health
+from breeze_infer.settings import Settings, settings_from_args
+from breeze_infer.version_header import VersionHeaderMiddleware
 
 
 @dataclass(frozen=True)
-class ApiSettings:
-    model: Path
-    fast_all: bool | None
-    fast_text_encoder: bool
-    fast_backbone_prefill: bool
-    fast_backbone_decode: bool
-    fast_depth_decoder: bool
-    fast_codec: bool
-    compile_cache_dir: Path | None = None
-    attn_implementation: str = "eager"
+class Components:
+    """Everything the routes (and, later, the WebSocket server) are built from."""
+
+    settings: Settings
+    events: Emitter
+    gate: GpuGate
+    gpu: GpuThread
+    readiness: Readiness
+    ws_port: Callable[[], int]
 
 
-_settings: ApiSettings | None = None
-_request_lock = threading.Lock()
-
-
-def _pcm16(audio: np.ndarray) -> bytes:
-    audio = np.asarray(audio, dtype=np.float32)
-    audio = np.clip(audio, -1.0, 1.0)
-    return (audio * 32767.0).astype("<i2", copy=False).tobytes()
-
-
-def _iter_seeded_audio_chunks(
-    runtime: FastBreezeStreamingRuntime,
-    inputs: dict[str, object],
-    *,
-    request_id: str,
-    seed: int,
-) -> Iterator[FastStreamingChunk]:
-    """Start model sampling from the request seed, after all input preparation.
-
-    The response body runs after the endpoint has returned a ``StreamingResponse``.
-    Seeding only while preparing the request leaves model sampling vulnerable to
-    lazy initialization or unrelated RNG use between preparation and iteration.
-    The API is deliberately single-request, so resetting the process generators at
-    this boundary gives each request an isolated, reproducible sampling start.
+def create_app(components: Components) -> ASGIApp:
+    """Build the FastAPI app and wrap it in the pure-ASGI middleware, outermost first:
+    version header, (CORS, T028), body limit, app.
     """
-    set_all_seeds(seed)
-    token_digest = None
-    token_frames = 0
-    if os.environ.get("BREEZE_DEBUG_TOKEN_HASH") == "1":
-        token_digest = hashlib.sha256()
+    # No /docs, /redoc or /openapi.json: FR-001 allows exactly the contract's routes.
+    app = FastAPI(title="Breeze TTS", docs_url=None, redoc_url=None, openapi_url=None)
+    install_error_handlers(app, components.events)
+    install_health(app, components.readiness, components.ws_port)
 
-    def observe_token_frame(frame) -> None:
-        nonlocal token_frames
-        assert token_digest is not None
-        token_digest.update(
-            frame.detach().to(device="cpu").contiguous().numpy().tobytes()
-        )
-        token_frames += 1
+    inner: ASGIApp = BodyLimitMiddleware(app)
+    # T028: CorsMiddleware wraps `inner` here, inside the version header, so that CORS's own
+    # preflight and 403 responses carry X-Breeze-Version too.
+    return VersionHeaderMiddleware(inner, version=__version__)
 
+
+def bind_http_socket(host: str, port: int) -> socket.socket:
+    """Bind and listen before uvicorn starts, so a taken port fails fast and the kernel
+    options below are in place for every accepted connection (research.md R5).
+    """
+    family, kind, proto, _, address = socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+    )[0]
+    sock = socket.socket(family, kind, proto)
     try:
-        yield from runtime.iter_audio_chunks(
-            inputs,
-            request_id=request_id,
-            seed=seed,
-            token_observer=observe_token_frame if token_digest is not None else None,
-        )
-    finally:
-        if token_digest is not None:
-            print(
-                "breeze token trace: "
-                f"request_id={request_id} seed={seed} frames={token_frames} "
-                f"sha256={token_digest.hexdigest()}",
-                flush=True,
-            )
-
-
-async def _save_upload(upload: UploadFile) -> Path:
-    suffix = Path(upload.filename or "reference.wav").suffix or ".wav"
-    with tempfile.NamedTemporaryFile(
-        prefix="breeze_ref_", suffix=suffix, delete=False
-    ) as temporary:
-        path = Path(temporary.name)
-        try:
-            payload = await upload.read()
-            if not payload:
-                raise HTTPException(status_code=400, detail="Reference audio is empty.")
-            temporary.write(payload)
-        except Exception:
-            path.unlink(missing_ok=True)
-            raise
-    return path
-
-
-def _load_app(app: FastAPI, settings: ApiSettings) -> None:
-    tokenizer, model, audio_tokenizer = load_runtime(
-        settings.model,
-        device=resolve_device(),
-        attn_implementation=settings.attn_implementation,
-    )
-    update_generation_config_for_breeze(model)
-
-    config = FastStreamingConfig(
-        max_new_tokens=MAX_NEW_TOKENS,
-        max_seq_len=MAX_SEQ_LEN,
-        fast_all=settings.fast_all,
-        fast_text_encoder=settings.fast_text_encoder,
-        fast_backbone_prefill=settings.fast_backbone_prefill,
-        fast_backbone_decode=settings.fast_backbone_decode,
-        fast_depth_decoder=settings.fast_depth_decoder,
-        fast_codec=settings.fast_codec,
-        repetition_penalty=REPETITION_PENALTY,
-    )
-    runtime = FastBreezeStreamingRuntime(
-        model, audio_tokenizer, config, tokenizer=tokenizer
-    )
-    if runtime.fast_enabled:
-        profile = load_warmup_profile(FAST_CONFIG)
-        profile = replace(profile, codec_chunk_frames=runtime.codec_chunk_frames)
-        manifest_path = (
-            settings.compile_cache_dir / MANIFEST_NAME
-            if settings.compile_cache_dir is not None
-            else None
-        )
-        manifest = runtime.warmup_from_profile(profile, manifest_path=manifest_path)
-        print(_warmup_summary(manifest), flush=True)
-
-    app.state.tokenizer = tokenizer
-    app.state.model = model
-    app.state.audio_tokenizer = audio_tokenizer
-    app.state.runtime = runtime
-
-
-def _warmup_summary(manifest: dict[str, Any]) -> str:
-    """One-line startup report: total warmup plus compile-cache hit/miss counts."""
-    counters = manifest.get("compile_cache", {}).get("counters", {})
-    hits = counters.get("inductor.fxgraph_cache_hit", 0)
-    misses = counters.get("inductor.fxgraph_cache_miss", 0)
-    return (
-        f"fast warmup: {manifest['total_elapsed_ms']:.2f} ms "
-        f"(fx graph cache hits {hits} / misses {misses})"
-    )
-
-
-@asynccontextmanager
-async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    if _settings is None:
-        raise RuntimeError("API settings are not initialized")
-    _load_app(app, _settings)
-    yield
-
-
-app = FastAPI(title="Breeze TTS API", lifespan=_lifespan)
-
-
-@app.get("/health")
-def health() -> JSONResponse:
-    if not hasattr(app.state, "runtime"):
-        return JSONResponse({"status": "loading"}, status_code=503)
-    return JSONResponse({"status": "ok", "sample_rate": app.state.runtime.sample_rate})
-
-
-@app.post("/v1/audio/speech")
-async def speech(
-    text: str = Form(...),
-    instruction: str = Form("Speak clearly and naturally."),
-    cfg_scale: float = Form(DEFAULT_CFG_SCALE),
-    ref_audio: UploadFile | None = OPTIONAL_AUDIO_FILE,
-    ref_text: str = Form(""),
-    seed: int = Form(42),
-) -> StreamingResponse:
-    if not _request_lock.acquire(blocking=False):
-        raise HTTPException(
-            status_code=409, detail="An inference request is already running."
-        )
-
-    reference_path: Path | None = None
-    try:
-        if not np.isfinite(cfg_scale) or cfg_scale <= 0:
-            raise HTTPException(
-                status_code=400, detail="cfg_scale must be greater than 0."
-            )
-        ref_text = ref_text.strip()
-        has_reference = ref_audio is not None and bool(ref_audio.filename)
-        if has_reference != bool(ref_text):
-            raise HTTPException(
-                status_code=400,
-                detail="ref_audio and ref_text must be provided together or both omitted.",
-            )
-        if has_reference:
-            assert ref_audio is not None
-            reference_path = await _save_upload(ref_audio)
-
-        request_id = f"api-{uuid.uuid4().hex}"
-        request = {
-            "id": request_id,
-            "text": text,
-            "instruction": instruction,
-            "speaker": "S0",
-        }
-        template_name = "tts_instruction"
-        if reference_path is not None:
-            request["ref_audio_path"] = str(reference_path)
-            request["ref_text"] = ref_text
-            template_name = "ref_edit_tata"
-
-        set_all_seeds(seed)
-        inputs = prepare_inputs(
-            app.state.tokenizer,
-            app.state.audio_tokenizer,
-            app.state.model,
-            [request],
-            get_template(template_name),
-            guidance_scale=cfg_scale,
-            guidance_scale_ref=None,
-            guidance_scale_ins=None,
-        )
-    except Exception:
-        if reference_path is not None:
-            reference_path.unlink(missing_ok=True)
-        _request_lock.release()
+        # Only on POSIX, where it just allows rebinding over TIME_WAIT. On Windows it would let
+        # us bind a port another server is already using (asyncio makes the same choice).
+        if os.name == "posix":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Accepted sockets inherit this: the kernel drops a connection whose peer has stopped
+        # acknowledging data, which no application timeout can do (R5). Linux only.
+        user_timeout = getattr(socket, "TCP_USER_TIMEOUT", None)
+        if user_timeout is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, user_timeout, TCP_USER_TIMEOUT_MS)
+        sock.bind(address)
+        sock.listen()
+    except BaseException:
+        sock.close()
         raise
-
-    def body() -> Iterator[bytes]:
-        try:
-            for chunk in _iter_seeded_audio_chunks(
-                app.state.runtime,
-                inputs,
-                request_id=request_id,
-                seed=seed,
-            ):
-                pcm = _pcm16(chunk.audio)
-                if pcm:
-                    yield pcm
-        finally:
-            if reference_path is not None:
-                reference_path.unlink(missing_ok=True)
-            _request_lock.release()
-
-    return StreamingResponse(
-        body(),
-        media_type="audio/pcm",
-        headers={
-            "X-Sample-Rate": str(app.state.runtime.sample_rate),
-            "X-Sample-Format": "s16le",
-            "Cache-Control": "no-store",
-        },
-    )
+    return sock
 
 
-def configure_compile_cache(settings: ApiSettings) -> ApiSettings:
-    """Export the compile cache dir; must run before any torch.compile.
+class _Server(uvicorn.Server):
+    """uvicorn's server, minus its own signal capture when ours is installed.
 
-    Returns settings with ``compile_cache_dir`` set to the resolved location so
-    later stages never have to read it back out of the environment.
+    uvicorn 0.52.4 wraps `serve()` in `capture_signals()`, which replaces the SIGINT/SIGTERM
+    handlers with `signal.signal` and, on exit, re-raises the captured signal against whatever
+    handler was there before. Two handlers for one signal is confusing, and the re-raise would
+    kill the process before `main()` has shut the GPU thread down, so it is switched off
+    whenever `_install_signal_handlers` succeeded.
     """
-    cache_dir = resolve_cache_dir(settings.compile_cache_dir)
-    status = pin_torch_key(cache_dir)
-    print(f"compile cache: {cache_dir} (torch key {status})", flush=True)
-    return replace(settings, compile_cache_dir=cache_dir)
+
+    uses_own_signal_handlers = False
+
+    def capture_signals(self) -> contextlib.AbstractContextManager[None]:
+        if self.uses_own_signal_handlers:
+            return contextlib.nullcontext()
+        return super().capture_signals()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Serve Breeze TTS 2 streaming inference"
-    )
-    parser.add_argument("model", type=Path)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=7860)
-    parser.add_argument(
-        "--fast-all", action=argparse.BooleanOptionalAction, default=None
-    )
-    parser.add_argument(
-        "--fast-text-encoder", action=argparse.BooleanOptionalAction, default=False
-    )
-    parser.add_argument(
-        "--fast-backbone-prefill", action=argparse.BooleanOptionalAction, default=False
-    )
-    parser.add_argument(
-        "--fast-backbone-decode", action=argparse.BooleanOptionalAction, default=False
-    )
-    parser.add_argument(
-        "--fast-depth-decoder", action=argparse.BooleanOptionalAction, default=False
-    )
-    parser.add_argument(
-        "--fast-codec", action=argparse.BooleanOptionalAction, default=False
-    )
-    parser.add_argument(
-        "--compile-cache-dir",
-        type=Path,
-        default=None,
-        help=(
-            "Where torch.compile artifacts persist between starts "
-            "(default: $TORCHINDUCTOR_CACHE_DIR if set, else ./.cache/torchinductor)"
-        ),
-    )
-    parser.add_argument(
-        "--attn-implementation",
-        # flash_attention_2 is deliberately absent: Hugging Face's FA2 path
-        # rejects the backbone's 4D attention masks ("cu_seqlens_k must have
-        # shape (batch_size + 1)") in both eager and CUDA-graph modes.
-        choices=("eager", "sdpa"),
-        default="eager",
-        help=(
-            "Attention kernel for the backbone and text encoder; the fast "
-            "text-encoder stage always runs sdpa for graph capture regardless "
-            "of this setting (default: eager)"
-        ),
-    )
-    args = parser.parse_args()
+def request_exit(server: uvicorn.Server) -> None:
+    """First signal: stop gracefully, letting open responses finish. Second: stop now."""
+    if server.should_exit:
+        server.force_exit = True
+    server.should_exit = True
 
-    global _settings
-    _settings = ApiSettings(
-        model=args.model,
-        fast_all=args.fast_all,
-        fast_text_encoder=args.fast_text_encoder,
-        fast_backbone_prefill=args.fast_backbone_prefill,
-        fast_backbone_decode=args.fast_backbone_decode,
-        fast_depth_decoder=args.fast_depth_decoder,
-        fast_codec=args.fast_codec,
-        compile_cache_dir=args.compile_cache_dir,
-        attn_implementation=args.attn_implementation,
+
+def _install_signal_handlers(loop: asyncio.AbstractEventLoop, server: _Server) -> None:
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, request_exit, server)
+    except NotImplementedError:
+        # Windows event loops have no add_signal_handler; uvicorn's own capture stays on.
+        return
+    server.uses_own_signal_handlers = True
+
+
+async def load_in_background(
+    components: Components, load: Callable[[], LoadedModel], server: uvicorn.Server
+) -> bool:
+    """Load the model on the GPU thread, then mark the server ready.
+
+    A failed load is fatal: the server is told to exit (and `serve` returns non-zero) rather
+    than answering `503 loading` forever.
+    """
+    try:
+        loaded = await components.gpu.run(load)
+    except Exception as exc:  # noqa: BLE001 - any load failure ends the process
+        components.events.emit(
+            "model.load_failed",
+            level="error",
+            error=repr(exc),
+            traceback="".join(traceback.format_exception(exc)),
+        )
+        server.should_exit = True
+        return False
+    components.readiness.mark_ready(loaded.runtime)
+    components.events.emit(
+        "model.loaded", sample_rate=int(loaded.runtime.sample_rate), **loaded.report
     )
-    _settings = configure_compile_cache(_settings)
+    return True
 
-    import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+async def serve(
+    components: Components,
+    app: ASGIApp,
+    sock: socket.socket,
+    load: Callable[[], LoadedModel],
+) -> int:
+    """Serve HTTP on `sock` while the model loads in the background. Returns the exit code."""
+    server = _Server(
+        uvicorn.Config(
+            app,
+            lifespan="off",
+            # h11 explicitly: research R2/R3 measured the abort-without-terminator and
+            # disconnect behaviour on it.
+            http="h11",
+            log_config=None,
+            access_log=False,
+        )
+    )
+    _install_signal_handlers(asyncio.get_running_loop(), server)
+    loading = asyncio.create_task(load_in_background(components, load, server))
+    components.events.emit(
+        "server.started", host=components.settings.host, port=sock.getsockname()[1]
+    )
+    try:
+        await server.serve(sockets=[sock])
+    finally:
+        # Stops waiting for a load still in progress. The GPU call itself can't be interrupted:
+        # the interpreter joins the GPU thread at exit, after that call and any queued
+        # `gen.close()` have run. wait=False keeps the event loop free meanwhile.
+        loading.cancel()
+        components.gpu.shutdown(wait=False)
+    load_failed = loading.done() and not loading.cancelled() and not loading.result()
+    return 1 if load_failed else 0
+
+
+def _cuda_device(environ: MutableMapping[str, str]) -> str:
+    """The device for this process: `cuda:<LOCAL_RANK>`, falling back to RANK, then 0
+    (the same rule as `runtime.get_dist_info`), or `cpu` without CUDA.
+    """
+    if not torch.cuda.is_available():
+        return "cpu"
+    return f"cuda:{int(environ.get('LOCAL_RANK', environ.get('RANK', '0')))}"
+
+
+def _select_no_device(_: str) -> None:
+    """`set_device` stand-in without CUDA; the load then fails with a clear runtime error."""
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    settings = settings_from_args(argv)
+    events = Emitter(sys.stdout, time.time)
+
+    try:
+        sock = bind_http_socket(settings.host, settings.port)
+    except OSError as exc:
+        events.emit(
+            "server.bind_failed",
+            level="error",
+            host=settings.host,
+            port=settings.port,
+            error=str(exc),
+        )
+        raise SystemExit(
+            f"breeze: cannot listen on {settings.host}:{settings.port}: {exc}"
+        ) from None
+
+    # The one read of the process environment (Constitution III): the device choice, and the
+    # mapping the compile-cache setup exports TORCHINDUCTOR_CACHE_DIR into.
+    environ = os.environ
+    device = _cuda_device(environ)
+    set_device = torch.cuda.set_device if device.startswith("cuda") else _select_no_device
+    components = Components(
+        settings=settings,
+        events=events,
+        gate=GpuGate(),
+        gpu=GpuThread(device, set_device),
+        readiness=Readiness(),
+        ws_port=lambda: 0,  # the WebSocket server arrives in Phase 8 (T077)
+    )
+    app = create_app(components)
+    load = partial(load_model, settings, device, environ)
+    exit_code = asyncio.run(serve(components, app, sock, load))
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
