@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -35,9 +36,22 @@ _DUAL_CFG_KEYS = (
 # a prompt exactly as the graph prefill does, so both read this one value.
 _PREFILL_TOKEN_GRANULARITY = 32
 
+# Lowest backbone sampling temperature. logits / temperature overflows float32
+# to inf for a tiny positive temperature (1e-40), softmax turns that into NaN
+# and multinomial fails mid-stream. At 1e-5 sampling is already effectively
+# greedy, so the floor changes nothing a caller could otherwise observe.
+_MIN_BACKBONE_TEMPERATURE = 1e-5
+
+# Overrides that count something, so a fractional value is a caller bug rather
+# than something to truncate.
+_INTEGER_OVERRIDES = frozenset({"top_k", "max_new_tokens"})
+
 
 @dataclass(frozen=True)
 class FastStreamingConfig:
+    # Hard ceiling on frames per request; also sizes the token-history buffer.
+    # The default when a request sets none is the model's
+    # generation_config.max_new_tokens, clamped to this.
     max_new_tokens: int = 750
     max_seq_len: int = 1024
     collect_timing: bool = False
@@ -140,6 +154,28 @@ def is_terminal_pad_frame(frame: torch.Tensor, config: Any) -> bool:
 
 def should_decode_codec_frame(frame: torch.Tensor, config: Any) -> bool:
     return not is_terminal_pad_frame(frame, config)
+
+
+def _require_valid_overrides(**overrides: float | None) -> None:
+    """Reject a per-request override that is neither ``None`` nor a finite value > 0.
+
+    ``None`` means the default. Translating the wire's "use the default" values
+    (such as ``max_new_tokens: 0``) into ``None`` is the API boundary's job, so
+    anything else invalid here is a caller bug and is not coerced. NaN compares
+    False against everything and inf survives until softmax, so both would
+    otherwise reach torch.multinomial as an invalid distribution mid-stream.
+    """
+    for name, value in overrides.items():
+        if value is None:
+            continue
+        if name in _INTEGER_OVERRIDES:
+            valid = isinstance(value, int) and not isinstance(value, bool) and value > 0
+            expected = "a positive integer"
+        else:
+            valid = math.isfinite(value) and value > 0
+            expected = "finite and > 0"
+        if not valid:
+            raise ValueError(f"{name} must be {expected} or None, got {value!r}")
 
 
 def _get_device(model: torch.nn.Module) -> torch.device:
@@ -612,6 +648,20 @@ class FastBreezeStreamingRuntime:
                 suppress_tokens=self._reserved_codec_token_ids,
                 **backbone_params,
             )
+        # The defaults may skip the top-k, top-p (sort/cumsum/scatter) and
+        # repetition-penalty (unique/where) kernels, and the synthetic requests
+        # stop before the first penalised step. Exercise them once so the first
+        # request that uses them does not pay lazy CUDA module loading in its TTFA.
+        sample_logits(
+            sampling_logits,
+            suppress_tokens=self._reserved_codec_token_ids,
+            temperature=backbone_params["temperature"],
+            top_k=50,
+            top_p=0.9,
+            do_sample=True,
+            token_history=torch.zeros(2, dtype=torch.long, device=self.device),
+            repetition_penalty=1.1,
+        )
         torch.cuda.synchronize(self.device)
         stages["backbone_decode"]["sampling_warmup_ms"] = (
             time.perf_counter() - sampling_started
@@ -800,16 +850,22 @@ class FastBreezeStreamingRuntime:
 
     def _prefill_plan(
         self, branch_batch_size: int, seq_len: int, prefix_len: int
-    ) -> bool:
-        """Whether the backbone prefill of ``seq_len`` tokens can use a graph.
+    ) -> tuple[bool, int]:
+        """How the backbone prefill of ``seq_len`` tokens will run.
 
-        A graph pads ``seq_len`` up to its bucket; it is used only when that
-        bucket still fits in ``max_seq_len`` after ``prefix_len`` and, for a
-        cache frozen after warmup, was captured. Otherwise the prefill runs
-        eagerly at the exact length instead of failing the request.
+        Returns ``(use_graph, prefill_len)``, where ``prefill_len`` is the cache
+        length the prefill leaves behind, ``prefix_len`` included. This is the
+        one decision ``_run_prefill``, ``build_reference_prefix`` and
+        ``max_new_tokens_room`` share, so the room estimate always matches
+        where the decode loop really stops. A graph pads ``seq_len`` up to its
+        bucket; it is used only when that bucket still fits in ``max_seq_len``
+        after ``prefix_len`` and, for a cache frozen after warmup, was captured.
+        Otherwise the prefill runs eagerly at the exact length instead of
+        failing the request.
         """
+        exact_len = prefix_len + seq_len
         if not self._fast_backbone_prefill:
-            return False
+            return False, exact_len
         # No cache yet means _prefill_graph_cache will create an unfrozen one
         # with the default granularity, which captures any bucket on demand.
         cache = self._backbone_prefill_graphs.get(branch_batch_size)
@@ -818,14 +874,14 @@ class FastBreezeStreamingRuntime:
         )
         bucketed_len = prefix_len + -(-seq_len // granularity) * granularity
         if bucketed_len > self.config.max_seq_len:
-            return False
+            return False, exact_len
         if (
             cache is not None
             and cache.frozen
             and not cache.has_bucket(branch_batch_size, seq_len, prefix_len)
         ):
-            return False
-        return True
+            return False, exact_len
+        return True, bucketed_len
 
     def _prefill_graph_cache(self, branch_batch_size: int) -> BackbonePrefillGraphCache:
         """The prefill graph cache for the current backbone graph, created on first use.
@@ -844,6 +900,59 @@ class FastBreezeStreamingRuntime:
         self._backbone_prefill_graph = cache
         return cache
 
+    def _frame_cap(self, requested: int | None) -> int:
+        """Frames a request may generate, before any context limit.
+
+        ``requested`` is the request's own ``max_new_tokens``; ``None`` means the
+        model's ``generation_config.max_new_tokens`` (750 for Breeze, as in the
+        C++ server). Either is clamped to the ``max_new_tokens`` ceiling. A model
+        with no default of its own is limited by the ceiling alone.
+        """
+        if requested is None:
+            requested = (
+                getattr(self.model.generation_config, "max_new_tokens", None)
+                or self.config.max_new_tokens
+            )
+        return min(int(requested), self.config.max_new_tokens)
+
+    def max_new_tokens_room(
+        self,
+        requested: int | None,
+        inputs: dict[str, Any],
+        *,
+        prefix_len: int = 0,
+    ) -> int:
+        """Frames one request for ``inputs`` will produce at most.
+
+        ``requested`` is validated and defaulted as in ``iter_audio_chunks``
+        (``None`` is the model default, anything invalid raises ``ValueError``)
+        and clamped to the ceiling. The result is then capped by the context
+        room the decode loop will really have: it stops once ``prefill_len +
+        step >= max_seq_len - 1``, where ``prefill_len`` (from
+        ``_prefill_plan``) includes ``prefix_len`` (a cached reference prefix),
+        CFG padding and graph-bucket padding. A result below the request's cap
+        means the piece will be clamped; ``<= 0`` means no room to generate.
+        """
+        _require_valid_overrides(max_new_tokens=requested)
+        # Mirrors _build_branch_batch: CFG left-pads both branches to the
+        # longer one.
+        cfg = select_fast_cfg(inputs)
+        if cfg.use_negative_as_main:
+            branch_batch_size = 1
+            seq_len = int(inputs["cfg_negative_prompt_attention_mask"].shape[1])
+        elif cfg.mode == "no_cfg":
+            branch_batch_size = 1
+            seq_len = int(inputs["attention_mask"].shape[1])
+        else:
+            branch_batch_size = 2
+            seq_len = max(
+                int(inputs["attention_mask"].shape[1]),
+                int(inputs["cfg_negative_prompt_attention_mask"].shape[1]),
+            )
+        _, prefill_len = self._prefill_plan(branch_batch_size, seq_len, prefix_len)
+        room = self.config.max_seq_len - prefill_len - 1
+        return min(self._frame_cap(requested), room)
+
     @torch.inference_mode()
     def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> ReferencePrefix:
         """Run the reference prefix alone (batch 1) and keep its backbone KV."""
@@ -861,7 +970,10 @@ class FastBreezeStreamingRuntime:
         prefix_len = int(mask.shape[1])
         if int(mask.sum().item()) != prefix_len or embeds.shape[0] != 1:
             raise ValueError("reference prefix must be a single unpadded row")
-        if prefix_len + self.config.max_new_tokens > self.config.max_seq_len:
+        # Only reject a prefix that leaves no slot to decode into. How much room
+        # a request really has depends on its own suffix and cap, which is
+        # max_new_tokens_room's job, per request.
+        if prefix_len >= self.config.max_seq_len - 1:
             raise ValueError(
                 f"reference prefix of {prefix_len} tokens leaves no room to generate"
             )
@@ -870,7 +982,8 @@ class FastBreezeStreamingRuntime:
         values: list[torch.Tensor] = []
         # A prefix longer than every warmed bucket runs eagerly, as an
         # over-long request prompt does in _run_prefill.
-        if self._prefill_plan(1, prefix_len, 0):
+        use_graph, _ = self._prefill_plan(1, prefix_len, 0)
+        if use_graph:
             output = self._prefill_graph_cache(1)(embeds, mask)
             bucket = output.prefill_len
             for layer in self._backbone_graph.static_cache.layers:
@@ -923,9 +1036,10 @@ class FastBreezeStreamingRuntime:
         if prefix is not None:
             self._load_prefix_kv(prefix, branch.branch_batch_size)
 
-        if self._prefill_plan(
+        use_graph, _ = self._prefill_plan(
             branch.branch_batch_size, int(attention_mask.shape[1]), prefix_len
-        ):
+        )
+        if use_graph:
             cache = self._prefill_graph_cache(branch.branch_batch_size)
             output = cache(branch.inputs_embeds, attention_mask, prefix_len=prefix_len)
             return (
@@ -989,7 +1103,33 @@ class FastBreezeStreamingRuntime:
         seed: int | None = None,
         token_observer: Callable[[torch.Tensor], None] | None = None,
         prefix: ReferencePrefix | None = None,
+        temperature: float | None = None,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        repetition_penalty: float | None = None,
+        max_new_tokens: int | None = None,
     ) -> Iterator[FastStreamingChunk]:
+        """Stream one request's audio.
+
+        The sampling overrides replace the model and config defaults for the
+        backbone only; the depth decoder keeps its defaults, as in the C++
+        server (``generation.cpp``). ``None`` keeps the default, and any other
+        invalid value raises ``ValueError`` (on the first ``next``, as this is
+        a generator). The backbone temperature is floored at
+        ``_MIN_BACKBONE_TEMPERATURE``. ``repetition_penalty`` is applied once
+        per distinct token in the history (see ``apply_repetition_penalty``).
+        ``max_new_tokens`` defaults to the model's
+        ``generation_config.max_new_tokens`` and is clamped to the configured
+        ``max_new_tokens`` ceiling; the context can stop generation earlier
+        (``max_new_tokens_room`` says where).
+        """
+        _require_valid_overrides(
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            max_new_tokens=max_new_tokens,
+        )
         cfg = select_fast_cfg(inputs)
         branch_batch_size = 2 if cfg.mode == "single_cfg" else 1
         self._ensure_graphs(branch_batch_size, cfg.guidance_scale)
@@ -1001,13 +1141,30 @@ class FastBreezeStreamingRuntime:
         request_id = request_id or f"local-{uuid.uuid4().hex}"
         codec.open_request(request_id, reset=True, is_first_decode=True)
 
+        # Backbone sampling runs eagerly (outside every captured graph), so
+        # per-request values are plain arguments and nothing is recaptured.
         backbone_params = self._sampling_params(self.model.generation_config)
+        if temperature is not None:
+            backbone_params["temperature"] = float(temperature)
+        if top_k is not None:
+            backbone_params["top_k"] = top_k
+        if top_p is not None:
+            backbone_params["top_p"] = float(top_p)
+        backbone_params["temperature"] = max(
+            backbone_params["temperature"], _MIN_BACKBONE_TEMPERATURE
+        )
+        backbone_repetition_penalty = (
+            self.config.repetition_penalty
+            if repetition_penalty is None
+            else float(repetition_penalty)
+        )
+        frame_limit = self._frame_cap(max_new_tokens)
         depth_params = self._sampling_params(self.model.depth_decoder.generation_config)
         chunk_buffer: list[torch.Tensor] = []
         chunk_index = 0
         total_frames = 0
         backbone_token_history = torch.empty(
-            self.config.max_new_tokens,
+            frame_limit,
             dtype=torch.long,
             device=self.device,
         )
@@ -1059,7 +1216,7 @@ class FastBreezeStreamingRuntime:
             if prefill_end_event is not None:
                 prefill_end_event.record()
 
-            for step_idx in range(self.config.max_new_tokens):
+            for step_idx in range(frame_limit):
                 if is_backbone_eos_token(token, self.model.config):
                     break
 
@@ -1088,7 +1245,7 @@ class FastBreezeStreamingRuntime:
                 # A complete codec frame can be decoded immediately. Emit it
                 # before computing the next backbone token so that one full
                 # backbone decode step is no longer on the TTFA critical path.
-                reached_limit = step_idx == self.config.max_new_tokens - 1
+                reached_limit = step_idx == frame_limit - 1
                 chunk_ready = len(chunk_buffer) >= self._codec_chunk_frames
                 if chunk_ready or reached_limit:
                     if chunk_buffer:
@@ -1150,7 +1307,7 @@ class FastBreezeStreamingRuntime:
                 token = sample_logits(
                     logits,
                     token_history=backbone_token_history[: step_idx + 1],
-                    repetition_penalty=self.config.repetition_penalty,
+                    repetition_penalty=backbone_repetition_penalty,
                     suppress_tokens=self._reserved_codec_token_ids,
                     **backbone_params,
                 ).view(1)

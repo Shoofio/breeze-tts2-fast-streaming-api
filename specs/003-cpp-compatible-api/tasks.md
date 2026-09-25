@@ -372,7 +372,7 @@ the GPU smoke test.
 
 ### Tests (write first)
 
-- [ ] T030 [P] [US1] Update `tests/test_fast_streaming.py`:
+- [X] T030 [P] [US1] Update `tests/test_fast_streaming.py`:
   - Replace the `_prefill_plan` bool assertions (lines ~234–240) with `A:`'s tuple test
     (`A:tests/test_fast_streaming.py` ~575–580).
   - Port `A:`'s override tests (backbone only, NaN and inf rejected, temperature floor),
@@ -386,14 +386,14 @@ the GPU smoke test.
 - [ ] T032 [P] [US1] Port the `A:` audio tests into `tests/test_audio.py`: `encode_prompt_waveform`,
   `pcm16` clipping, and `codec_fingerprint`, which must not change when the checkpoint is moved to
   another absolute path.
-- [ ] T033 [P] [US1] Port `A:tests/gpu/test_runtime_request_overrides.py` and
+- [X] T033 [P] [US1] Port `A:tests/gpu/test_runtime_request_overrides.py` and
   `A:tests/gpu/conftest.py` into `tests/gpu/`. Add `tests/gpu/test_cfg_values.py`: `cfg_scale` 2.5,
   7.5 and 0 each produce finite audio on the warmed graphs, with no recapture (check the graph
   cache size before and after).
 
 ### Implementation
 
-- [ ] T034 [US1] *(Opus)* Update `models/fast_streaming.py` (R12, points 1–4), porting the hunks of
+- [X] T034 [US1] *(Opus)* Update `models/fast_streaming.py` (R12, points 1–4), porting the hunks of
   `A:` commits `86647b8` and `220b3ca` onto 81a5ca7's code:
   - `iter_audio_chunks(..., temperature, top_k, top_p, repetition_penalty, max_new_tokens)`, where
     `None` means the default. Overrides apply to the backbone only, with a temperature floor of

@@ -18,6 +18,11 @@ def apply_repetition_penalty(
 ) -> torch.Tensor:
     """Apply repetition penalty to logits in-place and return them.
 
+    Each distinct token in ``token_history`` is penalised once, however often
+    it occurs (Hugging Face semantics). This deliberately differs from the C++
+    server (``sampling.cpp``), which compounds the penalty once per occurrence
+    over the whole generation so far (spec, Known Differences).
+
     Args:
         logits: Tensor shaped [1, 1, vocab] or [1, vocab].
         token_history: 1-D tensor of previously generated token ids.

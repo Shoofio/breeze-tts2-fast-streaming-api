@@ -144,8 +144,13 @@ def main() -> None:
         channels=1,
         subtype="PCM_16",
     ) as output_file:
+        # The runtime's default length is now the model default (750 frames); the CLI keeps
+        # its long-standing 1,500-frame cap by asking for it.
         for chunk in runtime.iter_audio_chunks(
-            inputs, request_id="single-request", seed=args.seed
+            inputs,
+            request_id="single-request",
+            seed=args.seed,
+            max_new_tokens=MAX_NEW_TOKENS,
         ):
             output_file.write(chunk.audio)
 
