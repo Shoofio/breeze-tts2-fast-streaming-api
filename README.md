@@ -39,7 +39,7 @@ Breeze TTS 2 is an open-weight text-to-speech model built for real-time interact
 
 ### Requirements
 
-- Linux and Python 3.11 or newer
+- Linux and Python 3.12 (tested; 3.11 is the minimum the `websockets` pin allows)
 - A CUDA-capable NVIDIA GPU
 - GPU memory: approximately 7.7 GiB for eager inference or 14.4 GiB with `--fast-all`; use a 12 GB GPU for eager or a 24 GB GPU for the fast path
 - The Breeze TTS 2 checkpoint
