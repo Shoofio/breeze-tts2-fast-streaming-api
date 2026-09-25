@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from breeze_infer.gpu import GpuGate
+from breeze_infer.gpu import GpuGate, GpuLease
 
 # A broken handoff shows up as a waiter that never wakes; fail instead of hanging the suite.
 TIMEOUT = 5.0
@@ -26,21 +26,28 @@ async def _settle() -> None:
         await asyncio.sleep(0)
 
 
+def _hold(gate: GpuGate) -> GpuLease:
+    lease = gate.try_acquire()
+    assert lease is not None
+    return lease
+
+
 def test_try_acquire_takes_a_free_gate_and_fails_while_held() -> None:
     gate = GpuGate()
-    assert gate.try_acquire()
-    assert not gate.try_acquire()
-    gate.release()
-    assert gate.try_acquire()
+    lease = _hold(gate)
+    assert gate.try_acquire() is None
+    lease.release()
+    assert gate.try_acquire() is not None
 
 
-def test_acquire_on_a_free_gate_does_not_wait() -> None:
+def test_acquire_on_a_free_gate_does_not_signal_queued() -> None:
     async def main() -> None:
         gate = GpuGate()
         waits: list[str] = []
-        assert await gate.acquire(on_wait=lambda: waits.append("queued")) is False
+        lease = await gate.acquire(on_wait=lambda: waits.append("queued"))
         assert waits == []
-        assert not gate.try_acquire()
+        assert gate.try_acquire() is None
+        lease.release()
 
     _run(main())
 
@@ -48,14 +55,14 @@ def test_acquire_on_a_free_gate_does_not_wait() -> None:
 def test_acquire_on_a_held_gate_signals_queued_then_waits() -> None:
     async def main() -> None:
         gate = GpuGate()
-        gate.try_acquire()
+        holder = _hold(gate)
         waits: list[str] = []
         task = asyncio.create_task(gate.acquire(on_wait=lambda: waits.append("queued")))
         await _settle()
         assert waits == ["queued"]
         assert not task.done()
-        gate.release()
-        assert await task is True
+        holder.release()
+        (await task).release()
 
     _run(main())
 
@@ -63,21 +70,21 @@ def test_acquire_on_a_held_gate_signals_queued_then_waits() -> None:
 def test_release_hands_over_in_fifo_order() -> None:
     async def main() -> None:
         gate = GpuGate()
-        gate.try_acquire()
+        holder = _hold(gate)
         order: list[int] = []
 
         async def piece(n: int) -> None:
-            await gate.acquire()
+            lease = await gate.acquire()
             order.append(n)
             await asyncio.sleep(0)  # hold across a suspension, like a real piece
-            gate.release()
+            lease.release()
 
         tasks = [asyncio.create_task(piece(n)) for n in range(4)]
         await _settle()
-        gate.release()
+        holder.release()
         await asyncio.gather(*tasks)
         assert order == [0, 1, 2, 3]
-        assert gate.try_acquire()  # the last release freed it
+        assert gate.try_acquire() is not None  # the last release freed it
 
     _run(main())
 
@@ -85,21 +92,21 @@ def test_release_hands_over_in_fifo_order() -> None:
 def test_http_try_acquire_fails_while_a_websocket_waiter_is_queued() -> None:
     async def main() -> None:
         gate = GpuGate()
-        gate.try_acquire()
+        holder = _hold(gate)
         waiter = asyncio.create_task(gate.acquire())
         await _settle()
-        assert not gate.try_acquire()
+        assert gate.try_acquire() is None
 
         # The race asyncio.Lock loses: right after release, before the woken waiter has run,
         # the gate must already belong to the waiter.
-        gate.release()
+        holder.release()
         assert not waiter.done()
-        assert not gate.try_acquire()
+        assert gate.try_acquire() is None
 
-        assert await waiter is True
-        assert not gate.try_acquire()
-        gate.release()
-        assert gate.try_acquire()
+        lease = await waiter
+        assert gate.try_acquire() is None
+        lease.release()
+        assert gate.try_acquire() is not None
 
     _run(main())
 
@@ -107,19 +114,19 @@ def test_http_try_acquire_fails_while_a_websocket_waiter_is_queued() -> None:
 def test_a_waiter_cancelled_while_queued_is_skipped() -> None:
     async def main() -> None:
         gate = GpuGate()
-        gate.try_acquire()
+        holder = _hold(gate)
         cancelled = asyncio.create_task(gate.acquire())
         survivor = asyncio.create_task(gate.acquire())
         await _settle()
 
         cancelled.cancel()
-        gate.release()  # before the cancelled task has run its cleanup
-        assert await survivor is True
+        holder.release()  # before the cancelled task has run its cleanup
+        lease = await survivor
         with pytest.raises(asyncio.CancelledError):
             await cancelled
 
-        gate.release()
-        assert gate.try_acquire()
+        lease.release()
+        assert gate.try_acquire() is not None
 
     _run(main())
 
@@ -127,16 +134,16 @@ def test_a_waiter_cancelled_while_queued_is_skipped() -> None:
 def test_the_only_waiter_cancelled_leaves_the_gate_free_after_release() -> None:
     async def main() -> None:
         gate = GpuGate()
-        gate.try_acquire()
+        holder = _hold(gate)
         waiter = asyncio.create_task(gate.acquire())
         await _settle()
         waiter.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiter
 
-        assert not gate.try_acquire()  # still held by the original holder
-        gate.release()
-        assert gate.try_acquire()
+        assert gate.try_acquire() is None  # still held by the original holder
+        holder.release()
+        assert gate.try_acquire() is not None
 
     _run(main())
 
@@ -144,19 +151,17 @@ def test_the_only_waiter_cancelled_leaves_the_gate_free_after_release() -> None:
 def test_a_waiter_cancelled_after_handoff_passes_the_gate_on() -> None:
     async def main() -> None:
         gate = GpuGate()
-        gate.try_acquire()
+        holder = _hold(gate)
         unlucky = asyncio.create_task(gate.acquire())
         next_in_line = asyncio.create_task(gate.acquire())
         await _settle()
 
-        gate.release()  # hands the gate to `unlucky`...
+        holder.release()  # hands the gate to `unlucky`...
         unlucky.cancel()  # ...which is cancelled before it gets to run
         with pytest.raises(asyncio.CancelledError):
             await unlucky
-        assert await next_in_line is True
-
-        gate.release()
-        assert gate.try_acquire()
+        (await next_in_line).release()
+        assert gate.try_acquire() is not None
 
     _run(main())
 
@@ -164,24 +169,58 @@ def test_a_waiter_cancelled_after_handoff_passes_the_gate_on() -> None:
 def test_a_waiter_cancelled_after_handoff_frees_the_gate_if_alone() -> None:
     async def main() -> None:
         gate = GpuGate()
-        gate.try_acquire()
+        holder = _hold(gate)
         unlucky = asyncio.create_task(gate.acquire())
         await _settle()
 
-        gate.release()
+        holder.release()
         unlucky.cancel()
         with pytest.raises(asyncio.CancelledError):
             await unlucky
-        assert gate.try_acquire()
+        assert gate.try_acquire() is not None
 
     _run(main())
 
 
-def test_releasing_a_free_gate_is_an_error() -> None:
+def test_a_waiter_closed_after_handoff_passes_the_gate_on() -> None:
+    # GeneratorExit rather than CancelledError: what an abandoned coroutine gets on close().
+    async def main() -> None:
+        gate = GpuGate()
+        holder = _hold(gate)
+        abandoned = gate.acquire()
+        abandoned.send(None)  # runs up to the wait, now queued
+        next_in_line = asyncio.create_task(gate.acquire())
+        await _settle()
+
+        holder.release()  # hands the gate to `abandoned`...
+        abandoned.close()  # ...which is thrown GeneratorExit instead of resuming
+        (await next_in_line).release()
+        assert gate.try_acquire() is not None
+
+    _run(main())
+
+
+def test_a_second_release_of_the_same_lease_is_rejected() -> None:
     gate = GpuGate()
+    lease = _hold(gate)
+    lease.release()
     with pytest.raises(RuntimeError):
-        gate.release()
-    gate.try_acquire()
-    gate.release()
-    with pytest.raises(RuntimeError):
-        gate.release()
+        lease.release()
+    assert gate.try_acquire() is not None
+
+
+def test_a_stale_lease_cannot_release_the_current_holder() -> None:
+    async def main() -> None:
+        gate = GpuGate()
+        first = _hold(gate)
+        waiter = asyncio.create_task(gate.acquire())
+        await _settle()
+        first.release()
+        second = await waiter
+
+        with pytest.raises(RuntimeError):
+            first.release()  # a late double release must not free `second`'s gate
+        assert gate.try_acquire() is None
+        second.release()
+
+    _run(main())
