@@ -52,19 +52,23 @@ async function main() {
         console.log(`note: --skip ${skip} had no effect; "${target}" does not include that phase`);
     }
 
-    const { browser, page } = await launchBrowser(config);
-    const events = captureBreezeEvents(page);
     const allResults = [];
-    // Declared outside the try so `finally` can tell whether captureSettings actually completed
-    // (review pass 2, finding 4) — restoring a snapshot we never took would be meaningless at best.
+    // Declared outside the try so `finally` can always reach them, however early something throws
+    // (review pass 3, finding 10): a launchBrowser() failure, for instance, must still let `finally`
+    // skip the close cleanly and writeRecord still run below, instead of the process dying to an
+    // unhandled rejection with nothing written anywhere.
+    let browser = null;
+    let page = null;
+    let events = [];
+    events.errors = [];
     let settingsSnapshot = null;
 
     try {
+        ({ browser, page } = await launchBrowser(config));
+        events = captureBreezeEvents(page);
         // Navigate once here, before any phase, so settings can be snapshotted before the `health`
-        // phase's selectBreezeProvider() starts changing them (review pass 1, finding 7). Both calls
-        // live inside this try: a navigation failure (SillyTavern isn't up, wrong URL, ...) must still
-        // reach the `finally` below, so the browser closes and a record gets written instead of the
-        // process dying to an unhandled rejection. Every phase assumes the page is already loaded.
+        // phase's selectBreezeProvider() starts changing them (review pass 1, finding 7). Every phase
+        // assumes the page is already loaded.
         await openSillyTavern(page, config);
         settingsSnapshot = await captureSettings(page);
 
@@ -78,16 +82,33 @@ async function main() {
         console.log('run aborted:', error.message);
         console.log('last events:', JSON.stringify(events.slice(-6)));
     } finally {
-        if (settingsSnapshot) {
-            // Restore whatever the user had configured, even when a phase failed or threw. A failure
-            // here is treated as a failed step, not just a console warning: the settings snapshot is
-            // also written into the record below, so it can still be restored by hand.
-            await restoreSettings(page, settingsSnapshot).catch((error) => {
+        if (settingsSnapshot && page) {
+            // Restore whatever the user had configured, even when a phase failed or threw. The result
+            // (including the read-back verification restoreSettings does — review pass 3, finding 4)
+            // is recorded as a step here, since the phases have already returned by this point.
+            try {
+                const restoreResult = await restoreSettings(page, settingsSnapshot);
+                allResults.push({
+                    step: `${target}: settings restored and verified on disk`,
+                    ok: restoreResult.restored,
+                    detail: restoreResult.detail,
+                });
+            } catch (error) {
                 console.log('warning: failed to restore settings:', error.message);
                 allResults.push({ step: `${target}: settings restore failed`, ok: false, detail: error.message });
-            });
+            }
         }
-        await browser.close();
+        // In its own try so a close failure can't stop writeRecord from running below (review pass 3,
+        // finding 10) — an exception thrown inside `finally` would otherwise replace whatever this
+        // block already decided and propagate straight out of main(), skipping the record entirely.
+        if (browser) {
+            try {
+                await browser.close();
+            } catch (error) {
+                console.log('warning: failed to close the browser:', error.message);
+                allResults.push({ step: `${target}: browser close failed`, ok: false, detail: error.message });
+            }
+        }
     }
 
     const outPath = writeRecord(record, allResults, settingsSnapshot);

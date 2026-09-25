@@ -2,17 +2,19 @@
 // "Breeze validation" chat under Seraphina. Exercises narration, stop/cancel, voice preview, the
 // server's queue signal, and cfg_scale settings end to end through the extension.
 import {
-    openValidationChat, expectEvent, waitForAnyEvent, readToasts, sleep, makeRecorder, holdGpuWithSession,
+    openValidationChat, expectEvent, expectAnyEvent, readToasts, sleep, makeRecorder, holdGpuWithSession,
 } from '../lib.mjs';
 
 // A few hundred characters keep the server generating for several seconds (RTF ~0.3-0.4 per the
 // baseline in research/), long enough for the page's own narration to arrive and get queued behind
 // it, and long enough that the cancel test (below) has time to send its stop click before the
-// narration finishes on its own.
-const LONG_HOLD_TEXT = 'The lighthouse keeper climbed the spiral stairs before dawn, counting each '
+// narration finishes on its own. Wrapped in double quotes so it still narrates even with
+// narrate_quoted_only on (this phase pins it off too, but the text works either way — review pass 3,
+// finding 3).
+const LONG_HOLD_TEXT = '"The lighthouse keeper climbed the spiral stairs before dawn, counting each '
     + 'worn stone step out of habit rather than need. Fog rolled in from the strait, thick enough to '
     + 'swallow the beam whole, so he lit the lamp early and settled in to wait for the first ships. '
-    + 'Somewhere below, the sea kept its own patient rhythm against the rocks, indifferent to the hour.';
+    + 'Somewhere below, the sea kept its own patient rhythm against the rocks, indifferent to the hour."';
 
 // A long narration runs at about real time on the C++ Q4 model (53 s of audio took 54 s), so a
 // 60 s wait was too tight. Three minutes still catches a hang.
@@ -37,41 +39,72 @@ async function stop(page) {
 /**
  * Used only by the cancel test: polls up to `timeoutMs` for the stop icon before deciding there's
  * nothing to stop, since the framework's own job-processing state can lag slightly behind our WS
- * session's 'started' event — a single immediate check (like {@link stop}) risks finding it still
- * idle and sending no click at all. Returns whether a click was actually sent, so the caller can tell
- * a genuine cancel from a narration that had already finished before the click could land (review
- * pass 2, finding 5).
+ * session's 'started' event. The class check and the click happen in one `page.evaluate` (review pass
+ * 3, finding 5) — two round trips would leave a window where the icon could flip between the check
+ * and the click.
+ *
+ * @returns {Promise<{clicked: boolean, since: number}>} whether a click was actually sent, and the
+ *   `events` index at that exact moment — not some earlier marker — so the caller waits for
+ *   synth.cancelled only from the click onward (review pass 3, finding 1: an earlier `since` could
+ *   include an unrelated cancellation, e.g. the throwaway line's own auto-narration being cancelled by
+ *   this test's own narrateLast()).
  */
-async function stopIfPlaying(page, timeoutMs = 3000) {
+async function stopIfPlaying(events, page, timeoutMs = 3000) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
-        if (await page.evaluate(() => $('#tts_media_control').hasClass('fa-stop-circle'))) {
-            await page.evaluate(() => { $('#tts_media_control').trigger('click'); });
-            return true;
-        }
+        const clicked = await page.evaluate(() => {
+            const active = $('#tts_media_control').hasClass('fa-stop-circle');
+            if (active) $('#tts_media_control').trigger('click');
+            return active;
+        });
+        if (clicked) return { clicked: true, since: events.length };
         await sleep(150);
     }
-    return false;
+    return { clicked: false, since: events.length };
 }
 
-/** Adds one throwaway line as Seraphina (as us4-browser-validation.mjs does with /sendas), waiting
- * for it to land, then stops any auto-narration the framework may have started for it on its own. */
-async function addThrowawayLine(page, text) {
+/**
+ * Adds one throwaway line as Seraphina (as us4-browser-validation.mjs does with /sendas), waiting for
+ * it to land, then stops any auto-narration the framework may have started for it on its own (belt and
+ * suspenders: this phase also pins tts.auto_generation off, so there normally is none — review pass 3,
+ * finding 1). Refuses to run outside the "Breeze validation" chat (standing rule 7) and records that
+ * refusal as a step rather than silently doing nothing.
+ */
+async function addThrowawayLine(page, step, text) {
+    const chatId = await page.evaluate(() => SillyTavern.getContext().getCurrentChatId());
+    if (chatId !== 'Breeze validation') {
+        step('cancel test: throwaway line added', false, `wrong chat (${chatId}); refused to send`);
+        return false;
+    }
     const before = await page.evaluate(() => SillyTavern.getContext().chat.length);
     await page.evaluate((t) => SillyTavern.getContext().executeSlashCommandsWithOptions(`/sendas name=Seraphina ${t}`), text);
     await page.waitForFunction((n) => SillyTavern.getContext().chat.length > n, before, { timeout: 10000 });
     await sleep(1500); // let the TTS extension's own auto-narration (if any) start, so stop() can catch it
     await stop(page);
+    step('cancel test: throwaway line added', true);
+    return true;
 }
 
-/** Removes {@link addThrowawayLine}'s line, but only while it is still the last message, so a real
- * line in the "Breeze validation" chat can never be deleted (standing rule 7). */
-const removeLastLine = (page, text) => page.evaluate(async (t) => {
-    const { chat, executeSlashCommandsWithOptions } = SillyTavern.getContext();
-    if (chat.length && chat[chat.length - 1].mes.trim() === t.trim()) {
-        await executeSlashCommandsWithOptions('/del 1');
-    }
-}, text);
+/**
+ * Removes {@link addThrowawayLine}'s line — but only in the "Breeze validation" chat, and only while
+ * it is still the last message, so a real line can never be deleted (standing rule 7). Records the
+ * outcome as a step either way (review pass 3, finding 6), instead of the caller silently swallowing
+ * whatever happened.
+ */
+async function removeThrowawayLine(page, step, text) {
+    const result = await page.evaluate(async (t) => {
+        const ctx = SillyTavern.getContext();
+        const chatId = ctx.getCurrentChatId();
+        if (chatId !== 'Breeze validation') return { removed: false, detail: `wrong chat (${chatId}); refused to delete` };
+        if (!ctx.chat.length || ctx.chat[ctx.chat.length - 1].mes.trim() !== t.trim()) {
+            return { removed: false, detail: 'the last message no longer matches the throwaway line; left it alone' };
+        }
+        await ctx.executeSlashCommandsWithOptions('/del 1');
+        return { removed: true, detail: '' };
+    }, text);
+    step('cancel test: throwaway line removed', result.removed, result.detail);
+    return result;
+}
 
 /**
  * @param {import('playwright-core').Page} page
@@ -85,6 +118,32 @@ export default async function full(page, config, events) {
     try {
         await openValidationChat(page);
         step('"Breeze validation" chat open under Seraphina', true);
+
+        // Pin every setting this phase's assertions depend on, for the whole phase (run.mjs restores
+        // all of it afterward from the whole-tree snapshot — review pass 1, findings 7/9; review pass
+        // 2, finding 1/3; review pass 3, finding 1/3). auto_generation and narrate_quoted_only are
+        // framework-level, not Breeze's own, and both toggles are click-bound
+        // (public/scripts/extensions/tts/index.js onAutoGenerationClick / onNarrateQuotedClick), the
+        // same idiom selectBreezeProvider already uses for #tts_enabled:
+        // - auto_generation off, so /sendas below never races its own auto-narration against this
+        //   phase's own narrateLast() calls (review pass 3, finding 1);
+        // - narrate_quoted_only off, so the throwaway line narrates regardless of its wording (belt and
+        //   suspenders alongside wrapping it in quotes — review pass 3, finding 3);
+        // - direction/vocal-event/inline tags off, delivery pinned to "buffer" (only that mode's
+        //   synth.first_audio carries `ms`), and every known voice's style cleared (a non-empty style
+        //   folds into the instruction regardless of direction/tags — src/provider.js buildRequest(),
+        //   src/guidance.js pickGuidance()), so every narration below has hasInstruction === false and
+        //   the cfg_scale checks (section 5) see the baseline directly, undistorted.
+        await page.evaluate(() => {
+            if ($('#tts_auto_generation').prop('checked')) $('#tts_auto_generation').trigger('click');
+            if ($('#tts_narrate_quoted').prop('checked')) $('#tts_narrate_quoted').trigger('click');
+            $('#breeze_direction_enabled').prop('checked', false).trigger('change');
+            $('#breeze_vocal_events_enabled').prop('checked', false).trigger('change');
+            $('#breeze_inline_tags_enabled').prop('checked', false).trigger('change');
+            $('#breeze_delivery_mode').val('buffer').trigger('change');
+            const voices = SillyTavern.getContext().extensionSettings.tts.Breeze?.voices ?? {};
+            for (const voiceId of Object.keys(voices)) voices[voiceId].style = '';
+        });
 
         // 1. Narrate the last message (it already contains quoted dialogue, as the validation chat is
         //    written that way). Expect synth.request, then a synth.event of type 'started', then synth.done.
@@ -102,31 +161,32 @@ export default async function full(page, config, events) {
         //    the stop click lands (review pass 2, finding 5). If no click was sent, that's a failed
         //    cancel test, not a skipped pass; if a click was sent but only synth.done arrived (not
         //    synth.cancelled), that's a genuine failure too.
+        const addedThrowawayLine = await addThrowawayLine(page, step, LONG_HOLD_TEXT);
         try {
-            await addThrowawayLine(page, LONG_HOLD_TEXT);
-            since = events.length;
-            await narrateLast(page);
-            await expectEvent(step, events, since, 'synth.event', (e) => e.type === 'started', 15000, 'narration (for the cancel test) reaches "started"');
-            const clickSent = await stopIfPlaying(page, 3000);
-            step('stop click was sent (narration was still active)', clickSent);
-            if (clickSent) {
-                try {
-                    const outcome = await waitForAnyEvent(events, ['synth.cancelled', 'synth.done'], () => true, 20000, since);
-                    step('stop cancelled the active session (not synth.done)', outcome.event === 'synth.cancelled', JSON.stringify(outcome));
-                } catch (error) {
-                    step('stop cancelled the active session (not synth.done)', false, error.message);
+            if (addedThrowawayLine) {
+                since = events.length;
+                await narrateLast(page);
+                await expectEvent(step, events, since, 'synth.event', (e) => e.type === 'started', 15000, 'narration (for the cancel test) reaches "started"');
+                const { clicked, since: clickSince } = await stopIfPlaying(events, page, 3000);
+                step('stop click was sent (narration was still active)', clicked);
+                if (clicked) {
+                    await expectAnyEvent(
+                        step, events, clickSince, ['synth.cancelled', 'synth.done'], () => true, 20000,
+                        'stop cancelled the active session (not synth.done)',
+                        (event) => event.event === 'synth.cancelled',
+                    );
+                } else {
+                    step(
+                        'cancel test: nothing to cancel (the narration had already finished before the stop click could be sent)',
+                        false,
+                        'the throwaway message may need to be even longer, or the stop poll longer',
+                    );
                 }
-            } else {
-                step(
-                    'cancel test: nothing to cancel (the narration had already finished before the stop click could be sent)',
-                    false,
-                    'the throwaway message may need to be even longer, or the stop poll longer',
-                );
+                const toastsAfterCancel = await readToasts(page);
+                step('no error toast after the cancel attempt', !toastsAfterCancel.hasError, toastsAfterCancel.text.slice(0, 120));
             }
-            const toastsAfterCancel = await readToasts(page);
-            step('no error toast after the cancel attempt', !toastsAfterCancel.hasError, toastsAfterCancel.text.slice(0, 120));
         } finally {
-            await removeLastLine(page, LONG_HOLD_TEXT).catch(() => {});
+            if (addedThrowawayLine) await removeThrowawayLine(page, step, LONG_HOLD_TEXT).catch((error) => step('cancel test: throwaway line removed', false, error.message));
         }
 
         // 3. Voice preview for eric (this only requests synthesis; the saved recording is untouched).
@@ -167,23 +227,9 @@ export default async function full(page, config, events) {
             step('queued narration completes once the GPU frees up', false, 'skipped: the Node client never confirmed it was generating');
         }
 
-        // 5. cfg_scale via the baseline guidance setting. Direction, vocal-event tags and inline tags
-        //    are pinned off, delivery is pinned to "buffer" (only that mode's synth.first_audio
-        //    carries `ms`; see bufferedTts() in src/provider.js), and every known voice's style is
-        //    cleared (buildRequest() folds a non-empty style into the instruction regardless of
-        //    direction/tags — src/provider.js buildRequest(), src/guidance.js pickGuidance() — review
-        //    pass 2, finding 7) so the request's cfgScale reflects the baseline directly — run.mjs
-        //    restores all of this afterward (review pass 1, findings 7 and 9; review pass 2, finding
-        //    1/3 for how). The first value (4) differs from the extension's default baseline (1), so a
-        //    setBaseline that silently no-ops can't pass by coincidence.
-        await page.evaluate(() => {
-            $('#breeze_direction_enabled').prop('checked', false).trigger('change');
-            $('#breeze_vocal_events_enabled').prop('checked', false).trigger('change');
-            $('#breeze_inline_tags_enabled').prop('checked', false).trigger('change');
-            $('#breeze_delivery_mode').val('buffer').trigger('change');
-            const voices = SillyTavern.getContext().extensionSettings.tts.Breeze?.voices ?? {};
-            for (const voiceId of Object.keys(voices)) voices[voiceId].style = '';
-        });
+        // 5. cfg_scale via the baseline guidance setting. Everything else that would affect it was
+        //    already pinned off above. The first value (4) differs from the extension's default
+        //    baseline (1), so a setBaseline that silently no-ops can't pass by coincidence.
         for (const cfgScale of [4, 7.5, 1]) {
             await stop(page);
             await sleep(300);

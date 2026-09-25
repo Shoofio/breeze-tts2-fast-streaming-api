@@ -5,6 +5,7 @@
 // behavior (the media control button, checkReady's trigger), the running container's own
 // public/scripts/extensions/tts/index.js (see the review-pass-1 fixup report for the specific lines).
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -54,21 +55,23 @@ export function captureBreezeEvents(page) {
     events.errors = [];
     page.on('console', (msg) => {
         if (msg.type() === 'error') events.errors.push(msg.text());
-        // Cheap text pre-filter, before touching `msg.args()` at all: the vast majority of console
-        // messages are SillyTavern's own and have nothing to do with Breeze, so this skips creating
-        // JSHandles (and reserving a slot) for them entirely (review pass 2, finding 9). The resolved
-        // value of args[0] below is still the authoritative check — another message's rendered text
-        // could coincidentally start the same way (review pass 1, finding 10).
-        if (!msg.text().startsWith('breeze')) return;
         const args = msg.args();
-        if (args.length < 2) {
+        // Every console message's arguments are JSHandles that must be disposed once read — on every
+        // path, including the vast majority of messages that turn out to have nothing to do with
+        // Breeze (review pass 3, finding 9). An earlier version of this comment claimed checking
+        // `msg.text()` first avoided creating handles at all; that was wrong — `msg.args()` already
+        // exist by the time this handler runs, so skipping the dispose here just leaked them.
+        if (!msg.text().startsWith('breeze') || args.length < 2) {
             Promise.all(args.map((arg) => arg.dispose().catch(() => {})));
-            return; // not a `console.debug('breeze', payload)` call after all
+            return; // not a `console.debug('breeze', payload)` call
         }
         const slot = {};
         events.push(slot);
         (async () => {
             try {
+                // The extension always logs the literal string 'breeze' as the first argument; check
+                // the resolved value rather than the message's rendered text, which can be misleading
+                // (e.g. an object whose own text also happens to start with "breeze").
                 const tag = await args[0].jsonValue();
                 if (tag !== 'breeze') return;
                 Object.assign(slot, await args[1].jsonValue());
@@ -127,11 +130,17 @@ export async function waitForAnyEvent(events, names, predicate = () => true, tim
     throw new Error(`timed out waiting for any of ${names.join(', ')}`);
 }
 
-/** {@link expectEvent}'s counterpart for {@link waitForAnyEvent}. */
-export async function expectAnyEvent(step, events, since, names, predicate, timeoutMs, label) {
+/**
+ * {@link expectEvent}'s counterpart for {@link waitForAnyEvent}. `predicate` filters which events are
+ * even candidates (e.g. matching this run's URL); `isOk` then decides whether the specific candidate
+ * that actually arrived counts as a pass — some callers wait for any of several outcomes but accept
+ * only one of them (e.g. `breeze.health` but not `breeze.check_failed`; `synth.cancelled` but not
+ * `synth.done`), which a bare "any of these names" can't express (review pass 3, finding 8).
+ */
+export async function expectAnyEvent(step, events, since, names, predicate, timeoutMs, label, isOk = () => true) {
     try {
         const event = await waitForAnyEvent(events, names, predicate, timeoutMs, since);
-        step(label, true, JSON.stringify(event));
+        step(label, isOk(event), JSON.stringify(event));
         return event;
     } catch (error) {
         step(label, false, error.message);
@@ -250,8 +259,9 @@ export async function captureSettings(page) {
 
 /**
  * Restores a snapshot from {@link captureSettings}. Writes the whole `tts` object back (undoing
- * anything the harness changed or newly created), saves it for real, then reselects the provider so
- * the live UI and the framework's in-memory provider instance match again.
+ * anything the harness changed or newly created), saves it for real, verifies the save actually
+ * reached disk, then reselects the provider so the live UI and the framework's in-memory provider
+ * instance match again.
  *
  * The explicit save matters (review pass 2, finding 1): SillyTavern's own `saveSettingsDebounced`
  * waits 1000 ms before writing to disk, which `browser.close()` would beat every time, so the restore
@@ -259,20 +269,57 @@ export async function captureSettings(page) {
  * (public/scripts/st-context.js), so this imports the real, awaitable `saveSettings()` directly from
  * `/script.js` (the container's public/script.js `export async function saveSettings(...)`, which
  * does a real `await fetch('/api/settings/save', ...)`) — the same "import the page's own module"
- * trick make-validation-chat.mjs already uses for `doNewChat()`.
+ * trick make-validation-chat.mjs already uses for `doNewChat()`. The import happens *before* the
+ * settings are assigned, so there is no `await` (hence no event-loop yield some other code could use
+ * to slip in a conflicting write) between the assignment and the save call (review pass 3, finding 7).
+ *
+ * `saveSettings()` only toasts and logs on failure (public/script.js), so it can silently not save;
+ * this reads the settings back through the same `/api/settings/get` the page itself uses on startup
+ * and compares the Breeze block, to catch that (review pass 3, finding 4).
+ *
+ * @returns {Promise<{restored: boolean, detail: string}>}
  */
 export async function restoreSettings(page, snapshot) {
-    if (!snapshot) return;
-    await page.evaluate(async (s) => {
+    if (!snapshot) return { restored: false, detail: 'no snapshot was captured' };
+    return page.evaluate(async (s) => {
+        const scriptModule = await import('/script.js');
         const ctx = SillyTavern.getContext();
         ctx.extensionSettings.tts = s.tts;
-        const scriptModule = await import('/script.js');
         await scriptModule.saveSettings();
+
+        const stableStringify = (value) => {
+            if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+            if (value && typeof value === 'object') {
+                return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+            }
+            return JSON.stringify(value);
+        };
+        let restored = false;
+        let detail = '';
+        try {
+            const response = await fetch('/api/settings/get', {
+                method: 'POST',
+                headers: scriptModule.getRequestHeaders(),
+                body: JSON.stringify({}),
+                cache: 'no-cache',
+            });
+            const data = await response.json();
+            const saved = JSON.parse(data.settings ?? '{}');
+            const savedBreeze = saved.extension_settings?.tts?.Breeze;
+            const expectedBreeze = s.tts?.Breeze;
+            restored = stableStringify(savedBreeze) === stableStringify(expectedBreeze);
+            if (!restored) detail = 'the Breeze settings read back from /api/settings/get do not match what was restored';
+        } catch (error) {
+            detail = `could not verify the save: ${error.message}`;
+        }
+
         // Reselect so the live UI and the framework's in-memory provider instance (closures inside
         // public/scripts/extensions/tts/index.js, not part of extensionSettings) match what was just
         // restored — loadTtsProvider() re-reads extension_settings.tts[name], already restored above.
         $('#tts_provider').val(s.provider).trigger('change');
         if ($('#tts_enabled').prop('checked') !== s.ttsEnabled) $('#tts_enabled').trigger('click');
+
+        return { restored, detail };
     }, snapshot);
 }
 
@@ -338,13 +385,32 @@ export function makeRecorder() {
     return { results, step };
 }
 
+/** Recursively blanks out any object key whose name looks like a credential, so a settings snapshot
+ * can be shown without risking leaking one (review pass 3, finding 0). */
+function redactSecrets(value) {
+    if (Array.isArray(value)) return value.map(redactSecrets);
+    if (value && typeof value === 'object') {
+        const out = {};
+        for (const [key, v] of Object.entries(value)) {
+            out[key] = /key|token|secret|password/i.test(key) ? '[redacted]' : redactSecrets(v);
+        }
+        return out;
+    }
+    return value;
+}
+
 /**
  * Writes one human-and-machine-readable record to
- * `specs/003-cpp-compatible-api/research/live-<name>.md`: a markdown summary table for people, the
- * raw results as a fenced JSON block so later phases (T011) can diff behavior mechanically, and,
- * when given, the settings snapshot `captureSettings` took — so if the automatic restore ever fails,
- * the exact pre-run `tts` settings tree is still on hand to repair by hand (review pass 2, "also give
- * a way to print the snapshot").
+ * `specs/003-cpp-compatible-api/research/live-<name>.md`: a markdown summary table for people, plus
+ * the raw results as a fenced JSON block so later phases (T011) can diff behavior mechanically.
+ *
+ * The settings snapshot `captureSettings` took is never written into this file: the whole `tts` tree
+ * covers every provider the user has configured, which can carry character names (other providers'
+ * voice maps) and, in principle, API keys (review pass 3, finding 0 — this repo's `research/` files
+ * are committed). Only the Breeze block goes in, and even that is redacted. The complete snapshot, if
+ * given, goes to a separate *untracked* file under the OS temp dir instead — the one to actually
+ * restore from by hand if the automatic restore ever failed — and its path is both printed and named
+ * in the record.
  */
 export function writeRecord(name, results, snapshot = null) {
     const outDir = path.join(repoRoot, 'specs/003-cpp-compatible-api/research');
@@ -355,9 +421,17 @@ export function writeRecord(name, results, snapshot = null) {
     const rows = results
         .map((r) => `| ${r.ok ? 'ok' : 'FAIL'} | ${r.step} | ${r.detail.replace(/\|/g, '\\|')} |`)
         .join('\n');
-    const snapshotSection = snapshot
-        ? `\n## Settings snapshot (captured before this run; restore by hand if needed)\n\n\`\`\`json\n${JSON.stringify(snapshot, null, 2)}\n\`\`\`\n`
-        : '';
+
+    let snapshotSection = '';
+    if (snapshot) {
+        const fullSnapshotPath = path.join(os.tmpdir(), `breeze-live-${name}-settings-snapshot.json`);
+        fs.writeFileSync(fullSnapshotPath, JSON.stringify(snapshot, null, 2));
+        console.log(`full settings snapshot (untracked, for manual restore): ${fullSnapshotPath}`);
+
+        const redactedBreeze = redactSecrets(snapshot.tts?.Breeze ?? null);
+        snapshotSection = `\n## Settings snapshot (Breeze block only; secrets redacted)\n\nThe complete snapshot — every TTS provider's settings, not just Breeze's — was written to \`${fullSnapshotPath}\` (untracked; not this record). Restore from there by hand if the automatic restore failed.\n\n\`\`\`json\n${JSON.stringify(redactedBreeze, null, 2)}\n\`\`\`\n`;
+    }
+
     const body = `# Live SillyTavern run: ${name}
 
 Generated ${new Date().toISOString()}. ${passed}/${results.length} steps passed.
