@@ -47,15 +47,16 @@ export default async function voices(page, config, events) {
         // 2. Re-upload the same name and accept "Replace". The extension's DELETE-then-POST replace
         //    flow has landed (src/provider.js ~415-450: onUploadClick logs voice.replaced right after
         //    the old copy is deleted, then voice.uploaded once the new one is saved), so this must
-        //    succeed now — a timeout or a voice.upload_failed is a real failure, not tolerated.
+        //    succeed now — a timeout or a voice.upload_failed is a real failure, not tolerated. 60 s
+        //    timeouts (review pass 2, finding 10), matching the first upload's own generous timeout.
         since = events.length;
         await fillUploadForm(TMP_NAME, sampleTranscript, sampleWav);
         await acceptPopupIfPresent(page, { accept: true, timeoutMs: 5000 });
-        await expectEvent(step, events, since, 'voice.replaced', () => true, 15000, 'st_live_tmp replaced (voice.replaced event)');
-        await expectEvent(step, events, since, 'voice.uploaded', () => true, 15000, 'st_live_tmp re-uploaded after replace (voice.uploaded event)');
+        await expectEvent(step, events, since, 'voice.replaced', () => true, 60000, 'st_live_tmp replaced (voice.replaced event)');
+        await expectEvent(step, events, since, 'voice.uploaded', () => true, 60000, 'st_live_tmp re-uploaded after replace (voice.uploaded event)');
         const uploadFailed = events.slice(since).find((e) => e.event === 'voice.upload_failed');
         step('replace did not fail (no voice.upload_failed)', !uploadFailed, JSON.stringify(uploadFailed ?? null));
-        await expectEvent(step, events, since, 'voices.refreshed', () => true, 15000, 'voice list refreshed after replace');
+        await expectEvent(step, events, since, 'voices.refreshed', () => true, 60000, 'voice list refreshed after replace');
 
         // 3. Delete st_live_tmp.
         since = events.length;

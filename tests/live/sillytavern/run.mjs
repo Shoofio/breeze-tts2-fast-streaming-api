@@ -54,14 +54,20 @@ async function main() {
 
     const { browser, page } = await launchBrowser(config);
     const events = captureBreezeEvents(page);
-    // Navigate once here, before any phase, so settings can be snapshotted before the `health`
-    // phase's selectBreezeProvider() starts changing them (review pass 1, finding 7). Every phase
-    // assumes the page is already loaded.
-    await openSillyTavern(page, config);
-    const settingsSnapshot = await captureSettings(page);
-
     const allResults = [];
+    // Declared outside the try so `finally` can tell whether captureSettings actually completed
+    // (review pass 2, finding 4) — restoring a snapshot we never took would be meaningless at best.
+    let settingsSnapshot = null;
+
     try {
+        // Navigate once here, before any phase, so settings can be snapshotted before the `health`
+        // phase's selectBreezeProvider() starts changing them (review pass 1, finding 7). Both calls
+        // live inside this try: a navigation failure (SillyTavern isn't up, wrong URL, ...) must still
+        // reach the `finally` below, so the browser closes and a record gets written instead of the
+        // process dying to an unhandled rejection. Every phase assumes the page is already loaded.
+        await openSillyTavern(page, config);
+        settingsSnapshot = await captureSettings(page);
+
         for (const name of names) {
             console.log(`\n=== ${name} ===`);
             const results = await PHASES[name](page, config, events);
@@ -72,14 +78,19 @@ async function main() {
         console.log('run aborted:', error.message);
         console.log('last events:', JSON.stringify(events.slice(-6)));
     } finally {
-        // Restore whatever the user had configured, even when a phase failed or threw.
-        await restoreSettings(page, settingsSnapshot).catch((error) => {
-            console.log('warning: failed to restore settings:', error.message);
-        });
+        if (settingsSnapshot) {
+            // Restore whatever the user had configured, even when a phase failed or threw. A failure
+            // here is treated as a failed step, not just a console warning: the settings snapshot is
+            // also written into the record below, so it can still be restored by hand.
+            await restoreSettings(page, settingsSnapshot).catch((error) => {
+                console.log('warning: failed to restore settings:', error.message);
+                allResults.push({ step: `${target}: settings restore failed`, ok: false, detail: error.message });
+            });
+        }
         await browser.close();
     }
 
-    const outPath = writeRecord(record, allResults);
+    const outPath = writeRecord(record, allResults, settingsSnapshot);
     const failed = allResults.filter((r) => !r.ok).length;
     console.log(`\n${allResults.length} checks, ${failed} failed. Record written to ${outPath}`);
     process.exit(failed ? 1 : 0);

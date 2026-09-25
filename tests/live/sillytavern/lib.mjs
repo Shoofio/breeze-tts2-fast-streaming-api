@@ -54,15 +54,21 @@ export function captureBreezeEvents(page) {
     events.errors = [];
     page.on('console', (msg) => {
         if (msg.type() === 'error') events.errors.push(msg.text());
+        // Cheap text pre-filter, before touching `msg.args()` at all: the vast majority of console
+        // messages are SillyTavern's own and have nothing to do with Breeze, so this skips creating
+        // JSHandles (and reserving a slot) for them entirely (review pass 2, finding 9). The resolved
+        // value of args[0] below is still the authoritative check — another message's rendered text
+        // could coincidentally start the same way (review pass 1, finding 10).
+        if (!msg.text().startsWith('breeze')) return;
         const args = msg.args();
-        if (args.length < 2) return; // not a `console.debug('breeze', payload)` call
+        if (args.length < 2) {
+            Promise.all(args.map((arg) => arg.dispose().catch(() => {})));
+            return; // not a `console.debug('breeze', payload)` call after all
+        }
         const slot = {};
         events.push(slot);
         (async () => {
             try {
-                // The extension always logs the literal string 'breeze' as the first argument; check
-                // the resolved value rather than the message's rendered text, which can be misleading
-                // (e.g. an object whose own text also happens to start with "breeze").
                 const tag = await args[0].jsonValue();
                 if (tag !== 'breeze') return;
                 Object.assign(slot, await args[1].jsonValue());
@@ -111,10 +117,10 @@ export async function expectEvent(step, events, since, name, predicate, timeoutM
  * more than one outcome is legitimate (e.g. a narration finishing on its own before a stop click
  * reaches it).
  */
-export async function waitForAnyEvent(events, names, timeoutMs = 45000, since = 0) {
+export async function waitForAnyEvent(events, names, predicate = () => true, timeoutMs = 45000, since = 0) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
-        const hit = events.slice(since).find((e) => names.includes(e.event));
+        const hit = events.slice(since).find((e) => names.includes(e.event) && predicate(e));
         if (hit) return hit;
         await sleep(200);
     }
@@ -122,15 +128,22 @@ export async function waitForAnyEvent(events, names, timeoutMs = 45000, since = 
 }
 
 /** {@link expectEvent}'s counterpart for {@link waitForAnyEvent}. */
-export async function expectAnyEvent(step, events, since, names, timeoutMs, label) {
+export async function expectAnyEvent(step, events, since, names, predicate, timeoutMs, label) {
     try {
-        const event = await waitForAnyEvent(events, names, timeoutMs, since);
+        const event = await waitForAnyEvent(events, names, predicate, timeoutMs, since);
         step(label, true, JSON.stringify(event));
         return event;
     } catch (error) {
         step(label, false, error.message);
         return null;
     }
+}
+
+/** Mirrors the extension's own normalizeUrl (src/provider.js): trims whitespace and strips a
+ * trailing slash, so comparing a saved address to this run's config isn't defeated by formatting
+ * (review pass 2, finding 8). */
+export function normalizeUrl(value) {
+    return String(value ?? '').trim().replace(/\/+$/, '');
 }
 
 /** Reads the toast tray. `hasError` checks toastr's own `toast-error` class rather than text, so it
@@ -215,54 +228,52 @@ export async function acceptPopupIfPresent(page, { accept = true, timeoutMs = 50
 }
 
 /**
- * Snapshots the framework/provider settings this harness changes, so `run.mjs` can put them back
- * (review pass 1, finding 7). `breeze` is `null` until Breeze has been selected at least once —
- * before that, `#breeze_settings` and its fields don't exist in the DOM (see openSillyTavern above),
- * so there is nothing of the user's to protect there yet.
+ * Snapshots the whole `tts` settings tree (`SillyTavern.getContext().extensionSettings.tts`), plus
+ * the selected provider and the enabled flag, so `run.mjs` can put everything back afterward. This
+ * replaces reading individual `#breeze_*` DOM fields (review pass 1, finding 7): those elements only
+ * exist once Breeze has actually been selected once (see openSillyTavern above), so a DOM-based
+ * snapshot missed everything whenever Breeze wasn't already the active provider (review pass 2,
+ * finding 3) — cloning the underlying settings object needs no such precondition, and covers every
+ * field the harness might touch (guidance, direction/vocal-event/inline-tag toggles, delivery mode,
+ * per-voice style, ...) without having to name each one.
  */
 export async function captureSettings(page) {
     return page.evaluate(() => {
-        const breeze = document.getElementById('breeze_settings')
-            ? {
-                httpUrl: $('#breeze_http_url').val(),
-                wsUrl: $('#breeze_ws_url').val(),
-                guidanceBaseline: $('#breeze_guidance_baseline').val(),
-                directionEnabled: $('#breeze_direction_enabled').prop('checked'),
-                vocalEventsEnabled: $('#breeze_vocal_events_enabled').prop('checked'),
-                deliveryMode: $('#breeze_delivery_mode').val(),
-            }
-            : null;
-        return { provider: $('#tts_provider').val(), ttsEnabled: $('#tts_enabled').prop('checked'), breeze };
+        const ctx = SillyTavern.getContext();
+        return {
+            provider: $('#tts_provider').val(),
+            ttsEnabled: $('#tts_enabled').prop('checked'),
+            tts: structuredClone(ctx.extensionSettings.tts),
+        };
     });
 }
 
 /**
- * Restores a snapshot from {@link captureSettings}. Breeze's own fields are restored first, while
- * Breeze is still the selected provider (they may vanish once another provider is selected); the
- * provider dropdown and the enabled flag are restored last, since that is what the user actually had
- * active.
+ * Restores a snapshot from {@link captureSettings}. Writes the whole `tts` object back (undoing
+ * anything the harness changed or newly created), saves it for real, then reselects the provider so
+ * the live UI and the framework's in-memory provider instance match again.
+ *
+ * The explicit save matters (review pass 2, finding 1): SillyTavern's own `saveSettingsDebounced`
+ * waits 1000 ms before writing to disk, which `browser.close()` would beat every time, so the restore
+ * would silently never reach disk. `getContext()` only exposes the debounced form
+ * (public/scripts/st-context.js), so this imports the real, awaitable `saveSettings()` directly from
+ * `/script.js` (the container's public/script.js `export async function saveSettings(...)`, which
+ * does a real `await fetch('/api/settings/save', ...)`) — the same "import the page's own module"
+ * trick make-validation-chat.mjs already uses for `doNewChat()`.
  */
 export async function restoreSettings(page, snapshot) {
     if (!snapshot) return;
-    if (snapshot.breeze) {
-        await page.evaluate((s) => {
-            if (!document.getElementById('breeze_settings')) return; // switched away already somehow
-            $('#breeze_http_url').val(s.httpUrl).trigger('input');
-            $('#breeze_ws_url').val(s.wsUrl).trigger('input');
-            $('#breeze_guidance_baseline').val(s.guidanceBaseline).trigger('input');
-            if ($('#breeze_direction_enabled').prop('checked') !== s.directionEnabled) {
-                $('#breeze_direction_enabled').prop('checked', s.directionEnabled).trigger('change');
-            }
-            if ($('#breeze_vocal_events_enabled').prop('checked') !== s.vocalEventsEnabled) {
-                $('#breeze_vocal_events_enabled').prop('checked', s.vocalEventsEnabled).trigger('change');
-            }
-            $('#breeze_delivery_mode').val(s.deliveryMode).trigger('change');
-        }, snapshot.breeze);
-    }
-    await page.evaluate((s) => {
+    await page.evaluate(async (s) => {
+        const ctx = SillyTavern.getContext();
+        ctx.extensionSettings.tts = s.tts;
+        const scriptModule = await import('/script.js');
+        await scriptModule.saveSettings();
+        // Reselect so the live UI and the framework's in-memory provider instance (closures inside
+        // public/scripts/extensions/tts/index.js, not part of extensionSettings) match what was just
+        // restored — loadTtsProvider() re-reads extension_settings.tts[name], already restored above.
         $('#tts_provider').val(s.provider).trigger('change');
         if ($('#tts_enabled').prop('checked') !== s.ttsEnabled) $('#tts_enabled').trigger('click');
-    }, { provider: snapshot.provider, ttsEnabled: snapshot.ttsEnabled });
+    }, snapshot);
 }
 
 /**
@@ -272,15 +283,25 @@ export async function restoreSettings(page, snapshot) {
  * extension's own in-flight client session before the server ever sees a competing request. Node 22+
  * has a global `WebSocket`; this repo's harness targets that (see the T004-T010 report).
  *
+ * `started` resolves on the server's `speaking` message, not `started` (confusingly similarly named):
+ * `started` only confirms the `start` message was accepted, before `end` has even been sent, so the
+ * GPU may not be generating anything yet at that point — `speaking` is contracts/ws-api.md's signal
+ * that a piece has actually begun (review pass 2, finding 6). It also has its own timeout, since a
+ * caller awaiting it needs to move on (and record the failure) rather than hang forever.
+ *
  * @param {import('./config.mjs').config} config
- * @param {{voiceId: string, text: string, cfgScale?: number}} opts
+ * @param {{voiceId: string, text: string, cfgScale?: number, readyTimeoutMs?: number}} opts
  * @returns {{started: Promise<void>, cancel: () => void, close: () => void}}
  */
-export function holdGpuWithSession(config, { voiceId, text, cfgScale = 1 }) {
+export function holdGpuWithSession(config, { voiceId, text, cfgScale = 1, readyTimeoutMs = 20000 }) {
     const socket = new WebSocket(config.wsUrl);
     let resolveStarted;
     let rejectStarted;
     const started = new Promise((resolve, reject) => { resolveStarted = resolve; rejectStarted = reject; });
+    const readyTimer = setTimeout(() => {
+        rejectStarted(new Error(`timed out waiting for the Node WS client to start speaking (${readyTimeoutMs} ms)`));
+    }, readyTimeoutMs);
+    const settle = (fn) => { clearTimeout(readyTimer); fn(); };
 
     socket.addEventListener('message', (event) => {
         if (typeof event.data !== 'string') return; // binary PCM frame; not needed here
@@ -290,13 +311,14 @@ export function holdGpuWithSession(config, { voiceId, text, cfgScale = 1 }) {
             socket.send(JSON.stringify({ type: 'start', voice_id: voiceId, cfg_scale: cfgScale }));
         } else if (message.type === 'started') {
             socket.send(JSON.stringify({ type: 'end', text }));
-            resolveStarted();
+        } else if (message.type === 'speaking') {
+            settle(resolveStarted);
         } else if (message.type === 'error') {
-            rejectStarted(new Error(`Breeze WS error: ${message.message ?? message.code}`));
+            settle(() => rejectStarted(new Error(`Breeze WS error: ${message.message ?? message.code}`)));
         }
     });
     socket.addEventListener('close', (event) => {
-        if (event.code !== 1000) rejectStarted(new Error(`Breeze WS closed unexpectedly (code ${event.code})`));
+        if (event.code !== 1000) settle(() => rejectStarted(new Error(`Breeze WS closed unexpectedly (code ${event.code})`)));
     });
 
     return {
@@ -318,10 +340,13 @@ export function makeRecorder() {
 
 /**
  * Writes one human-and-machine-readable record to
- * `specs/003-cpp-compatible-api/research/live-<name>.md`: a markdown summary table for people, plus
- * the raw results as a fenced JSON block so later phases (T011) can diff behavior mechanically.
+ * `specs/003-cpp-compatible-api/research/live-<name>.md`: a markdown summary table for people, the
+ * raw results as a fenced JSON block so later phases (T011) can diff behavior mechanically, and,
+ * when given, the settings snapshot `captureSettings` took — so if the automatic restore ever fails,
+ * the exact pre-run `tts` settings tree is still on hand to repair by hand (review pass 2, "also give
+ * a way to print the snapshot").
  */
-export function writeRecord(name, results) {
+export function writeRecord(name, results, snapshot = null) {
     const outDir = path.join(repoRoot, 'specs/003-cpp-compatible-api/research');
     fs.mkdirSync(outDir, { recursive: true });
     const outPath = path.join(outDir, `live-${name}.md`);
@@ -330,6 +355,9 @@ export function writeRecord(name, results) {
     const rows = results
         .map((r) => `| ${r.ok ? 'ok' : 'FAIL'} | ${r.step} | ${r.detail.replace(/\|/g, '\\|')} |`)
         .join('\n');
+    const snapshotSection = snapshot
+        ? `\n## Settings snapshot (captured before this run; restore by hand if needed)\n\n\`\`\`json\n${JSON.stringify(snapshot, null, 2)}\n\`\`\`\n`
+        : '';
     const body = `# Live SillyTavern run: ${name}
 
 Generated ${new Date().toISOString()}. ${passed}/${results.length} steps passed.
@@ -337,7 +365,7 @@ Generated ${new Date().toISOString()}. ${passed}/${results.length} steps passed.
 | Result | Step | Detail |
 | --- | --- | --- |
 ${rows}
-
+${snapshotSection}
 \`\`\`json
 ${JSON.stringify(results, null, 2)}
 \`\`\`
