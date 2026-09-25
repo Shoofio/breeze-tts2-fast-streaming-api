@@ -28,11 +28,24 @@ MAX_TEMPERATURE = 10.0
 MIN_REPETITION_PENALTY = 1e-4
 MAX_REPETITION_PENALTY = 10.0
 
-# What sample_logits returns for a row whose logits cannot form a distribution
-# (NaN, +inf, or no finite value). It is not a valid token id, so a caller
-# must check for it at the host read it already makes (the runtime's EOS check)
-# and fail the request there.
-UNSAMPLEABLE_TOKEN = -1
+# What _sample_logits_or_sentinel returns for a row whose logits cannot form a
+# distribution (NaN, +inf, or no finite value). It is not a valid token id;
+# the runtime checks for it at the host read it already makes (its EOS check)
+# with _check_sampled_token_id. Internal: public callers get
+# NonFiniteLogitsError from sample_logits instead.
+_UNSAMPLEABLE_TOKEN = -1
+
+
+class NonFiniteLogitsError(RuntimeError):
+    """Logits that cannot be sampled: NaN, +inf, or no finite value in a row.
+
+    A model or numerics failure, never the client's input (every sampling
+    setting is range-checked first), so it is a RuntimeError and not a
+    ValueError that a route could map to 400.
+    """
+
+
+_NONFINITE_MESSAGE = "logits contain NaN or +inf, or no finite value; cannot sample"
 
 
 class NumberRule(NamedTuple):
@@ -143,9 +156,59 @@ def sample_logits(
     in ``(0, MAX_TEMPERATURE]`` (``ValueError`` otherwise) and is floored at
     ``MIN_TEMPERATURE``.
 
-    A row whose logits cannot form a distribution gets ``UNSAMPLEABLE_TOKEN``
-    instead of a token, on the device and without a host sync; the caller must
-    check for it (see the guard below).
+    Raises ``NonFiniteLogitsError`` if a row cannot be sampled (see
+    ``_sample_logits_or_sentinel``). The check reads the result on the host,
+    so this call synchronizes with the device; the runtime's decode loop uses
+    ``_sample_logits_or_sentinel`` and checks at a read it already makes.
+    """
+    token = _sample_logits_or_sentinel(
+        logits,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        do_sample=do_sample,
+        token_history=token_history,
+        repetition_penalty=repetition_penalty,
+        suppress_mask=suppress_mask,
+        suppress_tokens=suppress_tokens,
+    )
+    if bool((token == _UNSAMPLEABLE_TOKEN).any()):
+        raise NonFiniteLogitsError(_NONFINITE_MESSAGE)
+    return token
+
+
+def _check_sampled_token_id(token_id: int) -> int:
+    """Return ``token_id``, or raise ``NonFiniteLogitsError`` for the sentinel."""
+    if token_id == _UNSAMPLEABLE_TOKEN:
+        raise NonFiniteLogitsError(f"backbone {_NONFINITE_MESSAGE}")
+    return token_id
+
+
+def _sample_logits_or_sentinel(
+    logits: torch.Tensor,
+    *,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    do_sample: bool,
+    token_history: torch.Tensor | None = None,
+    repetition_penalty: float | None = None,
+    suppress_mask: torch.Tensor | None = None,
+    suppress_tokens: Iterable[int] | None = None,
+) -> torch.Tensor:
+    """``sample_logits`` without the host read: bad rows get ``_UNSAMPLEABLE_TOKEN``.
+
+    The guard: NaN or +inf in a row (a model NaN, a CFG overflow, or finite
+    logits overflowing when divided by a floored temperature or a small
+    repetition penalty), or a row with no finite value, would make softmax
+    produce NaN and multinomial fail, on CUDA as a device-side assert that
+    poisons the whole process. It runs on the values softmax/argmax would
+    see: after the penalty and the temperature division. A row's max is NaN if
+    any value is (amax propagates NaN), +inf if any is +inf, and -inf if none
+    is finite, so one reduction finds all three. Such a row samples from zeros
+    instead, so everything stays well defined, and its token becomes
+    ``_UNSAMPLEABLE_TOKEN``. Nothing here reads a tensor on the host. -inf
+    alone is fine; it is how tokens are masked.
     """
     require_number("temperature", temperature, _SAMPLING_TEMPERATURE_RULE)
     logits = logits.clone().float()
@@ -155,32 +218,21 @@ def sample_logits(
         logits[..., suppress_mask] = float("-inf")
     if suppress_tokens:
         logits[..., list(suppress_tokens)] = float("-inf")
-    # The guard, for the greedy and the sampling path alike. NaN or +inf in a
-    # row (a model NaN, a CFG overflow), or a row with no finite logit, would
-    # make softmax produce NaN and multinomial fail: on CUDA as a device-side
-    # assert that poisons the whole process. A row's max is NaN if any logit
-    # is (amax propagates NaN), +inf if any is +inf, and -inf if none is
-    # finite, so one reduction finds all three. Such a row is replaced by
-    # zeros so everything below stays well defined, and its token by
-    # UNSAMPLEABLE_TOKEN. Nothing here reads a tensor on the host: the caller
-    # checks the token at the read it already makes. -inf alone is fine; it is
-    # how tokens are masked.
-    sampleable = torch.isfinite(logits.amax(dim=-1))
-    logits = torch.where(sampleable.unsqueeze(-1), logits, torch.zeros_like(logits))
     if do_sample:
-        token = _draw(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+        # temperature scaling (on raw logits, same as TemperatureLogitsWarper),
+        # floored so a tiny temperature is effectively greedy
+        logits = logits / max(temperature, MIN_TEMPERATURE)
+    sampleable = torch.isfinite(logits.amax(dim=-1))
+    logits = torch.where(sampleable.unsqueeze(-1), logits, 0.0)
+    if do_sample:
+        token = _draw(logits, top_k=top_k, top_p=top_p)
     else:
         token = torch.argmax(logits, dim=-1)
-    return torch.where(sampleable, token, UNSAMPLEABLE_TOKEN)
+    return torch.where(sampleable, token, _UNSAMPLEABLE_TOKEN)
 
 
-def _draw(
-    logits: torch.Tensor, *, temperature: float, top_k: int, top_p: float
-) -> torch.Tensor:
-    """Temperature, top-k and top-p on finite-max logits, then softmax + multinomial."""
-    # temperature scaling (on raw logits, same as TemperatureLogitsWarper),
-    # floored so a tiny temperature cannot overflow the logits
-    logits = logits / max(temperature, MIN_TEMPERATURE)
+def _draw(logits: torch.Tensor, *, top_k: int, top_p: float) -> torch.Tensor:
+    """Top-k and top-p on temperature-scaled, finite-max logits, then softmax + multinomial."""
     # top_k filtering (on raw logits, same as TopKLogitsWarper)
     if top_k > 0:
         k = min(top_k, logits.size(-1))

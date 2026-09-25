@@ -21,8 +21,10 @@ from .cudagraph.depth_decoder_graph import DepthDecoderGraph
 from .cudagraph.sampling import (
     MAX_TEMPERATURE,
     REPETITION_PENALTY_RULE,
-    UNSAMPLEABLE_TOKEN,
+    NonFiniteLogitsError,
     NumberRule,
+    _check_sampled_token_id,
+    _sample_logits_or_sentinel,
     require_number,
     sample_logits,
 )
@@ -195,7 +197,7 @@ def select_fast_cfg(inputs: dict[str, Any]) -> FastCfgSelection:
 
 
 def is_backbone_eos_token(token: torch.Tensor | int, config: Any) -> bool:
-    """Whether ``token`` ends generation; raises on ``UNSAMPLEABLE_TOKEN``.
+    """Whether ``token`` ends generation; raises ``NonFiniteLogitsError`` on the sentinel.
 
     This is the decode loop's per-step host read of the backbone token, so it
     is also where the sampler's sync-free guard is checked: a token that could
@@ -203,11 +205,7 @@ def is_backbone_eos_token(token: torch.Tensor | int, config: Any) -> bool:
     or the codec.
     """
     token_id = int(token.item() if isinstance(token, torch.Tensor) else token)
-    if token_id == UNSAMPLEABLE_TOKEN:
-        raise ValueError(
-            "backbone logits contain NaN or +inf, or no finite value; cannot sample"
-        )
-    return token_id == int(config.vocab_size)
+    return _check_sampled_token_id(token_id) == int(config.vocab_size)
 
 
 def _frame_flags(
@@ -1253,8 +1251,9 @@ class FastBreezeStreamingRuntime:
         backbone only; the depth decoder keeps its defaults, as in the C++
         server (``generation.cpp``). ``None`` keeps the default, and any other
         invalid value raises ``ValueError`` (on the first ``next``, as this is
-        a generator). ``sample_logits`` clamps the temperature it divides by
-        into a range that cannot produce NaN. ``repetition_penalty`` is applied once
+        a generator). Logits that cannot be sampled (NaN, +inf, or overflow)
+        raise ``NonFiniteLogitsError``, a RuntimeError, at the next per-frame
+        host read. ``repetition_penalty`` is applied once
         per distinct token in the history (see ``apply_repetition_penalty``).
         ``max_new_tokens`` defaults to the model's
         ``generation_config.max_new_tokens`` and is clamped to the configured
@@ -1349,7 +1348,7 @@ class FastBreezeStreamingRuntime:
                 )
             else:
                 logits = logits[:1]
-            token = sample_logits(
+            token = _sample_logits_or_sentinel(
                 logits,
                 suppress_tokens=self._reserved_codec_token_ids,
                 **backbone_params,
@@ -1390,8 +1389,9 @@ class FastBreezeStreamingRuntime:
                 if depth_nonfinite:
                     # Checked before the frame is observed or decoded; its
                     # codes are the guard's fixed stand-ins, not the model's.
-                    raise ValueError(
-                        "depth decoder logits had no finite value; cannot sample"
+                    raise NonFiniteLogitsError(
+                        "depth decoder logits contain NaN or +inf, or no finite "
+                        "value; cannot sample"
                     )
                 if token_observer is not None:
                     token_observer(frame)
@@ -1460,7 +1460,7 @@ class FastBreezeStreamingRuntime:
                 )
                 logits = logits.float()
                 backbone_token_history[step_idx] = token[0]
-                token = sample_logits(
+                token = _sample_logits_or_sentinel(
                     logits,
                     token_history=backbone_token_history[: step_idx + 1],
                     repetition_penalty=backbone_repetition_penalty,

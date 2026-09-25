@@ -115,11 +115,12 @@ class DepthDecoderGraph:
         self.device = device
         self.dtype = dtype
         self.config = config
-        # Set on the device by _cfg_sample when a row had no finite logit (it
-        # then samples a fixed code instead). One tensor shared by every
-        # bucket's graph and the eager path, cleared before each run, and read
-        # by the caller at its existing per-frame host sync. A captured graph
-        # cannot raise, so this flag is how its guard reports.
+        # Set on the device by _cfg_sample when a row had a NaN or +inf, or no
+        # finite value (it then samples a fixed code instead). One tensor
+        # shared by every bucket's graph and the eager path, cleared at the
+        # start of each run(), and read by the caller at its existing
+        # per-frame host sync. A captured graph cannot raise, so this flag is
+        # how its guard reports.
         self.nonfinite_logits = torch.zeros(1, dtype=torch.bool, device=device)
         self.debug = debug
         self.no_graph = (
@@ -518,25 +519,27 @@ class DepthDecoderGraph:
             token_vocab_size=self.vocab_size,
         )
 
-        # Capture-safe guard (no host sync). NaN and +inf entries become -inf,
-        # so sampling skips them. A row left with no finite logit cannot be
-        # sampled at all: multinomial on it is a CUDA device assert that
-        # poisons the process. Such a row samples from zeros, gets the fixed
-        # code 0 below, and sets nonfinite_logits for the caller to raise on.
-        cfg = torch.where(
-            torch.isfinite(cfg), cfg, torch.full_like(cfg, float("-inf"))
-        )
-        row_ok = torch.isfinite(cfg.amax(dim=-1))  # [half]
-        self.nonfinite_logits.logical_or_(~row_ok.all())
-        cfg = torch.where(row_ok.unsqueeze(-1), cfg, torch.zeros_like(cfg))
-
         # temperature scaling (on raw logits, same as TemperatureLogitsWarper),
-        # clamped to the sampler's range as sample_logits does: a tiny
-        # temperature (1e-40) overflows the logits to inf and softmax to NaN,
-        # and a graph cannot raise, so the clamp is the guard here.
+        # clamped to the sampler's range as sample_logits does (a graph cannot
+        # raise on an out-of-range buffer value).
         scaled = cfg / self.temperature_buf.clamp(
             MIN_TEMPERATURE, MAX_TEMPERATURE
         )  # [half, vocab]
+
+        # Capture-safe guard (no host sync), on the values softmax and argmax
+        # will see. A row with any NaN or +inf (a model NaN, a CFG overflow,
+        # or finite logits overflowing at the 1e-5 temperature floor), or with
+        # no finite value, cannot be trusted: multinomial on it is a CUDA
+        # device assert that poisons the process. One reduction finds all
+        # three (amax propagates NaN, is +inf if any entry is, and -inf if
+        # none is finite). Such a row samples from zeros, gets the fixed code
+        # 0 below, and sets nonfinite_logits for the caller to raise on. -inf
+        # alone is fine; it is how tokens are masked. Greedy rows are judged
+        # on the same scaled values; argmax is unchanged by a positive scale.
+        row_ok = torch.isfinite(scaled.amax(dim=-1))  # [half]
+        self.nonfinite_logits.logical_or_(~row_ok.all())
+        scaled = torch.where(row_ok.unsqueeze(-1), scaled, 0.0)
+        greedy_toks = torch.argmax(scaled, dim=-1)  # [half]
 
         # top_k on raw logits (graph-safe: fixed _max_k workspace)
         effective_k = torch.where(
@@ -573,12 +576,11 @@ class DepthDecoderGraph:
             self._debug_probs_slot.copy_(probs)
 
         # do_sample: compute both paths, select via torch.where (no Python branch in graph)
-        greedy_toks = torch.argmax(cfg, dim=-1)  # [half]
         sampled_toks = torch.multinomial(probs, 1).squeeze(-1)  # [half]
         toks = torch.where(
             self.do_sample_buf.bool(), sampled_toks, greedy_toks
         )  # [half] per-sample
-        toks = torch.where(row_ok, toks, torch.zeros_like(toks))
+        toks = torch.where(row_ok, toks, 0)
 
         # Write to the active slots; duplicate for paired cond/uncond mode.
         self._tok_buf[: self.half] = toks
@@ -902,7 +904,6 @@ class DepthDecoderGraph:
             self.set_guidance_scale(guidance_scale)
 
         self.static_cache.reset()
-        self.nonfinite_logits.zero_()
         self._full_loop()
         return self.output_tokens[: self.half].clone()
 
@@ -936,6 +937,9 @@ class DepthDecoderGraph:
 
         Returns: [actual_half, num_decode_codebooks] long tensor of codebook tokens
         """
+        # Cleared first, outside the graph, so no return path below (the
+        # early one included) can leave a previous run's flag set.
+        self.nonfinite_logits.zero_()
         actual_batch = backbone_hidden.shape[0]
         actual_half = self._real_batch_size(actual_batch)
 
@@ -1005,7 +1009,6 @@ class DepthDecoderGraph:
 
         # Replay graph
         self.static_cache.reset()
-        self.nonfinite_logits.zero_()
         state.graph.replay()
 
         if self.debug and self._debug_head_input is not None:

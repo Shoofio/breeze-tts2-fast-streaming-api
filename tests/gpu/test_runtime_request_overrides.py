@@ -20,13 +20,18 @@ from breeze_infer.templates import (
     prepare_suffix_inputs,
 )
 from models.cudagraph.sampling import (
+    _UNSAMPLEABLE_TOKEN,
     MAX_REPETITION_PENALTY,
     MAX_TEMPERATURE,
     MIN_REPETITION_PENALTY,
-    UNSAMPLEABLE_TOKEN,
+    _sample_logits_or_sentinel,
     sample_logits,
 )
-from models.fast_streaming import MIN_SUFFIX_FRAMES, MIN_SUFFIX_ROOM
+from models.fast_streaming import (
+    MIN_SUFFIX_FRAMES,
+    MIN_SUFFIX_ROOM,
+    NonFiniteLogitsError,
+)
 
 pytestmark = pytest.mark.gpu
 
@@ -235,12 +240,17 @@ def test_captured_depth_decoder_flags_nan_logits_instead_of_asserting(
     assert frames
 
 
-def test_backbone_sampler_returns_the_sentinel_for_nan_logits_on_cuda(gpu_env) -> None:
-    logits = torch.full((1, 2049), float("nan"), device="cuda")
+@pytest.mark.parametrize("fill", [float("nan"), 3e34])
+def test_backbone_sampler_catches_nan_and_overflow_on_cuda(gpu_env, fill) -> None:
+    # 3e34 is finite but overflows at the 1e-5 temperature floor.
+    logits = torch.full((1, 2049), fill, device="cuda")
+    sampling = {"temperature": 1e-5, "top_k": 50, "top_p": 1.0, "do_sample": True}
 
-    token = sample_logits(logits, temperature=0.9, top_k=50, top_p=1.0, do_sample=True)
+    token = _sample_logits_or_sentinel(logits, **sampling)
 
-    assert token.cpu().tolist() == [UNSAMPLEABLE_TOKEN]
+    assert token.cpu().tolist() == [_UNSAMPLEABLE_TOKEN]
+    with pytest.raises(NonFiniteLogitsError):
+        sample_logits(logits, **sampling)
 
 
 def test_smallest_allowed_repetition_penalty_still_samples(gpu_env) -> None:

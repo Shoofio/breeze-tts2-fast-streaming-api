@@ -11,12 +11,13 @@ import torch
 from breeze_infer.templates import get_template
 from models.cudagraph.depth_decoder_graph import DepthDecoderGraph
 from models.cudagraph.sampling import (
+    _UNSAMPLEABLE_TOKEN,
     MAX_REPETITION_PENALTY,
     MAX_TEMPERATURE,
     MIN_REPETITION_PENALTY,
     MIN_TEMPERATURE,
-    UNSAMPLEABLE_TOKEN,
     NumberRule,
+    _sample_logits_or_sentinel,
     apply_repetition_penalty,
     require_number,
     sample_logits,
@@ -27,6 +28,7 @@ from models.fast_streaming import (
     FastBreezeStreamingRuntime,
     FastStreamingChunk,
     FastStreamingConfig,
+    NonFiniteLogitsError,
     _branch_shape,
     _BranchBatch,
     _frame_flags,
@@ -392,7 +394,7 @@ class _RecordingDecodeRuntime:
             return torch.tensor([token])
 
         monkeypatch.setattr(
-            "models.fast_streaming.sample_logits", recording_sample_logits
+            "models.fast_streaming._sample_logits_or_sentinel", recording_sample_logits
         )
         self.runtime = runtime
 
@@ -628,6 +630,13 @@ _UNSAMPLEABLE_ROWS = [
 ]
 
 
+def test_nonfinite_logits_error_is_a_server_error_not_a_bad_request() -> None:
+    # A route maps ValueError to 400; a model producing NaN is not the
+    # client's fault.
+    assert issubclass(NonFiniteLogitsError, RuntimeError)
+    assert not issubclass(NonFiniteLogitsError, ValueError)
+
+
 @pytest.mark.parametrize("do_sample", [True, False])
 @pytest.mark.parametrize("bad_row", _UNSAMPLEABLE_ROWS)
 def test_unsampleable_logits_give_the_sentinel_token_without_a_host_sync(
@@ -635,23 +644,68 @@ def test_unsampleable_logits_give_the_sentinel_token_without_a_host_sync(
 ) -> None:
     # multinomial would raise on CPU, and on CUDA a device-side assert would
     # poison the whole process; argmax would pick an arbitrary token. The
-    # sampler flags the row on the device instead, and the caller checks it
-    # at the host read it already makes (the EOS check).
+    # runtime's sampler marks the row on the device instead, and the loop
+    # checks it at the host read it already makes (the EOS check).
     def no_host_read(*args, **kwargs):
-        raise AssertionError("sample_logits must not read a tensor on the host")
+        raise AssertionError("the sampler must not read a tensor on the host")
 
     for name in ("__bool__", "item", "tolist", "__int__", "__float__"):
         monkeypatch.setattr(torch.Tensor, name, no_host_read)
     logits = torch.tensor([bad_row, [0.0, 5.0, 0.0]])
 
-    token = sample_logits(
+    token = _sample_logits_or_sentinel(
         logits, temperature=1.0, top_k=0, top_p=1.0, do_sample=do_sample
     )
 
     monkeypatch.undo()
-    assert token.tolist()[0] == UNSAMPLEABLE_TOKEN
+    assert token.tolist()[0] == _UNSAMPLEABLE_TOKEN
     # The other row is sampled normally.
     assert 0 <= token.tolist()[1] < 3
+
+
+@pytest.mark.parametrize("do_sample", [True, False])
+@pytest.mark.parametrize("bad_row", _UNSAMPLEABLE_ROWS)
+def test_public_sample_logits_raises_on_unsampleable_logits(bad_row, do_sample) -> None:
+    with pytest.raises(NonFiniteLogitsError):
+        sample_logits(
+            torch.tensor([bad_row]),
+            temperature=1.0,
+            top_k=0,
+            top_p=1.0,
+            do_sample=do_sample,
+        )
+
+
+def test_overflow_from_the_temperature_floor_is_caught() -> None:
+    # Finite logits, but 3e34 / 1e-5 = 3e39 overflows float32 to inf.
+    logits = torch.tensor([[3e34, 1.0, 0.0, 1.0]])
+
+    token = _sample_logits_or_sentinel(
+        logits, temperature=MIN_TEMPERATURE, top_k=0, top_p=1.0, do_sample=True
+    )
+
+    assert token.tolist() == [_UNSAMPLEABLE_TOKEN]
+    with pytest.raises(NonFiniteLogitsError):
+        sample_logits(
+            logits, temperature=MIN_TEMPERATURE, top_k=0, top_p=1.0, do_sample=True
+        )
+
+
+def test_overflow_from_the_repetition_penalty_is_caught() -> None:
+    # 3.4e34 / 1e-4 = 3.4e38 is finite, but 3.4e35 / 1e-4 overflows.
+    logits = torch.tensor([[3.4e35, 1.0, 0.0]])
+
+    token = _sample_logits_or_sentinel(
+        logits,
+        temperature=1.0,
+        top_k=0,
+        top_p=1.0,
+        do_sample=False,
+        token_history=torch.tensor([0]),
+        repetition_penalty=MIN_REPETITION_PENALTY,
+    )
+
+    assert token.tolist() == [_UNSAMPLEABLE_TOKEN]
 
 
 @pytest.mark.parametrize("do_sample", [True, False])
@@ -727,9 +781,13 @@ def test_depth_decoder_sampling_floors_a_tiny_temperature(temperature) -> None:
     [
         [float("nan")] * 4,
         [float("inf"), float("nan"), float("-inf"), float("nan")],
+        [float("-inf")] * 4,
+        # Any NaN or +inf in a row fails it, even beside finite entries.
+        [float("nan"), 30.0, 1.0, 0.0],
+        [float("inf"), 30.0, 1.0, 0.0],
     ],
 )
-def test_depth_decoder_flags_a_row_with_no_finite_logit(row, do_sample) -> None:
+def test_depth_decoder_flags_a_row_with_a_non_finite_logit(row, do_sample) -> None:
     graph = _depth_sampler(0.9, do_sample=do_sample)
     graph._tok_buf.fill_(3)
 
@@ -745,14 +803,33 @@ def test_depth_decoder_flags_a_row_with_no_finite_logit(row, do_sample) -> None:
 
 
 @pytest.mark.parametrize("do_sample", [True, False])
-def test_depth_decoder_samples_around_non_finite_entries(do_sample) -> None:
+def test_depth_decoder_allows_masked_entries(do_sample) -> None:
     graph = _depth_sampler(0.9, do_sample=do_sample)
 
-    graph._cfg_sample(
-        torch.tensor([[[float("nan"), 30.0, float("inf"), float("nan")]]])
-    )
+    graph._cfg_sample(torch.tensor([[[float("-inf"), 30.0, float("-inf"), 0.0]]]))
 
     assert graph._tok_buf.tolist() == [1]
+    assert graph.nonfinite_logits.tolist() == [False]
+
+
+def test_depth_decoder_catches_overflow_from_the_temperature_floor() -> None:
+    graph = _depth_sampler(MIN_TEMPERATURE)
+
+    graph._cfg_sample(torch.tensor([[[3e34, 1.0, 0.0, 1.0]]]))
+
+    assert graph.nonfinite_logits.tolist() == [True]
+    assert graph._tok_buf.tolist() == [0]
+
+
+def test_depth_decoder_run_clears_a_stale_flag_even_on_its_early_return() -> None:
+    graph = object.__new__(DepthDecoderGraph)
+    graph.nonfinite_logits = torch.ones(1, dtype=torch.bool)
+    graph.num_decode_codebooks = 3
+    graph.device = "cpu"
+
+    # An odd CFG batch takes run()'s early return, before any graph replays.
+    graph.run(torch.zeros(3, 4), torch.zeros(3, dtype=torch.long))
+
     assert graph.nonfinite_logits.tolist() == [False]
 
 
@@ -858,10 +935,10 @@ def test_unsampleable_backbone_token_raises_at_the_eos_check(
         monkeypatch, FastStreamingConfig(max_new_tokens=10)
     )
     # Token 0 comes from the prefill; token n from decode step n - 1.
-    harness.next_tokens = [1] * bad_step + [UNSAMPLEABLE_TOKEN]
+    harness.next_tokens = [1] * bad_step + [_UNSAMPLEABLE_TOKEN]
     chunks = []
 
-    with pytest.raises(ValueError, match="cannot sample"):
+    with pytest.raises(NonFiniteLogitsError, match="cannot sample"):
         # extend keeps the chunks yielded before the error.
         chunks.extend(
             harness.runtime.iter_audio_chunks(
@@ -894,7 +971,7 @@ def test_depth_decoder_nonfinite_flag_raises_before_the_frame_is_used(
     observed = []
     chunks = []
 
-    with pytest.raises(ValueError, match="depth decoder"):
+    with pytest.raises(NonFiniteLogitsError, match="depth decoder"):
         chunks.extend(
             harness.runtime.iter_audio_chunks(
                 {"attention_mask": torch.ones(1, 1, dtype=torch.long)},
