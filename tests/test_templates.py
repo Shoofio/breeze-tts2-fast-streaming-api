@@ -5,19 +5,7 @@ import soundfile as sf
 import torch
 
 from breeze_infer.templates import _encode_prompt_audio
-
-
-class _FakeAudioTokenizer:
-    def __init__(self) -> None:
-        self.last_wav: np.ndarray | None = None
-        self.last_sr: int | None = None
-        self.encode_calls = 0
-
-    def encode(self, wav: np.ndarray, sr: int) -> dict[str, list[np.ndarray]]:
-        self.encode_calls += 1
-        self.last_wav = wav
-        self.last_sr = sr
-        return {"audio_codes": [np.zeros((4, 16), dtype=np.int16)]}
+from tests.fakes import FakeCodec, codec_frame_count
 
 
 class _FakeTokenizer:
@@ -56,12 +44,15 @@ def test_encode_prompt_audio_reads_with_soundfile_and_downmixes(tmp_path) -> Non
         axis=1,
     )
     sf.write(audio_path, wav, 24000)
-    tokenizer = _FakeAudioTokenizer()
+    tokenizer = FakeCodec()
 
     codes = _encode_prompt_audio(tokenizer, str(audio_path))
 
     assert isinstance(codes, torch.Tensor)
-    assert tuple(codes.shape) == (4, 16)
+    # 8 samples at 24 kHz is a fraction of one 1920-sample codec frame, so this is 1 frame,
+    # not the old fake's hard-coded 4 -- ``codec_frame_count`` is the real formula (also
+    # exercised directly in tests/test_fakes.py).
+    assert tuple(codes.shape) == (codec_frame_count(8, 24000), 16)
     assert tokenizer.last_sr == 24000
     assert tokenizer.last_wav is not None
     assert tokenizer.last_wav.shape == (8,)
