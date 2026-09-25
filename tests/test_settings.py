@@ -379,9 +379,87 @@ def test_cors_default_port_is_dropped(tmp_path: Path, entry: str, expected: str)
     assert settings.cors == (expected,)
 
 
-def test_cors_idn_host_becomes_punycode(tmp_path: Path) -> None:
-    settings = settings_from_args([str(tmp_path), "--cors", "https://café.example"])
+def test_cors_idn_host_rejected_suggests_punycode(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """c1: a browser's `Origin` header is always punycode, never raw Unicode, so this module
+    doesn't guess at an IDNA conversion -- the operator must already pass the punycode form."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "https://café.example"])
+    assert "punycode" in capsys.readouterr().err
+
+
+def test_cors_punycode_idn_host_accepted(tmp_path: Path) -> None:
+    settings = settings_from_args([str(tmp_path), "--cors", "https://xn--caf-dma.example"])
     assert settings.cors == ("https://xn--caf-dma.example",)
+
+
+def test_cors_underscore_in_hostname_allowed(tmp_path: Path) -> None:
+    """c2: docker-compose service names (e.g. `backend_service`) are common as `--cors` hosts
+    and aren't valid DNS labels, but must not be rejected."""
+    settings = settings_from_args(
+        [str(tmp_path), "--cors", "http://backend_service.local:8000"]
+    )
+    assert settings.cors == ("http://backend_service.local:8000",)
+
+
+def test_cors_ipv4_mapped_ipv6_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """c3: `::ffff:a.b.c.d` is valid IPv6 syntax, but no browser ever sends this form -- an
+    allowlist entry using it could never match a real `Origin` header."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "http://[::ffff:127.0.0.1]"])
+    assert "IPv4-mapped" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["https://a.example\t.evil.example", "https://a\n.example", "https://a .example"],
+)
+def test_cors_control_character_or_whitespace_rejected(
+    tmp_path: Path, entry: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """c4: `urlsplit` silently strips a tab/CR/LF rather than rejecting them, which could let
+    `"https://a.example\\t.evil.example"` parse as the (allowed) `a.example` while actually
+    meaning something else entirely; every control character and whitespace must be rejected
+    up front instead."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", entry])
+    assert "control characters or whitespace" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("entry", ["https://evil.example.2130706433", "https://evil.example.0x7f000001"])
+def test_cors_numeric_or_hex_last_label_rejected(
+    tmp_path: Path, entry: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """c6: some legacy URL parsers treat an all-numeric or hex-looking trailing label as an
+    encoded IP address, a known trick for smuggling a real destination past a hostname
+    allowlist; a real DNS label is never purely numeric or hex-prefixed."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", entry])
+    assert "numeric" in capsys.readouterr().err
+
+
+def test_cors_ipvfuture_literal_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """c6: `[v1....]` (RFC 3986 IPvFuture) is bracketed literal syntax no browser ever sends."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "http://[v1.fe80::1]"])
+    assert "IPvFuture" in capsys.readouterr().err
+
+
+def test_cors_bare_percent_in_hostname_is_not_reported_as_a_zone_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """c7: "zone id" only makes sense for a '%' *inside brackets* (an IPv6 literal); a stray '%'
+    in a plain hostname is just an invalid character, not a zone id."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "http://a%25b.example"])
+    err = capsys.readouterr().err
+    assert "zone id" not in err
+    assert "letters, digits" in err
 
 
 def test_cors_ipv6_uppercase_and_expanded_form_canonicalizes(tmp_path: Path) -> None:

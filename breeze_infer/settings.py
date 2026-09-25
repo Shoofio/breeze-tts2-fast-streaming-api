@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from breeze_infer.cors import canonical_origin
+from breeze_infer.origins import canonical_origin
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
@@ -101,8 +101,8 @@ def _parse_cors_origins(value: str | None) -> tuple[str, ...]:
 
     Otherwise ``value`` is a comma-separated list. Each entry is trimmed,
     validated and canonicalized as a bare origin (``canonical_origin``, in
-    ``cors.py`` so ``CorsMiddleware`` can canonicalize an incoming ``Origin``
-    header the same way before comparing) and deduplicated, preserving
+    ``origins.py`` so ``cors.py``'s ``CorsMiddleware`` can canonicalize an
+    incoming ``Origin`` header the same way before comparing) and deduplicated, preserving
     first-seen order -- so ``http://a.example:80`` and ``http://a.example``
     collapse to one entry. ``"*"`` means any origin only when every entry is
     ``"*"`` (so ``"*,*"`` collapses to ``("*",)``); mixed with any other

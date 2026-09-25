@@ -20,11 +20,17 @@ import pytest
 from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
+from starlette.routing import Mount, Route
 
 from breeze_infer import __version__
 from breeze_infer.api import Components, create_app
 from breeze_infer.body_limit import BodyLimitMiddleware
-from breeze_infer.cors import CorsMiddleware, CorsPolicy
+from breeze_infer.cors import (
+    CorsMiddleware,
+    CorsPolicy,
+    _route_methods,
+    preflight_headers,
+)
 from breeze_infer.events import Emitter
 from breeze_infer.gpu import GpuGate, GpuThread
 from breeze_infer.limits import MAX_BODY_BYTES
@@ -206,11 +212,9 @@ def test_bc_20_vary_origin_on_every_response_in_allowlist_mode(
     no_origin = client.get("/health")
     disallowed = client.get("/health", headers={"Origin": EVIL_ORIGIN})
     not_found = client.get("/nope", headers={"Origin": EVIL_ORIGIN})
-    # PUT, not POST/DELETE, so CORS's own unsafe-method check doesn't produce a 403 first --
-    # this must reach Starlette's routing and come back as a plain wrong-method 405.
-    wrong_method = client.put("/health", headers={"Origin": EVIL_ORIGIN})
-    # GET (not POST/DELETE), so CORS's own unsafe-method 403 check doesn't pre-empt this: the
-    # real `Content-Length` alone must trip BodyLimitMiddleware's immediate-rejection path.
+    # GET (not POST/DELETE/PUT/...), so CORS's own now-broadened (review issue 6)
+    # not-GET/HEAD/OPTIONS-and-disallowed check doesn't pre-empt this: the real
+    # `Content-Length` alone must trip BodyLimitMiddleware's immediate-rejection path.
     too_large = client.request(
         "GET", "/health", content=b"x" * (MAX_BODY_BYTES + 1), headers={"Origin": EVIL_ORIGIN}
     )
@@ -220,10 +224,24 @@ def test_bc_20_vary_origin_on_every_response_in_allowlist_mode(
     assert disallowed.headers["vary"] == "Origin"
     assert not_found.status_code == 404
     assert not_found.headers["vary"] == "Origin"
-    assert wrong_method.status_code == 405
-    assert wrong_method.headers["vary"] == "Origin"
     assert too_large.status_code == 413
     assert too_large.headers["vary"] == "Origin"
+
+
+def test_bc_20_vary_origin_on_a_plain_wrong_method_405() -> None:
+    """BC-20, continued: a wrong-*method* 405 (as opposed to CORS's own preflight-405) must
+    still carry `Vary: Origin` in allowlist mode. `GET` is used against a route that only
+    registers `POST` -- `GET` is exempt from the disallowed-origin check (review issue 6), so
+    this reaches Starlette's routing and comes back as a plain wrong-method 405, not CORS's own
+    403.
+    """
+    client, calls = _counting_app(CorsPolicy((GOOD_ORIGIN,)))
+
+    response = client.get("/v1/voices", headers={"Origin": EVIL_ORIGIN})
+
+    assert response.status_code == 405
+    assert response.headers["vary"] == "Origin"
+    assert calls == []
 
 
 def test_bc_20_vary_origin_on_a_500(make_client: Callable[..., TestClient]) -> None:
@@ -276,6 +294,9 @@ def test_bc_21_preflight_is_route_aware(make_client: Callable[..., TestClient]) 
 
     assert unsupported_method.status_code == 405
     assert unsupported_method.json() == METHOD_NOT_ALLOWED
+    # review issue 3: the preflight's own 405 carries an Allow header, same as a real
+    # wrong-method response would (test_health.py's test_bc_18_wrong_method_on_health_is_405).
+    assert set(unsupported_method.headers["allow"].split(", ")) == {"GET", "HEAD"}
 
 
 def test_disallowed_preflight_gets_403(make_client: Callable[..., TestClient]) -> None:
@@ -288,6 +309,113 @@ def test_disallowed_preflight_gets_403(make_client: Callable[..., TestClient]) -
 
     assert response.status_code == 403
     assert response.json() == ORIGIN_NOT_ALLOWED
+
+
+def test_preflight_unions_methods_across_separate_routes_on_one_path() -> None:
+    """review issue HIGH-1: FastAPI registers `@app.get()`/`@app.post()` on the same path as two
+    separate `Route` objects, not one route with two methods. `_route_methods` must union every
+    matching route's methods, not return only the first route it finds -- otherwise a preflight
+    for the second route's method wrongly comes back `405`.
+
+    Also incidentally locks in the HIGH-1 "stop claiming HEAD is added for GET" correction:
+    FastAPI's `APIRoute` (unlike base Starlette `Route`) does *not* auto-add `HEAD` when `GET` is
+    declared, so a plain `@app.get()` route's `.methods` really is just `{"GET"}`.
+    """
+    app = FastAPI()
+
+    @app.get("/v1/voices")
+    async def list_voices() -> dict:
+        return {}
+
+    @app.post("/v1/voices")
+    async def create_voice() -> dict:
+        return {}
+
+    client = _wrapped(app, CorsPolicy((GOOD_ORIGIN,)))
+
+    response = client.options(
+        "/v1/voices",
+        headers={"Origin": GOOD_ORIGIN, "Access-Control-Request-Method": "POST"},
+    )
+
+    assert response.status_code == 204
+    assert set(response.headers["access-control-allow-methods"].split(", ")) == {
+        "GET",
+        "POST",
+        "OPTIONS",
+    }
+
+
+def test_preflight_without_origin_is_not_a_preflight(
+    make_client: Callable[..., TestClient],
+) -> None:
+    """review issue 4: a real browser always sends `Origin` on a preflight; an `OPTIONS` with
+    `Access-Control-Request-Method` but no `Origin` isn't one, and must fall through to the
+    app's own wrong-method `405` rather than being answered as CORS preflight.
+    """
+    client = make_client(["--cors", GOOD_ORIGIN])
+
+    response = client.options("/health", headers={"Access-Control-Request-Method": "GET"})
+
+    assert response.status_code == 405
+    assert "access-control-allow-methods" not in response.headers
+    assert "access-control-max-age" not in response.headers
+
+
+def test_route_methods_skips_a_route_with_no_methods_attribute() -> None:
+    """review issue 5: a `Mount` (e.g. for static files) has no `.methods` attribute at all;
+    `_route_methods` must use `getattr(route, "methods", None)` and skip it, rather than
+    crashing on a bare `route.methods` access.
+    """
+
+    async def _endpoint(request: object) -> None:
+        del request
+
+    async def _sub_app(scope: object, receive: object, send: object) -> None:
+        del scope, receive, send
+
+    router = FastAPI().router
+    router.routes = [Mount("/static", app=_sub_app), Route("/static/thing", _endpoint, methods=["GET"])]
+    scope = {"type": "http", "method": "OPTIONS", "path": "/static/thing", "headers": []}
+
+    assert _route_methods(router, scope) == {"GET", "HEAD"}
+
+
+@pytest.mark.parametrize("method", ["PUT", "PATCH"])
+def test_every_unsafe_method_not_just_post_delete_is_blocked_from_a_disallowed_origin(
+    method: str,
+) -> None:
+    """review issue 6: only `POST`/`DELETE` were blocked before; any method other than
+    `GET`/`HEAD`/`OPTIONS` can write or have side effects, so all of them must be."""
+    app = FastAPI()
+    calls: list[str] = []
+
+    @app.api_route("/v1/voices/x", methods=["PUT", "PATCH"])
+    async def update_voice() -> dict:
+        calls.append(method)
+        return {"ok": True}
+
+    client = _wrapped(app, CorsPolicy((GOOD_ORIGIN,)))
+
+    response = client.request(method, "/v1/voices/x", headers={"Origin": EVIL_ORIGIN})
+
+    assert response.status_code == 403
+    assert response.json() == ORIGIN_NOT_ALLOWED
+    assert calls == []
+
+
+def test_preflight_headers_no_longer_takes_a_policy_argument() -> None:
+    """review issue 9: nothing in `preflight_headers` varies by `policy`; the dead parameter is
+    dropped."""
+    headers = dict(preflight_headers({"GET", "HEAD"}, "content-type"))
+
+    assert set(headers[b"access-control-allow-methods"].split(b", ")) == {
+        b"GET",
+        b"HEAD",
+        b"OPTIONS",
+    }
+    assert headers[b"access-control-max-age"] == b"86400"
+    assert headers[b"access-control-allow-headers"] == b"content-type"
 
 
 # ------------------------------------------------------------------------- expose-headers
