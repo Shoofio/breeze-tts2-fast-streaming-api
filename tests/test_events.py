@@ -138,7 +138,7 @@ def test_emit_round_trips_non_ascii_field_values() -> None:
 
     line = sink.getvalue()
     assert line.isascii()  # the raw bytes on the wire are pure ASCII
-    assert "café" not in line
+    assert "\\u00e9" in line  # 'é' (U+00E9), escaped -- not just "not the literal character"
     parsed = json.loads(line)
     assert parsed == record
     assert parsed["voice_id"] == "café_日本語"
@@ -204,8 +204,10 @@ def test_emit_swallows_a_valueerror_from_a_closed_sink() -> None:
 
 def test_emit_invalid_fallback_keeps_schema_ts_level_and_request_context() -> None:
     """E1: the `event.invalid` record must still carry `event_schema`/`ts`, be `level=warning`,
-    list the offending field names under `fields`, and keep any of `request_id`/`session_id`/
-    `piece_index` that were present -- so a bad field never loses the trail back to its request."""
+    and keep any of `request_id`/`session_id`/`piece_index` that were present -- so a bad field
+    never loses the trail back to its request. `fields` lists only the names of fields that
+    individually fail to serialise (E3): `other_field` here serialises fine on its own, so it's
+    dropped from the top-level record (only `rtf`'s reserved names are kept) but not listed."""
     sink = io.StringIO()
     events = Emitter(sink=sink, clock=lambda: 42.0)
 
@@ -229,6 +231,124 @@ def test_emit_invalid_fallback_keeps_schema_ts_level_and_request_context() -> No
     assert parsed["session_id"] == "sess-1"
     assert parsed["piece_index"] == 3
     assert "other_field" not in parsed
-    assert parsed["fields"] == sorted(
-        ["rtf", "request_id", "session_id", "piece_index", "other_field"]
+    assert parsed["fields"] == ["rtf"]
+
+
+def test_emit_invalid_fallback_drops_a_bad_context_value_but_keeps_the_good_ones() -> None:
+    """E1: a context value that itself fails to serialise must not be copied into the fallback
+    (that would just fail again) -- it's dropped, and listed under `fields` alongside whatever
+    field actually triggered the fallback in the first place."""
+    sink = io.StringIO()
+    events = Emitter(sink=sink, clock=lambda: 0.0)
+
+    record = events.emit(
+        "speech.completed",
+        rtf=math.nan,
+        request_id=object(),  # unserialisable on its own
+        session_id="sess-1",
     )
+
+    parsed = json.loads(sink.getvalue())
+    assert parsed == record
+    assert "request_id" not in parsed
+    assert parsed["session_id"] == "sess-1"
+    assert parsed["fields"] == sorted(["rtf", "request_id"])
+
+
+def test_emit_does_not_unwrap_a_non_numpy_object_with_an_item_method() -> None:
+    """E3/E5 (pass 1): `_json_default` only unwraps `np.generic`, not "anything with `.item()`".
+    A duck-typed look-alike must still fail serialisation like any other unknown type."""
+
+    class _FakeNumpyLike:
+        def item(self) -> int:
+            return 42
+
+    sink = io.StringIO()
+    events = Emitter(sink=sink, clock=lambda: 0.0)
+
+    record = events.emit("voice.used", payload=_FakeNumpyLike())
+
+    parsed = json.loads(sink.getvalue())
+    assert parsed == record
+    assert parsed["event"] == "event.invalid"
+    assert parsed["error"] == "TypeError"
+    assert parsed["fields"] == ["payload"]
+
+
+def test_emit_turns_an_arbitrary_serialisation_exception_into_event_invalid() -> None:
+    """E1/E2: not just `TypeError`/`ValueError` -- literally anything json's encoder raises while
+    walking a field's value must be caught, since a bad sink or a hostile value could raise
+    anything."""
+
+    class _BoomingDict(dict):
+        def items(self):
+            raise RuntimeError("boom")
+
+    sink = io.StringIO()
+    events = Emitter(sink=sink, clock=lambda: 0.0)
+
+    record = events.emit("voice.used", payload=_BoomingDict(a=1))
+
+    parsed = json.loads(sink.getvalue())
+    assert parsed == record
+    assert parsed["event"] == "event.invalid"
+    assert parsed["error"] == "RuntimeError"
+    assert parsed["fields"] == ["payload"]
+
+
+def test_emit_falls_back_to_the_fixed_minimal_line_if_the_fallback_itself_cant_serialise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E1: even the enriched `event.invalid` fallback must never raise. This forces that second
+    serialisation to fail too (by targeting only the enriched fallback dict, not the per-field
+    probes `_serializes` runs, nor the final minimal dict), and checks the line still comes out
+    as the fixed `{"event_schema": 1, "event": "event.invalid", "level": "warning"}`."""
+    real_dumps = json.dumps
+
+    def flaky_dumps(obj: object, *args: object, **kwargs: object) -> str:
+        if isinstance(obj, dict) and obj.get("event") == "event.invalid" and "invalid_event" in obj:
+            raise RuntimeError("the fallback serialisation is broken too")
+        return real_dumps(obj, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("breeze_infer.events.json.dumps", flaky_dumps)
+
+    sink = io.StringIO()
+    events = Emitter(sink=sink, clock=lambda: 0.0)
+
+    record = events.emit("voice.used", payload=object())
+
+    parsed = json.loads(sink.getvalue())
+    assert parsed == record == {
+        "event_schema": EVENT_SCHEMA,
+        "event": "event.invalid",
+        "level": "warning",
+    }
+
+
+def test_emit_drops_a_nested_emit_call_from_inside_the_sinks_write() -> None:
+    """E2: a sink that itself calls back into `emit` (e.g. logging its own write failure) must
+    not recurse -- the thread-local re-entry guard drops the nested call instead of writing it,
+    though it still returns a record like any other call."""
+    holder: dict[str, Emitter] = {}
+
+    class _ReentrantSink(io.StringIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.nested_record: dict[str, object] | None = None
+
+        def write(self, line: str) -> int:
+            if self.nested_record is None:
+                self.nested_record = holder["emitter"].emit("nested.event")
+            return super().write(line)
+
+    sink = _ReentrantSink()
+    events = Emitter(sink=sink, clock=lambda: 0.0)
+    holder["emitter"] = events
+
+    events.emit("outer.event")
+
+    lines = sink.getvalue().splitlines()
+    assert len(lines) == 1  # the nested call was dropped, not written
+    assert json.loads(lines[0])["event"] == "outer.event"
+    assert sink.nested_record is not None
+    assert sink.nested_record["event"] == "nested.event"  # still returns a record, just unwritten
