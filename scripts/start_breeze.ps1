@@ -1,4 +1,3 @@
-fg
 #Requires -Version 5.1
 <#
 .SYNOPSIS
