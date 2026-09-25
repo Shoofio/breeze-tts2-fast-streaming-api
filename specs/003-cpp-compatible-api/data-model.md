@@ -101,17 +101,17 @@ for a FLAC whose STREAMINFO `total_samples` was left at 0 -- what a streaming en
 one piped through `ffmpeg`). A trustworthy count over 30 s is rejected without decoding.
 Otherwise the actual decoded length decides instead: the decode is bounded at one sample past
 30 s, so an untrustworthy-length file still can't allocate or read past that regardless of what
-its header claims, and ending early there is expected rather than an error. Two checks (skipped
-when the recovered length is already going to be rejected as too short, below) make a corrupted
-file unlikely to be mistaken for one that legitimately ended: the underlying bytes must be almost
-fully consumed, and -- for FLAC, which always falls back to an uncompressed subframe for data it
-can't compress -- its audio frames (the file, minus its metadata blocks) can't be much bigger than
-an uncompressed encoding of the recovered samples would need. **Known limit**: a stream cut
-exactly at a frame boundary -- corruption or truncation that happens to leave what remains a
-complete, well-formed (if shorter) FLAC stream in its own right -- can't be told apart from a
-genuinely short recording without an independently known length, and isn't; these checks catch the
-much more common case of a cut landing inside a frame or past the metadata needed to make sense of
-one.
+its header claims. Ending early there is expected rather than an error, once the underlying bytes
+are almost fully consumed -- a check skipped when the recovered length is already going to be
+rejected as too short, below. **Known limit**: for a FLAC with unknown length (piped), a stream cut
+short -- between frames or inside one -- can be accepted with fewer samples than the original;
+nothing here can tell a deliberately or accidentally shortened but well-formed stream apart from a
+genuinely short recording without an independently known length. A size-based plausibility check
+(an upper bound on compressed bytes per sample) was tried and removed: it was both too strict --
+it rejected valid `ffmpeg` output, a short final frame at the end of a `-frame_size`-encoded
+stream -- and too loose, since a cut landing inside a frame could still look plausible. Genuinely
+corrupted data is still rejected reliably: libsndfile itself raises a distinct, non-tolerated
+decode failure for that, separate from the one signalling a stream's real end.
 
 Failures:
 - empty upload gives `invalid_audio`;

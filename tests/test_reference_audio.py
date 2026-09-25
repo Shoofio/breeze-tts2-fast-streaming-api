@@ -335,10 +335,9 @@ def test_flac_unknown_length_under_minimum_is_audio_too_short_not_invalid_audio(
 
 @requires_ffmpeg
 def test_flac_unknown_length_with_large_comment_is_accepted() -> None:
-    """1+3 HIGH: a comment block is real metadata, not audio. The plausibility bound
-    must be computed from the file size *after* its metadata, not the whole file --
-    otherwise a large enough tag makes a perfectly ordinary recording look
-    implausibly big for its sample count and gets wrongly rejected."""
+    """A large comment block is real metadata, not audio, and must not affect
+    whether the recording decodes -- regression coverage for a heuristic that used
+    to size-check the whole file (comment included) and wrongly rejected this."""
     blob = _ffmpeg_flac(
         "sine=frequency=220:duration=2:sample_rate=24000",
         metadata={"comment": "x" * 120_000},
@@ -352,14 +351,12 @@ def test_flac_unknown_length_with_large_comment_is_accepted() -> None:
 
 @requires_ffmpeg
 def test_flac_unknown_length_with_padding_and_tags_is_accepted() -> None:
-    """1+3 HIGH / 6: ffmpeg's own FLAC muxer adds a padding block by default
-    alongside a Vorbis comment block for title/artist/album -- real metadata that
-    must be excluded from the audio-frame size bound. Uses noise (the least
-    compressible, most size-sensitive content) at the smallest allowed sample rate,
-    where the metadata-to-audio ratio is most likely to trip a bound that doesn't
-    account for it."""
+    """ffmpeg's own FLAC muxer adds a padding block by default alongside a Vorbis
+    comment block for title/artist/album -- real metadata that must not affect
+    whether the recording decodes. Uses noise (seeded for a reproducible fixture)
+    at the smallest allowed sample rate."""
     blob = _ffmpeg_flac(
-        "anoisesrc=color=white:duration=0.08:sample_rate=8000",
+        "anoisesrc=color=white:duration=0.08:sample_rate=8000:seed=1",
         metadata={"title": "T", "artist": "A", "album": "Alb"},
     )
 
@@ -372,11 +369,10 @@ def test_flac_unknown_length_with_padding_and_tags_is_accepted() -> None:
 @requires_ffmpeg
 @pytest.mark.parametrize("frame_size", [16, 32])
 def test_flac_unknown_length_with_small_frame_size_is_accepted(frame_size: int) -> None:
-    """2 HIGH: many small frames (ffmpeg's -frame_size) means proportionally more
-    frame-header/footer overhead for the same duration. The plausibility bound must
-    scale its overhead allowance with the real frame count -- derived from
-    STREAMINFO's own minimum block size -- rather than a fixed guess, or a stream
-    legitimately encoded this way is wrongly rejected."""
+    """Many small frames (ffmpeg's -frame_size) is still a perfectly ordinary
+    stream, decodable start to finish -- regression coverage for a heuristic that
+    used to size-check against a per-frame overhead estimate and wrongly rejected
+    this when there were many more (smaller) frames than it assumed."""
     blob = _ffmpeg_flac("sine=frequency=220:duration=1:sample_rate=24000", frame_size=frame_size)
 
     audio = decode(blob)
@@ -386,16 +382,63 @@ def test_flac_unknown_length_with_small_frame_size_is_accepted(frame_size: int) 
 
 
 @requires_ffmpeg
-def test_flac_unknown_length_under_minimum_wins_over_size_check() -> None:
-    """4: too-short is checked before the plausibility check, so a piped clip that
-    ends up under 80 ms is always audio_too_short -- never invalid_audio, whatever
-    its audio-to-metadata size ratio looks like."""
+@pytest.mark.parametrize("sample_rate", [8000, 16000, 24000])
+@pytest.mark.parametrize("duration", [0.15, 0.3, 0.5])
+def test_flac_unknown_length_with_short_final_frame_is_accepted(duration: float, sample_rate: int) -> None:
+    """The specific case review found still wrongly rejected: a short clip encoded
+    with a large -frame_size (4608) ends in one short, partial final frame relative
+    to the rest -- exactly what made the old per-frame-overhead heuristic misjudge
+    the file's plausible size. Seeded noise (#4) for a reproducible fixture, across
+    every allowed sample rate at the low end where this bit hardest."""
+    blob = _ffmpeg_flac(f"anoisesrc=color=white:duration={duration}:sample_rate={sample_rate}:seed=1", frame_size=4608)
+
+    audio = decode(blob)
+
+    assert audio.sample_rate == sample_rate
+    assert audio.duration_seconds == pytest.approx(duration, abs=1e-3)
+
+
+@requires_ffmpeg
+def test_flac_unknown_length_under_minimum_wins_over_end_of_stream_check() -> None:
+    """4: too-short is checked before the end-of-stream check, so a piped clip that
+    ends up under 80 ms is always audio_too_short -- never invalid_audio."""
     blob = _ffmpeg_flac("sine=frequency=220:duration=0.05:sample_rate=16000")
 
     with pytest.raises(ApiError) as exc_info:
         decode(blob)
     assert exc_info.value.code == "audio_too_short"
     assert exc_info.value.message == "ref_audio is too short"
+
+
+@requires_ffmpeg
+def test_flac_unknown_length_tail_cut_is_accepted_with_fewer_samples() -> None:
+    """Known limit (module docstring, point 3): a piped FLAC cut short can decode
+    successfully with fewer samples than the original, when the cut happens to
+    land somewhere libsndfile's own bookkeeping treats as a plausible end rather
+    than a decode error. This isn't a corruption bypass -- `_corrupt_middle_third`
+    above still gets reliably rejected by libsndfile itself -- it's a real gap:
+    nothing here can tell a deliberately shortened but well-formed stream apart
+    from a genuinely short recording without an independently known length. A
+    small sweep of exact cut points finds one (some cut points instead hit a
+    genuine decode error and are rejected, which is also fine -- the point is that
+    at least one accepted, shortened case exists, documenting the gap rather than
+    asserting it never happens)."""
+    clean_blob = _ffmpeg_flac("sine=frequency=220:duration=1:sample_rate=16000")
+    clean_audio = decode(clean_blob)
+
+    found_shorter_accept = False
+    for lost_bytes in range(1, 500):
+        truncated = clean_blob[: len(clean_blob) - lost_bytes]
+        try:
+            audio = decode(truncated)
+        except ApiError:
+            continue
+        assert audio.samples.shape[0] <= clean_audio.samples.shape[0]
+        if audio.samples.shape[0] < clean_audio.samples.shape[0]:
+            found_shorter_accept = True
+            break
+
+    assert found_shorter_accept
 
 
 @requires_ffmpeg
@@ -409,8 +452,11 @@ def test_flac_unknown_length_never_silently_accepts_truncated_corruption() -> No
     plausible-looking but shorter or otherwise different result. That silent
     truncation, not "any corruption at all", was the actual bug: an accepted
     result's samples, not just its length or duration, must always match the clean
-    file exactly. Uses a real ffmpeg-piped fixture (6), not the hand-built
-    simulation, for the same reason the size-check fixtures below do.
+    file exactly. This rejection comes from libsndfile's own decode failure on the
+    corrupted data (a different, non-tolerated error from the one that signals a
+    genuine end-of-stream), not from any check of ours -- confirmed by the fact
+    that removing the (since-removed) size heuristic didn't change this test's
+    outcome. Uses a real ffmpeg-piped fixture, not the hand-built simulation.
     """
     clean_blob = _ffmpeg_flac("sine=frequency=220:duration=1:sample_rate=16000")
     clean_audio = decode(clean_blob)
