@@ -576,84 +576,188 @@ def test_a_signal_during_the_load_asks_main_for_a_hard_exit() -> None:
     assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
 
 
-@pytest.mark.usefixtures("keep_sigint")
-def test_serve_raising_during_the_load_hard_exits_non_zero_with_the_traceback(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """os._exit would swallow the exception: a crash must not look like a clean stop (0)."""
-    sink = io.StringIO()
-    components = _components(sink)
-    started, release = threading.Event(), threading.Event()
+def _stopping_events(sink: io.StringIO) -> list[dict[str, Any]]:
+    return [event for event in _events(sink) if event["event"] == "server.stopping"]
+
+
+def _serve_with(
+    monkeypatch: pytest.MonkeyPatch,
+    components: Components,
+    load: Any,
+    main_loop_raises: BaseException | None,
+    stop_gpu_raises: BaseException | None = None,
+    wait_until: Any = None,
+) -> tuple[ServeOutcome, BaseException | None]:
+    """Run serve() with uvicorn's main loop (once `wait_until()` holds) returning or raising
+    `main_loop_raises`, and `_stop_gpu` optionally raising. Returns the outcome and whatever
+    serve() raised."""
+
+    async def main_loop(self: Any) -> None:
+        if wait_until is not None:
+            await _wait_until(wait_until)
+        if main_loop_raises is not None:
+            raise main_loop_raises
+
+    monkeypatch.setattr(api._Server, "main_loop", main_loop)
+    if stop_gpu_raises is not None:
+
+        async def broken_stop_gpu(*_args: Any) -> None:
+            raise stop_gpu_raises
+
+        monkeypatch.setattr(api, "_stop_gpu", broken_stop_gpu)
     outcome = ServeOutcome()
-
-    def load() -> LoadedModel:
-        started.set()
-        assert release.wait(10)
-        return _loaded()
-
-    async def broken_main_loop(self: Any) -> None:
-        await asyncio.to_thread(started.wait, 10)
-        raise RuntimeError("uvicorn broke")
-
-    monkeypatch.setattr(api._Server, "main_loop", broken_main_loop)
 
     async def scenario() -> None:
         app = create_app(components)
         await serve(components, app, [_bind_one("127.0.0.1", 0)], load, outcome)
 
     try:
-        with pytest.raises(RuntimeError, match="uvicorn broke"):
-            asyncio.run(asyncio.wait_for(scenario(), 10))
-    finally:
-        release.set()
-        components.gpu.shutdown()
-    assert outcome == ServeOutcome(1, hard_exit=True)
-    stderr = capsys.readouterr().err
-    assert "Traceback" in stderr
-    assert "RuntimeError: uvicorn broke" in stderr
-    [crashed] = _stopping_events(sink)  # one event, not a warning plus an error
-    assert (crashed["level"], crashed["reason"]) == ("error", "serve raised")
-    assert crashed["hard_exit_reason"] == "load in progress"
-    assert "uvicorn broke" in crashed["error"]
-    assert "RuntimeError" in crashed["traceback"]
-
-
-def _stopping_events(sink: io.StringIO) -> list[dict[str, Any]]:
-    return [event for event in _events(sink) if event["event"] == "server.stopping"]
+        asyncio.run(scenario())
+    except BaseException as exc:  # noqa: BLE001 - returned for the test to inspect
+        return outcome, exc
+    return outcome, None
 
 
 @pytest.mark.usefixtures("keep_sigint")
-def test_a_failing_gpu_stop_cannot_hide_the_crash(
+@pytest.mark.parametrize(
+    ("crash", "exit_code"),
+    [
+        (RuntimeError("uvicorn broke"), 1),
+        (SystemExit(3), 3),  # SystemExit's own int code is kept
+        (KeyboardInterrupt(), 130),
+    ],
+    ids=["exception", "system-exit", "keyboard-interrupt"],
+)
+def test_a_crash_during_the_load_hard_exits_with_its_code_and_one_error_event(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    crash: BaseException,
+    exit_code: int,
+) -> None:
+    """os._exit would swallow the exception: a crash must not look like a clean stop (0)."""
+    sink = io.StringIO()
+    components = _components(sink)
+    started, release = threading.Event(), threading.Event()
+
+    def load() -> LoadedModel:
+        started.set()
+        assert release.wait(10)
+        return _loaded()
+
+    try:
+        outcome, raised = _serve_with(monkeypatch, components, load, crash, wait_until=started.is_set)
+    finally:
+        release.set()
+        components.gpu.shutdown()
+
+    assert raised is crash
+    assert outcome == ServeOutcome(exit_code, hard_exit=True)
+    assert type(crash).__name__ in capsys.readouterr().err
+    [stopping] = _stopping_events(sink)  # one event, not a warning plus an error
+    assert (stopping["level"], stopping["reason"]) == ("error", "load in progress")
+    assert type(crash).__name__ in stopping["crash"]
+    assert "stop_error" not in stopping
+
+
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_cancelled_serve_during_the_load_is_not_a_crash(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     sink = io.StringIO()
     components = _components(sink)
-    outcome = ServeOutcome()
+    started, release = threading.Event(), threading.Event()
 
-    async def broken_main_loop(self: Any) -> None:
-        raise RuntimeError("uvicorn broke")
-
-    async def broken_stop_gpu(*args: Any) -> None:
-        outcome.hard_exit = True  # decided, then failed before reporting anything
-        raise OSError("stop broke")
-
-    monkeypatch.setattr(api._Server, "main_loop", broken_main_loop)
-    monkeypatch.setattr(api, "_stop_gpu", broken_stop_gpu)
-
-    async def scenario() -> None:
-        app = create_app(components)
-        await serve(components, app, [_bind_one("127.0.0.1", 0)], _loaded, outcome)
+    def load() -> LoadedModel:
+        started.set()
+        assert release.wait(10)
+        return _loaded()
 
     try:
-        with pytest.raises(OSError, match="stop broke"):
-            asyncio.run(asyncio.wait_for(scenario(), 10))
+        outcome, raised = _serve_with(
+            monkeypatch, components, load, asyncio.CancelledError(), wait_until=started.is_set
+        )
+    finally:
+        release.set()
+        components.gpu.shutdown()
+
+    assert isinstance(raised, asyncio.CancelledError)
+    assert outcome == ServeOutcome(0, hard_exit=True)
+    assert capsys.readouterr().err == ""
+    [stopping] = _stopping_events(sink)
+    assert (stopping["level"], stopping["reason"]) == ("warning", "load in progress")
+    assert "crash" not in stopping
+
+
+def test_a_crash_without_a_hard_exit_is_reported_and_propagates(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sink = io.StringIO()
+    components = _components(sink)
+    crash = RuntimeError("uvicorn broke")
+
+    def loaded() -> bool:  # the load is over, so the GPU drains normally
+        return components.readiness.runtime is not None
+
+    outcome, raised = _serve_with(monkeypatch, components, _loaded, crash, wait_until=loaded)
+
+    assert raised is crash
+    # No hard exit: the exception reaches main() and Python prints it and exits non-zero.
+    assert outcome.hard_exit is False
+    assert capsys.readouterr().err == ""
+    [stopping] = _stopping_events(sink)
+    assert (stopping["level"], stopping["reason"]) == ("error", "serve raised")
+    assert "uvicorn broke" in stopping["crash"]
+
+
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_failing_gpu_stop_hard_exits_with_ex_software(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """It may have failed with the GPU thread still busy: exiting normally could hang."""
+    sink = io.StringIO()
+    components = _components(sink)
+    stop_error = OSError("stop broke")
+
+    try:
+        outcome, raised = _serve_with(
+            monkeypatch, components, _loaded, None, stop_gpu_raises=stop_error
+        )
     finally:
         components.gpu.shutdown()
-    assert outcome == ServeOutcome(1, hard_exit=True)
-    assert "RuntimeError: uvicorn broke" in capsys.readouterr().err
-    [crashed] = _stopping_events(sink)
-    assert (crashed["level"], crashed["reason"]) == ("error", "serve raised")
-    assert "uvicorn broke" in crashed["error"]
+
+    assert raised is stop_error
+    assert outcome == ServeOutcome(70, hard_exit=True)
+    assert "OSError: stop broke" in capsys.readouterr().err
+    [stopping] = _stopping_events(sink)
+    assert (stopping["level"], stopping["reason"]) == ("error", "gpu stop failed")
+    assert "stop broke" in stopping["stop_error"]
+    assert "crash" not in stopping
+
+
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_crash_and_a_failing_gpu_stop_re_raise_the_crash_and_report_both(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sink = io.StringIO()
+    components = _components(sink)
+    crash, stop_error = RuntimeError("uvicorn broke"), OSError("stop broke")
+
+    try:
+        outcome, raised = _serve_with(
+            monkeypatch, components, _loaded, crash, stop_gpu_raises=stop_error
+        )
+    finally:
+        components.gpu.shutdown()
+
+    assert raised is crash
+    assert outcome == ServeOutcome(70, hard_exit=True)
+    stderr = capsys.readouterr().err
+    assert "RuntimeError: uvicorn broke" in stderr
+    assert "OSError: stop broke" in stderr
+    [stopping] = _stopping_events(sink)
+    assert (stopping["level"], stopping["reason"]) == ("error", "gpu stop failed")
+    assert "uvicorn broke" in stopping["crash"]
+    assert "stop broke" in stopping["stop_error"]
 
 
 @posix_only
@@ -694,9 +798,10 @@ def test_serve_raising_with_a_stuck_drain_keeps_ex_software(
         components.gpu.shutdown()
     assert outcome == ServeOutcome(70, hard_exit=True)
     assert "RuntimeError: uvicorn broke" in capsys.readouterr().err
-    [crashed] = _stopping_events(sink)
-    assert (crashed["level"], crashed["reason"]) == ("error", "serve raised")
-    assert crashed["hard_exit_reason"] == "gpu drain timed out"
+    [stopping] = _stopping_events(sink)
+    # `reason` stays the hard-exit reason, so an alert on "gpu drain timed out" still fires.
+    assert (stopping["level"], stopping["reason"]) == ("error", "gpu drain timed out")
+    assert "uvicorn broke" in stopping["crash"]
 
 
 def test_hard_exit_survives_a_broken_stdout(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -333,20 +333,16 @@ async def serve(
         finally:
             serving = False
             hard_exit_reason: str | None = None
+            stop_error: BaseException | None = None
             try:
                 hard_exit_reason = await _stop_gpu(
                     components, server, loading, drain_interrupted, outcome
                 )
-            finally:
-                # In a `finally` of its own, so a failing _stop_gpu can't hide the crash. One
-                # `server.stopping` either way: the crash (level error) carries the hard-exit
-                # reason, rather than a warning followed by an error.
-                if crash is not None:
-                    _report_crash(components.events, crash, outcome, hard_exit_reason)
-                elif hard_exit_reason is not None:
-                    components.events.emit(
-                        "server.stopping", level="warning", reason=hard_exit_reason
-                    )
+            except BaseException as exc:  # noqa: BLE001 - re-raised or reported below
+                stop_error = exc
+            _conclude(components.events, outcome, crash, hard_exit_reason, stop_error)
+            if stop_error is not None and crash is None:
+                raise stop_error  # with a crash, the crash propagates (see _conclude)
     finally:
         # Only now that the hard-exit decision is made: until then a signal must still reach
         # `on_signal`.
@@ -355,32 +351,68 @@ async def serve(
             _ignore_sigint()
 
 
-def _report_crash(
-    events: Emitter,
-    exc: BaseException,
-    outcome: ServeOutcome,
-    hard_exit_reason: str | None,
-) -> None:
-    """serve() is raising: the one `server.stopping` event, at level error.
+def _crash_exit_code(crash: BaseException) -> int:
+    if isinstance(crash, SystemExit) and isinstance(crash.code, int):
+        return crash.code
+    if isinstance(crash, KeyboardInterrupt):
+        return 130  # the shell convention for "killed by SIGINT"
+    return 1
 
-    On a hard exit `os._exit` would also swallow the exception: no traceback, and a crash
-    that looks like a clean stop to Docker or Kubernetes. So then the traceback goes to stderr
-    too and the exit code is made non-zero (keeping `EXIT_GPU_STUCK`). Without a hard exit the
-    exception propagates and Python prints it and exits 1 as usual.
+
+def _conclude(
+    events: Emitter,
+    outcome: ServeOutcome,
+    crash: BaseException | None,
+    hard_exit_reason: str | None,
+    stop_error: BaseException | None,
+) -> None:
+    """Settle how serve() ends and report it in exactly one `server.stopping` (or none, for a
+    clean stop). `crash` is what uvicorn's serve() raised, `stop_error` what `_stop_gpu`
+    raised. A CancelledError is not a crash: it is someone stopping us.
+
+    | case                           | hard exit | exit code             | reason              | level   |
+    |--------------------------------|-----------|-----------------------|---------------------|---------|
+    | clean stop                     | no        | 0 / 1 (load failed)   | (no event)          |         |
+    | hard exit (load, signal, 70)   | yes       | from `_stop_gpu`      | hard-exit reason    | warning |
+    | crash, no hard exit            | no        | Python's, as it raises| "serve raised"      | error   |
+    | crash + hard exit              | yes       | the crash's (1, SystemExit's int, 130); 70 kept | hard-exit reason | error |
+    | `_stop_gpu` raised (± a crash) | yes       | 70                    | "gpu stop failed"   | error   |
+
+    A failed `_stop_gpu` is a hard exit because the GPU thread may still be busy, and a normal
+    exit would join it. The event carries `crash` and `stop_error` (formatted tracebacks)
+    when present; on a hard exit they also go to stderr, since `os._exit` would swallow them.
+    serve() then re-raises the crash if there was one, else the stop error.
     """
-    trace = "".join(traceback.format_exception(exc))
-    fields: dict[str, Any] = {"error": repr(exc), "traceback": trace}
-    if hard_exit_reason is not None:
-        fields["hard_exit_reason"] = hard_exit_reason
-    events.emit("server.stopping", level="error", reason="serve raised", **fields)
-    if not outcome.hard_exit:
+    if isinstance(crash, asyncio.CancelledError):
+        crash = None
+    # Exit code first, so a failure while reporting can't leave a crash exiting 0.
+    if stop_error is not None:
+        outcome.hard_exit = True
+        hard_exit_reason = "gpu stop failed"
+        outcome.exit_code = EXIT_GPU_STUCK
+    elif crash is not None and outcome.hard_exit and outcome.exit_code != EXIT_GPU_STUCK:
+        outcome.exit_code = _crash_exit_code(crash)
+    if crash is None and not outcome.hard_exit:
         return
-    if outcome.exit_code == 0:
-        outcome.exit_code = 1
-    # stderr, where an uncaught exception's traceback would normally have gone.
-    with contextlib.suppress(Exception):
-        sys.stderr.write(trace)
-        sys.stderr.flush()
+    try:
+        failures = {
+            name: "".join(traceback.format_exception(error))
+            for name, error in (("crash", crash), ("stop_error", stop_error))
+            if error is not None
+        }
+        events.emit(
+            "server.stopping",
+            level="error" if failures else "warning",
+            reason=hard_exit_reason or "serve raised",
+            **failures,
+        )
+        if outcome.hard_exit:
+            # Where an uncaught exception's traceback would normally have gone.
+            for trace in failures.values():
+                sys.stderr.write(trace)
+            sys.stderr.flush()
+    except Exception:  # noqa: BLE001, S110 - reporting must not change how we exit
+        pass
 
 
 async def _stop_gpu(
