@@ -512,7 +512,7 @@ and `test_bc_46` tests.
 
 ### Tests (write first; each docstring states the C++ behavior it rejects)
 
-- [ ] T044 [P] [US2] Add table-driven tests to `tests/test_http_fields.py`:
+- [X] T044 [P] [US2] Add table-driven tests to `tests/test_http_fields.py`:
   - `test_bc_01_unparseable_numbers_get_400`: `banana`, `1e`, `0x10`, `inf`, `nan`, `1.5` for an
     integer field;
   - `test_bc_02_empty_value_is_absent`;
@@ -554,7 +554,7 @@ and `test_bc_46` tests.
 
 ### Implementation
 
-- [ ] T048 [US2] Complete `breeze_infer/http_fields.py`:
+- [X] T048 [US2] Complete `breeze_infer/http_fields.py`:
   - the strict number grammar from contracts/http-api.md, with ranges;
   - duplicate detection (`getlist` over the form and the query, and their key intersection);
   - length limits and the control-character rule;

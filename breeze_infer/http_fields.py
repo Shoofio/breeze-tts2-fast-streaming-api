@@ -1,13 +1,16 @@
 """`POST /v1/audio/speech` field parsing (data-model.md `SpeechRequest`, `ReferenceSpec`).
 
-Happy path only (tasks.md T037): defaults, BC-02 (empty means absent), BC-09 (blank
+tasks.md T037 built the happy path: defaults, BC-02 (empty means absent), BC-09 (blank
 instruction means the default), BC-10 (missing/blank text is `400 text_required`) and
-FR-006's `0` -> `None` for the sampling fields. T048 completes this module: the strict
-number grammar with ranges, duplicate-field detection, length limits, the control-character
-rule, and the full `reference_conflict` / `ref_text_required` / `reference_required`
-ordering. The structure here -- `Fields` keeping the form and the query string as separate
-multi-dicts, `_first` as the one place that reads a named field -- is chosen so T048 can
-slot its checks in without reshaping this module.
+FR-006's `0` -> `None` for the sampling fields. T048 (contracts/http-api.md, data-model.md
+`SpeechRequest`) completes it: the strict ASCII-only number grammar with ranges (T048's
+`_INT_LITERAL`/`_DECIMAL_LITERAL` below), duplicate-field detection (BC-08, `_first`),
+length limits and the control-character rule (BC-05, BC-46), and the full
+`reference_conflict` / `ref_text_required` / `reference_required` ordering (`_build_reference`).
+`Fields` keeps the form and the query string as separate multi-dicts specifically so
+`_first` can tell "given twice in the form", "given twice in the query" and "given in both"
+apart for `duplicate_field`'s own bookkeeping, without either check needing to know which
+source a value came from.
 
 research.md R1: no `Form(...)` parameters -- FastAPI's silently keeps the last of a
 duplicate field, and its parser limits can't be changed. research.md R6: a truncated
@@ -53,9 +56,10 @@ own form or query objects.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import math
+import re
+import unicodedata
 from dataclasses import dataclass
-from typing import TypeVar
 from urllib.parse import parse_qsl
 
 from fastapi import Request
@@ -64,7 +68,13 @@ from starlette.datastructures import FormData, QueryParams, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from breeze_infer.errors import ApiError
-from breeze_infer.limits import MAX_AUDIO_BYTES, MAX_TEXT_CHARS
+from breeze_infer.limits import (
+    MAX_AUDIO_BYTES,
+    MAX_INSTRUCTION_CHARS,
+    MAX_NEW_TOKENS_CEILING,
+    MAX_REF_TEXT_CHARS,
+    MAX_TEXT_CHARS,
+)
 from breeze_infer.settings import Settings
 
 # contracts/http-api.md "Fields": the defaults for POST /v1/audio/speech.
@@ -110,24 +120,15 @@ class Fields:
     one. `form` and `query` here are both freshly built `QueryParams` over already-decoded,
     already-validated strings.
 
-    `form` and `query` are kept apart rather than merged into one mapping so T048's
-    duplicate check -- "`getlist(k)` has more than one value in the form or the query
-    string, or the same key appears in both" (research.md R6) -- can be built directly from
-    them instead of reconstructing which source each value came from.
+    `form` and `query` are kept apart rather than merged into one mapping so the duplicate
+    check -- "`getlist(k)` has more than one value in the form or the query string, or the
+    same key appears in both" (research.md R6, BC-08) -- can be built directly from them
+    instead of reconstructing which source each value came from.
     """
 
     form: QueryParams
     query: QueryParams
     ref_audio: bytes | None
-
-    def values(self, name: str) -> list[str]:
-        """Every value given for `name`: the form's values, then the query string's.
-
-        This order is today's precedence, not a considered API: with no duplicate check yet
-        (T048 adds `400 duplicate_field`), `_first` below just takes the first entry, so a
-        field given in both places silently resolves to its form value.
-        """
-        return [*self.form.getlist(name), *self.query.getlist(name)]
 
 
 async def read_fields(request: Request) -> Fields:
@@ -361,42 +362,154 @@ async def _read_ref_audio_bytes(part: UploadFile | None) -> bytes | None:
 
 
 def _first(fields: Fields, name: str) -> str | None:
-    """The field's first value, or `None` when it's absent or empty (BC-02).
+    """The field's value, or `None` when it's absent or empty (BC-02).
 
-    Happy-path lookup: it doesn't check for a second value. T048 replaces this call site
-    with a duplicate check that raises `400 duplicate_field` before falling back to this
-    same "first (and only) value, empty means absent" reading.
+    BC-08: a field given more than once -- twice in the form, twice in the query string, or
+    once in each -- is `400 duplicate_field` before anything else is checked about it.
+    Reading `form.getlist`/`query.getlist` separately (rather than a single merged list) is
+    what lets this tell those cases apart, which the message needs in order to stay
+    accurate regardless of which source doubled up.
     """
-    values = fields.values(name)
+    form_values = fields.form.getlist(name)
+    query_values = fields.query.getlist(name)
+    if len(form_values) > 1 or len(query_values) > 1 or (form_values and query_values):
+        raise ApiError(400, "duplicate_field", f"{_label(name)} was given more than once")
+    values = [*form_values, *query_values]
     if not values or values[0] == "":
         return None
     return values[0]
 
 
-# A parser matching _parse_int/_parse_float's own shape, used by _optional_number so its
-# return type tracks whichever one is passed in -- `int | None` for `_parse_int`,
-# `float | None` for `_parse_float` -- rather than the wider `int | float | None` either call
-# site would otherwise have to narrow back down itself.
-_Number = TypeVar("_Number", int, float)
+# contracts/http-api.md's number grammar, compiled once. `re.ASCII` is required, not
+# decorative: Python's bare `\d` matches every Unicode decimal-digit character (e.g. an
+# Arabic-Indic digit), which `int()`/`float()` then happily parse too -- `re.ASCII` restricts
+# `\d` to `[0-9]`, so a non-ASCII numeral fails the grammar the same as any other non-numeral
+# text. `fullmatch` is used throughout rather than the contract's literal `^...$` spelling:
+# in Python, a bare `$` also matches just before one trailing newline, which would let
+# "12\n" slip through where the contract means it not to.
+_INT_LITERAL = re.compile(r"[+-]?\d+", re.ASCII)
+_DECIMAL_LITERAL = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", re.ASCII)
 
 
-# Lenient on purpose, for now: Python's `int`/`float` accept a wider grammar than the
-# contract does (leading `+`, surrounding whitespace, `inf`/`nan`, underscore digit
-# separators), and don't enforce the contract's ranges at all. That's fine for the happy
-# path this task covers; T048 swaps these two functions for the strict regex grammar and
-# range checks in contracts/http-api.md, without changing any other call site.
 def _parse_int(value: str, field: str) -> int:
-    try:
-        return int(value)
-    except ValueError:
-        raise ApiError(400, "invalid_field", f"{field} must be an integer") from None
+    """The strict integer grammar (BC-01): reject anything `int()` itself is more lenient
+    about than the contract is -- surrounding whitespace, a non-ASCII digit, underscore
+    digit separators -- before ever calling `int()`, so only a string already known to
+    match `^[+-]?\\d+$` reaches it."""
+    if _INT_LITERAL.fullmatch(value) is None:
+        raise ApiError(400, "invalid_field", f"{field} must be an integer")
+    return int(value)
 
 
-def _parse_float(value: str, field: str) -> float:
-    try:
-        return float(value)
-    except ValueError:
-        raise ApiError(400, "invalid_field", f"{field} must be a number") from None
+def _parse_decimal(value: str, field: str) -> float:
+    """The strict decimal grammar (BC-01): same idea as `_parse_int`, for
+    `^[+-]?(\\d+\\.?\\d*|\\.\\d+)([eE][+-]?\\d+)?$` -- this also rejects `inf` and `nan`,
+    which Python's own `float()` accepts but the grammar's digit-only pattern never matches.
+
+    The result is not yet range- or finiteness-checked -- `_check_decimal_range` and the
+    `cfg_scale` call site in `parse_speech` do that next. A value that grammar-matches but
+    overflows to `inf` (e.g. `1e400`) is caught there, not here: "finite" is a range
+    concern, not a grammar one.
+    """
+    if _DECIMAL_LITERAL.fullmatch(value) is None:
+        raise ApiError(400, "invalid_field", f"{field} must be a number")
+    return float(value)
+
+
+def _is_zero_literal(value: str) -> bool:
+    """Whether a decimal literal already known to match `_DECIMAL_LITERAL` is zero,
+    decided from its digits rather than its parsed `float` value.
+
+    Review finding: `float("1e-400")` underflows to exactly `0.0`, even though its only
+    digit is `1` -- treating that as the "0 means use the model default" sentinel would
+    silently accept a value the field's own range actually rejects (a temperature of
+    `1e-400` is not `0`; it is an out-of-range positive number that happens to underflow).
+    Stripping the optional sign, the decimal point and the exponent leaves just the
+    mantissa's digits; the literal is zero only when every one of them is `0`.
+    """
+    mantissa = value.split("e", 1)[0].split("E", 1)[0]
+    digits = mantissa.lstrip("+-").replace(".", "")
+    return set(digits) == {"0"}
+
+
+def _check_int_range(value: int, field: str, low: int, high: int, rule: str) -> None:
+    if not (low <= value <= high):
+        raise ApiError(400, "invalid_field", f"{field} must be {rule}")
+
+
+def _check_decimal_range(
+    value: float, field: str, low: float, high: float, *, low_inclusive: bool, rule: str
+) -> None:
+    """`math.isfinite` guards an overflowed literal (e.g. `cfg_scale=1e400`, which parses to
+    `inf`): every field this module validates has a finite `high`, so `inf` would otherwise
+    fail the ordinary `value <= high` comparison anyway, but checking it explicitly doesn't
+    depend on that staying true for every future caller."""
+    in_range = (value >= low) if low_inclusive else (value > low)
+    if not (math.isfinite(value) and in_range and value <= high):
+        raise ApiError(400, "invalid_field", f"{field} must be {rule}")
+
+
+def _optional_int(fields: Fields, name: str, low: int, high: int, rule: str) -> int | None:
+    """FR-006: `0` (or an absent field) means the model default (`None`); otherwise the
+    value must fall in `[low, high]`. Python's `int` has arbitrary precision -- no overflow
+    or underflow -- so unlike `_optional_decimal` below, the sentinel is decided from the
+    parsed value directly."""
+    raw = _first(fields, name)
+    if raw is None:
+        return None
+    value = _parse_int(raw, name)
+    if value == 0:
+        return None
+    _check_int_range(value, name, low, high, rule)
+    return value
+
+
+def _optional_decimal(
+    fields: Fields, name: str, low: float, high: float, *, low_inclusive: bool, rule: str
+) -> float | None:
+    """FR-006: `0` (or an absent field) means the model default (`None`); otherwise the
+    value must fall in the given range. The sentinel is decided from the literal text
+    (`_is_zero_literal`), not the parsed `float`, per the review finding `_is_zero_literal`
+    documents -- so a nonzero literal that underflows still reaches, and fails,
+    `_check_decimal_range` instead of being mistaken for the default."""
+    raw = _first(fields, name)
+    if raw is None:
+        return None
+    value = _parse_decimal(raw, name)
+    if _is_zero_literal(raw):
+        return None
+    _check_decimal_range(value, name, low, high, low_inclusive=low_inclusive, rule=rule)
+    return value
+
+
+def _check_no_control_characters(value: str, field: str) -> None:
+    """BC-46: reject any Unicode general-category `Cc` (control) character except tab, CR
+    and LF. `Cc` is precisely C0 (`\\x00`-`\\x1f`, e.g. NUL and ESC), DEL (`\\x7f`) and the
+    C1 controls (`\\x80`-`\\x9f`, e.g. NEL `\\x85`) -- exactly the set the contract means by
+    "control characters", so this is checked via `unicodedata.category` rather than a fixed
+    codepoint list.
+    """
+    for ch in value:
+        if ch not in "\t\r\n" and unicodedata.category(ch) == "Cc":
+            raise ApiError(
+                400, "invalid_field", f"{field} must not contain control characters"
+            )
+
+
+def _validated_text_field(fields: Fields, name: str, max_chars: int) -> str | None:
+    """A text field's value (`None` when absent, BC-02), length- and control-character-
+    checked (BC-05/BC-46) -- shared by `instruction` and `ref_text`, whose only difference
+    from each other is their max length and (for `instruction`) the blank-means-default
+    rule the caller applies around this. `text` doesn't use this: it has its own
+    `text_required`/`text_too_long` codes instead of `invalid_field`.
+    """
+    raw = _first(fields, name)
+    if raw is None:
+        return None
+    if len(raw) > max_chars:
+        raise ApiError(400, "invalid_field", f"{name} must be at most {max_chars} characters")
+    _check_no_control_characters(raw, name)
+    return raw
 
 
 @dataclass(frozen=True)
@@ -444,7 +557,10 @@ def _build_reference(fields: Fields) -> ReferenceSpec:
     """
     voice_id = _first(fields, "voice_id")
     ref_audio = fields.ref_audio
-    ref_text = _first(fields, "ref_text")
+    # ref_text's own syntax (length, control characters) is checked here, before the
+    # reference-consistency checks below, per FR-007's order: field syntax and ranges
+    # (400) come before reference consistency (400).
+    ref_text = _validated_text_field(fields, "ref_text", MAX_REF_TEXT_CHARS)
 
     if voice_id is not None and ref_audio is not None:
         raise ApiError(
@@ -483,54 +599,81 @@ class SpeechRequest:
     split_chars: int
 
 
-def _optional_number(
-    fields: Fields, name: str, parser: Callable[[str, str], _Number]
-) -> _Number | None:
-    """FR-006: `0` or absent means the model default (`None`) for a sampling field."""
-    raw = _first(fields, name)
-    if raw is None:
-        return None
-    value = parser(raw, name)
-    return None if value == 0 else value
-
-
 def parse_speech(fields: Fields, settings: Settings) -> SpeechRequest:
-    """data-model.md "SpeechRequest": defaults, BC-02/BC-09/BC-10 and FR-006 applied."""
+    """data-model.md "SpeechRequest": defaults, ranges, length limits, the control-
+    character rule and FR-006's `0` -> `None` all applied, in the field's table order.
+    """
     text = _first(fields, "text")
     if text is None or not text.strip():
-        raise ApiError(400, "text_required", "text is required")
+        raise ApiError(400, "text_required", "text is required")  # BC-10
+    if len(text) > MAX_TEXT_CHARS:  # BC-05
+        raise ApiError(400, "text_too_long", "text is too long")
+    _check_no_control_characters(text, "text")  # BC-46
 
     # BC-09: a blank (or absent) instruction uses the default; a non-blank one is kept
-    # exactly as given, not stripped.
+    # exactly as given, not stripped -- its length and control characters are only
+    # checked once it's known not to be blank, since a huge whitespace-only string is
+    # still "blank" (BC-09), not "too long".
     instruction_raw = _first(fields, "instruction")
-    instruction = (
-        DEFAULT_INSTRUCTION
-        if instruction_raw is None or not instruction_raw.strip()
-        else instruction_raw
-    )
+    if instruction_raw is None or not instruction_raw.strip():
+        instruction = DEFAULT_INSTRUCTION
+    else:
+        if len(instruction_raw) > MAX_INSTRUCTION_CHARS:
+            raise ApiError(
+                400,
+                "invalid_field",
+                f"instruction must be at most {MAX_INSTRUCTION_CHARS} characters",
+            )
+        _check_no_control_characters(instruction_raw, "instruction")
+        instruction = instruction_raw
 
     cfg_scale_raw = _first(fields, "cfg_scale")
-    cfg_scale = (
-        _parse_float(cfg_scale_raw, "cfg_scale")
-        if cfg_scale_raw is not None
-        else DEFAULT_CFG_SCALE
-    )
+    if cfg_scale_raw is None:
+        cfg_scale = DEFAULT_CFG_SCALE
+    else:
+        cfg_scale = _parse_decimal(cfg_scale_raw, "cfg_scale")
+        _check_decimal_range(
+            cfg_scale,
+            "cfg_scale",
+            0,
+            100,
+            low_inclusive=True,
+            rule="finite and between 0 and 100",
+        )
 
     seed_raw = _first(fields, "seed")
-    seed = _parse_int(seed_raw, "seed") if seed_raw is not None else DEFAULT_SEED
+    if seed_raw is None:
+        seed = DEFAULT_SEED
+    else:
+        seed = _parse_int(seed_raw, "seed")
+        _check_int_range(seed, "seed", 0, 4_294_967_295, "an integer between 0 and 4294967295")
 
-    temperature = _optional_number(fields, "temperature", _parse_float)
-    top_k = _optional_number(fields, "top_k", _parse_int)
-    top_p = _optional_number(fields, "top_p", _parse_float)
-    repetition_penalty = _optional_number(fields, "repetition_penalty", _parse_float)
-    max_new_tokens = _optional_number(fields, "max_new_tokens", _parse_int)
+    temperature = _optional_decimal(
+        fields, "temperature", 0, 10, low_inclusive=False,
+        rule="0, or greater than 0 and at most 10",
+    )
+    top_k = _optional_int(fields, "top_k", 1, 10_000, "0, or an integer between 1 and 10000")
+    top_p = _optional_decimal(
+        fields, "top_p", 0, 1, low_inclusive=False, rule="0, or greater than 0 and at most 1"
+    )
+    repetition_penalty = _optional_decimal(
+        fields, "repetition_penalty", 0.0001, 10, low_inclusive=True,
+        rule="0, or between 0.0001 and 10",
+    )
+    max_new_tokens = _optional_int(
+        fields,
+        "max_new_tokens",
+        1,
+        MAX_NEW_TOKENS_CEILING,
+        f"0, or an integer between 1 and {MAX_NEW_TOKENS_CEILING}",
+    )
 
     split_chars_raw = _first(fields, "split_chars")
-    split_chars = (
-        _parse_int(split_chars_raw, "split_chars")
-        if split_chars_raw is not None
-        else settings.split_chars
-    )
+    if split_chars_raw is None:
+        split_chars = settings.split_chars
+    else:
+        split_chars = _parse_int(split_chars_raw, "split_chars")
+        _check_int_range(split_chars, "split_chars", 0, 10_000, "an integer between 0 and 10000")
 
     return SpeechRequest(
         text=text,
