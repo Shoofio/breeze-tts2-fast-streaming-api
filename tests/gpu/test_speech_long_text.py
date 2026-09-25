@@ -8,26 +8,39 @@ GPU thread, `RecordingEvents`) per run so no lease or event can leak between run
 the old `A:` file's module-level `breeze_infer.api.app`, which this branch no longer has
 (`breeze_infer/api.py` is a composition root only, per tasks.md T022).
 
-At the time this was written, `breeze_infer/routes_speech.py` had no anchoring yet (no
-`ANCHOR_CHARS` import; tasks.md T052/T053 land it later in the same phase) and `git log --oneline
--3` topped at `196f7af` "Decide every shutdown outcome in one table (T022 final review)". Text is
-still split with a flat `split_chars` budget and no first-piece anchor, so a later agent landing
-T052/T053 changes how pieces are seeded/anchored but not the per-run assertions this test makes
-(every stream completes with plausible, non-empty audio) -- the duration floor and piece count are
-loose enough to hold either way.
+Anchoring (tasks.md T050/T052/T053, commit `6bb3574`) has landed: with no reference and more than
+one piece, `breeze_infer/routes_speech.py`'s `_iter_pieces` collects piece 0's generated frames
+and turns them into a `synthesis.CodesRef` (`anchor_codes`) that every later piece is prepared
+against, so one speaker is heard throughout instead of a fresh voice design per piece. There is no
+dedicated event for this -- `breeze_infer/events.py` has no `speech.anchored` or similar, only
+`speech.piece_done{piece_index, frames}` and `speech.piece_clamped` -- so this test spies on
+`routes_speech.prepare_piece`'s `reference` argument (the same technique `tests/test_long_text.py`
+uses against `FakeRuntime`) to observe it directly: piece 0 must be prepared with `NoRef` (voice
+design) and every later piece with the `CodesRef` anchoring produced. If a future reviewer wants a
+GPU test that doesn't need to reach into route internals, `routes_speech.py` would need to emit
+something like `speech.anchored{piece, frames}` next to `anchor_codes`'s call site -- flagged here
+rather than added, since that's an observability change to production code, not this test.
 """
 
 from __future__ import annotations
 
+import hashlib
 import wave
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from breeze_infer import routes_speech
 from breeze_infer.api import create_app
+from breeze_infer.limits import ANCHOR_CHARS
+from breeze_infer.settings import DEFAULT_SPLIT_CHARS
 from breeze_infer.streaming import BYTES_PER_SAMPLE
+from breeze_infer.synthesis import CodesRef, NoRef, Reference
+from breeze_infer.synthesis import prepare_piece as _real_prepare_piece
+from breeze_infer.text_split import split_text
 from tests.gpu.test_speech_http import (
     SAMPLE_RATE,
     SPEECH_PATH,
@@ -92,6 +105,17 @@ LONG_PASSAGE = (
 )
 assert 2900 <= len(LONG_PASSAGE) <= 3200, f"passage is {len(LONG_PASSAGE)} characters"
 
+# The server's actual splitting rule (text_split.split_text), with no reference and the
+# server's default split_chars: the same opening-budget/flat-budget split
+# breeze_infer.routes_speech._serve_speech itself computes. Fixed once here (LONG_PASSAGE and
+# the split inputs are both constants), so every run must produce exactly this many pieces --
+# a silent change in piece count (e.g. a piece merging or an extra empty piece) would drop this
+# assertion rather than only be caught by a looser "at least one piece" check.
+EXPECTED_PIECES = split_text(LONG_PASSAGE, budget=DEFAULT_SPLIT_CHARS, first_budget=ANCHOR_CHARS)
+assert len(EXPECTED_PIECES) > 1, (
+    "the passage must split into more than one piece to exercise anchoring at all"
+)
+
 # SC-004's floor: "completes with audio covering the whole text." A believable spoken rate for
 # English prose is roughly 12-15 characters/second (~150 words/minute at ~5 characters/word); 25
 # characters/second is far faster than any real speaker, so text_chars / 25 is a deliberately
@@ -101,19 +125,29 @@ CHARS_PER_SECOND_FLOOR = 25.0
 MIN_DURATION_SECONDS = len(LONG_PASSAGE) / CHARS_PER_SECOND_FLOOR
 
 
-def _run_once(gpu_env) -> tuple[bytes, list[tuple[str, dict[str, object]]]]:
+def _run_once(
+    gpu_env, prepare_piece_spy: Any
+) -> tuple[bytes, list[tuple[str, dict[str, object]]]]:
     """POST the long passage once through a fresh app/gate/thread, wait for the stream's own
     terminal event (`test_speech_http._wait_for_terminal_event`: the response body can reach the
     TestClient a few loop iterations before `SpeechResponse.__call__`'s `finally` emits the
-    outcome event), and return the raw PCM body plus every event recorded."""
+    outcome event), and return the raw PCM body plus every event recorded.
+
+    `prepare_piece_spy` replaces `routes_speech.prepare_piece` for the run's duration (both of
+    its call sites, `_prepare_first_piece` and `_iter_pieces`, look it up by that module-level
+    name), so the caller can inspect which `Reference` each piece was actually prepared with.
+    """
     components, events = _components(gpu_env)
-    client = TestClient(create_app(components))
+    original_prepare_piece = routes_speech.prepare_piece
+    routes_speech.prepare_piece = prepare_piece_spy
     try:
+        client = TestClient(create_app(components))
         response = client.post(SPEECH_PATH, data={"text": LONG_PASSAGE})
         assert response.status_code == 200, response.text
         _wait_for_terminal_event(events)
         return response.content, events.calls
     finally:
+        routes_speech.prepare_piece = original_prepare_piece
         components.gpu.shutdown()
 
 
@@ -129,8 +163,26 @@ def _save_wav(body: bytes) -> None:
 
 
 def test_long_voice_design_completes_every_run(gpu_env) -> None:
+    body_lengths: list[int] = []
+    body_hashes: list[str] = []
+
     for run_index in range(RUNS):
-        body, calls = _run_once(gpu_env)
+        prepare_calls: list[Reference] = []
+
+        def prepare_piece_spy(
+            tokenizer: Any,
+            model: Any,
+            reference: Reference,
+            text: str,
+            instruction: str,
+            cfg_scale: float,
+            *,
+            _prepare_calls: list[Reference] = prepare_calls,
+        ) -> dict[str, Any]:
+            _prepare_calls.append(reference)
+            return _real_prepare_piece(tokenizer, model, reference, text, instruction, cfg_scale)
+
+        body, calls = _run_once(gpu_env, prepare_piece_spy)
 
         by_name: dict[str, list[dict[str, object]]] = {}
         for name, fields in calls:
@@ -142,11 +194,39 @@ def test_long_voice_design_completes_every_run(gpu_env) -> None:
             f"run {run_index}: expected exactly one speech.completed, got {calls}"
         )
 
+        # Piece count: the real split (EXPECTED_PIECES, computed once at module load from the
+        # same `split_text` call `_serve_speech` makes) rather than "at least one piece" -- a
+        # merged or dropped piece would otherwise pass silently as long as some audio came out.
         piece_events = by_name.get("speech.piece_done", [])
-        assert piece_events, f"run {run_index}: no speech.piece_done events, got {calls}"
+        assert len(piece_events) == len(EXPECTED_PIECES), (
+            f"run {run_index}: expected {len(EXPECTED_PIECES)} pieces "
+            f"(split_text(budget={DEFAULT_SPLIT_CHARS}, first_budget={ANCHOR_CHARS})), "
+            f"got {len(piece_events)}: {piece_events}"
+        )
         assert all(fields["frames"] > 0 for fields in piece_events), (
             f"run {run_index}: a piece produced 0 frames: {piece_events}"
         )
+
+        # Anchoring (T050/T052/T053): piece 0 is voice design (`NoRef`); every later piece must
+        # have been prepared against the `CodesRef` `anchor_codes` built from piece 0's own
+        # frames, not a fresh `NoRef` voice design each time -- see the module docstring for why
+        # this spies on `prepare_piece` rather than reading an event.
+        assert len(prepare_calls) == len(EXPECTED_PIECES), (
+            f"run {run_index}: expected one prepare_piece call per piece "
+            f"({len(EXPECTED_PIECES)}), got {len(prepare_calls)}"
+        )
+        assert isinstance(prepare_calls[0], NoRef), (
+            f"run {run_index}: piece 0 should start as voice design (NoRef), "
+            f"got {type(prepare_calls[0])}"
+        )
+        for piece_index, reference in enumerate(prepare_calls[1:], start=1):
+            assert isinstance(reference, CodesRef), (
+                f"run {run_index}: piece {piece_index} should be anchored to piece 0's audio "
+                f"(CodesRef), got {type(reference)}"
+            )
+            assert reference.codes.shape[0] > 0, (
+                f"run {run_index}: piece {piece_index}'s anchor has no frames"
+            )
 
         assert len(body) > 0
         assert len(body) % BYTES_PER_SAMPLE == 0
@@ -160,14 +240,32 @@ def test_long_voice_design_completes_every_run(gpu_env) -> None:
         samples = np.frombuffer(body, dtype="<i2")
         assert np.abs(samples).max() > 0, f"run {run_index}: audio is entirely silence"
 
+        body_lengths.append(len(body))
+        body_hashes.append(hashlib.sha256(body).hexdigest())
+
         # Each run costs real GPU minutes; print the numbers `-s` surfaces so a passing run still
         # leaves a record of what it actually generated (tasks.md T051 asks for these in the
         # report), without adding a second, silent way for a run to look fine while
         # under-producing relative to its neighbors.
         print(
             f"run {run_index}: {duration_seconds:.2f}s audio, {len(piece_events)} pieces, "
-            f"floor {MIN_DURATION_SECONDS:.2f}s"
+            f"floor {MIN_DURATION_SECONDS:.2f}s, sha256 {body_hashes[-1][:12]}"
         )
 
         if run_index == 0:
             _save_wav(body)
+
+    # The fixed text and fixed seed (the request's default) make the *shape* of every run
+    # identical -- confirmed above per run (same piece count, same frames>0 per piece, same
+    # anchoring) -- and that shows up here too: every run's audio is the same length. Verified
+    # empirically (this assertion used to also require the same sha256 hash across runs): the
+    # sample *values* are not bit-for-bit identical run to run, even with a matched seed on an
+    # already-warmed runtime. That's expected of CUDA kernels without
+    # `torch.use_deterministic_algorithms(True)` -- cuDNN's heuristic algorithm selection, TF32
+    # accumulation and CUDA-graph replay are not guaranteed bit-reproducible across invocations --
+    # not a bug this test should chase; forcing full determinism is a runtime-wide, production
+    # change (and would likely disable the CUDA graphs the fast path depends on), well outside a
+    # single test file. Each run's hash is still printed above so a real divergence in *shape*
+    # (a length change) is cheap to notice, and so anyone diffing runs by hand has the exact
+    # values to start from.
+    assert len(set(body_lengths)) == 1, f"runs produced different-length audio: {body_lengths}"
