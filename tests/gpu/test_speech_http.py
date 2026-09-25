@@ -177,6 +177,16 @@ def test_inline_reference_returns_plausible_audio(speech_app) -> None:
 
     _assert_plausible_speech(response, events)
 
+    # T049: reference_audio.predicted_frames' formula (an approximation of the real
+    # codec's own resample+frame arithmetic, reference_audio.py's own docstring) must
+    # actually agree with the real bundled codec on a genuine reference clip -- this is
+    # the one thing tests/test_reference_audio.py's unit tests, which never touch the
+    # real codec, can't itself prove. A mismatch would still be reported as a warning,
+    # not fail the request (routes_speech.py's _check_frame_prediction docstring), so
+    # this is checked as its own assertion rather than folded into a busy status check.
+    mismatches = [fields for name, fields in events.calls if name == "speech.frame_prediction_mismatch"]
+    assert mismatches == [], f"predicted_frames disagreed with the real codec: {mismatches}"
+
 
 def test_multi_piece_request_splits_and_emits_pieces(speech_app) -> None:
     client, events = speech_app
@@ -195,6 +205,16 @@ def test_multi_piece_request_splits_and_emits_pieces(speech_app) -> None:
     # Also proves every piece actually ran to completion, not just that the route
     # accepted a multi-piece plan: exactly one speech.completed, matching the full body.
     _assert_plausible_speech(response, events)
+
+    # T046 review, finding 7: the whole stream being non-empty only proves *some*
+    # piece produced audio -- a silently empty later piece would still leave the
+    # overall response non-empty. speech.piece_done (one per piece, emitted from
+    # routes_speech.py's _iter_pieces) catches that: every piece the request accepted
+    # must actually report frames > 0, in order.
+    piece_events = [fields for name, fields in events.calls if name == "speech.piece_done"]
+    assert len(piece_events) == accepted[0]["pieces"]
+    assert [fields["piece_index"] for fields in piece_events] == list(range(len(piece_events)))
+    assert all(fields["frames"] > 0 for fields in piece_events), piece_events
 
 
 def test_first_piece_without_room_gives_400_text_too_long(gpu_env, speech_app) -> None:

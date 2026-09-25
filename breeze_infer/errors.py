@@ -63,6 +63,34 @@ def _envelope(message: str, code: str) -> dict[str, str]:
     return {"error": message, "code": code}
 
 
+def _with_request_id(
+    headers: Mapping[str, str] | None, request_id: str | None
+) -> dict[str, str] | None:
+    """Add `X-Request-Id` to `headers` when `request_id` is known (T046 review, finding
+    8: every response should carry it, not just the ones a route already adds it to by
+    hand -- e.g. `routes_speech.py`'s own `ApiError` catch). `None` (nothing to attach,
+    e.g. a request that failed before any route named itself) leaves `headers`
+    unchanged rather than adding a header with no value.
+    """
+    if not request_id:
+        return dict(headers) if headers else None
+    return {**(headers or {}), "X-Request-Id": request_id}
+
+
+def _request_id_of(request: Request | None) -> str | None:
+    """`request.state.request_id`, however it got set -- a route's own first line
+    (`routes_speech.py`), or a dependency that runs before one that can fail (so a
+    `503`/`404` from a dependency still has an id to report, per the same review
+    finding) -- or `None` when nothing ever set it, or when there is no `request` at
+    all: `test_api_errors.py` calls a couple of these handlers directly with `request=
+    None` (to test their status-mapping in isolation, without building a real
+    `Request`), so this must not assume a `.state` to read.
+    """
+    if request is None:
+        return None
+    return getattr(request.state, "request_id", None)
+
+
 def api_error_response(
     exc: ApiError, headers: Mapping[str, str] | None = None
 ) -> JSONResponse:
@@ -181,10 +209,13 @@ def install_error_handlers(app: FastAPI, events: Emitter) -> None:
         # (never `ApiError`), each carrying whatever `headers` the raiser set -- e.g. a 405's
         # `Allow` header -- which must reach the client. `exc.detail` is not: see
         # `_HTTP_EXCEPTION_RESPONSES` above.
+        request_id = _request_id_of(request)
         mapped = _HTTP_EXCEPTION_RESPONSES.get(exc.status_code)
         if mapped is None:
             return JSONResponse(
-                _envelope("internal error", "internal_error"), status_code=500, headers=exc.headers
+                _envelope("internal error", "internal_error"),
+                status_code=500,
+                headers=_with_request_id(exc.headers, request_id),
             )
         code, message = mapped
         headers = exc.headers
@@ -206,24 +237,34 @@ def install_error_handlers(app: FastAPI, events: Emitter) -> None:
             if matched and methods:
                 headers = {**(headers or {}), "Allow": ", ".join(sorted(methods))}
         return JSONResponse(
-            _envelope(message, code), status_code=exc.status_code, headers=headers
+            _envelope(message, code),
+            status_code=exc.status_code,
+            headers=_with_request_id(headers, request_id),
         )
 
     @app.exception_handler(ApiError)
-    async def _api_error_handler(_: Request, exc: ApiError) -> JSONResponse:
-        return api_error_response(exc)
+    async def _api_error_handler(request: Request, exc: ApiError) -> JSONResponse:
+        # `routes_speech.py`'s own route already answers its `ApiError`s directly (with
+        # `X-Request-Id` by hand, before this handler would ever see them); this handler
+        # is what other routes -- and a *dependency* failure ahead of any route body,
+        # e.g. `require_ready`'s `503 loading` -- fall through to instead.
+        return api_error_response(exc, headers=_with_request_id(None, _request_id_of(request)))
 
     @app.exception_handler(GpuUnavailable)
-    async def _gpu_unavailable_handler(_: Request, __: GpuUnavailable) -> JSONResponse:
+    async def _gpu_unavailable_handler(request: Request, __: GpuUnavailable) -> JSONResponse:
         # A poisoned GpuGate (gpu.py): try_acquire/acquire raise this directly, rather than
         # going through Readiness -- distinct from busy (409), and from routes_health.py's
         # own GpuUnresponsive (raised by require_ready once Readiness.mark_unhealthy() has
         # run), but the two are meant to look identical to a client.
-        return JSONResponse(dict(_GPU_UNAVAILABLE_BODY), status_code=503)
+        return JSONResponse(
+            dict(_GPU_UNAVAILABLE_BODY),
+            status_code=503,
+            headers=_with_request_id(None, _request_id_of(request)),
+        )
 
     @app.exception_handler(FormParserError)
     async def _form_parser_error_handler(
-        _: Request, exc: FormParserError
+        request: Request, exc: FormParserError
     ) -> JSONResponse:
         # python-multipart raises this (or a subclass, e.g. MultipartParseError) for
         # a malformed body; without this handler it would fall through to the bare
@@ -231,18 +272,24 @@ def install_error_handlers(app: FastAPI, events: Emitter) -> None:
         # text describes its internals, so the client gets a fixed message.
         del exc
         return JSONResponse(
-            _envelope("could not parse the request body", "invalid_field"), status_code=400
+            _envelope("could not parse the request body", "invalid_field"),
+            status_code=400,
+            headers=_with_request_id(None, _request_id_of(request)),
         )
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error_handler(
-        _: Request, exc: RequestValidationError
+        request: Request, exc: RequestValidationError
     ) -> JSONResponse:
         # Reachable only via routes not yet ported to raw request/form parsing (see
         # contracts/http-api.md); once ported, malformed input is coerced or rejected
         # by the fields module instead, and this handler stops firing for them.
         del exc
-        return JSONResponse(_envelope("invalid request", "invalid_field"), status_code=400)
+        return JSONResponse(
+            _envelope("invalid request", "invalid_field"),
+            status_code=400,
+            headers=_with_request_id(None, _request_id_of(request)),
+        )
 
     @app.exception_handler(Exception)
     async def _unhandled_exception_handler(
@@ -257,8 +304,12 @@ def install_error_handlers(app: FastAPI, events: Emitter) -> None:
             # ServerErrorMiddleware only sends this if the response hasn't started, and a
             # StreamAborted always comes after it has: this response is never sent.
             return JSONResponse(_envelope("internal error", "internal_error"), status_code=500)
-        request_id = getattr(request.state, "request_id", None)
+        request_id = _request_id_of(request)
         if not request_id:
             request_id = f"api-{uuid.uuid4().hex}"
         events.emit("request.failed", level="error", request_id=request_id, error=repr(exc))
-        return JSONResponse(_envelope("internal error", "internal_error"), status_code=500)
+        return JSONResponse(
+            _envelope("internal error", "internal_error"),
+            status_code=500,
+            headers=_with_request_id(None, request_id),
+        )

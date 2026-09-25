@@ -12,11 +12,13 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
 2. `read_fields` and `parse_speech` (`http_fields.py`) -- field syntax, ranges and the
    `reference_conflict`/`ref_text_required`/`reference_required` checks all happen inside
    `parse_speech` already;
-3. a `VoiceRef` is `404 unknown_voice` for now -- voices arrive in Phase 7 (T049 names this
-   the stub lookup), so every `voice_id` is unknown until then;
-4. `split_text` and the "nothing to speak" check are CPU-only, so they run here too, before
-   the reference decode and the busy check (review-agent pass 1, finding 1: FR-007 puts every
-   `400`/`404` before `409 busy`, and this is a `400` this phase can already produce);
+3. `split_text` and the "nothing to speak" check are CPU-only, so they run here too, before
+   the voice lookup, the reference decode and the busy check (review-agent pass 1, finding 1:
+   FR-007 puts every `400`/`404` before `409 busy`, and this is a `400` this phase can already
+   produce; T046 review: it's still stage 2, "field syntax and ranges", a property of `text`
+   alone -- so it belongs before stage 4's unknown-voice `404` too, not just before decode/busy);
+4. a `VoiceRef` is `404 unknown_voice` for now -- voices arrive in Phase 7 (T049 names this
+   the stub lookup);
 5. an `InlineRef`'s bytes are decoded (`reference_audio.decode`) on a worker thread
    (`asyncio.to_thread`), never the event loop -- libsndfile's decode is blocking CPU work;
 6. `gate.try_acquire()`, else `409 busy` -- or `GpuUnavailable` if the gate is poisoned,
@@ -65,6 +67,7 @@ itself since no `SpeechResponse` is ever built for it.
 # same, for the same reason).
 import asyncio
 import contextlib
+import traceback
 from collections.abc import AsyncGenerator, Callable, Iterator
 from typing import Annotated, Any, Protocol
 
@@ -88,12 +91,15 @@ from breeze_infer.routes_health import Readiness
 from breeze_infer.settings import Settings
 from breeze_infer.streaming import SpeechResponse
 from breeze_infer.synthesis import (
+    CodesRef,
+    codec_samples_per_frame,
     generate_piece,
     piece_seed,
     prepare_piece,
     resolve_reference,
 )
 from breeze_infer.text_split import split_text
+from models.fast_streaming import NoRoomError
 
 
 class SpeechComponents(Protocol):
@@ -119,6 +125,36 @@ def _reference_kind(reference: ReferenceSpec) -> str:
     raise TypeError(f"unexpected reference spec: {reference!r}")
 
 
+def _check_frame_prediction(
+    decoded_audio: reference_audio.DecodedAudio | None,
+    reference: Any,
+    events: Emitter,
+    *,
+    request_id: str,
+) -> None:
+    """T049: `reference_audio.predicted_frames` is only ever a prediction -- the real
+    codec is what actually decides a reference's frame count once it encodes it
+    (`resolve_reference`, just above this call). A mismatch here means the formula
+    (`reference_audio.py`'s own docstring has the arithmetic) has drifted from what the
+    bundled codec really does, which is worth knowing about without failing a request
+    over it: the encoded codes are already in hand and just as usable either way, so
+    this only emits `speech.frame_prediction_mismatch` (a warning, not an error) and
+    lets synthesis continue on the actual codes.
+    """
+    if decoded_audio is None or not isinstance(reference, CodesRef):
+        return
+    actual_frames = reference.codes.shape[0]
+    if actual_frames == decoded_audio.predicted_frames:
+        return
+    events.emit(
+        "speech.frame_prediction_mismatch",
+        level="warning",
+        request_id=request_id,
+        predicted_frames=decoded_audio.predicted_frames,
+        actual_frames=actual_frames,
+    )
+
+
 def _prepare_first_piece(
     runtime: Any, reference: Any, text: str, request: SpeechRequest
 ) -> tuple[dict[str, Any], int]:
@@ -139,6 +175,15 @@ def _prepare_first_piece(
     return inputs, room
 
 
+
+# `generate_piece`/`ramp_pcm` (synthesis.py) discard everything but each chunk's PCM
+# bytes; `_iter_pieces` below counts those bytes back into a frame count for
+# `speech.piece_done` (T046 review, finding 7) rather than reach into `synthesis.py` for
+# a second per-piece signal, using the same `samples_per_frame` (`codec_samples_per_frame`)
+# the route already computed once for `generate_piece` itself.
+_PCM_BYTES_PER_SAMPLE = 2  # s16le
+
+
 def _iter_pieces(
     runtime: Any,
     reference: Any,
@@ -146,9 +191,11 @@ def _iter_pieces(
     request: SpeechRequest,
     request_id: str,
     first_inputs: dict[str, Any],
+    events: Emitter,
     *,
     chunk_first: int,
     chunk_max: int,
+    samples_per_frame: int,
 ) -> Iterator[bytes]:
     """One request's whole PCM stream: `generate_piece` chained over every piece.
 
@@ -159,6 +206,13 @@ def _iter_pieces(
     calls anywhere in this route. Piece 0 is the one exception: its inputs (and its room
     check) already ran, on the `GpuThread`, before this generator was even built, so they are
     passed in rather than rebuilt.
+
+    `events.emit` is called from here on the `GpuThread`, not the event loop -- `Emitter`
+    is documented safe for that (`events.py`) -- once each piece's own chunks are
+    exhausted, with `speech.piece_done{piece_index, frames}` (T046 review, finding 7): a
+    multi-piece GPU test can otherwise only see the whole request succeeded, not that
+    *every* piece actually produced audio, since a silently empty later piece would still
+    leave the overall stream non-empty.
     """
     for index, text in enumerate(pieces):
         inputs = (
@@ -173,18 +227,26 @@ def _iter_pieces(
                 request.cfg_scale,
             )
         )
-        yield from generate_piece(
+        piece_bytes = 0
+        for chunk in generate_piece(
             runtime,
             inputs,
             request_id=request_id,
             seed=piece_seed(request.seed, index),
             chunk_first=chunk_first,
             chunk_max=chunk_max,
+            samples_per_frame=samples_per_frame,
             temperature=request.temperature,
             top_k=request.top_k,
             top_p=request.top_p,
             repetition_penalty=request.repetition_penalty,
             max_new_tokens=request.max_new_tokens,
+        ):
+            piece_bytes += len(chunk)
+            yield chunk
+        frames = piece_bytes // _PCM_BYTES_PER_SAMPLE // samples_per_frame
+        events.emit(
+            "speech.piece_done", request_id=request_id, piece_index=index, frames=frames
         )
 
 
@@ -213,16 +275,20 @@ async def _serve_speech(
     fields = await read_fields(http_request)
     request = parse_speech(fields, components.settings)
 
-    if isinstance(request.reference, VoiceRef):
-        raise ApiError(404, "unknown_voice", "unknown voice_id")
-
-    # CPU-only, so it runs before the reference decode and the busy check (module docstring,
-    # step 4): text.strip() is non-blank (BC-10, parse_speech), but split_text also drops
-    # units with no letter or digit to speak (text_split.py's _speakable) -- text like "..."
-    # clears text_required but leaves nothing to synthesize.
+    # CPU-only, so it runs before the voice lookup, the reference decode and the busy
+    # check (FR-007 review: this is still stage 2, "field syntax and ranges" -- it's a
+    # property of `text` alone parse_speech's own field checks already validated, not a
+    # new stage of its own -- so it must come before stage 4's unknown-voice `404` too,
+    # not just before decode/busy): text.strip() is non-blank (BC-10, parse_speech), but
+    # split_text also drops units with no letter or digit to speak (text_split.py's
+    # _speakable) -- text like "..." clears text_required but leaves nothing to
+    # synthesize.
     pieces = split_text(request.text, budget=request.split_chars)
     if not pieces:
         raise ApiError(400, "text_required", "text is required")
+
+    if isinstance(request.reference, VoiceRef):
+        raise ApiError(404, "unknown_voice", "unknown voice_id")
 
     decoded_audio = None
     if isinstance(request.reference, InlineRef):
@@ -251,6 +317,9 @@ async def _serve_speech(
         )
         reference = await asyncio.shield(gpu_task)
         gpu_task = None
+        _check_frame_prediction(
+            decoded_audio, reference, components.events, request_id=request_id
+        )
 
         gpu_task = asyncio.ensure_future(
             components.gpu.run(_prepare_first_piece, runtime, reference, pieces[0], request)
@@ -274,18 +343,26 @@ async def _serve_speech(
             request,
             request_id,
             first_inputs,
+            components.events,
             chunk_first=components.settings.chunk_first,
             chunk_max=components.settings.chunk_max,
+            samples_per_frame=codec_samples_per_frame(runtime),
         )
         session = GpuSession(lease, components.gpu, gen)
         started_at = clock()  # generation start: SpeechResponse's own rtf origin
         try:
             first_chunk = await session.step()
-        except ValueError as error:
+        except NoRoomError as error:
             # T052/T053 (deferred): a later piece's own room check and clamp aren't built
             # yet, so this is reached only if priming ran past piece 0 within a single step
             # (e.g. an all-pad piece 0) and the next piece has no room. Still a text-too-long
             # failure, not an opaque 500, until that phase gives it a proper pre-check.
+            #
+            # Only `NoRoomError` maps to this `400` (T046 review, finding 1): the runtime's
+            # `iter_audio_chunks` also raises a plain `ValueError` for a genuinely invalid
+            # override or a malformed `inputs` shape -- a server bug, not "text too long" --
+            # and that must still surface as an unhandled `500` (below, uncaught) with a
+            # `request.failed` event, not be mistaken for this.
             raise ApiError(400, "text_too_long", "text is too long") from error
     except BaseException:
         # A cancellation (client disconnect) or any other failure while a GPU-thread call is
@@ -294,19 +371,50 @@ async def _serve_speech(
         # threaded) GPU executor (gpu.py), so releasing early would tell the next request
         # "free" while our own abandoned work is still really queued ahead of it there.
         if gpu_task is not None and not gpu_task.done():
-            with contextlib.suppress(Exception):
+            # Released from a done-callback, not from code below that only runs if this
+            # `except` block itself runs to completion (T046 review, finding 2 -- a lease
+            # leak): a *second* cancellation of this coroutine while the `await` just below
+            # is waiting can itself raise out of the `with suppress(...)` (it catches
+            # `BaseException`, but only around that one `await` -- nothing stops a `raise`
+            # reaching this frame from further out, e.g. from `finally` unwinding above).
+            # `add_done_callback` runs exactly once, whenever the GPU thread actually
+            # finishes this call, regardless of how many times *this* coroutine gets
+            # interrupted waiting for it -- the same pattern `GpuSession._release` already
+            # uses for the analogous case just below (`session.aclose()`).
+            gpu_task.add_done_callback(lambda _task: lease.release())
+            with contextlib.suppress(BaseException):
                 # Suppressed, not propagated: the exception this `except` is already
                 # handling must be what reaches the caller, even if the abandoned GPU call
                 # itself also fails, for some unrelated reason, while we wait for it here.
                 await asyncio.shield(gpu_task)
-        if session is not None:
-            await session.aclose()
+        elif session is not None:
+            try:
+                await session.aclose()
+            except Exception as close_error:  # noqa: BLE001 -- reported, never raised
+                # A close failure here must never replace the exception this `except`
+                # block is already handling (T046 review, finding 6): a `400` followed by
+                # a `GpuCloseTimeout` must still reach the client as the `400`, not an
+                # opaque close error. Reported as its own event instead (mirrors
+                # streaming.py's `_close_and_report`, which the same rule already governs
+                # for a response that streamed past its first chunk) -- the same
+                # `gpu.close_failed` name `api.py`'s own `_report_close_failed` uses for an
+                # abandoned close's error (data-model.md's event list), just with a
+                # `request_id` here since this one has a request to attribute it to.
+                components.events.emit(
+                    "gpu.close_failed",
+                    level="error",
+                    request_id=request_id,
+                    error=repr(close_error),
+                    traceback="".join(traceback.format_exception(close_error)),
+                )
         else:
             lease.release()
         raise
 
     if first_chunk is DONE:
-        await session.aclose()
+        # Emitted before the close (T046 review, finding 6): the outcome -- "no audio at
+        # all" -- is already decided the moment `session.step()` reports `DONE`, so it must
+        # not wait on (or be lost to) whatever `session.aclose()` does next.
         components.events.emit(
             "speech.failed",
             level="error",
@@ -314,6 +422,18 @@ async def _serve_speech(
             reason="no_audio",
             audio_seconds=0.0,
         )
+        try:
+            await session.aclose()
+        except Exception as close_error:  # noqa: BLE001 -- reported, never raised
+            # Same rule as the `except BaseException` cleanup above: a close failure must
+            # not replace "no_audio" as the reason this request failed.
+            components.events.emit(
+                "gpu.close_failed",
+                level="error",
+                request_id=request_id,
+                error=repr(close_error),
+                traceback="".join(traceback.format_exception(close_error)),
+            )
         # Not ApiError: every 500 must close the connection (contracts/http-api.md), which
         # only happens on the genuinely unhandled path (errors.py's catch-all re-raises after
         # answering); ApiError(500, ...) would be an ordinary, keep-alive JSON response.
@@ -353,16 +473,25 @@ def install_speech(
     docstring: two different readings of the same clock, not the same reading reused).
     """
 
+    async def _name_request(http_request: Request) -> str:
+        """A `Depends()` of its own, declared before `require_ready` below (T046 review,
+        finding 8): FastAPI resolves same-level dependencies in declaration order, so this
+        runs -- and sets `request.state.request_id` -- even when `require_ready` itself
+        then raises `503 loading`/`gpu_unavailable`, which happens *before* the route
+        body (and so before this id would otherwise ever be set) gets to run at all.
+        Without this, that response would have no id for `errors.py`'s handlers to attach
+        as `X-Request-Id`, and no correlation for the client to report back.
+        """
+        request_id = new_request_id()
+        http_request.state.request_id = request_id
+        return request_id
+
     @app.post("/v1/audio/speech")
     async def speech(
         http_request: Request,
+        request_id: Annotated[str, Depends(_name_request)],
         runtime: Annotated[Any, Depends(components.readiness.require_ready)],
     ) -> Response:
-        request_id = new_request_id()
-        # Set before anything below can fail, so even a request that never gets past field
-        # parsing still correlates with this id in the catch-all handler's request.failed
-        # (errors.py reads request.state.request_id).
-        http_request.state.request_id = request_id
         received_at = clock()
         try:
             return await _serve_speech(

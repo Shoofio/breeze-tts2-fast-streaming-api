@@ -267,13 +267,19 @@ offending record's field names), so one bad field never breaks the request emitt
   `piece_index`.
 - Event names:
   - server: `server.started` (with every bound `addresses`), `server.bind_failed`,
-    `server.stopping` (a hard exit, `reason`: a load still in progress, a signal during the
-    GPU drain, or the GPU drain timed out, which exits 70), `ws.bind_failed`, `model.loaded`,
+    `server.stopping` (exactly one when the process hard-exits or `serve()` crashes; none on
+    a clean stop. `reason`: the hard-exit reason, `load in progress`, `signal during drain`,
+    `gpu drain timed out` (exits 70) or `gpu stop failed` (exits 70), else `serve raised`;
+    optional `crash` and `stop_error`, each a formatted traceback; `level` is `error` when
+    either is present, else `warning`. A cancelled `serve()` is not a crash), `ws.bind_failed`,
+    `model.loaded`,
     `model.load_failed` (the process then exits non-zero), `gpu.close_failed`,
     `gpu.close_timeout` (a `gen.close()` ran past 30 s: the GPU gate is poisoned and `/health`
     answers `503 gpu_unavailable` until restart);
   - voices: `voices.loaded`, `voice.skipped`, `voice.created`, `voice.deleted`;
   - speech: `speech.accepted`, `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`,
-    `speech.completed` (`rtf`), `speech.failed`, `speech.aborted`;
+    `speech.piece_done` (`piece_index`, `frames`), `speech.completed` (`rtf`),
+    `speech.failed`, `speech.aborted`, `speech.frame_prediction_mismatch`
+    (`predicted_frames`, `actual_frames`);
   - WebSocket: `ws.connected`, `ws.rejected` (`reason`), `ws.closed` (`code`), `ws.piece`;
   - errors: `request.failed`.

@@ -526,7 +526,7 @@ and `test_bc_46` tests.
   - `test_bc_46_control_characters_get_400`: NUL, `\x07` and `\x1b` rejected; `\t`, `\r` and
     `\n` allowed;
   - seed range 0–4294967295; `split_chars` 0–10,000.
-- [ ] T045 [P] [US2] Add route tests to `tests/test_routes_reference.py` (TestClient,
+- [X] T045 [P] [US2] Add route tests to `tests/test_routes_reference.py` (TestClient,
   `FakeRuntime`, soundfile for real):
   - `test_bc_11_undecodable_or_empty_ref_audio_gets_400`;
   - `test_bc_12_ref_audio_without_ref_text_gets_400`;
@@ -536,12 +536,12 @@ and `test_bc_46` tests.
     `fmt` chunk, zero channels, zero bits, a 0 Hz sample rate, a 1 Hz sample rate, 65,535
     channels, an unknown format tag; also check that 8, 24-bit and float WAVs now decode;
   - `test_bc_16_too_long_or_too_short_reference_gets_400`.
-- [ ] T046 [P] [US2] Create `tests/test_validation_order.py` (FR-007):
+- [X] T046 [P] [US2] Create `tests/test_validation_order.py` (FR-007):
   - `test_bc_07_invalid_request_while_busy_gets_400_not_409`;
   - field errors come before an unknown `voice_id`, which comes before decoding, which comes
     before busy;
   - `test_bc_06_oversize_multipart_gets_413_envelope`.
-- [ ] T047 [US2] Create `tests/test_malformed_corpus.py` (SC-003). It sends **at least 50**
+- [X] T047 [US2] Create `tests/test_malformed_corpus.py` (SC-003). It sends **at least 50**
   malformed HTTP requests:
   - bad numbers, duplicates, control characters, reference conflicts;
   - corrupt, truncated and oversize audio;
@@ -561,7 +561,7 @@ and `test_bc_46` tests.
   - `ReferenceSpec` checks in order: `reference_conflict`, then `ref_text_required`, then
     `reference_required`;
   - error messages exactly as in the contract's error table.
-- [ ] T049 [US2] Enforce the FR-007 order in `breeze_infer/routes_speech.py`:
+- [X] T049 [US2] Enforce the FR-007 order in `breeze_infer/routes_speech.py`:
   1. body limit;
   2. fields;
   3. reference rules;
