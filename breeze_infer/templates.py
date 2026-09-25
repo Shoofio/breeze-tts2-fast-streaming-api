@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -74,25 +75,32 @@ def _ref_audio_segment(
     return segment
 
 
-def _ref_clone_tata_segments(request: Request) -> list[Segment]:
+def _ref_prefix_segments(request: Request) -> list[Segment]:
+    """The reference-only part of ``ref_edit_tata`` (``ref_text`` + the reference
+    audio segment): the common prefix that ``_ref_edit_tata_segments``,
+    ``_ref_clone_tata_segments`` and ``split_reference_prefix`` all build on (review
+    #6 -- there is exactly one place this pair of segments is assembled).
+    """
     prefix = _speaker_prefix(request)
     return [
         {"type": "text", "text": f"{prefix}{request['ref_text']}"},
         _ref_audio_segment(request),
-        {"type": "text", "text": f"{prefix}{request['text']}"},
     ]
+
+
+def _ref_clone_tata_segments(request: Request) -> list[Segment]:
+    """``ref_edit_tata`` with no instruction: the reference prefix followed by the
+    plain ``[speaker]text`` segment -- the same trailing segment ``tts_instruction``'s
+    negative branch (``_tts_instruction_negative_segments``) uses.
+    """
+    return _ref_prefix_segments(request) + _tts_plain_segments(request)
 
 
 def _ref_edit_tata_segments(request: Request) -> list[Segment]:
-    prefix = _speaker_prefix(request)
-    return [
-        {"type": "text", "text": f"{prefix}{request['ref_text']}"},
-        _ref_audio_segment(request),
-        {
-            "type": "text",
-            "text": f"{prefix}{INSTRUCTION_BOS}{request['instruction']}{INSTRUCTION_EOS}{request['text']}",
-        },
-    ]
+    """The reference prefix followed by the instruction-wrapped text segment -- the
+    same trailing segment the plain ``tts_instruction`` template uses.
+    """
+    return _ref_prefix_segments(request) + _tts_instruction_segments(request)
 
 
 def _ref_edit_tata_negative_segments(request: Request) -> list[Segment]:
@@ -100,9 +108,8 @@ def _ref_edit_tata_negative_segments(request: Request) -> list[Segment]:
 
 
 def _ref_edit_tata_dual_branches(request: Request) -> dict[str, list[Segment]]:
-    prefix = _speaker_prefix(request)
     return {
-        "uncond": [{"type": "text", "text": f"{prefix}{request['text']}"}],
+        "uncond": _tts_plain_segments(request),
         "ref": _ref_clone_tata_segments(request),
         "ins": _tts_instruction_segments(request),
     }
@@ -126,15 +133,6 @@ TEMPLATES: dict[str, TemplateSpec] = {
 }
 
 
-def _ref_prefix_segments(request: Request) -> list[Segment]:
-    """The reference-only part of ``ref_edit_tata``, shared by both CFG rows."""
-    prefix = _speaker_prefix(request)
-    return [
-        {"type": "text", "text": f"{prefix}{request['ref_text']}"},
-        _ref_audio_segment(request),
-    ]
-
-
 def split_reference_prefix(
     request: Request,
 ) -> tuple[list[Segment], list[Segment], list[Segment]]:
@@ -142,11 +140,9 @@ def split_reference_prefix(
 
     ``prefix + guided`` renders exactly what ``build_segments`` renders, and
     ``prefix + unguided`` exactly what ``build_negative_segments`` renders, so a
-    prefix processed once can be continued by either suffix. ``guided``/``unguided``
-    are not a third copy of the instruction/plain text-building logic: they reuse
-    ``_tts_instruction_segments``/``_tts_plain_segments``, the same helpers
-    ``_ref_edit_tata_segments``/``_ref_clone_tata_segments`` build their own trailing
-    segment from (review #5).
+    prefix processed once can be continued by either suffix -- true by construction,
+    since ``_ref_edit_tata_segments``/``_ref_clone_tata_segments`` are themselves
+    ``_ref_prefix_segments(request) + <this same guided/unguided piece>`` (review #6).
     """
     return (
         _ref_prefix_segments(request),
@@ -164,28 +160,64 @@ def get_template(name: str) -> TemplateSpec:
         ) from exc
 
 
+def _normalize_codes_array(codes: np.ndarray) -> torch.Tensor:
+    """Validate and normalize a numpy ``audio_codes`` array into a plain, native-
+    byte-order, contiguous ``int64`` tensor (review #2).
+
+    Checked on the *original* array, before any cast:
+    - an object-dtype array (e.g. a ragged/mixed-type array) is rejected with a
+      specific message, since ``np.issubdtype(object, np.integer)`` is silently
+      ``False`` and would otherwise fall into the generic "not an integer dtype"
+      message;
+    - any other non-integer dtype (float, bool, complex) is rejected the same way
+      as a torch tensor's dtype is (``_resolve_segment_audio_codes``).
+
+    Only once the dtype class is known-good does ``np.ascontiguousarray(codes,
+    dtype=np.int64)`` run, in one call: it makes a negative-stride view (e.g.
+    ``codes[::-1]``) into a real contiguous copy (``torch.from_numpy`` outright
+    refuses negative strides), it byte-swaps a non-native-endian array (e.g.
+    ``dtype('>i2')``) into native order the same way ``.astype`` does (``torch``
+    tensors have no non-native-byte-order concept at all), and it upcasts a numpy
+    integer width/signedness that ``torch`` doesn't support well (``uint16``,
+    ``uint32``, ``uint64``) into a signed width every torch build does. Values are
+    still checked against ``codebook_size`` by the caller once this returns, so the
+    generic upcast is safe: a real code is always tiny compared to ``int64``.
+    """
+    if codes.dtype == np.dtype("O"):
+        raise ValueError("audio_codes must not be an object array")
+    if not np.issubdtype(codes.dtype, np.integer):
+        raise ValueError(f"audio_codes must have an integer dtype, got {codes.dtype}")
+    return torch.from_numpy(np.ascontiguousarray(codes, dtype=np.int64))
+
+
 def _resolve_segment_audio_codes(
     segment: Segment, *, codebooks: int, codebook_size: int
 ) -> torch.Tensor:
     """Reference audio is always pre-encoded before it reaches a template (see
     ``_ref_audio_segment``), so this only normalizes and validates an already-encoded
     codes array/tensor -- nothing here re-encodes audio, so it no longer takes an
-    ``audio_tokenizer`` (review #6).
+    ``audio_tokenizer`` (review #6, prior round).
 
     Validation runs on the caller's own dtype and values, *before* the int16 cast: a
-    float/bool array or an out-of-range code that slipped through would otherwise be
-    silently coerced by the cast and only surface later as a CUDA device assert deep
-    in the backbone, which poisons the whole process (review #1/#2). One
-    ``torch.as_tensor`` call (review #7) covers both a numpy array and an existing
-    tensor, since it preserves the input's own dtype either way.
+    float/bool/object array, a byte-order or stride quirk, or an out-of-range code
+    that slipped through would otherwise be silently coerced or crash the conversion,
+    and would only surface later as a CUDA device assert deep in the backbone, which
+    poisons the whole process (review #1/#2).
     """
     codes = segment.get("audio_codes")
     if codes is None:
         raise ValueError("Audio segment must include audio_codes")
 
-    codes = torch.as_tensor(codes)
-    if codes.dtype is torch.bool or torch.is_floating_point(codes) or torch.is_complex(codes):
-        raise ValueError(f"audio_codes must have an integer dtype, got {codes.dtype}")
+    if isinstance(codes, np.ndarray):
+        codes = _normalize_codes_array(codes)
+    elif isinstance(codes, torch.Tensor):
+        if codes.dtype is torch.bool or torch.is_floating_point(codes) or torch.is_complex(codes):
+            raise ValueError(f"audio_codes must have an integer dtype, got {codes.dtype}")
+    else:
+        codes = torch.as_tensor(codes)
+        if codes.dtype is torch.bool or torch.is_floating_point(codes) or torch.is_complex(codes):
+            raise ValueError(f"audio_codes must have an integer dtype, got {codes.dtype}")
+
     if codes.ndim != 2:
         raise ValueError(
             f"audio_codes must be 2D [frames, codebooks], got {tuple(codes.shape)}"
@@ -210,7 +242,7 @@ def _missing_fields(request: Request, fields: tuple[str, ...]) -> list[str]:
     """Required fields that are absent, ``None``, or blank/whitespace-only.
 
     A string value is stripped before the truthy check, so ``" "`` counts as missing
-    the same as ``""`` (review #10).
+    the same as ``""`` (review #10, prior round).
 
     ``ref_audio_codes`` never belongs in ``fields``: it's array-valued, and a bare
     ``bool()`` on a multi-element array raises, so it's checked separately by
@@ -238,10 +270,11 @@ def _check_reference_source(template: TemplateSpec, request: Request) -> None:
 def _validate_reference_request(
     template: TemplateSpec, request: Request, fields: tuple[str, ...]
 ) -> None:
-    """Shared by ``prepare_inputs`` and ``prepare_prefix_inputs`` (review #8): both
-    need the same two checks -- the given ``fields`` are present, and (for a
-    reference-audio template) ``ref_audio_codes`` is too -- just against a different
-    field tuple (the full template vs. the reference-prefix-only fields).
+    """Shared by ``prepare_inputs``, ``prepare_prefix_inputs`` and
+    ``prepare_suffix_inputs`` (review #7/#8, this round and last): all three need the
+    same two checks -- the given ``fields`` are present, and (for a reference-audio
+    template) ``ref_audio_codes`` is too -- just against a different field tuple (the
+    full template vs. the reference-prefix-only vs. the text-continuation fields).
     """
     missing = _missing_fields(request, fields)
     if missing:
@@ -252,14 +285,53 @@ def _validate_reference_request(
 
 
 def _codec_facts(model_config: Any) -> tuple[int, int]:
-    """``(codebooks, codebook_size)``, read off the model config the same way
-    ``_prepare_one`` already reads ``num_codebooks`` (a ``getattr`` with the real
-    checkpoint's own value as the fallback default) rather than a new parameter --
-    every caller here already has ``model_config`` (review #1).
+    """``(codebooks, codebook_size)``.
+
+    ``codebooks`` keeps the existing fallback convention (``getattr`` with the real
+    checkpoint's own value, 16, as the default) since it only affects the shape of an
+    empty placeholder tensor when a request has no audio at all.
+
+    ``codebook_size`` has no such fallback (review #8): it reaches templates as a
+    **model attribute**, ``model_config.codec_config.codebook_size`` -- the backbone
+    config's own record of the codec it was loaded with, the same attribute
+    ``models/fast_streaming.py`` already reads as ``self._codec_codebook_size``. A
+    missing value means the loaded model can't say what its own codec's valid code
+    range is, so this raises rather than quietly assuming 2048.
+
+    It is then cross-checked against the backbone embedding's own layout via
+    ``codebook_pad_token_id``: ``models/fast_streaming.py``'s
+    ``range(self._codec_codebook_size, int(self.model.config.vocab_size))`` treats
+    every vocab id from ``codebook_size`` up to (not including) ``vocab_size`` as a
+    reserved special id, and ``codebook_pad_token_id`` is one of those ids (2050 for
+    the real checkpoint, with ``codebook_size`` 2048 and ``vocab_size`` 2051 -- 2
+    reserved slots below the pad id, then the backbone's own EOS at ``vocab_size``).
+    So ``codebook_pad_token_id`` must be at or above ``codebook_size``; if it's
+    below, the codec's own valid codes would collide with the pad token, which means
+    the codec and backbone configs were not loaded as a matching pair.
     """
     codebooks = getattr(model_config, "num_codebooks", 16)
+
     codec_config = getattr(model_config, "codec_config", None)
-    codebook_size = getattr(codec_config, "codebook_size", 2048)
+    codebook_size = getattr(codec_config, "codebook_size", None)
+    if codebook_size is None:
+        raise ValueError(
+            "model_config.codec_config.codebook_size is required to validate "
+            "reference audio codes, but the loaded model doesn't have it set"
+        )
+
+    pad_token_id = getattr(model_config, "codebook_pad_token_id", None)
+    if pad_token_id is None:
+        raise ValueError(
+            "model_config.codebook_pad_token_id is required to cross-check "
+            "codebook_size against the backbone embedding, but the loaded model "
+            "doesn't have it set"
+        )
+    if pad_token_id < codebook_size:
+        raise ValueError(
+            f"codebook_pad_token_id ({pad_token_id}) must be >= codebook_size "
+            f"({codebook_size}) -- the codec and backbone configs are inconsistent"
+        )
+
     return codebooks, codebook_size
 
 
@@ -475,9 +547,8 @@ def prepare_suffix_inputs(
     (``input_ids`` plus ``cfg_negative_*`` when ``guidance_scale != 1``) but
     carries no audio, so the runtime's branch builder can consume it unchanged.
     """
-    missing = _missing_fields(request, ("text", "instruction"))
-    if missing:
-        raise ValueError(f"Request {request.get('id')} missing {missing[0]}")
+    template = get_template("ref_edit_tata")
+    _validate_reference_request(template, request, ("text", "instruction"))
     _, guided, unguided = split_reference_prefix(request)
     inputs = _prepare_segment_batches(tokenizer, model.config, model.device, [guided])
     if guidance_scale != 1.0:

@@ -10,6 +10,17 @@ from typing import Any
 import numpy as np
 import torch
 
+# transformers.utils.SAFE_WEIGHTS_NAME / SAFE_WEIGHTS_INDEX_NAME: the single-file and
+# sharded safetensors conventions HuggingFace's own `from_pretrained` looks for, in
+# that order. `Qwen3TTSTokenizerV2Model.from_pretrained` (what `breeze_infer/runtime.py`
+# calls to load the bundled audio tokenizer) uses this same resolution, so this is the
+# one/few file(s) that actually determine what the loaded codec's weights are -- not
+# every `*.safetensors` file that happens to sit in the directory (review #1/#5).
+_SAFETENSORS_SINGLE_FILE = "model.safetensors"
+_SAFETENSORS_INDEX_FILE = "model.safetensors.index.json"
+
+_MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024  # 100 MB; a real header is a few KB.
+
 
 def encode_prompt_waveform(
     audio_tokenizer: Any, wav: np.ndarray, sample_rate: int
@@ -28,11 +39,12 @@ def encode_prompt_waveform(
 def pcm16(audio: np.ndarray) -> bytes:
     """Pack float32 samples as little-endian int16 PCM bytes.
 
-    Order matters (review #3): NaN maps to 0 first (``np.nan_to_num``, which also
-    folds +-inf to a large finite value), *then* the result is clipped to [-1, 1],
-    scaled by 32767 and rounded to the nearest integer (``np.rint``, not truncation)
-    before the final cast. Doing it in this order means no NaN/inf ever reaches the
-    multiply, so it raises no ``RuntimeWarning``.
+    Order matters (review #3, prior round): NaN maps to 0 first (``np.nan_to_num``,
+    which also folds +-inf to a large finite value), *then* the result is clipped to
+    [-1, 1], scaled by 32767 and rounded to the nearest integer (``np.rint``, ties to
+    even -- so ``pcm16([0.5 / 32767])`` gives 0, not 1) before the final cast. Doing
+    it in this order means no NaN/inf ever reaches the multiply, so it raises no
+    ``RuntimeWarning``.
 
     The scale is the *symmetric* int16 range: both +1.0 and -1.0 map to +-32767, one
     short of the asymmetric int16 minimum (-32768), so the positive and negative
@@ -45,54 +57,185 @@ def pcm16(audio: np.ndarray) -> bytes:
     return np.rint(audio * 32767.0).astype("<i2", copy=False).tobytes()
 
 
-# The codec config fields that determine what a stored code means (review #4): change
-# any of these and the same integer in ``codes`` decodes to different audio, so the
-# fingerprint must cover exactly this set -- no more (irrelevant fields like training
-# hyperparameters would churn the fingerprint for no reason) and no less.
+# The codec config fields that determine what a stored code means (review #4/#1,
+# this round): change any of these and the same integer in `codes` decodes to
+# different audio, so the fingerprint must cover exactly this set -- no more
+# (irrelevant fields like training hyperparameters would churn the fingerprint for
+# no reason) and no less. Every field is REQUIRED: a missing one means the config
+# can't say what its own codes mean, which is worth a clear error, not a silent gap
+# in the fingerprint.
 #
 # Read from ``<audio_tokenizer_dir>/config.json``, the ``Qwen3TTSTokenizerV2Config``
-# the bundled qwen-tts tokenizer loads (``breeze_infer/runtime.py``):
-#   - top level: ``input_sample_rate``, ``output_sample_rate`` (24000/24000 for the
-#     bundled tokenizer), ``encoder_valid_num_quantizers`` (how many of the encoder's
-#     quantizers are actually emitted -- 16 of 32), ``encode_downsample_rate`` (the
-#     encode-side frame rate: samples per codec frame, 1920);
-#   - ``encoder_config`` (a ``transformers.MimiConfig``): ``codebook_size`` (2048),
-#     ``codebook_dim``, ``num_quantizers`` (the encoder's full quantizer stack, 32,
-#     before ``encoder_valid_num_quantizers`` slices it down to 16);
-#   - ``decoder_config``: ``upsample_rates`` (how the decoder turns codes back into a
-#     waveform -- relevant because the same codec instance also decodes *generated*
-#     speech, not only reference audio).
-_CODEC_IDENTITY_FIELDS = (
+# the bundled qwen-tts tokenizer loads (``breeze_infer/runtime.py``), verified against
+# the real bundled checkpoint's own file
+# (``<model>/audio_tokenizer/config.json``):
+#   - top level: ``input_sample_rate``, ``output_sample_rate`` (24000/24000),
+#     ``encoder_valid_num_quantizers`` (how many of the encoder's quantizers are
+#     actually emitted -- 16 of 32), ``encode_downsample_rate`` (the encode-side
+#     frame rate: samples per codec frame, 1920), ``decode_upsample_rate`` (the
+#     decode-side counterpart, 1920);
+#   - ``encoder_config``: ``codebook_size`` (2048), ``codebook_dim`` (256),
+#     ``num_quantizers`` (the encoder's full quantizer stack, 32, before
+#     ``encoder_valid_num_quantizers`` slices it down to 16);
+#   - ``decoder_config``: ``codebook_size`` (2048), ``codebook_dim`` (512 -- not the
+#     same value as the encoder's), ``num_quantizers`` (16), ``semantic_codebook_size``
+#     (4096), ``num_semantic_quantizers`` (1), and its upsample schedule -- named
+#     ``upsample_rates`` in the real config, but ``upsampling_ratios`` is accepted too
+#     (both keys exist as aliases in different qwen-tts codec versions; whichever is
+#     present is used, and it's required that at least one is).
+_TOP_LEVEL_IDENTITY_FIELDS = (
     "input_sample_rate",
     "output_sample_rate",
     "encoder_valid_num_quantizers",
     "encode_downsample_rate",
+    "decode_upsample_rate",
 )
-_CODEC_ENCODER_IDENTITY_FIELDS = ("codebook_size", "codebook_dim", "num_quantizers")
-_CODEC_DECODER_IDENTITY_FIELDS = ("upsample_rates",)
+_ENCODER_IDENTITY_FIELDS = ("codebook_size", "codebook_dim", "num_quantizers")
+_DECODER_IDENTITY_FIELDS = (
+    "codebook_size",
+    "codebook_dim",
+    "num_quantizers",
+    "semantic_codebook_size",
+    "num_semantic_quantizers",
+)
+_DECODER_UPSAMPLE_FIELD_ALIASES = ("upsample_rates", "upsampling_ratios")
+
+
+def _require_field(config: dict[str, Any], key: str, *, where: str) -> Any:
+    value = config.get(key)
+    if value is None:
+        raise ValueError(f"codec config missing required {where} field '{key}'")
+    return value
+
+
+def _require_any_field(
+    config: dict[str, Any], keys: tuple[str, ...], *, where: str
+) -> tuple[str, Any]:
+    for key in keys:
+        value = config.get(key)
+        if value is not None:
+            return key, value
+    raise ValueError(
+        f"codec config missing required {where} field (any of {keys})"
+    )
 
 
 def _codec_identity_fields(config: dict[str, Any]) -> dict[str, Any]:
-    encoder_config = config.get("encoder_config") or {}
-    decoder_config = config.get("decoder_config") or {}
-    identity = {field: config.get(field) for field in _CODEC_IDENTITY_FIELDS}
-    identity.update({field: encoder_config.get(field) for field in _CODEC_ENCODER_IDENTITY_FIELDS})
-    identity.update({field: decoder_config.get(field) for field in _CODEC_DECODER_IDENTITY_FIELDS})
-    return identity
-
-
-def _safetensors_header_bytes(path: Path) -> bytes:
-    """The JSON header of a safetensors file, without reading the tensor data.
-
-    A safetensors file starts with an 8-byte little-endian ``uint64`` giving the
-    header's byte length, followed by that many bytes of JSON listing every tensor's
-    name, shape and dtype (https://github.com/huggingface/safetensors -- "Format").
-    That header is exactly the "are these the same weights" fact; the multi-GB tensor
-    payload after it is not read.
+    """The subset of ``config.json`` that determines code meaning, nested by which
+    sub-model it describes (encoder vs. decoder) so that a same-named field on each
+    side -- ``codebook_size``, ``codebook_dim`` and ``num_quantizers`` all differ
+    between the two in the real checkpoint -- can't collide and silently overwrite
+    one with the other in a flattened dict.
     """
+    # ValueError, not TypeError, for both checks below (noqa: TRY004): every other
+    # identity-field failure in this module is a ValueError, and callers (a future
+    # voices.py loading a saved voice) need one exception type to catch for "bad
+    # config", whether the problem is a missing field or the wrong shape of config.
+    encoder_config = config.get("encoder_config")
+    if not isinstance(encoder_config, dict):
+        raise ValueError("codec config missing required 'encoder_config' object")  # noqa: TRY004
+    decoder_config = config.get("decoder_config")
+    if not isinstance(decoder_config, dict):
+        raise ValueError("codec config missing required 'decoder_config' object")  # noqa: TRY004
+
+    upsample_key, upsample_value = _require_any_field(
+        decoder_config, _DECODER_UPSAMPLE_FIELD_ALIASES, where="decoder_config"
+    )
+
+    return {
+        "top": {
+            field: _require_field(config, field, where="top-level")
+            for field in _TOP_LEVEL_IDENTITY_FIELDS
+        },
+        "encoder": {
+            field: _require_field(encoder_config, field, where="encoder_config")
+            for field in _ENCODER_IDENTITY_FIELDS
+        },
+        "decoder": {
+            **{
+                field: _require_field(decoder_config, field, where="decoder_config")
+                for field in _DECODER_IDENTITY_FIELDS
+            },
+            upsample_key: upsample_value,
+        },
+    }
+
+
+def _safetensors_header(path: Path) -> dict[str, Any]:
+    """Parse a safetensors file's JSON header without reading the tensor payload.
+
+    The format: an 8-byte little-endian uint64 header length, then that many bytes of
+    JSON (https://github.com/huggingface/safetensors -- "Format"). The length prefix
+    is untrusted data until checked against the file's own size and a sane upper
+    bound (review #3): a git-lfs pointer file (a few hundred bytes of plain text, not
+    real weights) has *some* 8 bytes at its start that decode to an arbitrary
+    ``uint64``, and reading that many bytes without a cap could demand gigabytes for
+    a file that is not a safetensors file at all.
+    """
+    size = path.stat().st_size
+    if size < 8:
+        raise ValueError(f"not a safetensors file: {path} is only {size} bytes")
     with path.open("rb") as f:
         header_len = int.from_bytes(f.read(8), "little")
-        return f.read(header_len)
+        if header_len > _MAX_SAFETENSORS_HEADER_BYTES or header_len > size - 8:
+            raise ValueError(
+                f"not a safetensors file: {path} declares a {header_len}-byte "
+                f"header, which is not plausible for a {size}-byte file"
+            )
+        header_bytes = f.read(header_len)
+    try:
+        header = json.loads(header_bytes)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"not a safetensors file: {path} has an invalid JSON header"
+        ) from exc
+    if not isinstance(header, dict):
+        raise ValueError(f"not a safetensors file: {path} has a non-object header")  # noqa: TRY004
+    return header
+
+
+def _tensor_identity(header: dict[str, Any]) -> dict[str, list[Any]]:
+    """``{tensor_name: [dtype, shape]}``, excluding ``data_offsets``, any padding
+    key and ``__metadata__`` (review #1/#5): those describe *where* a tensor's bytes
+    sit in the file, not what the tensor logically is, and would make the fingerprint
+    depend on a resharding or a writer's padding choices rather than the weights
+    themselves. This is also, by construction, the limit of what this fingerprint can
+    see: two checkpoints with identical tensor names/dtypes/shapes but different
+    trained values hash the same. It detects an architecture, shape or dtype change,
+    not a retrain of the same-shaped weights.
+    """
+    return {
+        name: [entry["dtype"], entry["shape"]]
+        for name, entry in header.items()
+        if name != "__metadata__"
+    }
+
+
+def _weight_files(directory: Path) -> list[Path]:
+    """The weight file(s) ``Qwen3TTSTokenizerV2Model.from_pretrained`` actually loads
+    from ``audio_tokenizer/`` -- HuggingFace's own single-file/sharded-index
+    convention (``transformers.utils.SAFE_WEIGHTS_NAME`` /
+    ``SAFE_WEIGHTS_INDEX_NAME``), tried in that order, exactly as ``from_pretrained``
+    does. A stray extra ``*.safetensors`` file that the loader would never touch
+    (an old backup, an unrelated shard) is ignored rather than folded into the
+    fingerprint (review #1/#5).
+    """
+    index_path = directory / _SAFETENSORS_INDEX_FILE
+    if index_path.is_file():
+        index = json.loads(index_path.read_text())
+        weight_map = index.get("weight_map")
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError(f"{index_path} has no usable 'weight_map'")
+        return [directory / name for name in sorted(set(weight_map.values()))]
+
+    single_path = directory / _SAFETENSORS_SINGLE_FILE
+    if single_path.is_file():
+        return [single_path]
+
+    raise FileNotFoundError(
+        f"Neither {_SAFETENSORS_SINGLE_FILE} nor {_SAFETENSORS_INDEX_FILE} "
+        f"found under {directory}"
+    )
 
 
 def codec_fingerprint(audio_tokenizer_dir: str | Path) -> str:
@@ -106,19 +249,29 @@ def codec_fingerprint(audio_tokenizer_dir: str | Path) -> str:
     The fingerprint covers two things, hashed together in order:
     (a) the canonical JSON (``sort_keys=True``, compact separators, so re-serializing
         the same file with different key order or whitespace doesn't change the
-        fingerprint) of the codec config fields that determine code meaning -- see
-        ``_codec_identity_fields`` and the module-level field list above;
-    (b) every ``*.safetensors`` file's header under ``audio_tokenizer_dir`` (sorted by
-        filename, for the sharded-weights case), which names every tensor's shape and
-        dtype without reading the tensor data itself.
+        fingerprint) of the codec config's identity fields -- see
+        ``_codec_identity_fields`` and the module-level field list above. Every field
+        is required; a config missing one raises rather than silently leaving it out.
+    (b) the tensor identity (``{name: [dtype, shape]}``, not the trained values --
+        see ``_tensor_identity``) of the ONE weight file (or, for a sharded
+        checkpoint, every shard the loader's own index lists) that
+        ``Qwen3TTSTokenizerV2Model.from_pretrained`` actually loads.
 
-    Directory-only, not path plus caller-supplied facts (review #4's "read them
-    itself, or take them from the caller" choice): the caller already has this same
-    directory (it's the one ``breeze_infer/runtime.py`` loads the audio tokenizer
-    from), so a directory is no more information to thread through than the codec
-    facts were, and it keeps the ``qwen_tts`` config schema (the nested
-    ``encoder_config``/``decoder_config`` indirection above) known in exactly one
-    place instead of duplicated at every call site.
+    Consequently, this fingerprint detects an **architecture, shape or dtype**
+    change -- a different codec entirely, a retrained model with a different
+    quantizer count, etc. -- not a **retrain of weights with identical shapes**: two
+    checkpoints that differ only in trained values hash the same. That's an accepted
+    limitation of a fingerprint cheap enough to compute at every startup without
+    reading multi-GB tensor payloads, not an oversight (see
+    ``test_codec_fingerprint_cannot_detect_a_retrain_of_the_same_shapes`` in
+    ``tests/test_audio.py``).
+
+    Directory-only, not path plus caller-supplied facts: the caller already has this
+    same directory (it's the one ``breeze_infer/runtime.py`` loads the audio
+    tokenizer from), so a directory is no more information to thread through than
+    the codec facts were, and it keeps the ``qwen_tts`` config/weights-loading
+    conventions (the nested config blocks, the single-file-vs-sharded resolution)
+    known in exactly one place instead of duplicated at every call site.
 
     Never hashes ``audio_tokenizer_dir`` itself (R13): moving the checkpoint to a new
     location on disk must not invalidate every saved voice.
@@ -130,10 +283,13 @@ def codec_fingerprint(audio_tokenizer_dir: str | Path) -> str:
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     )
 
-    weight_files = sorted(directory.glob("*.safetensors"))
-    if not weight_files:
-        raise FileNotFoundError(f"No .safetensors weights found under {directory}")
-    for weight_path in weight_files:
-        digest.update(_safetensors_header_bytes(weight_path))
+    tensor_identity: dict[str, list[Any]] = {}
+    for weight_path in _weight_files(directory):
+        tensor_identity.update(_tensor_identity(_safetensors_header(weight_path)))
+    digest.update(
+        json.dumps(tensor_identity, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
 
     return digest.hexdigest()

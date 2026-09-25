@@ -122,7 +122,13 @@ def main() -> None:
             request["ref_audio_codes"] = encode_prompt_waveform(
                 audio_tokenizer, wav, sample_rate
             )
-        except (OSError, RuntimeError, ValueError) as exc:
+        # Narrow on purpose (review #10): a bad file (soundfile's own errors, plus
+        # plain OSError for e.g. a permissions problem) or a codec that returned the
+        # wrong shape (encode_prompt_waveform's ValueError) are the CLI's own
+        # problem to explain with the file path attached. torch.OutOfMemoryError and
+        # any other RuntimeError from the codec itself are not about this file and
+        # must propagate with their real traceback intact.
+        except (OSError, sf.SoundFileError, ValueError) as exc:
             raise ValueError(
                 f"Could not encode reference audio '{args.ref_audio}': {exc}"
             ) from exc

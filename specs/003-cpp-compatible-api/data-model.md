@@ -175,7 +175,7 @@ Path: `<voices_dir>/<id>.voice.json`, UTF-8 JSON. A consumer rejects any file wh
   "codebooks": 16,
   "codes": "<base64 of int16 little-endian, row-major [frames][codebooks]>",
   "codes_sha256": "<hex sha256 of the decoded bytes>",
-  "codec_fingerprint": "<hex sha256 of config.json bytes ‖ codebooks ‖ codebook_size ‖ sample_rate>",
+  "codec_fingerprint": "<hex sha256 of the codec config's required identity fields (sample rates, quantizer counts, codebook sizes/dims, upsample rates, from both the encoder and decoder blocks of audio_tokenizer/config.json) ‖ the loaded weight file's safetensors header ({tensor: [dtype, shape]} only, no tensor data) -- detects an architecture/shape/dtype change, not a retrain of same-shaped weights>",
   "encode_ms": 812,
   "created_at": "2026-09-24T20:15:00Z"
 }
