@@ -540,11 +540,12 @@ def test_a_trickling_reader_is_aborted_as_too_slow() -> None:
 
     direct = asyncio.run(scenario())
 
-    # First byte at t=1. Breached once t > 1 + 2 + audio / 0.5: after 3 chunks, t=4 > 3.48.
+    # Budget = 2 + audio / 0.5 - blocked. Headers: blocked 1. Chunk 1: budget 1, blocked 2.
+    # Chunk 2: budget 2.16 - 2 = 0.16, blocked 3. Chunk 3: budget 2.32 - 3 < 0, aborted.
     [(name, fields)] = direct.events.calls
     assert name == "speech.aborted"
     assert fields["reason"] == "too_slow"
-    assert fields["audio_seconds"] == 3 * CODEC_SAMPLES_PER_FRAME / 24000
+    assert fields["audio_seconds"] == 2 * CODEC_SAMPLES_PER_FRAME / 24000
     assert direct.generation.yielded < direct.runtime.chunks
     assert direct.runtime.closed == 1
 
@@ -559,6 +560,36 @@ def test_a_reader_above_the_minimum_rate_completes() -> None:
     async def scenario() -> Direct:
         direct = await Direct.open(FakeRuntime(chunks=20))
         response = direct.response(clock=clock, started_at=0.0, min_rate_grace=0.1)
+        await response(SCOPE, never_disconnects, send)
+        await direct.shut_down()
+        return direct
+
+    direct = asyncio.run(scenario())
+
+    [(name, fields)] = direct.events.calls
+    assert name == "speech.completed"
+    assert fields["audio_seconds"] == 20 * CODEC_SAMPLES_PER_FRAME / 24000
+
+
+def test_a_slow_generator_with_a_fast_reader_completes() -> None:
+    """Generation at 0.016x real time (5 s per 0.08 s chunk) is the server's slowness, not
+    the client's: only time blocked in send() counts, so this never becomes `too_slow`."""
+    clock = FakeClock()
+
+    async def send(message: dict[str, Any]) -> None:
+        clock.now += 0.001
+
+    async def scenario() -> Direct:
+        direct = await Direct.open(FakeRuntime(chunks=20))
+
+        async def slow_body() -> AsyncGenerator[bytes, None]:
+            async for chunk in rest_of_audio(direct.session):
+                clock.now += 5.0
+                yield chunk
+
+        response = direct.response(
+            body=slow_body(), clock=clock, started_at=0.0, min_rate_grace=0.1
+        )
         await response(SCOPE, never_disconnects, send)
         await direct.shut_down()
         return direct

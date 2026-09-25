@@ -28,4 +28,14 @@ WS_HANDSHAKE_SECONDS = 10
 WS_OUTBOX_BYTES = 2 * _MIB
 
 HTTP_SEND_TIMEOUT_SECONDS = 30
+
+# Minimum delivery rate for a streamed speech response (research.md R3). The send timeout only
+# catches a client that stops reading entirely; one that trickles (a few bytes before each
+# timeout) could hold the single GPU for hours. So the total time spent blocked in send() may
+# not exceed the grace period plus the audio delivered divided by the rate. Only time blocked
+# in send() counts, so a slow GPU never trips it; only a slow client does. The grace period
+# absorbs slow starts and hiccups; half of real time is far below what any client that plays
+# the audio has to read.
+MIN_RATE_GRACE_SECONDS = 30.0
+MIN_RATE_REAL_TIME = 0.5
 TCP_USER_TIMEOUT_MS = 30_000

@@ -63,14 +63,16 @@ read it); forcing a TCP reset (plain ASGI can't reach the transport, and it isn'
 
 **Minimum delivery rate**: the send timeout only catches a client that stops reading entirely.
 A client that trickles (draining a few bytes just before each timeout) would keep every send
-under 30 s and hold the single GPU for hours. So after a 30 s grace period, the stream must have
-delivered audio at an average of at least half of real time since its first byte:
-`bytes_sent / (2 × sample_rate) ≥ 0.5 × (elapsed − 30 s)`. A stream below that is aborted like a
-send timeout, as `speech.aborted` with reason `too_slow`. Each send's timeout is the shorter of
-the send timeout and the time left before the rate would be breached, so a trickle is caught
-mid-send too. The grace period absorbs slow starts and hiccups, and any client that plays the
-audio reads at least at real time. Note that the elapsed time includes waiting for generation,
-so a GPU generating below 0.5× real time would trip the rule on its own.
+under 30 s and hold the single GPU for hours. So the total time the stream has spent blocked in
+`send()` may not exceed a 30 s grace period plus twice the audio delivered so far:
+`send_blocked ≤ 30 s + audio_seconds_sent / 0.5`, i.e. past the grace period the client must read
+at least at half of real time. A stream past that is aborted like a send timeout, as
+`speech.aborted` with reason `too_slow`. Each send's timeout is the shorter of the send timeout
+and the budget left, so a trickle is caught mid-send too. Only time blocked in `send()` counts:
+waiting for generation between sends is the server's own doing, so a slow GPU never trips the
+rule and only a slow client does. The grace period absorbs slow starts and hiccups, and any
+client that plays the audio reads at least at real time. The constants are
+`MIN_RATE_GRACE_SECONDS` and `MIN_RATE_REAL_TIME` in `limits.py`.
 
 **Alternatives considered**: releasing the gate in the generator's `finally` (skipped when the
 body never starts); polling `request.is_disconnected()` (redundant under spec 2.3).

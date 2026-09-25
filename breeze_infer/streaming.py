@@ -55,17 +55,13 @@ from starlette.types import Message, Receive, Scope, Send
 
 from breeze_infer.errors import StreamAborted
 from breeze_infer.gpu import GpuCloseTimeout, GpuSession
-from breeze_infer.limits import HTTP_SEND_TIMEOUT_SECONDS
+from breeze_infer.limits import (
+    HTTP_SEND_TIMEOUT_SECONDS,
+    MIN_RATE_GRACE_SECONDS,
+    MIN_RATE_REAL_TIME,
+)
 
 BYTES_PER_SAMPLE = 2  # s16le mono
-
-# Minimum delivery rate (research.md R3). The send timeout alone only catches a reader that
-# stops completely; one that trickles (a few bytes before each timeout) could hold the only
-# GPU for hours. So after a grace period, the audio delivered since the first byte must keep
-# up with at least half of real time. The grace period covers slow starts and short hiccups;
-# half of real time is far below what any client that plays the audio has to read.
-MIN_RATE_GRACE_SECONDS = 30.0
-MIN_RATE_REAL_TIME = 0.5
 
 
 class Events(Protocol):
@@ -138,7 +134,8 @@ class SpeechResponse(StreamingResponse):
     - `sample_rate`: sets the contract headers and turns bytes into audio seconds. `headers`
       adds to the contract headers; it can't replace them.
     - `clock` and `started_at`: a monotonic clock and its reading when generation started,
-      for the real-time factor in `speech.completed` and the minimum delivery rate.
+      for the real-time factor in `speech.completed`. The clock also times each send for the
+      minimum delivery rate (`min_rate_grace`, `min_rate`; see `limits.py`).
 
     Exactly one of `speech.completed`, `speech.aborted` or `speech.failed` is emitted, after
     the session is closed. Build it on the event loop that will serve it.
@@ -181,7 +178,7 @@ class SpeechResponse(StreamingResponse):
         self._min_rate_grace = min_rate_grace
         self._min_rate = min_rate
         self._bytes_sent = 0
-        self._first_byte_at: float | None = None
+        self._send_blocked = 0.0  # seconds spent inside send(); generation time not included
         self._disconnected = False
         self._finished = False  # the terminator went out to a client still connected
         self._unsent = weakref.finalize(
@@ -202,7 +199,6 @@ class SpeechResponse(StreamingResponse):
                     "headers": self.raw_headers,
                 },
             )
-            self._first_byte_at = self._clock()
             await self._send_chunk(send, self._first_chunk)
             async for chunk in self._body:
                 await self._send_chunk(send, chunk)
@@ -224,22 +220,24 @@ class SpeechResponse(StreamingResponse):
             self._bytes_sent += len(chunk)
 
     async def _send(self, send: Send, message: Message) -> None:
+        # Only time blocked in send() counts against the client: waiting for a slow GPU
+        # between sends is the server's own doing and must never trip this.
+        budget = (
+            self._min_rate_grace + self._audio_seconds() / self._min_rate - self._send_blocked
+        )
+        if budget <= 0:
+            raise SendTimeout("too_slow", "the client reads below the minimum delivery rate")
         timeout, reason = self._send_timeout, "send_timeout"
-        if self._first_byte_at is not None:
-            # Past this moment the delivered audio is below `min_rate` x real time.
-            too_slow_at = (
-                self._first_byte_at + self._min_rate_grace + self._audio_seconds() / self._min_rate
-            )
-            left = too_slow_at - self._clock()
-            if left <= 0:
-                raise SendTimeout("too_slow", "delivery fell below the minimum rate")
-            if left < timeout:
-                timeout, reason = left, "too_slow"
+        if budget < timeout:
+            timeout, reason = budget, "too_slow"
+        started = self._clock()
         try:
             async with asyncio.timeout(timeout):
                 await send(message)
         except TimeoutError as error:
             raise SendTimeout(reason, f"send() blocked for {timeout:g} s ({reason})") from error
+        finally:
+            self._send_blocked += self._clock() - started
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         self._unsent.detach()  # from here on, the `finally` below owns the close
