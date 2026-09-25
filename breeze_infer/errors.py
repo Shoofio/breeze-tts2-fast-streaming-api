@@ -13,6 +13,7 @@ specs/003-cpp-compatible-api/contracts/http-api.md.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -61,7 +62,9 @@ def _envelope(message: str, code: str) -> dict[str, str]:
     return {"error": message, "code": code}
 
 
-def api_error_response(exc: ApiError) -> JSONResponse:
+def api_error_response(
+    exc: ApiError, headers: Mapping[str, str] | None = None
+) -> JSONResponse:
     """Build the one response shape every `ApiError` produces.
 
     Shared by the `ApiError` exception handler below and `body_limit.py`'s immediate-rejection
@@ -69,8 +72,13 @@ def api_error_response(exc: ApiError) -> JSONResponse:
     anything raised there) -- both 413s the body-limit middleware can produce must be
     byte-for-byte the same response, and building them from one place is how that's kept true
     rather than merely asserted.
+
+    `headers` is passed straight to `JSONResponse` so a caller with extra headers to add (e.g.
+    `cors.py`'s `_reject`, which needs its own CORS headers alongside a synthesized `403`/`404`/
+    `405`) can hand them over here instead of building the response and then mutating `.headers`
+    on it afterward (review-agent second-to-last pass, issue 8).
     """
-    return JSONResponse(_envelope(exc.message, exc.code), status_code=exc.status)
+    return JSONResponse(_envelope(exc.message, exc.code), status_code=exc.status, headers=headers)
 
 
 # A fixed status -> (code, message) table for bare `StarletteHTTPException`s -- i.e. ones this
@@ -105,30 +113,33 @@ def http_status_error(status: int) -> tuple[str, str]:
     return _HTTP_EXCEPTION_RESPONSES[status]
 
 
-def route_methods_for_path(router: Router, scope: Scope) -> tuple[bool, set[str]]:
-    """The union of the declared methods of every route matching ``scope``'s path.
+def route_methods_for_path(router: Router, scope: Scope) -> tuple[bool, set[str], bool]:
+    """The union of the declared methods of every *plain* route matching ``scope``'s path, plus
+    whether any matched route can't be enumerated at all.
 
-    Returns ``(True, methods)`` when at least one route matches the path, ``(False, set())`` when
-    none does. ``methods`` is the union of every matched route's own ``.methods`` -- whatever that
-    actually contains, with no assumption here about what it is (it is *not* safe to assume
-    ``HEAD`` comes along with ``GET``: base Starlette ``Route.__init__`` adds it automatically,
-    but FastAPI's own ``APIRoute`` -- what ``@app.get()`` etc. actually build -- does not). FastAPI
-    registers ``@app.get(path)``/``@app.post(path)`` on the same path as two separate ``Route``
-    objects, not one route with two methods, so every matching route must contribute -- both here
-    and in ``_http_exception_handler``'s own ``405`` below, which otherwise only sees Starlette's
-    own ``Router.app`` keeping just the *first* ``Match.PARTIAL`` route it finds (review-agent
-    final pass, issue 4).
+    Returns ``(matched, methods, any_method)``. ``matched`` is whether at least one route matches
+    the path at all. ``methods`` is the union of every matched route's own ``.methods`` that
+    *does* enumerate one -- whatever that actually contains, with no assumption here about what it
+    is (it is *not* safe to assume ``HEAD`` comes along with ``GET``: base Starlette
+    ``Route.__init__`` adds it automatically, but FastAPI's own ``APIRoute`` -- what
+    ``@app.get()`` etc. actually build -- does not). FastAPI registers ``@app.get(path)``/
+    ``@app.post(path)`` on the same path as two separate ``Route`` objects, not one route with two
+    methods, so every matching route must contribute -- both here and in
+    ``_http_exception_handler``'s own ``405`` below, which otherwise only sees Starlette's own
+    ``Router.app`` keeping just the *first* ``Match.PARTIAL`` route it finds (review-agent final
+    pass, issue 4).
 
     ``Route.matches`` returns ``Match.NONE`` only when the *path* doesn't match; a path match with
     the "wrong" method comes back as ``Match.PARTIAL`` -- either counts as a match here. Not every
     matched entry is a plain ``Route`` with a ``.methods`` set: a ``Mount`` has none at all, and
     neither does a ``Route`` registered with ``methods=None`` (a raw ASGI sub-app, meaning "the
     sub-app decides"). Such an entry is skipped rather than crashing on a bare ``route.methods``
-    access (review-agent second-to-last pass, issue 5) -- and makes the whole result ``methods ==
-    set()`` even if other matched routes *do* enumerate methods, since callers must treat an
-    empty-but-matched result as "any method is allowed here", not as an empty allowlist to reject
-    everything against (review-agent final pass, issue 6): there's no way to know a Mount's own
-    sub-app doesn't handle a method this function can't see.
+    access (review-agent second-to-last pass, issue 5), and sets ``any_method`` -- but it does
+    *not* discard whatever plain routes matching the same path *did* enumerate (review-agent
+    second-to-last pass, issue 4; the previous pass folded that into an all-or-nothing ``methods
+    == set()``, silently losing known-good methods whenever a Mount happened to overlap). Callers
+    must treat ``any_method`` as "something here might also accept a method not in ``methods``",
+    not assume ``methods`` alone is the complete allowlist, whenever it is ``True``.
     """
     matched = False
     any_method = False
@@ -143,9 +154,7 @@ def route_methods_for_path(router: Router, scope: Scope) -> tuple[bool, set[str]
             any_method = True
             continue
         methods |= set(route_methods)
-    if not matched:
-        return False, set()
-    return True, (set() if any_method else methods)
+    return matched, methods, any_method
 
 
 def install_error_handlers(app: FastAPI, events: Emitter) -> None:
@@ -166,11 +175,21 @@ def install_error_handlers(app: FastAPI, events: Emitter) -> None:
             )
         code, message = mapped
         headers = exc.headers
-        if exc.status_code == 405:
-            # Starlette's own `Route.handle` set `exc.headers["Allow"]` from just the first
-            # matching route it found (review issue 4) -- recomputed here as the union across
-            # every route that matches this path, the same way `cors.py`'s preflight does.
-            matched, methods = route_methods_for_path(request.app.router, request.scope)
+        # Starlette's own `Route.handle` set `exc.headers["Allow"]` from just the first matching
+        # route it found (review issue 4) -- recomputed here as the union across every route that
+        # matches this path, the same way `cors.py`'s preflight does. Only when `root_path` is
+        # still empty, though: once routing has passed through a `Mount`, `Mount.matches` has
+        # already extended `scope["root_path"]` by its own matched prefix, so re-matching against
+        # `request.app.router` (the *top-level* router) would check whatever text is left after
+        # stripping that prefix, not the original path -- liable to pick up an unrelated top-level
+        # route that happens to share that remainder, replacing a Mount-internal 405's own
+        # (correct) `Allow` with a wrong one (review-agent second-to-last pass, issue 3). There is
+        # no general way to find "the router that actually handled this path" from here, so this
+        # skips the recompute entirely in that case rather than risk a wrong answer.
+        if exc.status_code == 405 and not request.scope.get("root_path"):
+            matched, methods, _any_method = route_methods_for_path(
+                request.app.router, request.scope
+            )
             if matched and methods:
                 headers = {**(headers or {}), "Allow": ", ".join(sorted(methods))}
         return JSONResponse(

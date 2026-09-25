@@ -22,6 +22,8 @@ treated as not allowed, never raised.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from starlette.responses import Response
@@ -42,6 +44,13 @@ from breeze_infer.origins import canonical_origin
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _MAX_AGE = b"86400"
 _EXPOSE_HEADERS = b"X-Sample-Rate, X-Sample-Format, X-Breeze-Version"
+# RFC 7230 tchar: a bare HTTP method name, never a list, never anything with a space or comma in
+# it. `Access-Control-Request-Method` must be exactly this before it's ever trusted as a method
+# name to echo into a response header (review-agent second-to-last pass, issue 2) -- e.g.
+# `"µ".upper()` is `"Μ"` (U+039C GREEK CAPITAL LETTER MU), which isn't Latin-1 and would crash
+# encoding a header with it; a comma- or space-separated list must never be echoed as if it were
+# one method either.
+_TOKEN_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 
 # Fixed (status, code, message) triples this middleware itself can answer with. 404/405 are built
 # from `errors.http_status_error` (review-agent final pass, issue 8) rather than copied as string
@@ -157,6 +166,12 @@ def _header(scope: Scope, name: bytes) -> str | None:
     return None
 
 
+def _allow_header(methods: set[str]) -> list[tuple[bytes, bytes]]:
+    if not methods:
+        return []
+    return [(b"allow", ", ".join(sorted(methods)).encode("latin-1"))]
+
+
 class CorsMiddleware:
     """Pure-ASGI CORS: preflight, ``403`` for a disallowed cross-origin write, and response
     headers on everything else, including error and streamed responses.
@@ -220,30 +235,33 @@ class CorsMiddleware:
             await self._reject(scope, receive, send, origin, allowed, *_ORIGIN_NOT_ALLOWED)
             return
 
-        matched, route_methods = route_methods_for_path(self.router, scope)
+        matched, route_methods, any_method = route_methods_for_path(self.router, scope)
         if not matched:
             await self._reject(scope, receive, send, origin, allowed, *_NOT_FOUND)
             return
+
         requested = requested_method.upper()
-        # An empty `route_methods` with `matched` True means a Mount, or a Route registered with
-        # `methods=None`, matched -- its sub-app decides its own methods, which this function
-        # can't see, so the requested method is let through rather than rejected against an
-        # allowlist that isn't really one (review-agent final pass, issue 6).
-        if route_methods and requested not in route_methods:
-            # The matched routes' own methods, same as a real wrong-method 405 would carry
-            # (review issue 3) -- not "+ OPTIONS": Allow describes what the *resource* supports,
-            # and OPTIONS is how you ask, not a method the resource itself implements.
-            allow = ", ".join(sorted(route_methods)).encode("latin-1")
-            await self._reject(
-                scope, receive, send, origin, allowed, *_METHOD_NOT_ALLOWED,
-                extra_headers=[(b"allow", allow)],
-            )
-            return
+        effective_methods = route_methods
+        if requested not in route_methods:
+            # `any_method` means a Mount, or a Route registered with `methods=None`, also matched
+            # -- its sub-app decides its own methods, which this function can't enumerate, so a
+            # method not already in `route_methods` isn't rejected outright (review-agent final
+            # pass, issue 6) -- but only when it's a legitimate single HTTP method token; nothing
+            # sane to echo back otherwise (review-agent second-to-last pass, issue 2), so that
+            # case is rejected exactly like the plain "not a method this path supports" one below.
+            if not (any_method and _TOKEN_RE.fullmatch(requested)):
+                # The matched routes' own known methods, same as a real wrong-method 405 would
+                # carry (review issue 3) -- not "+ OPTIONS": Allow describes what the *resource*
+                # supports, and OPTIONS is how you ask, not a method the resource itself
+                # implements. Empty when only an any-method route matched (nothing known to list).
+                await self._reject(
+                    scope, receive, send, origin, allowed, *_METHOD_NOT_ALLOWED,
+                    extra_headers=_allow_header(route_methods),
+                )
+                return
+            effective_methods = route_methods | {requested}
 
         requested_headers = _header(scope, b"access-control-request-headers")
-        # Nothing to enumerate for the any-method case beyond the one method this preflight
-        # actually asked about (review-agent final pass, issue 6).
-        effective_methods = route_methods or {requested}
         headers = response_headers(self.policy, origin, allowed) + preflight_headers(
             effective_methods, requested_headers
         )
@@ -260,15 +278,15 @@ class CorsMiddleware:
         status: int,
         code: str,
         message: str,
-        extra_headers: list[tuple[bytes, bytes]] = (),
+        extra_headers: Sequence[tuple[bytes, bytes]] = (),
     ) -> None:
-        # Built once here (review-agent final pass, issue 9), so every rejection this middleware
-        # sends -- a disallowed origin's 403, preflight's own 404/405 -- goes through the same
-        # header-assembly path instead of each caller repeating it.
+        # Built once here (review-agent final pass, issue 9) and handed straight to
+        # `api_error_response` (review-agent second-to-last pass, issue 8) instead of
+        # constructing the response and then mutating `.headers` on it afterward -- so every
+        # rejection this middleware sends (a disallowed origin's 403, preflight's own 404/405)
+        # goes through the same header-assembly path instead of each caller repeating it.
         headers = _as_str_headers(response_headers(self.policy, origin, allowed) + list(extra_headers))
-        response = api_error_response(ApiError(status, code, message))
-        for name, value in headers.items():
-            response.headers[name] = value
+        response = api_error_response(ApiError(status, code, message), headers)
         await response(scope, receive, send)
 
     def _wrap_send(self, send: Send, origin: str | None, allowed: bool) -> Send:

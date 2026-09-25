@@ -538,25 +538,31 @@ def test_cors_bracketed_ipvfuture_without_a_colon_is_rejected(
     assert "IPvFuture" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(
-    "entry",
-    [
-        "https://evil.example.2130706433.",
-        "http://0x7f000001.",
-        "http://evil.0x",
-        "http://0x",
-    ],
-)
-def test_cors_numeric_or_hex_last_label_edge_cases_rejected(
+@pytest.mark.parametrize("entry", ["http://evil.0x", "http://0x"])
+def test_cors_bare_0x_last_label_rejected(
     tmp_path: Path, entry: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """issue 2: a trailing '.' (FQDN absolute-name syntax) left the last label empty after
-    `rsplit(".", 1)`, silently bypassing the numeric/hex check entirely (`"...2130706433."` was
-    accepted); and the hex check required at least one digit after `"0x"`, letting the bare label
-    `"0x"` itself through."""
+    """issue 2: the hex check required at least one digit after `"0x"`, letting the bare label
+    `"0x"` itself -- just as much a smuggled-IP trick as `"0x7f000001"` -- through."""
     with pytest.raises(SystemExit):
         settings_from_args([str(tmp_path), "--cors", entry])
     assert "numeric" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "entry", ["https://evil.example.2130706433.", "http://0x7f000001."]
+)
+def test_cors_numeric_or_hex_last_label_with_trailing_dot_rejected(
+    tmp_path: Path, entry: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue 2 (first review-agent pass): a trailing '.' (FQDN absolute-name syntax) left the
+    last label empty after `rsplit(".", 1)`, silently bypassing the numeric/hex check entirely.
+    Superseded by the general empty-label rejection (second-to-last pass, issue 1,
+    `test_cors_empty_label_rejected`), which now catches the trailing dot itself, before the
+    numeric/hex check ever runs -- this only confirms the entry is still rejected."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", entry])
+    assert "empty label" in capsys.readouterr().err
 
 
 def test_cors_origin_error_is_prefixed_with_the_flag_name(
@@ -603,3 +609,55 @@ def test_cors_c1_control_character_rejected(
     with pytest.raises(SystemExit):
         settings_from_args([str(tmp_path), "--cors", "https://a\x80b.example"])
     assert "control characters or whitespace" in capsys.readouterr().err
+
+
+# ------------------------------------------------- review-agent second-to-last pass (800k fuzz)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "http://.example.com",
+        "http://example..com",
+        "http://example.com.",
+        "http://example.com..",
+    ],
+)
+def test_cors_empty_label_rejected(
+    tmp_path: Path, entry: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue 1: a leading '.', '..', or a trailing '.' (even just one -- the FQDN absolute-name
+    form, real DNS syntax, but no browser ever sends it in an `Origin` header) all produce an
+    empty label. `_HOST_CHARS_RE` allows '.' as a character but says nothing about *where*, so
+    all of these previously slipped through -- and a single trailing '.' had silently defeated
+    the numeric/hex last-label check from the previous pass (issue 2 there)."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", entry])
+    assert "empty label" in capsys.readouterr().err
+
+
+def test_cors_kelvin_sign_host_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue 5: U+212A KELVIN SIGN lowercases to the plain ASCII "k" -- `SplitResult.hostname`
+    lowercases internally, so checking `str.isascii()` only *after* that (as `_canonical_host`
+    alone did) would miss exactly this: a non-ASCII origin quietly laundering itself into one
+    that looks perfectly ordinary once lowercased."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "https://aKxample.com"])
+    err = capsys.readouterr().err
+    assert "ASCII" in err
+    assert "punycode" in err
+
+
+def test_cors_non_ascii_digit_port_rejected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """issue 6: `str.isdigit()` (used for the leading-zero check) is also true for non-ASCII
+    decimal digits (e.g. full-width '０８０'); `int()`/`SplitResult.port` parse them
+    the same as their ASCII equivalents, so a port spelled entirely in full-width digits would
+    silently canonicalize to an ordinary-looking port number -- a form no browser's `Origin`
+    header would ever carry."""
+    with pytest.raises(SystemExit):
+        settings_from_args([str(tmp_path), "--cors", "http://a.example:０８０"])
+    assert "ASCII" in capsys.readouterr().err

@@ -12,6 +12,7 @@ and BC-23's counting endpoint (the voice routes don't exist yet).
 
 from __future__ import annotations
 
+import asyncio
 import io
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -376,10 +377,11 @@ def test_route_methods_for_path_does_not_crash_on_a_route_with_no_methods_attrib
     router.routes = [Mount("/static", app=_sub_app)]
     scope = {"type": "http", "method": "OPTIONS", "path": "/static/thing", "headers": []}
 
-    matched, methods = route_methods_for_path(router, scope)
+    matched, methods, any_method = route_methods_for_path(router, scope)
 
     assert matched is True
     assert methods == set()
+    assert any_method is True
 
 
 def test_route_methods_for_path_no_match_is_not_matched() -> None:
@@ -387,7 +389,32 @@ def test_route_methods_for_path_no_match_is_not_matched() -> None:
     router.routes = [Route("/health", _noop_endpoint, methods=["GET"])]
     scope = {"type": "http", "method": "OPTIONS", "path": "/nope", "headers": []}
 
-    assert route_methods_for_path(router, scope) == (False, set())
+    assert route_methods_for_path(router, scope) == (False, set(), False)
+
+
+def test_route_methods_for_path_unions_plain_routes_even_when_a_mount_also_matches() -> None:
+    """review-agent second-to-last pass, issue 4: a `Mount` matching the same path as a plain
+    `Route` must not discard that route's own known methods -- both the union of every plain
+    route's methods *and* the any-method flag are reported, not one instead of the other."""
+
+    async def _sub_app(scope: object, receive: object, send: object) -> None:
+        del scope, receive, send
+
+    router = FastAPI().router
+    router.routes = [
+        # A `Mount` only matches *under* its prefix ("/multi/..."), never the bare prefix itself,
+        # so both routes have to match "/multi/thing" specifically for this to exercise anything.
+        Mount("/multi", app=_sub_app),
+        Route("/multi/thing", _noop_endpoint, methods=["GET"]),
+    ]
+    scope = {"type": "http", "method": "OPTIONS", "path": "/multi/thing", "headers": []}
+
+    matched, methods, any_method = route_methods_for_path(router, scope)
+
+    assert matched is True
+    # Base Starlette `Route` (unlike FastAPI's `APIRoute`) auto-adds HEAD when GET is declared.
+    assert methods == {"GET", "HEAD"}
+    assert any_method is True
 
 
 def test_preflight_to_a_mounted_path_allows_any_method_instead_of_404(
@@ -412,6 +439,72 @@ def test_preflight_to_a_mounted_path_allows_any_method_instead_of_404(
 
     assert response.status_code == 204
     assert "PUT" in response.headers["access-control-allow-methods"].split(", ")
+
+
+async def _call_asgi(app: object, headers: list[tuple[bytes, bytes]], path: str = "/static/thing") -> list[dict]:
+    """Drives an ASGI app directly with a hand-built scope, bypassing httpx/`TestClient` --
+    needed for `Access-Control-Request-Method: \\xb5`, which httpx itself refuses to send at all
+    (`UnicodeEncodeError` client-side, since it isn't valid ASCII)."""
+    sent: list[dict] = []
+
+    async def receive() -> dict:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "OPTIONS",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": headers,
+        "client": ("127.0.0.1", 1),
+        "server": ("127.0.0.1", 80),
+    }
+    await app(scope, receive, send)
+    return sent
+
+
+@pytest.mark.parametrize(
+    "acrm", [b"\xb5", b"GET, POST", b"GET POST", b"GET,DELETE"], ids=["mu-byte", "list-space", "list", "list-comma"]
+)
+def test_any_method_preflight_with_a_non_token_acrm_is_405_not_500(acrm: bytes) -> None:
+    """review-agent second-to-last pass, issue 2: in the any-method (`Mount`) preflight case,
+    `Access-Control-Request-Method` must be validated as a single RFC 7230 token before being
+    trusted as a method name to echo back. `b"\\xb5"` decodes (Latin-1) to "µ"
+    (MICRO SIGN); `"µ".upper()` is "Μ" (GREEK CAPITAL LETTER MU), which isn't Latin-1 and
+    previously crashed `.encode("latin-1")` when building the response header -- a 500, not a
+    controlled rejection. A comma- or space-separated list must also never be echoed as if it
+    were one method. The fix answers `405 method_not_allowed` in every case, never a `500`.
+    """
+    app = FastAPI()
+
+    async def _sub_app(scope: object, receive: object, send: object) -> None:
+        del scope, receive, send
+
+    app.router.routes.append(Mount("/static", app=_sub_app))
+    wrapped = VersionHeaderMiddleware(
+        CorsMiddleware(BodyLimitMiddleware(app), CorsPolicy((GOOD_ORIGIN,)), app.router),
+        version=__version__,
+    )
+    headers = [
+        (b"origin", GOOD_ORIGIN.encode()),
+        (b"access-control-request-method", acrm),
+    ]
+
+    sent = asyncio.run(_call_asgi(wrapped, headers))
+
+    start = sent[0]
+    assert start["type"] == "http.response.start"
+    assert start["status"] == 405
+    header_names = {name for name, _ in start["headers"]}
+    assert b"access-control-allow-methods" not in header_names
 
 
 def test_origin_allowed_returns_false_immediately_when_cors_is_off() -> None:

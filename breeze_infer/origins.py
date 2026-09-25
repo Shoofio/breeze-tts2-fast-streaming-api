@@ -39,6 +39,11 @@ def canonical_origin(value: str) -> str:
     - No control character or whitespace may appear anywhere in ``value`` -- checked before
       ``urlsplit``, which otherwise silently strips a tab, CR or LF rather than rejecting them.
     - Scheme must be ``http`` or ``https`` (lowercased).
+    - ``netloc`` (the ``host[:port]`` portion) must be pure ASCII, checked *before* anything
+      lowercases it: ``SplitResult.hostname`` lowercases internally, and naively checking
+      ``str.isascii()`` only after that would miss a character like U+212A KELVIN SIGN, whose
+      lowercase form *is* the plain ASCII ``"k"`` -- letting a non-ASCII origin quietly launder
+      itself into one that looks ordinary.
     - Host is lowercased. An IP literal (IPv4 dotted-quad, or IPv6 in brackets) is canonicalized
       with ``ipaddress``: ``127.1`` (which browsers never send; ``ipaddress`` requires all four
       octets) and an IPv4-mapped IPv6 address (``::ffff:a.b.c.d``, which no browser sends either)
@@ -46,10 +51,14 @@ def canonical_origin(value: str) -> str:
       rejected, and ``[0:0:0:0:0:0:0:1]`` canonicalizes to ``[::1]``. A non-ASCII hostname is
       rejected -- browsers send punycode, so the caller must too, rather than this module guessing
       at an IDNA conversion. A hostname of ``*``, one containing any character outside
-      ``[a-z0-9_.-]``, or one whose last label is all-digit or hex-looking (``0x...``) -- a
-      classic trick for smuggling an IP address past a hostname allowlist -- is also rejected.
-    - Port must be plain digits, 1-65535 (browsers never send port ``0``); the scheme's own
-      default port (80 for http, 443 for https) is dropped, since browsers omit it.
+      ``[a-z0-9_.-]``, one with an empty label (a leading ``.``, ``".."``, or a trailing ``.`` --
+      real DNS syntax, but no browser ever sends any of it in an ``Origin`` header, so it's
+      rejected rather than accepted-but-pointless), or one whose last label is all-digit or
+      hex-looking (``0x...``) -- a classic trick for smuggling an IP address past a hostname
+      allowlist -- is also rejected.
+    - Port must be ASCII digits only, 1-65535 (browsers never send port ``0``, a non-ASCII
+      "digit" such as a full-width numeral, or a leading zero); the scheme's own default port
+      (80 for http, 443 for https) is dropped, since browsers omit it.
     - Userinfo, a path (including a lone trailing ``/``), a query or a fragment are all rejected,
       including an empty ``?`` or ``#`` -- none of those can ever appear in an ``Origin`` header.
     """
@@ -69,6 +78,13 @@ def canonical_origin(value: str) -> str:
             f"origin {value!r} must be a bare scheme://host[:port] origin (no userinfo)"
         )
 
+    # Checked before anything -- `.hostname` below -- lowercases: `str.lower()` can turn a
+    # non-ASCII character into a plain ASCII one (U+212A KELVIN SIGN -> "k"), so checking
+    # ASCII-ness only *after* lowering would miss exactly the input this exists to catch
+    # (review-agent second-to-last pass, issue 5).
+    if not parsed.netloc.isascii():
+        raise ValueError(f"origin {value!r} host must be ASCII; use the punycode (xn--) form")
+
     # `parsed.query`/`parsed.fragment` are empty strings both when the header is absent and when
     # it's present but empty (a bare trailing '?' or '#'), so the raw value is checked instead.
     has_query_or_fragment = "?" in value or "#" in value
@@ -83,16 +99,24 @@ def canonical_origin(value: str) -> str:
             "with no path, query or fragment"
         )
 
+    # Brackets are parsed once here and shared by both the host branch below and the raw-port
+    # check, instead of each re-deriving the boundary independently (review-agent second-to-last
+    # pass, issue 9).
+    bracketed, after_host = _split_bracketed_host(parsed.netloc)
+
     # `SplitResult.port` is an `int`: it can't tell a genuinely absent port from an *empty* one
-    # (`"host:"`, `.port` gives `None` either way), and it silently drops a leading zero
-    # (`"080"` -> `80`) -- neither of which a real browser's `Origin` header would ever produce.
-    # The raw text is checked before `.port` gets a chance to launder either away (review-agent
-    # final pass, issue 5).
-    raw_port = _raw_port(parsed.netloc)
+    # (`"host:"`, `.port` gives `None` either way), silently drops a leading zero (`"080"` ->
+    # `80`), and (like `int()` generally) accepts non-ASCII decimal digits a browser would never
+    # send -- none of which the raw text lets slip through (review-agent final and second-to-last
+    # passes, issues 5 and 6).
+    raw_port = _raw_port(after_host)
     if raw_port == "":
         raise ValueError(f"origin {value!r} has an empty port")
-    if raw_port is not None and raw_port.isdigit() and len(raw_port) > 1 and raw_port[0] == "0":
-        raise ValueError(f"origin {value!r} port must not have a leading zero")
+    if raw_port is not None:
+        if not (raw_port.isascii() and raw_port.isdigit()):
+            raise ValueError(f"origin {value!r} port must be ASCII digits")
+        if len(raw_port) > 1 and raw_port[0] == "0":
+            raise ValueError(f"origin {value!r} port must not have a leading zero")
 
     try:
         host = parsed.hostname
@@ -105,7 +129,7 @@ def canonical_origin(value: str) -> str:
     if port == 0:
         raise ValueError(f"origin {value!r} port must be between 1 and 65535")
 
-    host = _canonical_host(value, host, bracketed=parsed.netloc.startswith("["))
+    host = _canonical_host(value, host, bracketed=bracketed)
 
     port_suffix = "" if port is None or port == _DEFAULT_PORTS[scheme] else f":{port}"
     return f"{scheme}://{host}{port_suffix}"
@@ -128,21 +152,36 @@ def _reject_unsafe_characters(value: str) -> None:
             )
 
 
-def _raw_port(netloc: str) -> str | None:
-    """The raw text after the port-introducing ``':'`` in ``netloc`` (userinfo, if any, is
-    already rejected by the caller before this runs), or ``None`` if there is no ``':'`` at all.
+def _split_bracketed_host(netloc: str) -> tuple[bool, str]:
+    """Whether ``netloc`` opens with a bracketed IP literal (``"[...]"``), and everything in
+    ``netloc`` *after* that bracket (``netloc`` itself, unchanged, when there is no leading
+    bracket at all).
+
+    The one place the ``"[...]"`` boundary is found, shared by the host-canonicalization branch
+    (the ``bracketed`` flag) and ``_raw_port`` below (the text it looks for a port in) instead of
+    each re-deriving it independently (review-agent second-to-last pass, issue 9). An unterminated
+    bracket returns an empty remainder; ``urlsplit`` itself already rejects that case before this
+    ever runs, so it's never actually reachable, but returning something rather than raising keeps
+    this function a plain, total string operation.
+    """
+    if not netloc.startswith("["):
+        return False, netloc
+    end = netloc.find("]")
+    if end == -1:
+        return True, ""
+    return True, netloc[end + 1 :]
+
+
+def _raw_port(rest: str) -> str | None:
+    """The raw text after the port-introducing ``':'`` in ``rest`` (the part of ``netloc`` after
+    any bracketed host, from ``_split_bracketed_host``; userinfo, if any, is already rejected by
+    the caller before this runs), or ``None`` if there is no ``':'`` at all.
 
     ``SplitResult.port`` is an ``int``, so it can't distinguish an *empty* port
     (``"host:"`` -- gives ``None``, same as no port) from a genuinely absent one, and it silently
     drops a leading zero (``"080"`` -> ``80``). Working from the original text lets the caller
     reject both.
     """
-    rest = netloc
-    if rest.startswith("["):
-        end = rest.find("]")
-        if end == -1:
-            return None  # unterminated bracket; urlsplit itself already rejects this
-        rest = rest[end + 1 :]
     if ":" not in rest:
         return None
     return rest.split(":", 1)[1]
@@ -183,13 +222,21 @@ def _canonical_host(value: str, host: str, *, bracketed: bool) -> str:
             f"(got {host!r})"
         )
 
-    # A trailing '.' is FQDN absolute-name syntax ("example.com."); stripped before splitting on
-    # '.' so it doesn't leave an *empty* last label, which neither `isdigit()` nor the hex regex
-    # would ever match -- silently bypassing the check below for e.g. "evil.example.2130706433."
-    # (review-agent final pass, issue 2). The returned `host` keeps the dot as written; only the
-    # label check ignores it.
-    without_trailing_dot = host.removesuffix(".")
-    last_label = without_trailing_dot.rsplit(".", 1)[-1]
+    # No empty label: a leading '.', '..', or a trailing '.' (FQDN absolute-name syntax, real DNS
+    # syntax -- but no browser ever sends it in an Origin header, so it's simplest to reject it
+    # outright rather than special-case accepting it) all produce one. `_HOST_CHARS_RE` above
+    # allows '.' as a character but says nothing about *where*, so e.g. "evil.example.2130706433."
+    # passed it -- and its trailing '.' then left the numeric/hex check below looking at an empty
+    # last label, which neither `isdigit()` nor the hex regex would ever match, silently bypassing
+    # it (review-agent final pass, issue 2; review-agent second-to-last pass, issue 1).
+    labels = host.split(".")
+    if "" in labels:
+        raise ValueError(
+            f"origin {value!r} host must not have an empty label (a leading '.', '..', or a "
+            f"trailing '.') (got {host!r})"
+        )
+
+    last_label = labels[-1]
     if last_label.isdigit() or _HEX_LABEL_RE.fullmatch(last_label):
         # A trailing all-numeric or hex-looking label (e.g. "evil.example.2130706433" or
         # "evil.example.0x7f000001") is a classic trick for smuggling an IP address past a

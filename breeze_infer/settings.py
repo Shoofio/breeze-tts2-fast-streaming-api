@@ -115,7 +115,7 @@ def _parse_cors_origins(value: str | None) -> tuple[str, ...]:
         # An empty allowlist would silently mean "CORS off" despite the flag. No "--cors" here:
         # `settings_from_args` prepends the flag name once, uniformly, for every rejection this
         # function raises (review-agent final pass, issue 3).
-        raise ValueError("was given an empty origin list")
+        raise ValueError("empty origin list")
     if "*" in raw_entries:
         if any(entry != "*" for entry in raw_entries):
             raise ValueError("'*' can't be combined with other origins")

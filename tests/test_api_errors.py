@@ -21,8 +21,9 @@ import json
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Mount
 
-from breeze_infer.errors import ApiError, install_error_handlers
+from breeze_infer.errors import ApiError, api_error_response, install_error_handlers
 from tests.fakes import RecordingEvents
 
 
@@ -266,6 +267,48 @@ def test_wrong_method_on_a_split_route_lists_the_union_of_every_matching_route_s
     assert response.status_code == 405
     assert response.json() == {"error": "method not allowed", "code": "method_not_allowed"}
     assert set(response.headers["allow"].split(", ")) == {"GET", "POST"}
+
+
+def test_405_allow_is_not_recomputed_from_the_wrong_router_when_a_mount_is_involved() -> None:
+    """review-agent second-to-last pass, issue 3: once routing has passed through a `Mount`,
+    `scope["root_path"]` has been extended by the Mount's own matched prefix (`Mount.matches`),
+    so re-matching against `request.app.router` no longer checks the *original* path but
+    whatever text is left after stripping that prefix -- here, an unrelated top-level route at
+    `/thing` would otherwise get unioned into a completely unrelated Mount-internal `405`'s
+    `Allow`, replacing the sub-app's own correct answer with a wrong one instead of just an
+    incomplete one. The fix must skip the recompute in that case and leave the sub-app's `Allow`
+    untouched.
+    """
+    app = _app()
+
+    @app.get("/thing")
+    async def unrelated() -> dict:
+        return {}
+
+    async def _sub_app(scope: object, receive: object, send: object) -> None:
+        del scope, receive, send
+        raise StarletteHTTPException(status_code=405, headers={"Allow": "PUT"})
+
+    app.router.routes.append(Mount("/mounted", app=_sub_app))
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.put("/mounted/thing")
+
+    assert response.status_code == 405
+    assert response.headers["allow"] == "PUT"
+
+
+def test_api_error_response_accepts_headers() -> None:
+    """review-agent second-to-last pass, issue 8: `cors.py`'s `_reject` now passes its extra
+    headers straight to `api_error_response` instead of building the response and then mutating
+    `.headers` on it afterward."""
+    response = api_error_response(
+        ApiError(404, "not_found", "not found"), headers={"Allow": "GET"}
+    )
+
+    assert response.headers["allow"] == "GET"
+    assert response.status_code == 404
+    assert json.loads(response.body) == {"error": "not found", "code": "not_found"}
 
 
 def test_bc_18_every_error_response_is_application_json() -> None:
