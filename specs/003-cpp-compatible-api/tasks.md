@@ -349,7 +349,7 @@ route (quickstart Scenario 1.3–1.4); the SillyTavern `health` live gate passes
   outside the body limit and the app, and even `413`s and `500`s carry its headers; the version
   header stays outermost (T025). Build the policy from `Settings`. With CORS off the policy allows no
   origin, and every `OPTIONS` falls through to `405`.
-- [ ] T029 [US5] **Live gate (health)**. Standing rule 8: the version is already `2.0.0.dev1`;
+- [X] T029 [US5] **Live gate (health)**. Standing rule 8: the version is already `2.0.0.dev1`;
   update the CHANGELOG for BC-19–BC-23.
   1. Start `scripts/start_breeze.sh --cors http://127.0.0.1:8000`.
   2. Check with curl as in quickstart Scenario 1.1–1.4.
