@@ -26,6 +26,18 @@ fg
 .PARAMETER Port
     Port to listen on. Defaults to 8080.
 
+.PARAMETER Cors
+    CORS mode for browser clients (e.g. SillyTavern). Empty (the default)
+    leaves CORS off, so no browser origin is allowed. Pass '*' to allow every
+    origin -- this is how to send the API's bare `--cors` flag from
+    PowerShell, since a string parameter can't be given with no value -- or a
+    comma-separated allowlist, e.g.
+    -Cors 'http://127.0.0.1:8000,http://localhost:8000'.
+
+.PARAMETER WsPort
+    WebSocket port. Defaults to the HTTP port + 1. Pass 'disabled' to turn
+    the WebSocket endpoint off.
+
 .PARAMETER ModelPath
     Override the checkpoint path. By default the current HuggingFace snapshot
     is resolved from the hub cache's refs/main.
@@ -61,6 +73,8 @@ fg
 param(
     [string]$BindHost = '0.0.0.0',
     [int]$Port = 8080,
+    [string]$Cors = '',
+    [string]$WsPort,
     [string]$ModelPath,
     [switch]$NoFastAll,
     [ValidateSet('eager', 'sdpa')]
@@ -213,6 +227,8 @@ try {
         $fastFlag,
         '--attn-implementation', $AttnImplementation
     )
+    if ($Cors) { $argList += @('--cors', $Cors) }
+    if ($WsPort) { $argList += @('--ws-port', $WsPort) }
     if ($ExtraArgs) { $argList += $ExtraArgs }
 
     Write-Host "==> Serving $ModelPath on http://${BindHost}:$Port ($fastFlag, attn $AttnImplementation)" -ForegroundColor Green

@@ -12,10 +12,11 @@ image_tag="${BREEZE_IMAGE:-breeze-pytorch-infer:latest}"
 
 docker run --rm --gpus all \
   --ipc=host \
-  --publish 7860:7860 \
+  --publish 8080:8080 \
+  --publish 8081:8081 \
   --volume "$model_path:/models/breeze:ro" \
   "$image_tag" \
   python -m breeze_infer.api /models/breeze \
     --host 0.0.0.0 \
-    --port 7860 \
+    --port 8080 \
     "$@"
