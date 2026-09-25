@@ -235,8 +235,9 @@ allowed origin, a disallowed origin and no origin, for every route and the WebSo
 - **WebSocket message before `start`**: an `error` event, as in C++.
 - **Unknown message type, invalid JSON, wrong field type**: an `error` event naming the problem;
   the connection stays open.
-- **CJK text with no punctuation streamed over WebSocket**: once it exceeds the piece budget it is
-  cut at the last clause mark or at the budget. It never grows without bound.
+- **CJK text with no punctuation streamed over WebSocket**: it is cut at a clause mark once a
+  clause reaches the budget; with no clause mark at all, it is hard-cut into budget-sized chunks
+  once it passes twice the budget. It never grows without bound.
 - **WebSocket port in use at startup**: the HTTP server still starts, `/health` reports
   `ws_port: 0`, and a structured startup event records why.
 - **Voice file on disk with an invalid name or corrupt content**: skipped at startup with a
@@ -409,9 +410,12 @@ allowed origin, a disallowed origin and no origin, for every route and the WebSo
 **CORS and cross-origin protection**
 
 - **FR-034**: CORS MUST be off by default. When enabled, it takes either `*` or a comma-separated
-  allowlist; entries are whitespace-trimmed and matched exactly. `*` mixed with other entries MUST
-  be a startup error. Response and preflight headers MUST behave as in User Story 5, including on
-  error responses and streamed responses.
+  allowlist; entries are whitespace-trimmed, validated and canonicalized (lowercase scheme and
+  host, IDN hosts in punycode, IP literals in canonical form, the scheme's default port dropped),
+  and deduplicated after canonicalizing. `*` mixed with other entries MUST be a startup error. An
+  incoming `Origin` header is canonicalized the same way before matching against the allowlist.
+  Response and preflight headers MUST behave as in User Story 5, including on error responses and
+  streamed responses.
 - **FR-035**: A `POST`, `DELETE` or WebSocket handshake whose `Origin` header is present and not
   allowed MUST be rejected with `403` before any work. Requests without `Origin` are unaffected.
 
@@ -508,7 +512,7 @@ by area, not listed in numeric order (BC-46 to BC-48 were added later).
 | BC-36 | `start` mid-speech mutates the running session (a data race) | Cancels in-flight work (`cancelled`), then `started` | Clients restarting mid-speech |
 | BC-37 | Empty `instruction` message stores `""` | Resets to the default instruction | Clients sending an empty instruction |
 | BC-38 | `split_chars ≤ 0` at `start` means 600; on HTTP `0` means no splitting | `0` means no length splitting on both; negative gets an `error` | Clients sending `split_chars: 0` |
-| BC-39 | Period at the end of the buffer cuts immediately (splits `Dr.`, `3.` mid-stream); CJK without spaces never drains; the 200-char opening budget applies to every piece of that drain; different stop set from HTTP | Shared segmenter; end-of-buffer punctuation waits for the next character; CJK fallback; opening budget on the first piece only | All streaming clients (piece boundaries differ) |
+| BC-39 | Period at the end of the buffer cuts immediately (splits `Dr.`, `3.` mid-stream); CJK without spaces never drains; the 200-char opening budget applies to every piece of that drain; different stop set from HTTP | Shared segmenter; end-of-buffer punctuation waits for the next character; CJK fallback; opening budget on the first piece only | All clients: streaming piece boundaries differ, and so do HTTP piece boundaries for long text (over-budget sentences are now cut at spaces; pieces with no letter or digit, such as emoji-only ones, are dropped) |
 | BC-40 | Buffered text unbounded | `error` event above the maximum text length | Clients buffering very long text without punctuation |
 | BC-41 | Generation error in a session terminates the whole server process | `error` event; session and server continue | All |
 | BC-42 | A client that stops reading holds the GPU and blocks every other client; unbounded connection threads; no handshake timeout | Bounded outgoing buffer; slow client disconnected; connection and handshake limits | Very slow clients; connection floods |

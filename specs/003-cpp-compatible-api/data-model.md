@@ -15,7 +15,7 @@ A frozen value object, built once at the composition root from the command line.
 | `host` | `127.0.0.1` | HTTP and WebSocket both bind here only |
 | `port` | `8080` | 1–65535 |
 | `ws_port` | `port + 1` | 1–65535, or `disabled` |
-| `cors` | off | `*` or a comma-separated allowlist (trimmed). Startup errors: `*` mixed with other entries, an empty list, or an entry that isn't a bare `scheme://host[:port]` origin (it could never match a browser `Origin`) |
+| `cors` | off | `*` or a comma-separated allowlist: entries are trimmed, validated and canonicalized (lowercase scheme/host, IDN to punycode, IP literals canonicalized, default port dropped), then deduplicated; an incoming `Origin` is canonicalized the same way before matching. Startup errors: `*` mixed with other entries, an empty list, or an entry that isn't a bare `scheme://host[:port]` origin (it could never match a browser `Origin`) |
 | `split_chars` | `600` | ≥ 0 |
 | `chunk_first` / `chunk_max` | `1` / `25` frames | ≥ 1; `chunk_first` is clamped to `chunk_max` |
 | `voices_dir` | `voices` | Created if missing |
@@ -198,7 +198,7 @@ Other files in the directory:
 |---|---|
 | `epoch` | Incremented by `cancel`, by `start` with pending work, and on disconnect |
 | `config` | Snapshot from `start`: reference, instruction, cfg, seed, sampling, `split_chars`. `instruction` is mutable via the `instruction` message and read when each piece starts |
-| `buffer` | Pending text: the unfinished clause after the last complete sentence or closed clause, weighing at most max(opening budget, 2 × budget) plus one combining sequence (with `split_chars` 0, unbounded except by the character limit); total characters ≤ 10,000 |
+| `buffer` | Pending text: the unfinished clause after the last complete sentence or closed clause, weighing at most max(2 × budget, 93), where 93 is one capped grapheme cluster of 31 non-ASCII code points (with `split_chars` 0, unbounded except by the character limit); total characters ≤ 10,000 |
 | `opening_pending` | True while there is no reference and no anchor yet (and none queued) |
 | `anchor` | Reference built from piece 0 |
 | `piece_index` | Resets at `start` |

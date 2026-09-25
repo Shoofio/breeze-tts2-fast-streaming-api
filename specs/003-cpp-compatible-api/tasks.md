@@ -223,16 +223,19 @@ phases as follows:
   R11 fixes. It exposes `weigh(text)`, `segment(buffer, *, budget, first_budget=0, final)` and
   `split_text(text, *, budget, first_budget=0)`, and keeps `ANCHOR_CHARS` in `limits.py`.
   1. Drop the NUL-as-closer quirk.
-  2. Use one stop set: `\n`; `.!?;` followed by whitespace or the end of a final buffer; and
-     `。！？；…．`.
-  3. Absorb closing quotes `"')]` on both interfaces.
+  2. Use one stop set: `\n`; `.!?;` followed by space, tab, CR, LF or U+3000 (not NBSP) or the end
+     of a final buffer; and `。！？；…．` (not `．` between digits).
+  3. Absorb closing quotes and brackets on both interfaces (ASCII, curly and CJK closers; the full
+     list is in contracts/ws-api.md).
   4. A sentence end at the end of a non-final buffer doesn't cut.
   5. Use weighted length everywhere.
-  6. Unpunctuated non-final overflow: cut at the last `,，、:` or space, else hard-cut at
-     2 × budget.
+  6. Over-budget sentences are cut into clauses at the first break (space-like characters, `，`,
+     `、`; `,` and `:` only via the whitespace after them) once a clause reaches the budget; a
+     clause passing 2 × budget closes at its last break; a run with no break is hard-cut past
+     2 × budget into chunks within budget, between grapheme clusters (review changes).
   7. `first_budget` applies to the first returned piece only.
   8. `budget == 0` means no length splitting.
-  9. Strip pieces and drop empty ones; keep inner `\t` and `\r`.
+  9. Strip pieces and drop pieces with no letter or digit; keep inner `\t` and `\r`.
 - [X] T020 Port `A:tests/cpp_golden/{README.md,harness.cpp,gen_goldens.py,golden.json}` into
   `tests/cpp_golden/`. Change `gen_goldens.py` so it no longer rewrites the test file.
 

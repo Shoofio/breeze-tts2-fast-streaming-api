@@ -262,13 +262,12 @@ normalized C++ output and keeps a table of intentional differences, each tagged 
 that table is SC-002's evidence.
 - **Change after normalization (stripped, empties dropped):** 6 split goldens and 6 drain
   goldens, after the T019/T020 review fixes: NUL (BC-46); the undrained byte-vs-weight case, quote
-  absorption and the fullwidth period (BC-39, from the port itself); and eight more (BC-39) from
+  absorption and the fullwidth period (BC-39, from the port itself); four split goldens from
   removing C++'s quarter-budget space guard, which let spaced text with no punctuation grow past the
-  context, from the streaming hard cut, and from dropping emoji-only pieces. The planning estimate
-  here was 5 and 5, and the port alone changed 1 and 3. The other candidates match once
-  normalized (empty, whitespace-only), give the same pieces by another route (the ellipsis, the
-  drained byte-vs-weight case), or were already right in C++ `split_text` (the first-budget pair;
-  the whole-drain opening budget lived in `ws_api.cpp`, which no golden exercises at 200). The
+  context; one from dropping emoji-only pieces; and three drain goldens from the streaming clause
+  rules (bounded overflow and the opening budget on the first piece only). The planning estimate
+  here was 5 and 5, and the port alone changed 1 and 3. The rest match once normalized (empty,
+  whitespace-only) or were already right in C++ `split_text`. The
   table is `INTENTIONAL_DIFFERENCES` in `tests/test_text_split.py`.
 
 **Rationale**: FR-014/FR-031. The same text gives the same pieces over HTTP and WebSocket.

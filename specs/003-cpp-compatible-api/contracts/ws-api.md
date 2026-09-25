@@ -89,11 +89,18 @@ escapes work (BC-32). Rules for every message:
 - A sentence end at the very end of the buffer waits for more text, `flush` or `end` (BC-39).
 - Text is cut at sentence ends and packed into pieces up to the budget, which is soft: a single
   unit heavier than it stays whole. A sentence over the budget is cut into clauses at the first
-  space, `，` or `、` after the clause reaches the budget (`,` and `:` break only before whitespace,
-  so `1,000` and `10:30` stay whole). A clause that would pass 2 × the budget is closed at its last
-  break instead, and a run with no break at all (for example CJK without punctuation) is hard-cut
-  into chunks within the budget once it is over 2 × the budget. Complete sentences and closed
-  clauses are spoken at once; the rest waits, so the buffer stays bounded.
+  break after the clause reaches the budget. Breaks are space, tab, CR, U+3000, NBSP and the other
+  fixed-width spaces (U+2000–U+200A, U+202F, U+205F), `，` and `、`; `,` and `:` break only through
+  the whitespace after them, so `1,000` and `10:30` stay whole. A clause that would pass 2 × the
+  budget is closed at its last break instead, and a run with no break at all (for example CJK
+  without punctuation) is hard-cut into chunks within the budget once it is over 2 × the budget,
+  never inside a grapheme cluster. Complete sentences and closed clauses are spoken at once; the
+  rest waits, so the buffer stays bounded.
+- Sentence ends: LF; `.` `!` `?` `;` (after any closers) followed by space, tab, CR, LF or U+3000
+  (NBSP doesn't end a sentence, so `Dr.\u00a0Smith` stays whole); and the CJK stops `。！？；…．`,
+  which absorb following stops and closers (a `．` between two digits is not a stop). Closers
+  absorbed: `" ' ) ] } ” ’ 」 』 ） 》 】 〉 〕 〗 〙 〛 ］ ｝ » › ｣ 〞 〟 ＂ ＇`.
+- A piece with no letter or digit (for example emoji-only or punctuation-only) is dropped.
 - If the buffer plus the new text would exceed 10,000 characters, the server sends
   `error{code: text_too_long}` and does not append the text (BC-40).
 - Control characters are rejected with `invalid_field` (BC-46).
