@@ -626,7 +626,7 @@ and `test_bc_46` tests.
     tokenized text via `_prefill_plan`);
   - prepare later pieces on the `GpuThread` inside the body.
 - [ ] T054 [US3] **Live gate (speech)**:
-  1. Set the version to `2.0.0.dev2`, and add BC-01–BC-17, BC-46 and BC-47 to the CHANGELOG
+  1. Set the version to `2.0.0.dev2` (bumped to `2.0.0.dev3` for the run, after the review fixes), and add BC-01–BC-17, BC-46 and BC-47 to the CHANGELOG
      (standing rule 8).
   2. Start the server with `--cors http://127.0.0.1:8000`.
   3. Run quickstart Scenario 2.1–2.5 by hand, and `node tests/live/sillytavern/run.mjs speech`.
