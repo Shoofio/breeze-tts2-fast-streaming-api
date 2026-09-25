@@ -71,7 +71,7 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, unquote_to_bytes
 
 from fastapi import Request
 from python_multipart.multipart import parse_options_header
@@ -325,10 +325,12 @@ def _urlencoded_pairs_sync(
         # parse_qsl's own "Max number of fields exceeded" guard: one O(len(body)) count of
         # the separator byte, raised before any per-field split or decode work starts, so a
         # huge body with many tiny fields is rejected in roughly one pass over the bytes
-        # (test_a_huge_body_of_many_pairs_fails_fast_on_the_field_cap) -- that guarantee has
-        # to survive the fallback below too, so `_names_from_raw_urlencoded` stays a single
-        # cheap split, never a real per-field decode. T048 post-final review finding #3: a
-        # name repeated enough times to have caused this (33 `seed=`... fields, say) is
+        # (test_a_huge_body_of_many_pairs_fails_fast_on_the_field_cap,
+        # test_a_huge_body_of_distinct_names_fails_fast_on_the_field_cap) -- that guarantee
+        # has to survive the fallback below too, so `_names_from_raw_urlencoded` bounds its
+        # own split to at most `FORM_MAX_FIELDS + 1` pieces, never the whole body (T048
+        # post-final review finding #2, HIGH). T048 post-final review finding #3: a name
+        # repeated enough times to have caused this (33 `seed=`... fields, say) is
         # `duplicate_field`, a more useful answer than this generic error, which names no
         # field at all -- `_check_no_duplicate_names` raises that itself when it finds one;
         # otherwise this falls through to the same generic error as before.
@@ -359,21 +361,45 @@ def _urlencoded_pairs_sync(
 
 
 def _names_from_raw_urlencoded(body: bytes) -> list[str]:
-    """Every field name `body` splits into on `&` (`parse_qsl`'s own separator), decoded
-    latin-1 -- lossless, so this never itself raises -- rather than fully parsed: no
-    percent-decoding, and no strict UTF-8 validation the way a real value gets. Called only
-    from `_urlencoded_pairs_sync`'s `except ValueError` branch, once `parse_qsl`'s own
-    field-count guard has already fired, purely to check whether a name was repeated enough
-    times to have caused it (T048 post-final review finding #3) -- a name spelled two
-    different ways under percent-encoding is missed by this cheaper check, but that only ever
-    falls back to the generic error every other limit hit still gets, never a false 500 or a
-    wrong duplicate.
+    """The field names among the first `FORM_MAX_FIELDS + 1` pieces `body` splits into on
+    `&` (`parse_qsl`'s own separator) -- capped there, not split in full, since `parse_qsl`'s
+    own field-count guard only ever fires once there are at least that many pieces (T048
+    post-final review finding #2, HIGH -- a DoS: an earlier version split the *whole* body
+    and ran `Counter` over every piece, ~1.25s and ~1.1GB RSS with the GIL held for a 26 MiB
+    body of two-byte names; the sibling test using single-letter names only passed because
+    CPython caches those as small-string singletons,
+    `test_a_huge_body_of_many_pairs_fails_fast_on_the_field_cap`).
+    `body.split(b"&", FORM_MAX_FIELDS + 1)` performs at most that many splits, so its own
+    cost is bounded the same way regardless of how much of `body` follows the piece that
+    trips the limit; the trailing remainder past that point (index `FORM_MAX_FIELDS + 1`,
+    present only when `body` actually has more pieces than that) is sliced off rather than
+    treated as one more name.
+
+    Each name is then decoded exactly as `parse_qsl`'s own bytes branch would -- `+` means
+    space, then percent-unescaped (`unquote_to_bytes`), then strict UTF-8 -- not left as raw
+    wire bytes: comparing an undecoded name against `other_names` (the query's own,
+    already-decoded names, from `_urlencoded_pairs_sync`'s caller) used to risk a false
+    duplicate (`?a%2Bb=1`, decoded name `a+b`, next to a body field literally spelled `a+b`,
+    decoded name `a b` -- different names that only looked equal undecoded) or a missed real
+    one (`seed` next to `se%65d`, the same name once both are decoded) (T048 post-final
+    review findings #4/#5). A name that fails to decode as UTF-8 raises the same `400
+    invalid_field` the successful parse path (`_urlencoded_pairs_sync`) would have raised for
+    it, rather than being silently papered over here -- decoding only the first
+    `FORM_MAX_FIELDS + 1` names keeps this as cheap as the rest of this function.
     """
-    return [
-        segment.split(b"=", 1)[0].decode("latin-1")
-        for segment in body.split(b"&")
-        if segment
-    ]
+    pieces = body.split(b"&", FORM_MAX_FIELDS + 1)[: FORM_MAX_FIELDS + 1]
+    names: list[str] = []
+    for piece in pieces:
+        if not piece:
+            continue
+        raw_name = piece.split(b"=", 1)[0]
+        try:
+            names.append(unquote_to_bytes(raw_name.replace(b"+", b" ")).decode("utf-8"))
+        except UnicodeDecodeError:
+            raise ApiError(
+                400, "invalid_field", f"{_display_label(raw_name)} must be UTF-8 text"
+            ) from None
+    return names
 
 
 class _StrictMultiPartParser(MultiPartParser):
@@ -458,11 +484,19 @@ def _names_seen_by_multipart_parser(parser: _StrictMultiPartParser) -> list[str]
     Starlette release renaming or dropping either one should fall back to
     `_parse_multipart_form`'s own generic error, not a 500 (T048 post-final review
     finding #3).
+
+    `current_name` is appended only when it's truthy, not merely "not `None`":
+    `MultipartPart.field_name` (`starlette/formparsers.py`) defaults to `""`, not `None`, so
+    a part that never got as far as having a real name read from it (a request whose
+    multipart parsing fails before any part does, e.g. a missing boundary) still has a
+    `_current_part` with that empty default -- appending it unconditionally used to make an
+    unrelated empty-named query field (`?=1`) look like the same field given twice, `400
+    duplicate_field` naming no field at all (T048 post-final review finding #3, review 31b).
     """
     names = [name for name, _ in getattr(parser, "items", [])]
     current_part = getattr(parser, "_current_part", None)
     current_name = getattr(current_part, "field_name", None)
-    if current_name is not None:
+    if current_name:
         names.append(current_name)
     return names
 
@@ -556,8 +590,10 @@ def _first(fields: Fields, name: str) -> str | None:
 # DECISION (final review): the exponent is *not* capped -- the contract's own grammar
 # (`^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$`) allows any number of exponent digits, and nothing
 # here should be stricter than the contract itself. A literal with an exponent
-# `decimal.Decimal`'s default context can't represent (`Emax`/`Emin`, roughly +/-999999) --
-# e.g. `Decimal("1e1000000000000000000")` -- is instead handled by `_check_decimal_range`
+# `decimal.Decimal` can't represent (`MAX_EMAX`/`MIN_EMIN`, +/-999999999999999999 -- not the
+# active context's Emax/Emin, roughly +/-999999, which only bounds arithmetic, not
+# construction; T048 post-final review finding #6) -- e.g. `Decimal("1e1000000000000000000")`
+# -- is instead handled by `_check_decimal_range`
 # below, which catches `decimal.InvalidOperation` directly and rebuilds a `Decimal` with the
 # literal's own sign and digits, but a re-anchored exponent (`_decimal_from_unrepresentable_
 # literal`, T048 post-final review finding #1) -- not the already-parsed `float`, whose
@@ -645,31 +681,66 @@ def _is_zero_literal(value: str) -> bool:
     return set(digits) == {"0"}
 
 
-# T048 post-final review finding #1: how far outside decimal's own default context
-# (Emax/Emin, roughly +/-999999) `_decimal_from_unrepresentable_literal` re-anchors an
-# unrepresentable literal's exponent. Any magnitude comfortably past every field this
-# contract validates (all bounded between 0.0001 and 4294967295) works equally well; this is
-# comfortably past decimal's own default context too, so the reconstructed Decimal is itself
-# never rejected by anything downstream.
+# T048 post-final review finding #1: how far outside decimal's own representable range
+# (`decimal.MAX_EMAX`/`MIN_EMIN`, +/-999999999999999999 -- *not* the active context's
+# Emax/Emin, roughly +/-999999, which only bounds *arithmetic*, not construction; T048
+# post-final review finding #6 (NIT): `Decimal("1e999999999999999999")` constructs fine,
+# `InvalidOperation` only starts one exponent digit further out) `_decimal_from_
+# unrepresentable_literal` re-anchors an unrepresentable literal's exponent. Any magnitude
+# comfortably past every field this contract validates (all bounded between 0.0001 and
+# 4294967295) works equally well; this is comfortably past decimal's own representable range
+# too, so the reconstructed Decimal is itself never rejected by anything downstream.
 _CLAMPED_EXPONENT = 10**6
+
+# T048 post-final review finding #1 (HIGH, a 500 regression): past this many significant
+# exponent digits, `_parse_exponent` clamps straight to `_CLAMPED_EXPONENT` rather than
+# calling `int()` at all -- Python 3.11+ refuses to convert a digit string longer than
+# `sys.get_int_max_str_digits()` (4,300 by default) to `int`, raising `ValueError`,
+# unhandled, for a literal like `cfg_scale=1e` + 5,000 nines. A comfortable margin under
+# that (not right up against it, since digit count alone doesn't bound the *value* -- an
+# 18-digit exponent can already exceed `MAX_EMAX`) is all this needs: any exponent this long
+# is already far past `_CLAMPED_EXPONENT` in magnitude, so the clamp is exact either way.
+_MAX_SAFE_EXPONENT_DIGITS = 20
+
+
+def _parse_exponent(exponent_digits: str) -> int:
+    """The value of a decimal literal's exponent digits (the part after `e`/`E`, sign
+    included, from `_DECIMAL_LITERAL`'s own grammar) -- or, once there are more than
+    `_MAX_SAFE_EXPONENT_DIGITS` of them, `_CLAMPED_EXPONENT` with the same sign, computed
+    without ever calling `int()` on the full string (T048 post-final review finding #1).
+
+    Leading zeros are stripped *before* counting digits, not after: an exponent padded with
+    thousands of zeros ahead of a single significant digit (`e` + 5,000 zeros + `1`) is
+    genuinely just `1`, cheap and safe to convert, not a huge number that happens to look
+    short once reduced -- counting raw digits would clamp that too, silently turning an
+    ordinary small value into a wildly wrong one.
+    """
+    if not exponent_digits:
+        return 0
+    sign = -1 if exponent_digits.startswith("-") else 1
+    magnitude_digits = exponent_digits.lstrip("+-").lstrip("0") or "0"
+    if len(magnitude_digits) > _MAX_SAFE_EXPONENT_DIGITS:
+        return sign * _CLAMPED_EXPONENT
+    return sign * int(magnitude_digits)
 
 
 def _decimal_from_unrepresentable_literal(literal: str) -> Decimal:
     """`literal` matched `_DECIMAL_LITERAL` but its exponent overflows `decimal.Decimal`'s
-    default context (`Emax`/`Emin`) -- `Decimal(literal)` itself already raised
-    `InvalidOperation`, which is what sends `_check_decimal_range` here instead of building
-    `decimal_value` directly.
+    representable range -- `Decimal(literal)` itself already raised `InvalidOperation`,
+    which is what sends `_check_decimal_range` here instead of building `decimal_value`
+    directly.
 
     Rebuilt from the literal's own sign and digits, with only the exponent re-anchored to
     `_CLAMPED_EXPONENT`: `Decimal`'s tuple constructor -- unlike its string constructor --
     isn't bounds-checked against the context at all, so it never raises here, however far
-    outside `Emax`/`Emin` the clamped exponent still is. A zero mantissa is exactly zero,
-    whatever its exponent (`_is_zero_literal`'s rule, kept here too since `cfg_scale` never
-    calls it separately, unlike the optional sampling fields); a nonzero mantissa keeps its
-    sign and a merely very large (not unrepresentable) exponent, so `_check_decimal_range`'s
-    ordinary bound comparison judges it exactly as it would any other out-of-range value --
-    unlike falling back to `Decimal(float(literal))`, whose underflow-to-zero can't carry a
-    negative sign a range check needs (T048 post-final review finding #1).
+    outside decimal's representable range the clamped exponent still is. A zero mantissa is
+    exactly zero, whatever its exponent (`_is_zero_literal`'s rule, kept here too since
+    `cfg_scale` never calls it separately, unlike the optional sampling fields); a nonzero
+    mantissa keeps its sign and a merely very large (not unrepresentable) exponent, so
+    `_check_decimal_range`'s ordinary bound comparison judges it exactly as it would any
+    other out-of-range value -- unlike falling back to `Decimal(float(literal))`, whose
+    underflow-to-zero can't carry a negative sign a range check needs (T048 post-final
+    review finding #1).
     """
     if _is_zero_literal(literal):
         return Decimal(0)
@@ -682,7 +753,7 @@ def _decimal_from_unrepresentable_literal(literal: str) -> Decimal:
     # point's position, so stripping them here is safe -- `_is_zero_literal` above already
     # ruled out every digit being zero, so at least one significant digit survives.
     digits = (int_part + frac_part).lstrip("0")
-    exponent = -len(frac_part) + (int(exponent_digits) if exponent_digits else 0)
+    exponent = -len(frac_part) + _parse_exponent(exponent_digits)
     clamped_exponent = max(-_CLAMPED_EXPONENT, min(_CLAMPED_EXPONENT, exponent))
     return Decimal((sign_bit, tuple(int(d) for d in digits), clamped_exponent))
 
@@ -727,15 +798,16 @@ def _check_decimal_range(
     `float_in_range` on its own, no special-casing required.)
 
     `Decimal(literal)` construction is guarded by `try`/`except InvalidOperation` as the
-    *primary* handling for a literal the grammar accepts but `Decimal`'s own default context
-    can't represent (`Emax`/`Emin`, roughly +/-999999) -- e.g.
-    `cfg_scale=0e1000000000000000000` -- not a safety net alongside some other cap: the
-    grammar's exponent cap was removed (see the DECISION above `_INT_LITERAL`), so this is
-    now how such a literal is actually handled, for every numeric field this function
-    guards. `cfg_scale` in particular never runs `_is_zero_literal` first the way the
-    optional sampling fields do (0 is an ordinary in-range value for it, not a "use the
-    default" sentinel), so a zero-mantissa literal with an unrepresentable exponent reaches
-    here, not just a nonzero one (T048 post-final review finding #1).
+    *primary* handling for a literal the grammar accepts but `Decimal` can't represent
+    (`MAX_EMAX`/`MIN_EMIN`, +/-999999999999999999 -- not the active context's Emax/Emin,
+    roughly +/-999999, which bounds arithmetic, not construction; T048 post-final review
+    finding #6) -- e.g. `cfg_scale=0e1000000000000000000` -- not a safety net alongside some
+    other cap: the grammar's exponent cap was removed (see the DECISION above
+    `_INT_LITERAL`), so this is now how such a literal is actually handled, for every numeric
+    field this function guards. `cfg_scale` in particular never runs `_is_zero_literal` first
+    the way the optional sampling fields do (0 is an ordinary in-range value for it, not a
+    "use the default" sentinel), so a zero-mantissa literal with an unrepresentable exponent
+    reaches here, not just a nonzero one (T048 post-final review finding #1).
 
     On that exception, `decimal_value` is rebuilt by `_decimal_from_unrepresentable_literal`
     from the literal's own sign and digits, not from `Decimal(value)` (the already-parsed

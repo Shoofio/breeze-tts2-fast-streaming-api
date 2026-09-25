@@ -16,6 +16,7 @@ hand and skipping that parsing entirely.
 
 from __future__ import annotations
 
+import itertools
 import time
 from pathlib import Path
 from urllib.parse import quote
@@ -705,6 +706,39 @@ def test_a_huge_body_of_many_pairs_fails_fast_on_the_field_cap(tmp_path: Path) -
         "error": "a was given more than once",
         "code": "duplicate_field",
     }
+
+
+def test_a_huge_body_of_distinct_names_fails_fast_on_the_field_cap(tmp_path: Path) -> None:
+    """T048 post-final review finding #2 (HIGH, DoS): an earlier `_names_from_raw_urlencoded`
+    split the *whole* body on `&` and ran `Counter` over every piece -- ~1.25s and ~1.1GB RSS
+    for a 26 MiB body of two-byte names, with the GIL held throughout. The test above
+    (`test_a_huge_body_of_many_pairs_fails_fast_on_the_field_cap`) only passed because its
+    single-letter names are small-string singletons CPython already caches, hiding that cost
+    -- this one uses distinct multi-byte names, which aren't. The fallback now bounds its own
+    split to `FORM_MAX_FIELDS + 1` pieces -- exactly enough to see whatever caused
+    `parse_qsl`'s own guard to trip, and no more -- so this must still fail fast regardless of
+    how large or distinct the rest of the body is."""
+    distinct_names = [
+        "".join(letters)
+        for letters in itertools.islice(
+            itertools.product("abcdefghijklmnopqrstuvwxyz", repeat=2), 40
+        )
+    ]
+    head = "&".join(f"{name}=1" for name in distinct_names).encode("ascii")
+    filler = b"zz9=1&"  # three bytes, distinct from every two-letter name above
+    body = head + b"&" + filler * (27_000_000 // len(filler))  # ~26 MiB total
+
+    start = time.monotonic()
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 5.0, f"took {elapsed:.2f}s -- did not fail fast on the field cap"
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
 
 
 # finding #3: a text-then-file ref_audio is rejected regardless of order.
@@ -1541,6 +1575,44 @@ def test_temperature_unrepresentable_exponent_gets_400(tmp_path: Path, literal: 
     assert response.json()["code"] == "invalid_field"
 
 
+@pytest.mark.parametrize(
+    ("field", "literal"),
+    [
+        ("cfg_scale", "1e" + "9" * 5000),
+        ("temperature", "1e-" + "9" * 5000),
+    ],
+    ids=["cfg_scale-huge-positive", "temperature-huge-negative"],
+)
+def test_decimal_exponent_over_4300_digits_doesnt_crash(
+    tmp_path: Path, field: str, literal: str
+) -> None:
+    """T048 post-final review finding #1 (HIGH, a 500 regression): a 5,000-digit exponent is
+    well past `sys.get_int_max_str_digits()` (4,300 by default) -- `Decimal(literal)` raises
+    `InvalidOperation` for it same as any other unrepresentable exponent, but the fallback
+    used to call bare `int(exponent_digits)` on the *full* exponent string to re-anchor it,
+    which itself raises `ValueError`, unhandled, a `500`. This must still be the ordinary 400
+    an out-of-range value gets."""
+    response = _client(tmp_path).post("/speech", data={"text": "hi", field: literal})
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+
+
+def test_decimal_exponent_of_5000_leading_zero_digits_then_one_is_accepted(
+    tmp_path: Path,
+) -> None:
+    """The digit-count cap above must count *significant* exponent digits, not raw ones on
+    the wire -- an exponent padded with thousands of leading zeros in front of a single `1`
+    is exactly `1e1`, not an unrepresentable magnitude, and must resolve to that value, not
+    be clamped as if it were huge."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "cfg_scale": "1e" + "0" * 4998 + "1"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["cfg_scale"] == 10.0
+
+
 def test_bc_01_leading_zeros_dont_count_against_the_digit_cap(tmp_path: Path) -> None:
     """The integer literal digit cap (test_bc_01_integer_longer_than_20_digits_gets_400)
     counts significant digits, not raw digits on the wire -- a value padded with leading
@@ -1813,6 +1885,27 @@ def test_bc_08_five_distinctly_named_file_parts_keep_the_generic_error(
     }
 
 
+def test_multipart_missing_boundary_with_an_empty_query_name_keeps_the_generic_error(
+    tmp_path: Path,
+) -> None:
+    """T048 post-final review finding #3 (review 31b): `MultipartPart.field_name` defaults
+    to `""`, not `None` -- a request whose multipart parsing fails before any part ever gets
+    a real name (here, a missing boundary raises immediately) still has a `_current_part`
+    with that default, empty name. `?=1` puts one query field with an empty name alongside
+    it, and `""` (not `None`) used to get appended to the names list regardless, so the two
+    empty names looked like the same field given twice -- `duplicate_field` naming no field
+    at all, instead of the generic parser error this malformed request should get."""
+    response = _client(tmp_path).post(
+        "/speech?=1", content=b"", headers={"content-type": "multipart/form-data"}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "could not parse the request body",
+        "code": "invalid_field",
+    }
+
+
 def test_bc_08_multipart_limit_hit_with_parser_missing_private_attribute_stays_400_not_500(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1896,14 +1989,59 @@ def test_bc_08_33_same_named_urlencoded_fields_get_duplicate_field(tmp_path: Pat
     """T048 post-final review finding #3: the urlencoded equivalent -- `parse_qsl`'s own
     `max_num_fields` guard (`test_urlencoded_field_count_over_the_cap_gets_400`) fires before
     it has split or decoded a single field, so `_urlencoded_pairs_sync` re-derives just the
-    raw field names (cheap: no percent-decoding, no UTF-8 validation, since this only ever
-    feeds a duplicate-name check) to run the same duplicate check against."""
+    first `FORM_MAX_FIELDS + 1` field names (findings #2/#4/#5: bounded, and decoded the same
+    way the real parse would) to run the same duplicate check against."""
     body = "&".join(f"seed={n}" for n in range(FORM_MAX_FIELDS + 1)).encode("ascii")
 
     response = _client(tmp_path).post(
         "/speech",
         content=body,
         headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "seed was given more than once",
+        "code": "duplicate_field",
+    }
+
+
+def test_urlencoded_fallback_decodes_body_names_before_comparing_avoids_false_duplicate(
+    tmp_path: Path,
+) -> None:
+    """T048 post-final review findings #4/#5: comparing an undecoded body name against the
+    query's own already-decoded names can report a false duplicate. `?a%2Bb=1` decodes to
+    the name `a+b`; a body field literally spelled `a+b` decodes to `a b` (a real `+` in a
+    urlencoded body always means space) -- two different names that only looked equal when
+    the body side wasn't decoded the same way. 32 unrelated filler fields plus this one push
+    the body to 33 fields, one past `FORM_MAX_FIELDS`, so the fallback runs."""
+    body = ("&".join(f"f{i}=1" for i in range(FORM_MAX_FIELDS)) + "&a+b=x").encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        params={"a+b": "1"},  # httpx percent-encodes this to ?a%2Bb=1 on the wire
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+
+
+def test_urlencoded_fallback_decodes_body_names_before_comparing_still_finds_real_duplicate(
+    tmp_path: Path,
+) -> None:
+    """The flip side of the test above: `seed` in the query next to `se%65d` in the body (33
+    fields deep, past `FORM_MAX_FIELDS`) are the same name once both sides are decoded the
+    same way (`%65` is `e`) -- decoding the body side properly must still catch a real
+    duplicate, not just avoid a false one."""
+    body = ("&".join(f"f{i}=1" for i in range(FORM_MAX_FIELDS)) + "&se%65d=2").encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        params={"seed": "1"},
     )
 
     assert response.status_code == 400
