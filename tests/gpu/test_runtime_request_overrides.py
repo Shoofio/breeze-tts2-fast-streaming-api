@@ -12,7 +12,13 @@ import pytest
 import torch
 
 from breeze_infer.runtime import set_all_seeds
-from breeze_infer.templates import get_template, prepare_inputs
+from breeze_infer.templates import (
+    get_template,
+    prepare_inputs,
+    prepare_prefix_inputs,
+    prepare_suffix_inputs,
+)
+from models.fast_streaming import MIN_SUFFIX_ROOM
 
 pytestmark = pytest.mark.gpu
 
@@ -126,9 +132,6 @@ def test_tiny_temperature_is_floored_instead_of_producing_nan(gpu_env) -> None:
 def test_reference_prefix_longer_than_every_prefill_bucket_builds_eagerly(
     gpu_env, reference_clips
 ) -> None:
-    # Imported here so the rest of this module runs before T035 adds them.
-    from breeze_infer.templates import prepare_prefix_inputs, prepare_suffix_inputs
-
     env = gpu_env
     runtime = env.runtime
     clip = reference_clips[0]
@@ -180,3 +183,36 @@ def test_reference_prefix_longer_than_every_prefill_bucket_builds_eagerly(
     assert chunks[0].timing["prefill_path"] == "graph"
     assert 0 < len(frames) <= 4
     assert sum(chunk.audio.size for chunk in chunks) > 0
+
+
+def test_largest_allowed_temperature_and_penalty_still_sample(gpu_env) -> None:
+    # 1e4 is the override ceiling; the logits shrink toward uniform but stay
+    # finite, so every step samples a valid token.
+    inputs = _inputs(gpu_env, "The cat sat on the mat.")
+
+    chunks, frames = _run(
+        gpu_env, inputs, temperature=1e4, repetition_penalty=1e4, max_new_tokens=4
+    )
+
+    assert 0 < len(frames) <= 4
+    assert sum(chunk.audio.size for chunk in chunks) > 0
+
+
+def test_min_suffix_room_is_the_smallest_real_suffix_plus_one_frame(gpu_env) -> None:
+    # The smallest suffix a cached prefix can be continued with: a one-word
+    # text on the unguided branch, which cfg_scale 0 runs on its own. The
+    # guided branch always adds the instruction, so it is longer.
+    env = gpu_env
+    request = {
+        "id": "min-suffix",
+        "speaker": "S0",
+        "ref_text": "x",
+        "text": "a",
+        "instruction": "a",
+    }
+    inputs = prepare_suffix_inputs(env.tokenizer, env.model, request, guidance_scale=0.0)
+    unguided = int(inputs["cfg_negative_prompt_attention_mask"].shape[1])
+    guided = int(inputs["attention_mask"].shape[1])
+
+    assert MIN_SUFFIX_ROOM == unguided + 1
+    assert guided > unguided

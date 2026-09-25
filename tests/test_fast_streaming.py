@@ -8,12 +8,13 @@ import pytest
 import torch
 
 from breeze_infer.templates import get_template
-from models.cudagraph.sampling import sample_logits
+from models.cudagraph.sampling import MIN_TEMPERATURE, sample_logits
 from models.fast_streaming import (
-    _MIN_BACKBONE_TEMPERATURE,
+    MIN_SUFFIX_ROOM,
     FastBreezeStreamingRuntime,
     FastStreamingChunk,
     FastStreamingConfig,
+    _branch_shape,
     _BranchBatch,
     _get_dtype,
     is_backbone_eos_token,
@@ -45,6 +46,11 @@ def test_runtime_dtype_follows_backbone_after_shared_lm_head_is_cast() -> None:
 
 def test_fast_streaming_defaults_to_repetition_penalty_1p1() -> None:
     assert FastStreamingConfig().repetition_penalty == 1.1
+
+
+def test_fast_streaming_ceiling_defaults_to_the_server_maximum() -> None:
+    # R12: 750 is the per-request default (from the model); 1500 the ceiling.
+    assert FastStreamingConfig().max_new_tokens == 1500
 
 
 def test_fast_streaming_exposes_master_and_one_switch_per_stage() -> None:
@@ -207,9 +213,12 @@ class _RecordingDecodeRuntime:
     ) -> None:
         self.sample_calls: list[dict] = []
         self.depth_calls: list[dict] = []
+        self.codec_events: list[str] = []
         runtime = object.__new__(FastBreezeStreamingRuntime)
         runtime.config = config
         runtime.device = torch.device("cpu")
+        runtime._fast_backbone_prefill = False
+        runtime._backbone_prefill_graphs = {}
         runtime._reserved_codec_token_ids = ()
         runtime._codec_chunk_frames = 1
         runtime._fast_text_encoder = False
@@ -232,8 +241,8 @@ class _RecordingDecodeRuntime:
         logits = torch.zeros(1, self.VOCAB + 1)
         runtime._ensure_graphs = lambda *args, **kwargs: None
         runtime._codec = lambda: SimpleNamespace(
-            open_request=lambda *args, **kwargs: None,
-            close_request=lambda *args, **kwargs: None,
+            open_request=lambda *args, **kwargs: self.codec_events.append("open"),
+            close_request=lambda *args, **kwargs: self.codec_events.append("close"),
         )
         runtime._build_branch_batch = lambda inputs: _BranchBatch(
             hidden, torch.ones(1, 1, dtype=torch.long), 1, select_fast_cfg(inputs)
@@ -275,7 +284,9 @@ class _RecordingDecodeRuntime:
         self.runtime = runtime
 
     def run(self, **overrides) -> list[FastStreamingChunk]:
-        return list(self.runtime.iter_audio_chunks({}, request_id="r", **overrides))
+        # A one-token prompt, matching the fake prefill's cache length of 1.
+        inputs = {"attention_mask": torch.ones(1, 1, dtype=torch.long)}
+        return list(self.runtime.iter_audio_chunks(inputs, request_id="r", **overrides))
 
 
 def _frames(chunks: list[FastStreamingChunk]) -> int:
@@ -359,35 +370,59 @@ def test_missing_generation_config_default_falls_back_to_the_ceiling(
     assert _frames(harness.run()) == 5
 
 
-@pytest.mark.parametrize("temperature", [1e-40, 5e-324, 1e-6])
-def test_tiny_backbone_temperature_is_floored(monkeypatch, temperature) -> None:
-    harness = _RecordingDecodeRuntime(
-        monkeypatch, FastStreamingConfig(max_new_tokens=3)
-    )
-
-    harness.run(temperature=temperature)
-
-    assert [call["temperature"] for call in harness.sample_calls] == [
-        _MIN_BACKBONE_TEMPERATURE
-    ] * 3
-    # The depth decoder keeps its own default.
-    assert all(call["temperature"] == 0.7 for call in harness.depth_calls)
-
-
-def test_temperature_floor_samples_finite_logits_greedily() -> None:
+@pytest.mark.parametrize("temperature", [1e-40, 5e-324, 1e-6, MIN_TEMPERATURE])
+def test_tiny_temperature_samples_finite_logits_greedily(temperature) -> None:
     logits = torch.tensor([[30.0, -30.0, 29.0, 0.0]])
 
     # 1e-40 itself overflows logits / temperature to inf and softmax to NaN.
     assert torch.isnan(torch.softmax(logits / 1e-40, dim=-1)).any()
     token = sample_logits(
-        logits,
-        temperature=_MIN_BACKBONE_TEMPERATURE,
-        top_k=0,
-        top_p=1.0,
-        do_sample=True,
+        logits, temperature=temperature, top_k=0, top_p=1.0, do_sample=True
     )
 
     assert token.tolist() == [0]
+
+
+@pytest.mark.parametrize("temperature", [1e39, float(torch.finfo(torch.float32).max)])
+def test_huge_temperature_samples_without_nan(temperature) -> None:
+    # Above float32 max the temperature becomes inf, and a suppressed token's
+    # -inf / inf is NaN, which made torch.multinomial raise.
+    torch.manual_seed(0)
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+
+    for _ in range(20):
+        token = sample_logits(
+            logits,
+            temperature=temperature,
+            top_k=0,
+            top_p=1.0,
+            do_sample=True,
+            suppress_tokens=[3],
+        )
+        assert token.tolist()[0] in (0, 1, 2)
+
+
+def test_tiny_temperature_override_is_passed_through_not_rejected(
+    monkeypatch,
+) -> None:
+    # sample_logits floors it; the runtime only rejects values <= 0.
+    harness = _RecordingDecodeRuntime(
+        monkeypatch, FastStreamingConfig(max_new_tokens=3)
+    )
+
+    harness.run(temperature=1e-40)
+
+    assert [call["temperature"] for call in harness.sample_calls] == [1e-40] * 3
+    # The depth decoder keeps its own default.
+    assert all(call["temperature"] == 0.7 for call in harness.depth_calls)
+
+
+def test_override_upper_bounds_are_inclusive(monkeypatch) -> None:
+    harness = _RecordingDecodeRuntime(
+        monkeypatch, FastStreamingConfig(max_new_tokens=2)
+    )
+
+    assert _frames(harness.run(temperature=1e4, repetition_penalty=1e4)) == 2
 
 
 _INVALID_OVERRIDES = [
@@ -408,6 +443,21 @@ _INVALID_OVERRIDES = [
     # Counts must be integers; the runtime does not truncate them.
     {"top_k": 2.5},
     {"max_new_tokens": 2.5},
+    # Absurd magnitudes are a caller error, not a numerics problem.
+    {"temperature": 1e39},
+    {"temperature": 1e4 * (1 + 1e-9)},
+    {"repetition_penalty": 1e5},
+    # Non-numbers and bools are rejected as ValueError, never TypeError.
+    {"temperature": "0.5"},
+    {"top_p": "x"},
+    {"repetition_penalty": [1.1]},
+    {"top_k": "5"},
+    {"max_new_tokens": "5"},
+    {"temperature": True},
+    {"top_p": True},
+    {"repetition_penalty": False},
+    {"top_k": True},
+    {"max_new_tokens": True},
 ]
 
 
@@ -418,6 +468,60 @@ def test_iter_audio_chunks_rejects_invalid_overrides(monkeypatch, override) -> N
     with pytest.raises(ValueError, match=next(iter(override))):
         harness.run(**override)
     assert harness.sample_calls == []
+    assert harness.codec_events == []
+
+
+def test_setup_failure_before_decoding_does_not_leak_a_codec_request(
+    monkeypatch,
+) -> None:
+    harness = _RecordingDecodeRuntime(monkeypatch, FastStreamingConfig())
+    # The depth decoder's sampling parameters are read during request setup.
+    harness.runtime.model.depth_decoder.generation_config.temperature = "broken"
+
+    with pytest.raises(ValueError):
+        harness.run()
+    assert harness.codec_events.count("open") == harness.codec_events.count("close")
+
+
+def test_prefill_failure_closes_the_codec_request(monkeypatch) -> None:
+    harness = _RecordingDecodeRuntime(monkeypatch, FastStreamingConfig())
+
+    def failing_prefill(branch, prefix):
+        raise RuntimeError("CUDA error")
+
+    harness.runtime._run_prefill = failing_prefill
+
+    with pytest.raises(RuntimeError, match="CUDA error"):
+        harness.run()
+    assert harness.codec_events == ["open", "close"]
+
+
+def test_prompt_that_leaves_no_room_raises_before_streaming(monkeypatch) -> None:
+    harness = _RecordingDecodeRuntime(
+        monkeypatch, FastStreamingConfig(max_new_tokens=500, max_seq_len=128)
+    )
+    runtime = harness.runtime
+    hidden = torch.zeros(1, 1, 4)
+    logits = torch.zeros(1, harness.VOCAB + 1)
+    runtime._build_branch_batch = lambda inputs: _BranchBatch(
+        hidden, inputs["attention_mask"], 1, select_fast_cfg(inputs)
+    )
+    runtime._run_prefill = lambda branch, prefix: (
+        hidden,
+        logits,
+        branch.attention_mask,
+        int(branch.attention_mask.shape[1]),
+        "eager",
+    )
+
+    # 127 tokens fill the cache to max_seq_len - 1: the room is 0.
+    assert runtime.max_new_tokens_room(None, _prompt(127)) == 0
+    with pytest.raises(ValueError, match="no room"):
+        list(runtime.iter_audio_chunks(_prompt(127), request_id="r"))
+    assert harness.codec_events == []
+    assert harness.sample_calls == []
+    # One token shorter leaves exactly one frame.
+    assert _frames(list(runtime.iter_audio_chunks(_prompt(126), request_id="r"))) == 1
 
 
 def _room_runtime(
@@ -463,11 +567,30 @@ def test_room_without_a_request_uses_the_generation_config_default() -> None:
     )
 
 
-@pytest.mark.parametrize("requested", [0, -3, float("nan"), float("inf"), 2.5])
+@pytest.mark.parametrize(
+    "requested", [0, -3, float("nan"), float("inf"), 2.5, "5", True]
+)
 def test_room_rejects_an_invalid_request(requested) -> None:
     # Mapping the wire's 0 to "use the default" is the boundary's job.
     with pytest.raises(ValueError, match="max_new_tokens"):
         _room_runtime().max_new_tokens_room(requested, _prompt(100))
+
+
+@pytest.mark.parametrize(
+    ("inputs", "shape"),
+    [
+        (_prompt(7), ("no_cfg", 1, 7)),
+        # CFG left-pads both branches to the longer one.
+        (_prompt(7, 9), ("single_cfg", 2, 9)),
+        (_prompt(9, 7), ("single_cfg", 2, 9)),
+        # cfg_scale 0 runs the negative prompt alone.
+        ({**_prompt(7, 9), "cfg_scale": 0.0}, ("no_cfg", 1, 9)),
+    ],
+)
+def test_branch_shape(inputs, shape) -> None:
+    cfg, branch_batch_size, seq_len = _branch_shape(inputs)
+
+    assert (cfg.mode, branch_batch_size, seq_len) == shape
 
 
 def test_room_clamps_request_to_ceiling_and_context() -> None:
@@ -680,17 +803,26 @@ _PREFIX_INPUTS = dict.fromkeys(
 )
 
 
+# The longest prefix that still leaves room for the smallest suffix and one
+# frame: the decode loop needs prefix + suffix + 1 <= max_seq_len - 1.
+_LONGEST_PREFIX = 2048 - 1 - MIN_SUFFIX_ROOM
+
+
 def test_reference_prefix_is_not_limited_by_the_max_new_tokens_ceiling() -> None:
     # 600 + the 1500 ceiling exceeds 2048, but the prefix still leaves room.
     prefix = _prefix_runtime(600).build_reference_prefix(_PREFIX_INPUTS)
 
     assert prefix.prefix_len == 600
-    assert _prefix_runtime(2046).build_reference_prefix(_PREFIX_INPUTS).prefix_len == 2046
+    longest = _prefix_runtime(_LONGEST_PREFIX).build_reference_prefix(_PREFIX_INPUTS)
+    assert longest.prefix_len == _LONGEST_PREFIX
 
 
-def test_reference_prefix_that_leaves_no_slot_is_rejected() -> None:
+@pytest.mark.parametrize("prefix_len", [_LONGEST_PREFIX + 1, 2046, 2047])
+def test_reference_prefix_without_room_for_a_minimal_suffix_is_rejected(
+    prefix_len,
+) -> None:
     with pytest.raises(ValueError, match="leaves no room"):
-        _prefix_runtime(2047).build_reference_prefix(_PREFIX_INPUTS)
+        _prefix_runtime(prefix_len).build_reference_prefix(_PREFIX_INPUTS)
 
 
 def test_reference_prefix_longer_than_every_frozen_bucket_runs_eagerly() -> None:

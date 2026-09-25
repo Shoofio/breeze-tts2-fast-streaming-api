@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tests.gpu.conftest import synthesize
+from tests.gpu.helpers import synthesize
 
 pytestmark = pytest.mark.gpu
 

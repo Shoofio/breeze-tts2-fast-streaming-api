@@ -36,15 +36,24 @@ _DUAL_CFG_KEYS = (
 # a prompt exactly as the graph prefill does, so both read this one value.
 _PREFILL_TOKEN_GRANULARITY = 32
 
-# Lowest backbone sampling temperature. logits / temperature overflows float32
-# to inf for a tiny positive temperature (1e-40), softmax turns that into NaN
-# and multinomial fails mid-stream. At 1e-5 sampling is already effectively
-# greedy, so the floor changes nothing a caller could otherwise observe.
-_MIN_BACKBONE_TEMPERATURE = 1e-5
-
 # Overrides that count something, so a fractional value is a caller bug rather
 # than something to truncate.
 _INTEGER_OVERRIDES = frozenset({"top_k", "max_new_tokens"})
+
+# Upper bounds for the float overrides that scale logits. Far past any useful
+# setting (the API allows much less), they keep absurd values a caller error
+# instead of a numerics question. top_p needs none: above 1 it filters nothing.
+_OVERRIDE_MAXIMUMS = {"temperature": 1e4, "repetition_penalty": 1e4}
+
+# Cache slots a reference prefix must leave free: the smallest real suffix plus
+# one generated frame, since the decode loop needs
+# prefix_len + suffix_len + 1 <= max_seq_len - 1 to produce frame 0. The
+# smallest suffix is 3 tokens, measured with prepare_suffix_inputs for the
+# one-word text "a" on the unguided branch (what cfg_scale 0 runs on its own;
+# the guided branch adds the instruction, 6 tokens with a one-character one).
+# tests/gpu/test_runtime_request_overrides.py re-measures it on the real
+# tokenizer.
+MIN_SUFFIX_ROOM = 3 + 1
 
 
 @dataclass(frozen=True)
@@ -52,7 +61,7 @@ class FastStreamingConfig:
     # Hard ceiling on frames per request; also sizes the token-history buffer.
     # The default when a request sets none is the model's
     # generation_config.max_new_tokens, clamped to this.
-    max_new_tokens: int = 750
+    max_new_tokens: int = 1500
     max_seq_len: int = 1024
     collect_timing: bool = False
     fast_all: bool | None = None
@@ -156,26 +165,58 @@ def should_decode_codec_frame(frame: torch.Tensor, config: Any) -> bool:
     return not is_terminal_pad_frame(frame, config)
 
 
-def _require_valid_overrides(**overrides: float | None) -> None:
-    """Reject a per-request override that is neither ``None`` nor a finite value > 0.
+def _require_valid_overrides(**overrides: Any) -> None:
+    """Reject a per-request override that is not ``None`` or a valid positive number.
 
     ``None`` means the default. Translating the wire's "use the default" values
     (such as ``max_new_tokens: 0``) into ``None`` is the API boundary's job, so
-    anything else invalid here is a caller bug and is not coerced. NaN compares
-    False against everything and inf survives until softmax, so both would
-    otherwise reach torch.multinomial as an invalid distribution mid-stream.
+    anything else invalid here is a caller bug and is not coerced: a non-number
+    or a bool raises ``ValueError`` like any other bad value. NaN compares False
+    against everything and inf survives until softmax, so both would otherwise
+    reach torch.multinomial as an invalid distribution mid-stream.
     """
     for name, value in overrides.items():
         if value is None:
             continue
-        if name in _INTEGER_OVERRIDES:
-            valid = isinstance(value, int) and not isinstance(value, bool) and value > 0
-            expected = "a positive integer"
+        maximum = _OVERRIDE_MAXIMUMS.get(name, math.inf)
+        if isinstance(value, bool):
+            valid = False
+        elif name in _INTEGER_OVERRIDES:
+            valid = isinstance(value, int) and value > 0
         else:
-            valid = math.isfinite(value) and value > 0
-            expected = "finite and > 0"
+            valid = (
+                isinstance(value, (int, float))
+                and math.isfinite(value)
+                and 0 < value <= maximum
+            )
         if not valid:
+            if name in _INTEGER_OVERRIDES:
+                expected = "a positive integer"
+            elif maximum < math.inf:
+                expected = f"a finite number in (0, {maximum:g}]"
+            else:
+                expected = "a finite number > 0"
             raise ValueError(f"{name} must be {expected} or None, got {value!r}")
+
+
+def _branch_shape(inputs: dict[str, Any]) -> tuple[FastCfgSelection, int, int]:
+    """``(cfg, branch_batch_size, seq_len)`` of the backbone batch for ``inputs``.
+
+    The one place that says which prompts run: ``cfg_scale`` 0 runs the
+    negative prompt alone, CFG runs both rows left-padded to the longer one.
+    ``_build_branch_batch`` builds exactly this shape and ``max_new_tokens_room``
+    and ``iter_audio_chunks`` size the context from it.
+    """
+    cfg = select_fast_cfg(inputs)
+    if cfg.use_negative_as_main:
+        return cfg, 1, int(inputs["cfg_negative_prompt_attention_mask"].shape[1])
+    if cfg.mode == "no_cfg":
+        return cfg, 1, int(inputs["attention_mask"].shape[1])
+    seq_len = max(
+        int(inputs["attention_mask"].shape[1]),
+        int(inputs["cfg_negative_prompt_attention_mask"].shape[1]),
+    )
+    return cfg, 2, seq_len
 
 
 def _get_device(model: torch.nn.Module) -> torch.device:
@@ -461,7 +502,7 @@ class FastBreezeStreamingRuntime:
         return merged["inputs_embeds"].contiguous(), attention_mask.contiguous()
 
     def _build_branch_batch(self, inputs: dict[str, Any]) -> _BranchBatch:
-        cfg = select_fast_cfg(inputs)
+        cfg, branch_batch_size, seq_len = _branch_shape(inputs)
         if cfg.use_negative_as_main:
             embeds, mask = self._merge_branch(
                 input_ids=inputs["cfg_negative_prompt_ids"],
@@ -470,7 +511,9 @@ class FastBreezeStreamingRuntime:
                 text_ids_len=inputs["cfg_negative_text_ids_len"],
                 input_values=inputs.get("cfg_negative_input_values"),
             )
-            return _BranchBatch(embeds.contiguous(), mask.contiguous(), 1, cfg)
+            return _BranchBatch(
+                embeds.contiguous(), mask.contiguous(), branch_batch_size, cfg
+            )
 
         if cfg.mode == "no_cfg":
             cond_embeds, cond_mask = self._merge_branch(
@@ -481,13 +524,13 @@ class FastBreezeStreamingRuntime:
                 input_values=inputs.get("input_values"),
             )
             return _BranchBatch(
-                cond_embeds.contiguous(), cond_mask.contiguous(), 1, cfg
+                cond_embeds.contiguous(), cond_mask.contiguous(), branch_batch_size, cfg
             )
 
         joint = self._merge_cfg_branches(inputs) if self._fast_text_encoder else None
         if joint is not None:
             inputs_embeds, attention_mask = joint
-            return _BranchBatch(inputs_embeds, attention_mask, 2, cfg)
+            return _BranchBatch(inputs_embeds, attention_mask, branch_batch_size, cfg)
 
         cond_embeds, cond_mask = self._merge_branch(
             input_ids=inputs["input_ids"],
@@ -503,22 +546,21 @@ class FastBreezeStreamingRuntime:
             text_ids_len=inputs["cfg_negative_text_ids_len"],
             input_values=inputs.get("cfg_negative_input_values"),
         )
-        max_len = max(cond_embeds.shape[1], uncond_embeds.shape[1])
         inputs_embeds = torch.cat(
             [
-                _left_pad_tensor(cond_embeds, max_len, 0),
-                _left_pad_tensor(uncond_embeds, max_len, 0),
+                _left_pad_tensor(cond_embeds, seq_len, 0),
+                _left_pad_tensor(uncond_embeds, seq_len, 0),
             ],
             dim=0,
         ).contiguous()
         attention_mask = torch.cat(
             [
-                _left_pad_tensor(cond_mask, max_len, 0),
-                _left_pad_tensor(uncond_mask, max_len, 0),
+                _left_pad_tensor(cond_mask, seq_len, 0),
+                _left_pad_tensor(uncond_mask, seq_len, 0),
             ],
             dim=0,
         ).contiguous()
-        return _BranchBatch(inputs_embeds, attention_mask, 2, cfg)
+        return _BranchBatch(inputs_embeds, attention_mask, branch_batch_size, cfg)
 
     def _decode_codec_frames(
         self,
@@ -933,24 +975,13 @@ class FastBreezeStreamingRuntime:
         means the piece will be clamped; ``<= 0`` means no room to generate.
         """
         _require_valid_overrides(max_new_tokens=requested)
-        # Mirrors _build_branch_batch: CFG left-pads both branches to the
-        # longer one.
-        cfg = select_fast_cfg(inputs)
-        if cfg.use_negative_as_main:
-            branch_batch_size = 1
-            seq_len = int(inputs["cfg_negative_prompt_attention_mask"].shape[1])
-        elif cfg.mode == "no_cfg":
-            branch_batch_size = 1
-            seq_len = int(inputs["attention_mask"].shape[1])
-        else:
-            branch_batch_size = 2
-            seq_len = max(
-                int(inputs["attention_mask"].shape[1]),
-                int(inputs["cfg_negative_prompt_attention_mask"].shape[1]),
-            )
+        return min(self._frame_cap(requested), self._context_room(inputs, prefix_len))
+
+    def _context_room(self, inputs: dict[str, Any], prefix_len: int) -> int:
+        """Frames the context leaves after the prefill of ``inputs`` (``<= 0``: none)."""
+        _, branch_batch_size, seq_len = _branch_shape(inputs)
         _, prefill_len = self._prefill_plan(branch_batch_size, seq_len, prefix_len)
-        room = self.config.max_seq_len - prefill_len - 1
-        return min(self._frame_cap(requested), room)
+        return self.config.max_seq_len - prefill_len - 1
 
     @torch.inference_mode()
     def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> ReferencePrefix:
@@ -969,10 +1000,11 @@ class FastBreezeStreamingRuntime:
         prefix_len = int(mask.shape[1])
         if int(mask.sum().item()) != prefix_len or embeds.shape[0] != 1:
             raise ValueError("reference prefix must be a single unpadded row")
-        # Only reject a prefix that leaves no slot to decode into. How much room
-        # a request really has depends on its own suffix and cap, which is
-        # max_new_tokens_room's job, per request.
-        if prefix_len >= self.config.max_seq_len - 1:
+        # Only reject a prefix no request could ever continue: one without room
+        # for the smallest suffix and a frame. How much room a request really
+        # has depends on its own suffix and cap, which max_new_tokens_room
+        # checks per request.
+        if prefix_len > self.config.max_seq_len - 1 - MIN_SUFFIX_ROOM:
             raise ValueError(
                 f"reference prefix of {prefix_len} tokens leaves no room to generate"
             )
@@ -1114,13 +1146,15 @@ class FastBreezeStreamingRuntime:
         backbone only; the depth decoder keeps its defaults, as in the C++
         server (``generation.cpp``). ``None`` keeps the default, and any other
         invalid value raises ``ValueError`` (on the first ``next``, as this is
-        a generator). The backbone temperature is floored at
-        ``_MIN_BACKBONE_TEMPERATURE``. ``repetition_penalty`` is applied once
+        a generator). ``sample_logits`` clamps the temperature it divides by
+        into a range that cannot produce NaN. ``repetition_penalty`` is applied once
         per distinct token in the history (see ``apply_repetition_penalty``).
         ``max_new_tokens`` defaults to the model's
         ``generation_config.max_new_tokens`` and is clamped to the configured
         ``max_new_tokens`` ceiling; the context can stop generation earlier
-        (``max_new_tokens_room`` says where).
+        (``max_new_tokens_room`` says where). A prompt that leaves no room at
+        all raises ``ValueError`` before anything is generated, the same
+        condition as ``max_new_tokens_room(...) <= 0``.
         """
         _require_valid_overrides(
             temperature=temperature,
@@ -1129,16 +1163,22 @@ class FastBreezeStreamingRuntime:
             repetition_penalty=repetition_penalty,
             max_new_tokens=max_new_tokens,
         )
-        cfg = select_fast_cfg(inputs)
-        branch_batch_size = 2 if cfg.mode == "single_cfg" else 1
+        prefix_len = 0 if prefix is None else int(prefix.prefix_len)
+        if self._context_room(inputs, prefix_len) <= 0:
+            raise ValueError(
+                "prompt leaves no room to generate in the "
+                f"{self.config.max_seq_len}-token context"
+            )
+        cfg, branch_batch_size, _ = _branch_shape(inputs)
         self._ensure_graphs(branch_batch_size, cfg.guidance_scale)
         assert self._backbone_graph is not None
         assert self._depth_decoder_graph is not None
 
+        # Everything that can fail runs before the codec request is opened, and
+        # the try that closes it starts right after, so no failure leaks one.
         codec = self._codec()
         branch = self._build_branch_batch(inputs)
         request_id = request_id or f"local-{uuid.uuid4().hex}"
-        codec.open_request(request_id, reset=True, is_first_decode=True)
 
         # Backbone sampling runs eagerly (outside every captured graph), so
         # per-request values are plain arguments and nothing is recaptured.
@@ -1149,9 +1189,6 @@ class FastBreezeStreamingRuntime:
             backbone_params["top_k"] = top_k
         if top_p is not None:
             backbone_params["top_p"] = float(top_p)
-        backbone_params["temperature"] = max(
-            backbone_params["temperature"], _MIN_BACKBONE_TEMPERATURE
-        )
         backbone_repetition_penalty = (
             self.config.repetition_penalty
             if repetition_penalty is None
@@ -1167,24 +1204,28 @@ class FastBreezeStreamingRuntime:
             dtype=torch.long,
             device=self.device,
         )
-        # All lazy request setup must precede the reset. In particular, the
-        # first request may allocate caches and initialize the streaming codec.
-        # A request seed is a sampling contract, so those one-time operations
-        # must not be allowed to shift the backbone/depth multinomial streams.
-        if seed is not None:
-            torch.manual_seed(seed)
-            torch.cuda.manual_seed_all(seed)
-        first_decode = True
-        t_start = time.perf_counter()
-        t_chunk = t_start
         prefill_start_event = None
         prefill_end_event = None
         if self.config.collect_timing:
             prefill_start_event = torch.cuda.Event(enable_timing=True)
             prefill_end_event = torch.cuda.Event(enable_timing=True)
-            prefill_start_event.record()
 
+        codec.open_request(request_id, reset=True, is_first_decode=True)
         try:
+            # All lazy request setup must precede the reset. In particular, the
+            # first request may allocate caches and initialize the streaming
+            # codec (open_request). A request seed is a sampling contract, so
+            # those one-time operations must not shift the backbone/depth
+            # multinomial streams.
+            if seed is not None:
+                torch.manual_seed(seed)
+                torch.cuda.manual_seed_all(seed)
+            first_decode = True
+            t_start = time.perf_counter()
+            t_chunk = t_start
+            if prefill_start_event is not None:
+                prefill_start_event.record()
+
             (
                 hidden,
                 logits,

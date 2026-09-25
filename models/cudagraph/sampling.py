@@ -10,6 +10,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+# The temperature range sample_logits divides by. Below 1e-5, logits / t
+# overflows float32 to inf and softmax turns it into NaN; sampling there is
+# already effectively greedy, so the floor changes nothing observable. Above
+# float32 max, t itself becomes inf once it meets the float32 logits, and a
+# suppressed token's -inf / inf is NaN. Either NaN makes torch.multinomial raise.
+MIN_TEMPERATURE = 1e-5
+MAX_TEMPERATURE = float(torch.finfo(torch.float32).max)
+
 
 def apply_repetition_penalty(
     logits: torch.Tensor,
@@ -65,8 +73,9 @@ def sample_logits(
         logits[..., list(suppress_tokens)] = float("-inf")
     if not do_sample:
         return torch.argmax(logits, dim=-1)
-    # temperature scaling (on raw logits, same as TemperatureLogitsWarper)
-    logits = logits / temperature
+    # temperature scaling (on raw logits, same as TemperatureLogitsWarper),
+    # clamped so no caller can turn the distribution into NaN
+    logits = logits / min(max(temperature, MIN_TEMPERATURE), MAX_TEMPERATURE)
     # top_k filtering (on raw logits, same as TopKLogitsWarper)
     if top_k > 0:
         k = min(top_k, logits.size(-1))

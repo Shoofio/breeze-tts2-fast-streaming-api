@@ -289,8 +289,12 @@ that table is SC-002's evidence.
 3. **`_prefill_plan` returns `(use_graph, prefill_len)`.** Adopt `A:`'s tuple and update
    81a5ca7's two call sites. `max_new_tokens_room(requested, inputs, prefix_len)` is the third
    caller.
-4. **Prefix guard:** relax `build_reference_prefix` to `prefix_len >= max_seq_len - 1`. Today any
-   voice prefix over 548 tokens is rejected (`P:fast_streaming.py:864-867`).
+4. **Prefix guard:** `build_reference_prefix` rejects only a prefix that leaves less than
+   `MIN_SUFFIX_ROOM` (4) slots, i.e. `prefix_len > max_seq_len - 1 - MIN_SUFFIX_ROOM`: the
+   smallest real suffix (3 tokens, a one-word text on the unguided branch, measured with
+   `prepare_suffix_inputs`) plus one generated frame. Each request's own room is checked by
+   `max_new_tokens_room`. The old guard rejected any voice prefix over 548 tokens
+   (`P:fast_streaming.py:864-867`).
 5. **Room semantics:** a partial room clamps and emits `speech.piece_clamped`. Piece 0 with no
    room gets `400 text_too_long`. A later piece with no room aborts the stream (FR-036a, BC-47).
 6. **Other `cfg_scale` values already work on the warmed graphs.** The guidance scale is a runtime
