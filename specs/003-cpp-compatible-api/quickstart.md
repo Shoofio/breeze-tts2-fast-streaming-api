@@ -41,7 +41,8 @@ These are also listed in the README development section (Constitution X).
 
 ## Scenario 0: Baseline (before any code change)
 
-1. **Record performance on the current API:** check out `perf-and-fixes` HEAD, start the current
+1. **Record performance on the current API:** with the old `api.py` still in place (it was
+   recorded on `enhanced-api` before T022 replaced it), start the current
    API (`python -m breeze_infer.api <model> --port 7860 --fast-all`), and run `bench_api` in
    old-API mode. Save the medians to `research/baseline-<date>.md` (SC-007).
 2. **Record SillyTavern against the C++ server:** start the C++ `breeze-server --cors` and run
@@ -125,7 +126,7 @@ These are also listed in the README development section (Constitution X).
 2. **Breaking-change coverage:** `.venv/bin/pytest -k bc_` runs one test per BC id. Each fails
    against the C++ behavior, as recorded in the test docstrings (SC-002).
 3. **Performance:** the 10-run benchmark medians for time to first audio and real-time factor on
-   the gating cases (`short_design`, `short_inline`, `medium_inline`) are within 10% of the
+   the gating cases (`short_design`, `medium_design`, `short_inline`, `medium_inline`) are within 10% of the
    Scenario 0 10-run baseline (SC-007; the method is in tasks.md "SC-007 method").
 4. **Documentation:** the README lists every endpoint, field, error code, launch option, WebSocket
    message and BC id (SC-008).

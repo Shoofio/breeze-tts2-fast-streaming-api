@@ -16,7 +16,7 @@ The approach:
   envelope.
 - Add a native `websockets` server on the same event loop for the session protocol.
 - Run all CUDA work on one GPU thread, behind an asyncio gate shared by HTTP (try, then `409`) and
-  WebSocket (wait, then `queued`).
+  WebSocket (`queued` sent just before waiting).
 - Use one pure text segmenter for both interfaces, and a small versioned voice-file store.
 - Port the earlier `api-alignment` work where it survives revalidation (research R10) and rewrite
   the rest.

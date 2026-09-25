@@ -73,7 +73,8 @@ phases as follows:
   - Add `--api old|new`. `old` drives the current API: port 7860, form fields `text`,
     `instruction`, `cfg_scale`, `seed`, `ref_audio`, `ref_text`. `new` drives
     contracts/http-api.md at 8080.
-  - Cases: `short_design`, `medium_design`, `short_inline`, plus `short_voice` for `new` only.
+  - Cases: `short_design`, `medium_design`, `short_inline`, `medium_inline` (added after T002), plus
+    `short_voice` for `new` only.
   - Report the median time to first audio (TTFA, ms) and real-time factor (RTF) over `--runs`.
   - Output JSON events to stdout.
   - Add `tests/test_bench_api.py`, covering argument parsing and median maths.
@@ -198,11 +199,13 @@ phases as follows:
   where they target the old parser.
 - [X] T017 *(Opus)* Create `breeze_infer/gpu.py` `GpuGate` (R14): asyncio only, used only on the
   event loop.
-  - `try_acquire() -> bool` is false when the gate is held or any waiter is pending.
+  - `try_acquire() -> GpuLease | None` is `None` when the gate is held or any waiter is pending.
   - `async acquire(on_wait)` calls `on_wait` synchronously just before it blocks, and only if it
     blocks, so the caller can enqueue `queued` before waiting (changed after review: a returned
     flag arrives only after the wait).
-  - `release()` hands the gate directly to the next non-cancelled waiter.
+  - `lease.release()` hands the gate directly to the next non-cancelled waiter; only the current
+    lease can release (changed after review). `GpuSession(lease, gpu, gen)` closes the generator on
+    the GPU thread before releasing, and is what T039 and T077 use.
 
   `tests/test_gpu_gate.py` covers try/acquire, handoff order, a cancelled waiter being skipped, and
   HTTP `try_acquire` failing while a WebSocket waiter is queued.
@@ -884,12 +887,15 @@ T002 showed that 3 runs with one warm-up leave cold runs in the median (medium_d
 3 runs against a steady 75 ms over 10). So every benchmark in this feature (T002, T043, T054, T082)
 runs `--warmup 3 --runs 10`, and compares its 10-run medians with the T002 10-run medians.
 
-- **Gating cases:** `short_design`, `short_inline` and `medium_inline`. `medium_inline` has an
-  inline reference, so it is one piece on both APIs and stays like-for-like.
-- **Reported only:** `medium_design`, which becomes two anchored pieces on the new API by design,
-  and `short_voice`, which has no baseline.
-- **Context, not a gate:** TTFA min and p25 are reported too, because `short_design` TTFA is
-  bimodal.
+- **Gating cases:** `short_design`, `medium_design`, `short_inline` and `medium_inline`. All four
+  are one piece on both APIs (text within `split_chars` stays one piece), so they compare like for
+  like. `medium_design` was first left out on the mistaken belief that it splits in two; the user
+  moved it into the gate on 2026-09-24.
+- **Reported only:** `short_voice`, which has no baseline.
+- **Context, not a gate:** TTFA min and p25, which show outliers that move a median.
+- **Conditions:** nothing else runs while a benchmark runs (no test suites or builds; the first
+  T002 recording ran alongside agents' test suites, and its RTF was about 17% worse). Record the
+  per-run values and the GPU clock/power state.
 
 ## Dependencies & Execution Order
 

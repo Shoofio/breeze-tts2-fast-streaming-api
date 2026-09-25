@@ -28,8 +28,8 @@ BUSY_RETRY_INTERVAL_S = 1.0
 BUSY_RETRY_BUDGET_S = 60.0
 
 # short_voice needs POST /v1/voices, which the current (old) API doesn't have.
-# medium_inline has a reference, so there's no opening budget and it stays
-# one piece on both APIs -- the like-for-like SC-007 case.
+# Every case's text fits split_chars, so each is one piece on both APIs and the
+# SC-007 comparison is like for like (tasks.md "SC-007 method").
 CASES_BY_API = {
     "old": ("short_design", "medium_design", "short_inline", "medium_inline"),
     "new": ("short_design", "medium_design", "short_inline", "medium_inline", "short_voice"),

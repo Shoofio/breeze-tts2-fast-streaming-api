@@ -77,7 +77,9 @@ escapes work (BC-32). Rules for every message:
 | `cancel` | — | Discards buffered text and queued pieces, stops the piece in flight, replaces a pending `done`, and replies with one `cancelled`, even when idle (BC-35). |
 
 **`start` details**
-- `split_chars` is 0–10,000. `0` means no length limit: each drain's ready text becomes one piece; absent means the
+- `split_chars` is 0–10,000. `0` means no length limit: each drain's ready text becomes one piece, and unpunctuated text
+  waits for a sentence end, `flush` or `end` (the 10,000-character buffer limit still applies, so an
+  endless unpunctuated stream gets `text_too_long`); absent means the
   server default. A negative value gets `invalid_field` (BC-38).
 - `start` is rejected with an `error`, leaving the previous session unchanged, when:
   - `voice_id` is unknown (`unknown_voice`, `unknown voice_id`);

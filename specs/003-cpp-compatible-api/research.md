@@ -341,12 +341,15 @@ only in our own format; re-encoding isn't required); C++ `.breeze` (rejected by 
 
 **Decision**:
 - **`GpuGate`:** an asyncio gate used only on the event loop.
-  - `try_acquire()` is for HTTP. It fails if the gate is held *or* a WebSocket piece is waiting;
-    the caller then answers `409 busy`.
+  - `try_acquire() -> GpuLease | None` is for HTTP. It fails if the gate is held *or* a WebSocket
+    piece is waiting; the caller then answers `409 busy`.
   - `await acquire(on_wait=...)` is for WebSocket pieces. `on_wait` runs synchronously just before
     the call blocks, and only if it will block, so the worker can enqueue `queued` ahead of the
     wait. A returned flag would arrive too late: after the wait.
-  - `release()` hands the gate directly to the next waiter.
+  - `lease.release()` hands the gate directly to the next waiter; only the current lease can
+    release. `GpuSession(lease, gpu, gen)` holds the lease for a generator's whole life and releases
+    it only after the generator has been closed on the GPU thread, so a cancelled step can't leave
+    the GPU busy behind a free gate. HTTP and WebSocket both use it.
 - **`GpuThread`:** a single-thread executor that runs *all* CUDA work: model load and warmup
   (in the background, so `/health` shows `503 loading`), reference encode, prefix builds,
   `prepare_inputs`, every `next(gen)` and every `gen.close()`. It calls `torch.cuda.set_device`
@@ -426,7 +429,8 @@ SillyTavern-BreezeTTS`):
 
 **Decision**: Before any code change, record time to first audio (TTFA) and real-time factor
 (RTF) on `P:` with `A:bench_api.py`, pointed at the current API (port 7860, `--fast-all`):
-- cases: short and medium voice design, short inline reference, 3 runs each, median;
+- cases: short and medium voice design, short and medium inline reference; 3 warm-ups, then the
+  median of 10 runs (tasks.md "SC-007 method"; the first plan of 3 runs proved too noisy);
 - saved to `research/baseline-<date>.md`.
 
 The 002 baseline (RTX 4090: short design 75 ms / 0.379) is for reference only; it was taken on a
