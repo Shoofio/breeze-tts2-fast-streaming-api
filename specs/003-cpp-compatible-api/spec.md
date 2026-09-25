@@ -393,9 +393,10 @@ allowed origin, a disallowed origin and no origin, for every route and the WebSo
     cut until more text, `flush` or `end` arrives.
   - **Opening budget:** the 200-character opening budget applies only to the first piece of a
     session without a reference.
-  - **Unpunctuated text:** once over the budget it MUST be cut at the last clause or space
-    boundary; a run with no such boundary MUST be hard-cut once it exceeds twice the budget, so the
-    buffer stays bounded.
+  - **Unpunctuated text:** a sentence over the budget MUST be cut into clauses at a clause or
+    space boundary once a clause reaches the budget; a run with no boundary MUST be hard-cut once
+    it exceeds twice the budget, so the buffer stays bounded (contracts/ws-api.md gives the exact
+    rule).
 - **FR-032**: A generation failure in a session MUST be reported as an `error` event. It MUST NOT
   end other sessions or the process.
 - **FR-033**: Audio for a WebSocket client MUST go through a bounded per-connection outgoing

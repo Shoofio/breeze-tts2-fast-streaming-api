@@ -85,9 +85,13 @@ escapes work (BC-32). Rules for every message:
 
 **`text` details**
 - A sentence end at the very end of the buffer waits for more text, `flush` or `end` (BC-39).
-- Text over the budget is cut at its last clause mark or space. A run with no such break at all
-  (for example CJK without punctuation) is hard-cut once it weighs more than 2 × the budget. The
-  buffer stays bounded either way.
+- Text is cut at sentence ends and packed into pieces up to the budget, which is soft: a single
+  unit heavier than it stays whole. A sentence over the budget is cut into clauses at the first
+  space, `，` or `、` after the clause reaches the budget (`,` and `:` break only before whitespace,
+  so `1,000` and `10:30` stay whole). A clause that would pass 2 × the budget is closed at its last
+  break instead, and a run with no break at all (for example CJK without punctuation) is hard-cut
+  into chunks within the budget once it is over 2 × the budget. Complete sentences and closed
+  clauses are spoken at once; the rest waits, so the buffer stays bounded.
 - If the buffer plus the new text would exceed 10,000 characters, the server sends
   `error{code: text_too_long}` and does not append the text (BC-40).
 - Control characters are rejected with `invalid_field` (BC-46).

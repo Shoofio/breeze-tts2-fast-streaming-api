@@ -260,9 +260,12 @@ It also changes three things:
 **Golden tests**: `gen_goldens.py` no longer rewrites the test file. The test compares against
 normalized C++ output and keeps a table of intentional differences, each tagged with its BC id;
 that table is SC-002's evidence.
-- **Change after normalization (stripped, empties dropped), measured in T020:** 1 split golden
-  (NUL, BC-46) and 3 drain goldens (the undrained byte-vs-weight case, quote absorption, and the
-  fullwidth period; BC-39). The planning estimate here was 5 and 5. The other candidates match once
+- **Change after normalization (stripped, empties dropped):** 6 split goldens and 6 drain
+  goldens, after the T019/T020 review fixes: NUL (BC-46); the undrained byte-vs-weight case, quote
+  absorption and the fullwidth period (BC-39, from the port itself); and eight more (BC-39) from
+  removing C++'s quarter-budget space guard, which let spaced text with no punctuation grow past the
+  context, from the streaming hard cut, and from dropping emoji-only pieces. The planning estimate
+  here was 5 and 5, and the port alone changed 1 and 3. The other candidates match once
   normalized (empty, whitespace-only), give the same pieces by another route (the ellipsis, the
   drained byte-vs-weight case), or were already right in C++ `split_text` (the first-budget pair;
   the whole-drain opening budget lived in `ws_api.cpp`, which no golden exercises at 200). The
