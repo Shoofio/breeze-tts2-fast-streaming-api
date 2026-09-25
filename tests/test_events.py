@@ -127,11 +127,21 @@ def test_emit_rejects_a_field_that_collides_with_a_reserved_key(reserved_key: st
     assert sink.getvalue() == ""
 
 
-def test_emit_rejects_a_field_named_event_with_value_error_not_type_error() -> None:
-    events = Emitter(sink=io.StringIO(), clock=lambda: 0.0)
+def test_emit_round_trips_non_ascii_field_values() -> None:
+    """`ensure_ascii=True` escapes non-ASCII as `\\uXXXX` on the wire; this guards that decoding
+    still recovers the original string (a regression test for the escaping itself, not just the
+    reserved-key/level checks the other tests cover)."""
+    sink = io.StringIO()
+    events = Emitter(sink=sink, clock=lambda: 0.0)
 
-    with pytest.raises(ValueError):
-        events.emit("voice.used", event="collision")
+    record = events.emit("voice.used", voice_id="café_日本語")
+
+    line = sink.getvalue()
+    assert line.isascii()  # the raw bytes on the wire are pure ASCII
+    assert "café" not in line
+    parsed = json.loads(line)
+    assert parsed == record
+    assert parsed["voice_id"] == "café_日本語"
 
 
 def test_emit_turns_a_nan_field_into_an_event_invalid_record_instead_of_raising() -> None:
@@ -181,3 +191,44 @@ def test_emit_swallows_an_oserror_from_a_gone_sink() -> None:
 
     # Telemetry must never break a request (Constitution VII): a dead sink is silently dropped.
     events.emit("voice.used")
+
+
+def test_emit_swallows_a_valueerror_from_a_closed_sink() -> None:
+    """`io` raises `ValueError` (not `OSError`) for "I/O operation on closed file"."""
+    sink = io.StringIO()
+    sink.close()
+    events = Emitter(sink=sink, clock=lambda: 0.0)
+
+    events.emit("voice.used")  # must not raise
+
+
+def test_emit_invalid_fallback_keeps_schema_ts_level_and_request_context() -> None:
+    """E1: the `event.invalid` record must still carry `event_schema`/`ts`, be `level=warning`,
+    list the offending field names under `fields`, and keep any of `request_id`/`session_id`/
+    `piece_index` that were present -- so a bad field never loses the trail back to its request."""
+    sink = io.StringIO()
+    events = Emitter(sink=sink, clock=lambda: 42.0)
+
+    record = events.emit(
+        "speech.completed",
+        rtf=math.nan,
+        request_id="req-1",
+        session_id="sess-1",
+        piece_index=3,
+        other_field="dropped",
+    )
+
+    parsed = json.loads(sink.getvalue())
+    assert parsed == record
+    assert parsed["event_schema"] == EVENT_SCHEMA
+    assert parsed["ts"] == 42.0
+    assert parsed["event"] == "event.invalid"
+    assert parsed["level"] == "warning"
+    assert parsed["invalid_event"] == "speech.completed"
+    assert parsed["request_id"] == "req-1"
+    assert parsed["session_id"] == "sess-1"
+    assert parsed["piece_index"] == 3
+    assert "other_field" not in parsed
+    assert parsed["fields"] == sorted(
+        ["rtf", "request_id", "session_id", "piece_index", "other_field"]
+    )
