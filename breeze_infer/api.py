@@ -20,7 +20,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
 
@@ -34,10 +34,12 @@ from breeze_infer.body_limit import BodyLimitMiddleware
 from breeze_infer.cors import CorsMiddleware, CorsPolicy
 from breeze_infer.errors import install_error_handlers
 from breeze_infer.events import Emitter
-from breeze_infer.gpu import GPU_CLOSE_TIMEOUT_SECONDS, GpuGate, GpuThread
-
-# The shared `gpu.close_failed` reporter, under the name tests/test_api_main.py already uses.
-from breeze_infer.gpu import report_close_failed as _report_close_failed
+from breeze_infer.gpu import (
+    GPU_CLOSE_TIMEOUT_SECONDS,
+    GpuGate,
+    GpuThread,
+    report_close_failed,
+)
 from breeze_infer.limits import TCP_USER_TIMEOUT_MS
 from breeze_infer.model_loading import LoadedModel, load_model
 from breeze_infer.request_id import RequestIdMiddleware
@@ -270,14 +272,25 @@ class ServeOutcome:
     """How `serve()` ended, filled in by `serve()` even when it raises, so `main()` can act on
     it from a `finally`.
 
-    `hard_exit` means the GPU thread is still busy (a model load; a close past
-    `GPU_DRAIN_SECONDS`; or a signal cut the drain short): a normal exit would join it and hang
-    for as long as that takes, so `main()` ends the process with `os._exit(exit_code)`.
-    `exit_code`: 0, 1 after a failed model load, `EXIT_GPU_STUCK` after a drain timeout.
+    `hard_exit` means the GPU thread may still be busy (a model load; a close past
+    `GPU_DRAIN_SECONDS`; the drain cut short by a signal or a cancel; a failed GPU stop): a
+    normal exit would join it and hang for as long as that takes, so `main()` ends the process
+    with `os._exit(exit_code)`.
+
+    `exit_code`, all set by `_stop_gpu` and `_conclude`:
+    - 0: a clean stop;
+    - 1: the model load failed;
+    - 70 (`EXIT_GPU_STUCK`): a GPU failure (below) with no crash, or with a crash whose code
+      would exit 0;
+    - a crash's own code (`_crash_exit_code`): 1, `SystemExit`'s code, or 130 for Ctrl+C.
+
+    `gpu_failed`: the drain timed out or the GPU stop failed, so the GPU may be stuck. Left out
+    of equality, so tests compare codes; it only feeds the "never exit 0" rule.
     """
 
     exit_code: int = 0
     hard_exit: bool = False
+    gpu_failed: bool = field(default=False, compare=False)
 
 
 _CLIENT_ABORT_LOG_FILTER = ClientAbortLogFilter()
@@ -385,10 +398,14 @@ def _conclude(
     | `_stop_gpu` cancelled             | yes       | unchanged                  | "gpu stop cancelled" | warning |
     | `_stop_gpu` failed                | yes       | 70                         | "gpu stop failed"    | error   |
     | crash, no hard exit               | no        | Python's, as it propagates | "serve raised"       | error   |
-    | crash + any hard exit above       | yes       | the crash's (`_crash_exit_code`); 70 if that is 0 after a GPU failure | as above | error |
+    | crash + any hard exit above       | yes       | the crash's (`_crash_exit_code`); 70 if it would exit 0 after a GPU failure | as above | error |
 
-    A GPU failure is a drain timeout or a failed `_stop_gpu`. It never exits 0, so a supervisor
-    restarts a process whose GPU may be stuck, even when the crash was `SystemExit(0)`.
+    A GPU failure is a drain timeout or a failed `_stop_gpu` (`outcome.gpu_failed`). It never
+    exits 0, so a supervisor restarts a process whose GPU may be stuck: a crash code that
+    `os._exit` would turn into 0 (0, None, or any multiple of 256, as it keeps only 8 bits)
+    becomes 70. A signal during the drain and a cancelled `_stop_gpu` also hard-exit with the
+    GPU possibly busy, but they are not GPU failures (someone asked us to stop), so a crash
+    code of 0 there still exits 0.
 
     `_stop_gpu` ending early (failed or cancelled) is a hard exit because the GPU thread may
     still be busy, and a normal exit would join it. The event carries `crash` and
@@ -400,16 +417,18 @@ def _conclude(
         crash = None
     stop_cancelled = isinstance(stop_error, asyncio.CancelledError)
     stop_failure = None if stop_cancelled else stop_error
-    # Read before the exit code changes: only `_stop_gpu` sets 70, for a drain timeout.
-    gpu_failed = stop_failure is not None or outcome.exit_code == EXIT_GPU_STUCK
+    if stop_failure is not None:
+        outcome.gpu_failed = True
     # Exit code first, so a failure while reporting can't leave a crash exiting 0.
     if stop_error is not None:
         outcome.hard_exit = True
         hard_exit_reason = "gpu stop cancelled" if stop_cancelled else "gpu stop failed"
     if crash is not None and outcome.hard_exit:
-        # The crash's own code wins, except that a GPU failure never exits 0.
+        # The crash's own code wins, except that a GPU failure never exits 0: judged on what
+        # the process will really exit with, as os._exit keeps only the low 8 bits.
         crash_code = _crash_exit_code(crash)
-        outcome.exit_code = EXIT_GPU_STUCK if gpu_failed and crash_code == 0 else crash_code
+        exits_0 = crash_code % 256 == 0
+        outcome.exit_code = EXIT_GPU_STUCK if outcome.gpu_failed and exits_0 else crash_code
     elif stop_failure is not None:
         outcome.exit_code = EXIT_GPU_STUCK
     if crash is None and not outcome.hard_exit:
@@ -472,6 +491,7 @@ async def _stop_gpu(
     if not drain.result():
         outcome.exit_code = EXIT_GPU_STUCK
         outcome.hard_exit = True
+        outcome.gpu_failed = True
         return "gpu drain timed out"
     return None
 
@@ -556,7 +576,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         settings=settings,
         events=events,
         gate=GpuGate(on_poisoned=partial(_gpu_unresponsive, events, readiness)),
-        gpu=GpuThread(device, set_device, partial(_report_close_failed, events)),
+        gpu=GpuThread(device, set_device, partial(report_close_failed, events)),
         readiness=readiness,
         ws_port=lambda: 0,  # the WebSocket server arrives in Phase 8 (T077)
     )

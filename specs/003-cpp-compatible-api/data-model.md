@@ -278,13 +278,15 @@ offending record's field names), so one bad field never breaks the request emitt
 - Event names:
   - server: `server.started` (with every bound `addresses`), `server.bind_failed`,
     `server.stopping` (exactly one when the process hard-exits or `serve()` crashes; none on
-    a clean stop. `reason`: the hard-exit reason, `load in progress`, `signal during drain`,
-    `gpu drain timed out` (exits 70 unless `serve()` crashed with a non-zero code),
-    `gpu stop cancelled`, or `gpu stop failed` (exits 70 unless `serve()` crashed with a
-    non-zero code), else `serve raised`; a crash otherwise exits with its own code (1,
-    `SystemExit`'s code, 130 for Ctrl+C), so a GPU failure never exits 0; optional
-    `crash` and `stop_error`, each a formatted traceback; `level` is `error` when either is
-    present, else `warning`. A cancellation is never a crash or a stop failure), `ws.bind_failed`,
+    a clean stop. `reason` is the hard-exit reason if there is one, else `serve raised`. The
+    hard-exit reasons: `load in progress`, `signal during drain` and `gpu stop cancelled`
+    (the GPU may be busy, but someone asked to stop: not a GPU failure), and
+    `gpu drain timed out` and `gpu stop failed` (the GPU failures, which exit 70). A crash
+    exits with its own code (1, `SystemExit`'s code, 130 for Ctrl+C), except that after a
+    GPU failure a code the process would exit 0 with (0, None, or a multiple of 256) becomes
+    70: a GPU failure never exits 0. Optional `crash` and `stop_error`, each a formatted
+    traceback; `level` is `error` when either is present, else `warning`. A cancellation is
+    never a crash or a stop failure), `ws.bind_failed`,
     `model.loaded`,
     `model.load_failed` (the process then exits non-zero), `gpu.close_failed`,
     `gpu.close_timeout` (a `gen.close()` ran past 30 s: the GPU gate is poisoned and `/health`

@@ -32,7 +32,7 @@ from breeze_infer.api import (
     serve,
 )
 from breeze_infer.events import Emitter
-from breeze_infer.gpu import GpuGate, GpuSession, GpuThread
+from breeze_infer.gpu import GpuGate, GpuSession, GpuThread, report_close_failed
 from breeze_infer.limits import MAX_BODY_BYTES, TCP_USER_TIMEOUT_MS
 from breeze_infer.model_loading import LoadedModel
 from breeze_infer.routes_health import Readiness
@@ -50,7 +50,7 @@ def _components(sink: io.StringIO) -> Components:
         events=events,
         gate=GpuGate(on_poisoned=lambda: api._gpu_unresponsive(events, readiness)),
         gpu=GpuThread(
-            "cpu", lambda _device: None, lambda error: api._report_close_failed(events, error)
+            "cpu", lambda _device: None, lambda error: report_close_failed(events, error)
         ),
         readiness=readiness,
         ws_port=lambda: 0,
@@ -650,9 +650,18 @@ def test_crash_exit_codes_follow_python(crash: BaseException, exit_code: int) ->
         (RuntimeError("uvicorn broke"), 1),
         (SystemExit(3), 3),  # SystemExit's own int code is kept
         (SystemExit(0), 0),  # a load in progress is not a GPU failure: 0 stands
+        (SystemExit(None), 0),
+        (SystemExit(70), 70),  # 70 from the crash itself; still not a GPU failure
         (KeyboardInterrupt(), 130),
     ],
-    ids=["exception", "system-exit", "system-exit-0", "keyboard-interrupt"],
+    ids=[
+        "exception",
+        "system-exit",
+        "system-exit-0",
+        "system-exit-none",
+        "system-exit-70",
+        "keyboard-interrupt",
+    ],
 )
 def test_a_crash_during_the_load_hard_exits_with_its_code_and_one_error_event(
     monkeypatch: pytest.MonkeyPatch,
@@ -678,6 +687,7 @@ def test_a_crash_during_the_load_hard_exits_with_its_code_and_one_error_event(
 
     assert raised is crash
     assert outcome == ServeOutcome(exit_code, hard_exit=True)
+    assert outcome.gpu_failed is False
     assert type(crash).__name__ in capsys.readouterr().err
     [stopping] = _stopping_events(sink)  # one event, not a warning plus an error
     assert (stopping["level"], stopping["reason"]) == ("error", "load in progress")
@@ -893,22 +903,36 @@ def _returns_once(condition: Any) -> Any:
 @posix_only
 @pytest.mark.usefixtures("keep_sigint")
 @pytest.mark.parametrize(
-    ("crash", "exit_code"),
+    ("crash", "signal_while_draining", "exit_code", "reason"),
     [
-        (RuntimeError("uvicorn broke"), 1),
-        (KeyboardInterrupt(), 130),
-        (SystemExit(0), 70),  # a GPU failure never exits 0
-        (SystemExit(None), 70),
+        (RuntimeError("uvicorn broke"), False, 1, "gpu drain timed out"),
+        (KeyboardInterrupt(), False, 130, "gpu drain timed out"),
+        (SystemExit(0), False, 70, "gpu drain timed out"),  # a GPU failure never exits 0
+        (SystemExit(None), False, 70, "gpu drain timed out"),
+        # os._exit keeps 8 bits: 256 would exit 0, so it counts as 0 too.
+        (SystemExit(256), False, 70, "gpu drain timed out"),
+        # An operator stopped the drain: the GPU may be busy, but it didn't fail. 0 stands.
+        (SystemExit(0), True, 0, "signal during drain"),
     ],
-    ids=["exception", "sigint", "system-exit-0", "system-exit-none"],
+    ids=[
+        "exception",
+        "sigint",
+        "system-exit-0",
+        "system-exit-none",
+        "system-exit-256",
+        "system-exit-0-signal-during-drain",
+    ],
 )
 def test_a_crash_with_a_stuck_drain_exits_with_the_crash_code_but_never_0(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     crash: BaseException,
+    signal_while_draining: bool,
     exit_code: int,
+    reason: str,
 ) -> None:
-    monkeypatch.setattr(api, "GPU_DRAIN_SECONDS", 0.5)
+    # With a signal, the drain must still be running when it arrives.
+    monkeypatch.setattr(api, "GPU_DRAIN_SECONDS", 8.0 if signal_while_draining else 0.5)
     sink = io.StringIO()
     components = _components(sink)
     proceed, cancelled, streaming = (threading.Event() for _ in range(3))
@@ -930,7 +954,14 @@ def test_a_crash_with_a_stuck_drain_exits_with_the_crash_code_but_never_0(
             await _wait_until(lambda: components.readiness.runtime is not None)
             return await _start_request(port)
 
+        async def signal_once_draining() -> None:
+            # Requests are cancelled only once uvicorn has returned and the drain began.
+            await asyncio.to_thread(cancelled.wait, 10)
+            os.kill(os.getpid(), signal.SIGTERM)
+
         requesting = asyncio.create_task(client())
+        if signal_while_draining:
+            signalling = asyncio.create_task(signal_once_draining())
         # serve() awaited in this task, not its own: SystemExit and KeyboardInterrupt out of
         # a task escape the event loop instead of reaching the `except` here.
         try:
@@ -940,6 +971,8 @@ def test_a_crash_with_a_stuck_drain_exits_with_the_crash_code_but_never_0(
         finally:
             proceed.set()  # unstick the GPU before asyncio.run's cleanup
             (await requesting).close()
+            if signal_while_draining:
+                await signalling
 
     try:
         asyncio.run(scenario())
@@ -948,10 +981,11 @@ def test_a_crash_with_a_stuck_drain_exits_with_the_crash_code_but_never_0(
         components.gpu.shutdown()
     assert raised == [crash]
     assert outcome == ServeOutcome(exit_code, hard_exit=True)
+    assert outcome.gpu_failed is (not signal_while_draining)
     assert type(crash).__name__ in capsys.readouterr().err
     [stopping] = _stopping_events(sink)
     # `reason` stays the hard-exit reason, so an alert on "gpu drain timed out" still fires.
-    assert (stopping["level"], stopping["reason"]) == ("error", "gpu drain timed out")
+    assert (stopping["level"], stopping["reason"]) == ("error", reason)
     assert type(crash).__name__ in stopping["crash"]
 
 
