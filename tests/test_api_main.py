@@ -44,14 +44,15 @@ MODEL_DIR = str(Path(__file__).parent)  # any existing directory; nothing loads 
 
 def _components(sink: io.StringIO) -> Components:
     events = Emitter(sink, lambda: 0.0)
+    readiness = Readiness()
     return Components(
         settings=settings_from_args([MODEL_DIR]),
         events=events,
-        gate=GpuGate(),
+        gate=GpuGate(on_poisoned=lambda: api._gpu_unresponsive(events, readiness)),
         gpu=GpuThread(
             "cpu", lambda _device: None, lambda error: api._report_close_failed(events, error)
         ),
-        readiness=Readiness(),
+        readiness=readiness,
         ws_port=lambda: 0,
     )
 
@@ -314,12 +315,33 @@ def _loaded() -> LoadedModel:
     return LoadedModel(runtime=FakeRuntime(), report={"device": "cpu"})
 
 
+async def _serve(
+    components: Components,
+    app: Any,
+    sockets: list[socket.socket],
+    load: Any,
+    outcome: ServeOutcome | None = None,
+) -> ServeOutcome:
+    outcome = ServeOutcome() if outcome is None else outcome
+    await serve(components, app, sockets, load, outcome)
+    return outcome
+
+
 def _serving(
     components: Components, load: Any, app: Any = None
 ) -> tuple[asyncio.Task[ServeOutcome], int]:
     sock = _bind_one("127.0.0.1", 0)
     app = create_app(components) if app is None else app
-    return asyncio.create_task(serve(components, app, [sock], load)), sock.getsockname()[1]
+    port = sock.getsockname()[1]
+    return asyncio.create_task(_serve(components, app, [sock], load)), port
+
+
+@pytest.fixture()
+def keep_sigint() -> Any:
+    """A hard-exit outcome leaves SIGINT ignored (main() is about to os._exit); undo it."""
+    before = signal.getsignal(signal.SIGINT)
+    yield
+    signal.signal(signal.SIGINT, before)
 
 
 @posix_only
@@ -345,7 +367,7 @@ def test_serve_loads_in_the_background_then_stops_cleanly_on_sigterm() -> None:
     names = [event["event"] for event in _events(sink)]
     assert names == ["server.started", "model.loaded"]
     started, loaded = _events(sink)
-    assert started["port"] == port
+    assert "port" not in started  # one port can't describe several sockets
     assert started["addresses"] == [f"127.0.0.1:{port}"]
     assert loaded["sample_rate"] == 24000
     assert loaded["device"] == "cpu"
@@ -522,6 +544,7 @@ def test_each_open_generation_is_closed_on_the_gpu_thread_before_it_stops(
 
 
 @posix_only
+@pytest.mark.usefixtures("keep_sigint")
 def test_a_signal_during_the_load_asks_main_for_a_hard_exit() -> None:
     sink = io.StringIO()
     components = _components(sink)
@@ -549,6 +572,193 @@ def test_a_signal_during_the_load_asks_main_for_a_hard_exit() -> None:
     assert stopping["event"] == "server.stopping"
     assert stopping["level"] == "warning"
     assert stopping["reason"] == "load in progress"
+    # From the decision on, a Ctrl+C can't turn the hard exit into a KeyboardInterrupt.
+    assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
+
+
+@pytest.mark.usefixtures("keep_sigint")
+def test_serve_raising_still_reports_the_hard_exit_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink = io.StringIO()
+    components = _components(sink)
+    started, release = threading.Event(), threading.Event()
+    outcome = ServeOutcome()
+
+    def load() -> LoadedModel:
+        started.set()
+        assert release.wait(10)
+        return _loaded()
+
+    async def broken_main_loop(self: Any) -> None:
+        await asyncio.to_thread(started.wait, 10)
+        raise RuntimeError("uvicorn broke")
+
+    monkeypatch.setattr(api._Server, "main_loop", broken_main_loop)
+
+    async def scenario() -> None:
+        app = create_app(components)
+        await serve(components, app, [_bind_one("127.0.0.1", 0)], load, outcome)
+
+    try:
+        with pytest.raises(RuntimeError, match="uvicorn broke"):
+            asyncio.run(asyncio.wait_for(scenario(), 10))
+    finally:
+        release.set()
+        components.gpu.shutdown()
+    assert outcome.hard_exit is True
+
+
+def test_hard_exit_survives_a_broken_stdout(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BrokenStdout(io.StringIO):
+        def flush(self) -> None:
+            raise BrokenPipeError("gone")
+
+    exits: list[int] = []
+    monkeypatch.setattr(api.sys, "stdout", BrokenStdout())
+    monkeypatch.setattr(api.os, "_exit", exits.append)
+
+    api._hard_exit(70)
+
+    assert exits == [70]
+
+
+# --- stuck GPU work while draining -------------------------------------------------------
+
+
+def _stuck_close_app(
+    components: Components, proceed: threading.Event, cancelled: threading.Event
+) -> Any:
+    """A streaming request whose gen.close() is stuck behind other GPU work."""
+
+    def hold() -> None:
+        assert proceed.wait(20)
+
+    async def app(scope: dict, receive: Any, send: Any) -> None:
+        lease = components.gate.try_acquire()
+        assert lease is not None
+        session = GpuSession(lease, components.gpu, _frames([]))
+        blocker = asyncio.ensure_future(components.gpu.run(hold))
+        try:
+            await session.step()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await asyncio.sleep(60)
+        finally:
+            cancelled.set()
+            await session.aclose()
+            await blocker
+
+    return app
+
+
+def _run_with_stuck_close(
+    components: Components, extra_signal: bool
+) -> tuple[ServeOutcome, float]:
+    proceed, cancelled = threading.Event(), threading.Event()
+
+    async def scenario() -> tuple[ServeOutcome, float]:
+        app = _stuck_close_app(components, proceed, cancelled)
+        serving, port = _serving(components, _loaded, app=app)
+        await _wait_until(lambda: components.readiness.runtime is not None)
+        writer = await _start_request(port)
+        os.kill(os.getpid(), signal.SIGTERM)
+        assert await asyncio.to_thread(cancelled.wait, 10)  # uvicorn gave up on the request
+        await asyncio.sleep(0.2)  # uvicorn has returned; serve() is draining
+        signalled_at = time.monotonic()
+        if extra_signal:
+            os.kill(os.getpid(), signal.SIGTERM)
+        outcome = await asyncio.wait_for(serving, 10)
+        elapsed = time.monotonic() - signalled_at
+        # Unstick the GPU before asyncio.run's cleanup, which waits for the abandoned drain
+        # (main() would have hard-exited instead).
+        proceed.set()
+        writer.close()
+        return outcome, elapsed
+
+    try:
+        return asyncio.run(scenario())
+    finally:
+        proceed.set()
+        components.gpu.shutdown()
+
+
+@posix_only
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_signal_while_draining_hard_exits_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api, "GRACEFUL_SHUTDOWN_SECONDS", 0.3)
+    monkeypatch.setattr(api, "GPU_DRAIN_SECONDS", 8.0)
+    sink = io.StringIO()
+    components = _components(sink)
+
+    outcome, after_signal = _run_with_stuck_close(components, extra_signal=True)
+
+    assert outcome == ServeOutcome(0, hard_exit=True)
+    assert after_signal < 1.0
+    stopping = _events(sink)[-1]
+    assert (stopping["event"], stopping["reason"]) == ("server.stopping", "signal during drain")
+
+
+@posix_only
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_drain_past_its_bound_hard_exits_with_ex_software(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(api, "GRACEFUL_SHUTDOWN_SECONDS", 0.3)
+    monkeypatch.setattr(api, "GPU_DRAIN_SECONDS", 0.5)
+    sink = io.StringIO()
+    components = _components(sink)
+
+    outcome, _ = _run_with_stuck_close(components, extra_signal=False)
+
+    assert outcome == ServeOutcome(70, hard_exit=True)
+    stopping = _events(sink)[-1]
+    assert (stopping["event"], stopping["reason"]) == ("server.stopping", "gpu drain timed out")
+
+
+# --- a close that never finishes: the gate is poisoned and the server unhealthy ------------
+
+
+def test_a_poisoned_gate_marks_the_server_unhealthy_and_reports_it() -> None:
+    sink = io.StringIO()
+    components = _components(sink)
+    components.readiness.mark_ready(FakeRuntime())
+    try:
+        lease = components.gate.try_acquire()
+        assert lease is not None
+        lease.poison()
+    finally:
+        components.gpu.shutdown()
+
+    assert components.readiness.runtime is None
+    event = _events(sink)[-1]
+    assert (event["event"], event["level"]) == ("gpu.close_timeout", "error")
+
+
+@pytest.mark.skipif(not _has_ipv6_loopback(), reason="no IPv6 loopback here")
+def test_server_started_lists_each_sockets_own_port_for_a_dual_stack_port_0(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _resolving_to(
+        monkeypatch,
+        (socket.AF_INET, ("127.0.0.1", 0)),
+        (socket.AF_INET6, ("::1", 0, 0, 0)),
+    )
+    sockets = bind_http_sockets("localhost", 0)
+    monkeypatch.undo()
+    expected = [f"127.0.0.1:{sockets[0].getsockname()[1]}", f"[::1]:{sockets[1].getsockname()[1]}"]
+    sink = io.StringIO()
+    components = _components(sink)
+
+    def load() -> LoadedModel:
+        raise RuntimeError("no model needed")
+
+    asyncio.run(_serve(components, create_app(components), sockets, load))
+
+    started = _events(sink)[0]
+    assert started["event"] == "server.started"
+    assert started["addresses"] == expected
 
 
 # --- signal handler installation -----------------------------------------------------------
@@ -595,7 +805,7 @@ def test_off_the_main_thread_no_handlers_are_installed() -> None:
     def in_thread() -> None:
         loop = asyncio.new_event_loop()
         try:
-            api._install_signal_handlers(loop, server)()  # install, then undo
+            api._install_signal_handlers(loop, lambda: request_exit(server))()  # and undo
             results.append(None)
         except BaseException as exc:  # noqa: BLE001 - reported to the main thread
             results.append(exc)

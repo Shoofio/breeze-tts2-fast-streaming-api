@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from breeze_infer.gpu import GpuGate, GpuLease
+from breeze_infer.gpu import GpuGate, GpuLease, GpuUnavailable
 
 # A broken handoff shows up as a waiter that never wakes; fail instead of hanging the suite.
 TIMEOUT = 5.0
@@ -222,5 +222,48 @@ def test_a_stale_lease_cannot_release_the_current_holder() -> None:
             first.release()  # a late double release must not free `second`'s gate
         assert gate.try_acquire() is None
         second.release()
+
+    _run(main())
+
+
+# --- poisoned: a gen.close() never finished, so the GPU can't be trusted again -------------
+
+
+def test_a_poisoned_gate_refuses_new_holders_and_fails_queued_waiters() -> None:
+    async def main() -> None:
+        poisoned: list[str] = []
+        gate = GpuGate(on_poisoned=lambda: poisoned.append("poisoned"))
+        holder = _hold(gate)
+        waiters = [asyncio.create_task(gate.acquire()) for _ in range(2)]
+        await _settle()
+
+        holder.poison()
+        holder.poison()  # idempotent: reported once
+        for waiter in waiters:
+            with pytest.raises(GpuUnavailable):
+                await waiter
+        assert gate.try_acquire() is None
+        with pytest.raises(GpuUnavailable):
+            await gate.acquire()
+        assert poisoned == ["poisoned"]
+
+        holder.release()  # the stuck close finishing later doesn't reopen the gate
+        assert gate.try_acquire() is None
+        with pytest.raises(GpuUnavailable):
+            await gate.acquire()
+
+    _run(main())
+
+
+def test_a_waiter_failed_by_poisoning_then_cancelled_does_not_raise_from_cleanup() -> None:
+    async def main() -> None:
+        gate = GpuGate()
+        holder = _hold(gate)
+        waiter = asyncio.create_task(gate.acquire())
+        await _settle()
+        holder.poison()
+        waiter.cancel()  # races the failure; either outcome, but never a stray error
+        with pytest.raises((GpuUnavailable, asyncio.CancelledError)):
+            await waiter
 
     _run(main())

@@ -274,7 +274,7 @@ phases as follows:
     `load_runtime` and warmup; then mark it ready and emit `model.loaded`.
   - Pre-bind the HTTP socket on `settings.host:settings.port`, with `TCP_USER_TIMEOUT` set when
     `socket` has it. Serve with `uvicorn.Server(Config(app, lifespan="off")).serve(sockets=[sock])`
-    and emit `server.started` with the bound port.
+    and emit `server.started` with every bound address (`host`, `addresses`).
   - Install one SIGINT/SIGTERM handler with `loop.add_signal_handler`, setting `should_exit`.
   - Remove the old `/v1/audio/speech` handler, `_settings`, `_request_lock`, the `os.environ` read,
     `print`s, and `MAX_*` duplicates (use `limits.py`).

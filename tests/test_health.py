@@ -185,3 +185,30 @@ def test_require_ready_gives_other_routes_the_loading_503_then_the_runtime(
     assert loading.status_code == 503
     assert loading.json() == LOADING
     assert ready.json() == {"sample_rate": 24000}
+
+
+GPU_UNAVAILABLE = {
+    "status": "error",
+    "error": "gpu is not responding",
+    "code": "gpu_unavailable",
+}
+
+
+def test_health_is_503_gpu_unavailable_once_the_gpu_stops_responding(
+    readiness: Readiness, ready_client: TestClient
+) -> None:
+    readiness.mark_unhealthy()
+    response = ready_client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == GPU_UNAVAILABLE
+
+
+def test_unhealthy_wins_over_a_later_ready_and_over_loading(
+    readiness: Readiness, client: TestClient
+) -> None:
+    readiness.mark_unhealthy()
+    assert client.get("/health").json() == GPU_UNAVAILABLE
+    readiness.mark_ready(FakeRuntime())
+    assert client.get("/health").json() == GPU_UNAVAILABLE
+    assert readiness.runtime is None

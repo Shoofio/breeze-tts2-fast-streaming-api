@@ -257,9 +257,11 @@ offending record's field names), so one bad field never breaks the request emitt
   `piece_index`.
 - Event names:
   - server: `server.started` (with every bound `addresses`), `server.bind_failed`,
-    `server.stopping` (a hard exit: a load still in progress, or the GPU drain timed out),
-    `ws.bind_failed`, `model.loaded`, `model.load_failed` (the process then exits non-zero),
-    `gpu.close_failed`;
+    `server.stopping` (a hard exit, `reason`: a load still in progress, a signal during the
+    GPU drain, or the GPU drain timed out, which exits 70), `ws.bind_failed`, `model.loaded`,
+    `model.load_failed` (the process then exits non-zero), `gpu.close_failed`,
+    `gpu.close_timeout` (a `gen.close()` ran past 30 s: the GPU gate is poisoned and `/health`
+    answers `503 gpu_unavailable` until restart);
   - voices: `voices.loaded`, `voice.skipped`, `voice.created`, `voice.deleted`;
   - speech: `speech.accepted`, `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`,
     `speech.completed` (`rtf`), `speech.failed`, `speech.aborted`;

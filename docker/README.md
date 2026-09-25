@@ -24,6 +24,13 @@ bash docker/run.sh /path/to/breeze-model \
   --fast-all
 ```
 
+`run.sh` passes `--stop-timeout 30`. On SIGTERM the server lets open responses
+finish for up to 10 s, then gives the GPU up to 10 s to drain; docker's default
+of 10 s before SIGKILL would cut that short. Anything else that stops the
+container needs the same allowance of at least 30 s: `stop_grace_period: 30s`
+in Docker Compose, `terminationGracePeriodSeconds: 30` in Kubernetes. An exit
+code of 70 means the GPU did not drain in time (the process hard-exited).
+
 The model is mounted read-only and is never copied into the image. The build
 runs an import/version smoke check and the CPU-safe core unit tests. GPU graph
 capture happens only when fast stages are explicitly enabled on an NVIDIA GPU.

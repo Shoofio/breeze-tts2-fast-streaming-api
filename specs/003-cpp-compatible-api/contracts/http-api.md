@@ -40,6 +40,9 @@ and lets consumers pin the contract version (FR-037a).
   running or queued.
 - Until the model is ready, every route returns
   `503 {"status":"loading","error":"model is loading","code":"loading"}`.
+- Once the GPU has stopped responding (a generation's cleanup ran past 30 s), every route
+  returns `503 {"status":"error","error":"gpu is not responding","code":"gpu_unavailable"}`
+  until the server is restarted.
 
 ## CORS (launch option; off by default)
 
@@ -68,7 +71,9 @@ allowed (BC-23). Requests without `Origin` are unaffected.
 - `ws_port` is the port that is actually listening, or `0` when the WebSocket is disabled or
   failed to bind (BC-24).
 
-**`503`** with the loading body while the model loads. `HEAD` is supported.
+**`503`** with the loading body while the model loads, and with the `gpu_unavailable` body
+once the GPU has stopped responding (it stays so until restart, so a supervisor can restart
+the server). `HEAD` is supported.
 
 ## `POST /v1/audio/speech`
 
@@ -232,6 +237,7 @@ Files that failed validation at startup are not listed.
 `invalid_field`, `duplicate_field`, `text_required`, `text_too_long`, `reference_conflict`,
 `ref_text_required`, `reference_required`, `invalid_audio`, `audio_too_long`, `audio_too_short`,
 `voice_fields_required`, `invalid_name`, `unknown_voice`, `voice_exists`, `busy`, `loading`,
+`gpu_unavailable`,
 `not_found`, `method_not_allowed`, `payload_too_large`, `origin_not_allowed`,
 `voice_write_failed`, `voice_delete_failed`, `internal_error`.
 

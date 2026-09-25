@@ -41,6 +41,16 @@ class GpuLease:
         release is a caller bug, and honouring it would free a gate someone else now holds."""
         self._gate._release(self)
 
+    def poison(self) -> None:
+        """Mark the GPU unusable for the rest of the process: this lease's `gen.close()` never
+        finished (`GpuCloseTimeout`), so the GPU may still be busy. See `GpuGate.poison`."""
+        self._gate.poison()
+
+
+class GpuUnavailable(Exception):
+    """`GpuGate.acquire()` on a poisoned gate: a `gen.close()` never finished, so the GPU may
+    still be busy and nothing new is allowed on it until the process restarts."""
+
 
 class GpuGate:
     """A FIFO gate with direct handoff, for use on the event loop only.
@@ -50,9 +60,15 @@ class GpuGate:
     the next waiter's lease as the owner itself, which gives the invariant: whenever there is no
     owner, no live waiter exists. So "owned" alone answers `try_acquire`, and it already covers
     "a waiter is pending".
+
+    Poisoned (after a `GpuCloseTimeout`), it refuses everyone for good: `try_acquire` returns
+    None, `acquire` raises `GpuUnavailable`, and queued waiters fail with it. Recovery is a
+    restart: `on_poisoned` (injected; production marks `/health` unhealthy) is called once.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, on_poisoned: Callable[[], None] | None = None) -> None:
+        self._on_poisoned = on_poisoned
+        self._poisoned = False
         self._owner: GpuLease | None = None
         # Each future is resolved with a lease to hand over ownership. A cancelled one may
         # linger here until its task runs and removes it; `_release` skips it meanwhile.
@@ -60,7 +76,7 @@ class GpuGate:
 
     def try_acquire(self) -> GpuLease | None:
         """Take the gate if it is free right now, else None. Never waits."""
-        if self._owner is not None:
+        if self._owner is not None or self._poisoned:
             return None
         self._owner = GpuLease(self)
         return self._owner
@@ -73,7 +89,11 @@ class GpuGate:
         blocking. A callback rather than a `would_wait()` query because nothing can change
         between the check and joining the queue; with a separate query, any `await` the caller
         made in between (e.g. sending `queued`) could make the answer stale. It must not await.
+
+        Raises `GpuUnavailable` if the gate is poisoned, now or while waiting.
         """
+        if self._poisoned:
+            raise GpuUnavailable("the GPU stopped responding")
         lease = self.try_acquire()
         if lease is not None:
             return lease
@@ -87,7 +107,11 @@ class GpuGate:
             # Interrupted after the gate was already handed to us (CancelledError, or
             # GeneratorExit if the coroutine is closed): we own it but will never release it,
             # so pass it on before re-raising.
-            if waiter.done() and not waiter.cancelled():
+            if (
+                waiter.done()
+                and not waiter.cancelled()
+                and waiter.exception() is None  # not failed by `poison()`
+            ):
                 waiter.result().release()
             raise
         finally:
@@ -99,6 +123,9 @@ class GpuGate:
             raise RuntimeError(
                 "GpuLease.release() called by a lease that doesn't hold the gate"
             )
+        if self._poisoned:
+            self._owner = None  # nobody to hand it to: `poison()` failed the waiters
+            return
         while self._waiters:
             waiter = self._waiters.popleft()
             if not waiter.done():  # skip waiters cancelled while queued
@@ -106,6 +133,19 @@ class GpuGate:
                 waiter.set_result(self._owner)
                 return  # ownership moved without a free window
         self._owner = None
+
+    def poison(self) -> None:
+        """Refuse every current and future holder; idempotent. Called by `GpuSession` when a
+        close times out, so no request runs on a GPU that is still busy."""
+        if self._poisoned:
+            return
+        self._poisoned = True
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                waiter.set_exception(GpuUnavailable("the GPU stopped responding"))
+        if self._on_poisoned is not None:
+            self._on_poisoned()
 
 
 class Done(enum.Enum):
@@ -131,9 +171,9 @@ def _next_or_done(gen: Generator[T, None, None]) -> T | Done:
 class GpuCloseTimeout(Exception):
     """`gen.close()` did not finish within `GPU_CLOSE_TIMEOUT_SECONDS`.
 
-    The close is still queued or running on the GPU thread. A `GpuSession` keeps holding the
-    gate until it finishes (for good, if the GPU is hung), so later requests answer `busy`
-    instead of running on a GPU that is still occupied. The caller logs it.
+    The close is still queued or running on the GPU thread. A `GpuSession` then poisons the
+    gate (`GpuGate.poison`), so no later request runs on a GPU that may still be occupied, and
+    the server reports itself unhealthy until restarted. The caller logs it.
     """
 
 
@@ -153,8 +193,9 @@ class GpuThread:
     it always runs, because a skipped close would leave the generator to be closed by the
     garbage collector on whatever thread happens to drop it.
 
-    `on_close_error` receives a `gen.close()` error that no caller will see: the caller was
-    cancelled, closed, or timed out before the close finished. It is called on the event loop.
+    `on_close_error` receives a `gen.close()` error that a caller won't see because it was
+    cancelled, closed, or timed out before the close finished. Once per close, however many
+    callers gave up; on the event loop.
     """
 
     def __init__(
@@ -179,6 +220,12 @@ class GpuThread:
         self._accepting = True  # run() and step() allowed
         self._drained = False  # nothing allowed, not even close()
         self._pending: set[Future[Any]] = set()
+        # Counted as pending, so `shutdown(timeout)` also waits for (and honours its timeout
+        # against) a set_device that is still running.
+        self._pending.add(self._device_set)
+        self._device_set.add_done_callback(self._forget)
+        # Close futures some caller stopped waiting for: their error goes to `on_close_error`.
+        self._abandoned: set[asyncio.Future[None]] = set()
 
     def _call(self, fn: Callable[..., T], *args: Any) -> T:
         # FIFO means set_device has already finished. A fresh error each time, so callers
@@ -225,20 +272,23 @@ class GpuThread:
         except RuntimeError as error:
             future = Future()
             future.set_exception(error)
-        return asyncio.wrap_future(future)
+        closing = asyncio.wrap_future(future)
+        # One callback per close, so an abandoned close's error is reported exactly once.
+        closing.add_done_callback(self._report_if_abandoned)
+        return closing
 
     async def wait_closed(self, closing: asyncio.Future[None]) -> None:
         """Wait for a close from `submit_close`, for at most `GPU_CLOSE_TIMEOUT_SECONDS`.
 
         - Cancelled meanwhile: keeps waiting, and re-raises the cancellation once the close
-          has finished. A close error then goes to `on_close_error`, not to the caller: the
+          has finished. A close error then goes to `on_close_error`, not to this caller: the
           cancellation must win, because timeouts and task groups depend on seeing it.
         - Interrupted by anything else (`GeneratorExit` when this coroutine is closed, which
           forbids waiting any longer): re-raises at once; the close keeps running.
         - Timed out: raises `GpuCloseTimeout`, even if also cancelled, so the caller learns
           the GPU is still busy. The close keeps running.
 
-        When the caller stops waiting early, a later close error goes to `on_close_error`.
+        In every case but the first, a later close error goes to `on_close_error`.
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + GPU_CLOSE_TIMEOUT_SECONDS
@@ -246,7 +296,7 @@ class GpuThread:
         while not closing.done():
             remaining = deadline - loop.time()
             if remaining <= 0:
-                closing.add_done_callback(self._report_close_error)
+                self._abandoned.add(closing)
                 raise GpuCloseTimeout(
                     f"gen.close() still running after {GPU_CLOSE_TIMEOUT_SECONDS:g} s"
                 ) from cancelled
@@ -254,12 +304,14 @@ class GpuThread:
                 # Unlike awaiting `closing` directly, `wait` doesn't cancel it when we are.
                 await asyncio.wait([closing], timeout=remaining)
             except asyncio.CancelledError as error:
+                # Marked now, while the close is still running, so its done-callback (which
+                # runs before this waiter resumes) knows to report the error.
+                self._abandoned.add(closing)
                 cancelled = error
             except BaseException:
-                closing.add_done_callback(self._report_close_error)
+                self._abandoned.add(closing)
                 raise
         if cancelled is not None:
-            self._report_close_error(closing)
             raise cancelled
         closing.result()
 
@@ -267,7 +319,10 @@ class GpuThread:
         """Close `gen` on the GPU thread: `submit_close` then `wait_closed`."""
         await self.wait_closed(self.submit_close(gen))
 
-    def _report_close_error(self, closing: asyncio.Future[None]) -> None:
+    def _report_if_abandoned(self, closing: asyncio.Future[None]) -> None:
+        if closing not in self._abandoned:
+            return
+        self._abandoned.discard(closing)
         # Reading the exception also marks it retrieved, so asyncio doesn't log it as lost.
         error = None if closing.cancelled() else closing.exception()
         if error is not None and self._on_close_error is not None:
@@ -330,15 +385,19 @@ class GpuSession(Generic[T]):
         happens exactly when `gen.close()` has finished, however the caller ended: cancelled,
         closed (`GeneratorExit`) or timed out. Repeated and concurrent calls all wait for the
         same close. Raises what the close raised (the gate is released anyway), and
-        `GpuCloseTimeout` if it hasn't finished in time; the gate then stays held until it does.
-        Cancellation behaves as in `GpuThread.wait_closed`.
+        `GpuCloseTimeout` if it hasn't finished in time: the gate is then poisoned, since the
+        GPU may still be busy. Cancellation behaves as in `GpuThread.wait_closed`.
         """
         if self._closing is None:
             self._closing = self._gpu.submit_close(self._gen)
             # Added before anyone waits, so it runs before any waiter resumes: the gate is
             # already free when `aclose()` returns.
             self._closing.add_done_callback(self._release)
-        await self._gpu.wait_closed(self._closing)
+        try:
+            await self._gpu.wait_closed(self._closing)
+        except GpuCloseTimeout:
+            self._lease.poison()
+            raise
 
     def _release(self, _closing: asyncio.Future[None]) -> None:
         self._lease.release()

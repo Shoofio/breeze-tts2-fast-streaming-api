@@ -37,7 +37,10 @@ fi
 
 image_tag="${BREEZE_IMAGE:-breeze-pytorch-infer:latest}"
 
+# --stop-timeout: docker's default is 10 s before SIGKILL. The server needs up to
+# 10 s to let open responses finish plus 10 s to drain the GPU, so give it 30.
 docker run --rm --gpus all \
+  --stop-timeout 30 \
   --ipc=host \
   --publish 8080:8080 \
   --publish 8081:8081 \

@@ -32,7 +32,7 @@ from breeze_infer.body_limit import BodyLimitMiddleware
 from breeze_infer.cors import CorsMiddleware, CorsPolicy
 from breeze_infer.errors import install_error_handlers
 from breeze_infer.events import Emitter
-from breeze_infer.gpu import GpuGate, GpuThread
+from breeze_infer.gpu import GPU_CLOSE_TIMEOUT_SECONDS, GpuGate, GpuThread
 from breeze_infer.limits import TCP_USER_TIMEOUT_MS
 from breeze_infer.model_loading import LoadedModel, load_model
 from breeze_infer.routes_health import Readiness, install_health
@@ -79,6 +79,11 @@ GRACEFUL_SHUTDOWN_SECONDS = 10.0
 # thread get to drain. A close normally takes milliseconds, so past this the GPU is presumably
 # stuck, and a hard exit beats hanging in the interpreter's join of the GPU thread.
 GPU_DRAIN_SECONDS = 10.0
+
+# The exit code when the drain ran past GPU_DRAIN_SECONDS: sysexits.h's EX_SOFTWARE ("internal
+# software error"), so a supervisor can tell a stuck GPU from a clean stop (0) or a failed
+# model load (1). Spelled out because `os.EX_SOFTWARE` exists on POSIX only.
+EXIT_GPU_STUCK = 70
 
 
 def bind_http_sockets(host: str, port: int) -> list[socket.socket]:
@@ -169,9 +174,10 @@ def _exit_signals() -> list[signal.Signals]:
 
 
 def _install_signal_handlers(
-    loop: asyncio.AbstractEventLoop, server: uvicorn.Server
+    loop: asyncio.AbstractEventLoop, on_signal: Callable[[], None]
 ) -> Callable[[], None]:
-    """Route SIGINT/SIGTERM (and SIGBREAK on Windows) to `request_exit`. Returns the undo.
+    """Call `on_signal` on the loop for SIGINT/SIGTERM (and SIGBREAK on Windows). Returns the
+    undo.
 
     `loop.add_signal_handler` where the loop has it. Windows loops don't (NotImplementedError),
     and it refuses off the main thread (RuntimeError); then `signal.signal`, handing over to
@@ -182,7 +188,7 @@ def _install_signal_handlers(
     added: list[signal.Signals] = []
     try:
         for sig in signals:
-            loop.add_signal_handler(sig, request_exit, server)
+            loop.add_signal_handler(sig, on_signal)
             added.append(sig)
     except (NotImplementedError, RuntimeError):
         for sig in added:
@@ -196,7 +202,7 @@ def _install_signal_handlers(
         return remove
 
     def handle(_signum: int, _frame: object) -> None:
-        loop.call_soon_threadsafe(request_exit, server)
+        loop.call_soon_threadsafe(on_signal)
 
     previous: dict[signal.Signals, Any] = {}
     try:
@@ -210,6 +216,13 @@ def _install_signal_handlers(
             signal.signal(sig, handler)
 
     return restore
+
+
+def _ignore_sigint() -> None:
+    """On the way to a hard exit: a Ctrl+C now would only turn it into a KeyboardInterrupt
+    unwinding through code that joins the busy GPU thread."""
+    with contextlib.suppress(ValueError):  # not the main thread: nothing to guard
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 
 async def load_in_background(
@@ -240,14 +253,18 @@ async def load_in_background(
     return True
 
 
-@dataclass(frozen=True)
+@dataclass
 class ServeOutcome:
-    """How `serve()` ended. `hard_exit` means the GPU thread is still busy (a model load, or a
-    close past `GPU_DRAIN_SECONDS`): a normal exit would join it and hang for as long as that
-    takes, so `main()` ends the process with `os._exit(exit_code)` instead.
+    """How `serve()` ended, filled in by `serve()` even when it raises, so `main()` can act on
+    it from a `finally`.
+
+    `hard_exit` means the GPU thread is still busy (a model load; a close past
+    `GPU_DRAIN_SECONDS`; or a signal cut the drain short): a normal exit would join it and hang
+    for as long as that takes, so `main()` ends the process with `os._exit(exit_code)`.
+    `exit_code`: 0, 1 after a failed model load, `EXIT_GPU_STUCK` after a drain timeout.
     """
 
-    exit_code: int
+    exit_code: int = 0
     hard_exit: bool = False
 
 
@@ -256,9 +273,14 @@ async def serve(
     app: ASGIApp,
     sockets: list[socket.socket],
     load: Callable[[], LoadedModel],
-) -> ServeOutcome:
+    outcome: ServeOutcome,
+) -> None:
     """Serve HTTP on `sockets` while the model loads in the background, until a signal or a
-    failed load stops it; then drain the GPU thread (see `_stop_gpu`).
+    failed load stops it; then drain the GPU thread (see `_stop_gpu`). Records how it ended in
+    `outcome`.
+
+    Signals: the first stops uvicorn gracefully, a second forces it (`request_exit`); one
+    arriving after uvicorn has returned, while the GPU drains, cuts the drain short.
     """
     server = _Server(
         uvicorn.Config(
@@ -272,40 +294,79 @@ async def serve(
             timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
         )
     )
-    restore_signals = _install_signal_handlers(asyncio.get_running_loop(), server)
+    serving = True
+    drain_interrupted = asyncio.Event()
+
+    def on_signal() -> None:
+        if serving:
+            request_exit(server)
+        else:
+            drain_interrupted.set()
+
+    restore_signals = _install_signal_handlers(asyncio.get_running_loop(), on_signal)
     try:
         loading = asyncio.create_task(load_in_background(components, load, server))
         components.events.emit(
             "server.started",
             host=components.settings.host,
-            port=sockets[0].getsockname()[1],
             addresses=[_address(sock) for sock in sockets],
         )
         try:
             await server.serve(sockets=sockets)
         finally:
-            outcome = await _stop_gpu(components, server, loading)
+            serving = False
+            await _stop_gpu(components, server, loading, drain_interrupted, outcome)
     finally:
+        # Only now that the hard-exit decision is made: until then a signal must still reach
+        # `on_signal`.
         restore_signals()
-    return outcome
+        if outcome.hard_exit:
+            _ignore_sigint()
 
 
 async def _stop_gpu(
-    components: Components, server: uvicorn.Server, loading: asyncio.Task[bool]
-) -> ServeOutcome:
+    components: Components,
+    server: uvicorn.Server,
+    loading: asyncio.Task[bool],
+    drain_interrupted: asyncio.Event,
+    outcome: ServeOutcome,
+) -> None:
     """Wind the GPU down once uvicorn has stopped: every generation closed on the GPU thread,
-    then the thread stopped. Bounded by `GPU_DRAIN_SECONDS`; past it, or with a model load
-    still running (it can't be interrupted), the outcome asks `main()` for a hard exit.
+    then the thread stopped. Bounded by `GPU_DRAIN_SECONDS` and cut short by a signal; either
+    of those, or a model load still running (it can't be interrupted), sets `hard_exit`.
     """
     load_failed = loading.done() and not loading.cancelled() and not loading.result()
-    exit_code = 1 if load_failed else 0
+    outcome.exit_code = 1 if load_failed else 0
     if not loading.done():
         loading.cancel()
+        outcome.hard_exit = True
         components.events.emit(
             "server.stopping", level="warning", reason="load in progress"
         )
-        return ServeOutcome(exit_code, hard_exit=True)
+        return
 
+    drain = asyncio.create_task(_drain_gpu(components, server))
+    interrupted = asyncio.create_task(drain_interrupted.wait())
+    await asyncio.wait([drain, interrupted], return_when=asyncio.FIRST_COMPLETED)
+    interrupted.cancel()
+    if not drain.done():
+        # The drain is abandoned, not awaited: the process is about to end.
+        drain.cancel()
+        outcome.hard_exit = True
+        components.events.emit(
+            "server.stopping", level="warning", reason="signal during drain"
+        )
+    elif not drain.result():
+        outcome.exit_code = EXIT_GPU_STUCK
+        outcome.hard_exit = True
+        components.events.emit(
+            "server.stopping", level="warning", reason="gpu drain timed out"
+        )
+
+
+async def _drain_gpu(components: Components, server: uvicorn.Server) -> bool:
+    """Close every open generation on the GPU thread, then stop the thread, within
+    `GPU_DRAIN_SECONDS`. Returns whether the thread stopped."""
     # Requests uvicorn left running: it doesn't cancel them on a forced exit, and cancels
     # without waiting when the graceful timeout expires. Each one's GpuSession queues its
     # gen.close() as it unwinds, and the GPU thread must still be there to run it.
@@ -317,12 +378,7 @@ async def _stop_gpu(
     if requests:
         await asyncio.wait(requests, timeout=GPU_DRAIN_SECONDS)
     remaining = max(0.0, deadline - loop.time())
-    if not await asyncio.to_thread(components.gpu.shutdown, remaining):
-        components.events.emit(
-            "server.stopping", level="warning", reason="gpu drain timed out"
-        )
-        return ServeOutcome(exit_code, hard_exit=True)
-    return ServeOutcome(exit_code)
+    return await asyncio.to_thread(components.gpu.shutdown, remaining)
 
 
 def _cuda_device(environ: Mapping[str, str]) -> str:
@@ -343,6 +399,27 @@ def _report_close_failed(events: Emitter, error: BaseException) -> None:
         error=repr(error),
         traceback="".join(traceback.format_exception(error)),
     )
+
+
+def _gpu_unresponsive(events: Emitter, readiness: Readiness) -> None:
+    """The GPU gate was poisoned: a `gen.close()` ran past `GPU_CLOSE_TIMEOUT_SECONDS`. Report
+    it, and fail `/health` so a supervisor restarts the process; nothing else recovers it."""
+    events.emit(
+        "gpu.close_timeout",
+        level="error",
+        timeout_seconds=GPU_CLOSE_TIMEOUT_SECONDS,
+    )
+    readiness.mark_unhealthy()
+
+
+def _hard_exit(exit_code: int) -> None:
+    """End the process now, without the interpreter's shutdown (which joins the busy GPU
+    thread). The only process-exit call in the package; `main()` is its only caller."""
+    try:
+        sys.stdout.flush()  # the events already written; a broken pipe must not stop the exit
+    except BaseException:  # noqa: BLE001, S110 - nothing left to report it to
+        pass
+    os._exit(exit_code)
 
 
 def _select_no_device(_: str) -> None:
@@ -372,24 +449,27 @@ def main(argv: Sequence[str] | None = None) -> None:
     environ = os.environ
     device = _cuda_device(environ)
     set_device = torch.cuda.set_device if device.startswith("cuda") else _select_no_device
+    readiness = Readiness()
     components = Components(
         settings=settings,
         events=events,
-        gate=GpuGate(),
+        gate=GpuGate(on_poisoned=partial(_gpu_unresponsive, events, readiness)),
         gpu=GpuThread(device, set_device, partial(_report_close_failed, events)),
-        readiness=Readiness(),
+        readiness=readiness,
         ws_port=lambda: 0,  # the WebSocket server arrives in Phase 8 (T077)
     )
     app = create_app(components)
     load = partial(load_model, settings, device, environ)
+    outcome = ServeOutcome()
     with asyncio.Runner() as runner:
-        outcome = runner.run(serve(components, app, sockets, load))
-        if outcome.hard_exit:
+        try:
+            runner.run(serve(components, app, sockets, load, outcome))
+        finally:
             # Inside the runner on purpose: its cleanup, and then the interpreter's exit, both
-            # wait for the GPU thread, which is still busy. The only process-exit call in the
-            # package, and only here at the composition root.
-            sys.stdout.flush()
-            os._exit(outcome.exit_code)
+            # wait for the GPU thread, which is still busy. In a `finally`, so an exception out
+            # of serve() can't bypass the decision either.
+            if outcome.hard_exit:
+                _hard_exit(outcome.exit_code)
     if outcome.exit_code:
         raise SystemExit(outcome.exit_code)
 
