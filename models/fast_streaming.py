@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import math
+import numbers
 import time
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import numpy as np
 import torch
@@ -19,7 +20,7 @@ from .cudagraph.backbone_prefill_graph import (
     continuation_positions,
 )
 from .cudagraph.depth_decoder_graph import DepthDecoderGraph
-from .cudagraph.sampling import sample_logits
+from .cudagraph.sampling import MAX_TEMPERATURE, MIN_REPETITION_PENALTY, sample_logits
 from .warmup_profile import FastStreamingWarmupProfile
 
 FastCfgMode = Literal["no_cfg", "single_cfg"]
@@ -36,24 +37,50 @@ _DUAL_CFG_KEYS = (
 # a prompt exactly as the graph prefill does, so both read this one value.
 _PREFILL_TOKEN_GRANULARITY = 32
 
-# Overrides that count something, so a fractional value is a caller bug rather
-# than something to truncate.
-_INTEGER_OVERRIDES = frozenset({"top_k", "max_new_tokens"})
+class _NumberRule(NamedTuple):
+    """What a sampling setting accepts: an integer or a real, within a range."""
 
-# Upper bounds for the float overrides that scale logits. Far past any useful
-# setting (the API allows much less), they keep absurd values a caller error
-# instead of a numerics question. top_p needs none: above 1 it filters nothing.
-_OVERRIDE_MAXIMUMS = {"temperature": 1e4, "repetition_penalty": 1e4}
+    integer: bool
+    minimum: float
+    minimum_inclusive: bool
+    maximum: float = math.inf
 
-# Cache slots a reference prefix must leave free: the smallest real suffix plus
-# one generated frame, since the decode loop needs
-# prefix_len + suffix_len + 1 <= max_seq_len - 1 to produce frame 0. The
-# smallest suffix is 3 tokens, measured with prepare_suffix_inputs for the
-# one-word text "a" on the unguided branch (what cfg_scale 0 runs on its own;
-# the guided branch adds the instruction, 6 tokens with a one-character one).
-# tests/gpu/test_runtime_request_overrides.py re-measures it on the real
-# tokenizer.
-MIN_SUFFIX_ROOM = 3 + 1
+    def describe(self) -> str:
+        kind = "an integer" if self.integer else "a finite number"
+        low = "[" if self.minimum_inclusive else "("
+        high = "inf)" if self.maximum == math.inf else f"{self.maximum:g}]"
+        return f"{kind} in {low}{self.minimum:g}, {high}"
+
+
+# Per-request overrides. Counts must be integers (a fraction is a caller bug,
+# not something to truncate). The upper bounds on the logit-scaling floats are
+# far past any useful setting (the API allows much less) and keep absurd values
+# a caller error rather than a numerics question; top_p needs none, since above
+# 1 it filters nothing. The penalty's floor keeps a positive logit divided by
+# it finite (see MIN_REPETITION_PENALTY).
+_OVERRIDE_RULES = {
+    "temperature": _NumberRule(False, 0.0, False, MAX_TEMPERATURE),
+    "top_k": _NumberRule(True, 0, False),
+    "top_p": _NumberRule(False, 0.0, False),
+    "repetition_penalty": _NumberRule(False, MIN_REPETITION_PENALTY, True, 1e4),
+    "max_new_tokens": _NumberRule(True, 0, False),
+}
+# A configured or model default top_k of 0 means "no top-k filtering".
+_DEFAULT_TOP_K_RULE = _NumberRule(True, 0, True)
+_POSITIVE_INTEGER_RULE = _NumberRule(True, 0, False)
+
+# Frames of audio a registered voice prefix must leave room for: 12 frames at
+# the codec's 12.5 Hz is about 1 s.
+MIN_SUFFIX_FRAMES = 12
+# Cache slots a reference prefix must leave free: the suffix of a one-word text
+# with the default instruction on the guided branch (10 tokens, measured with
+# prepare_suffix_inputs and the real tokenizer for "a", "Hi", "I", "嗨" and ".";
+# tests/gpu/test_runtime_request_overrides.py re-measures it) plus
+# MIN_SUFFIX_FRAMES, since the decode loop needs
+# prefix_len + suffix_len + frames <= max_seq_len - 1. It guarantees those
+# frames at the exact prefill length; graph bucket padding of the suffix can
+# take up to 31 more slots, which each request's own room check accounts for.
+MIN_SUFFIX_ROOM = 10 + MIN_SUFFIX_FRAMES
 
 
 @dataclass(frozen=True)
@@ -75,6 +102,24 @@ class FastStreamingConfig:
     top_p: float | None = None
     do_sample: bool | None = None
     repetition_penalty: float = 1.1
+
+    def __post_init__(self) -> None:
+        # Fail at construction, not mid-stream: every value here reaches the
+        # sampler or sizes a buffer on every request.
+        _require_number("max_new_tokens", self.max_new_tokens, _POSITIVE_INTEGER_RULE)
+        _require_number("max_seq_len", self.max_seq_len, _POSITIVE_INTEGER_RULE)
+        _require_number(
+            "repetition_penalty",
+            self.repetition_penalty,
+            _OVERRIDE_RULES["repetition_penalty"],
+        )
+        for name, value, rule in (
+            ("temperature", self.temperature, _OVERRIDE_RULES["temperature"]),
+            ("top_k", self.top_k, _DEFAULT_TOP_K_RULE),
+            ("top_p", self.top_p, _OVERRIDE_RULES["top_p"]),
+        ):
+            if value is not None:
+                _require_number(name, value, rule)
 
     def stage_fast(self, stage: str) -> bool:
         """Resolve the master switch before the per-stage setting."""
@@ -165,41 +210,58 @@ def should_decode_codec_frame(frame: torch.Tensor, config: Any) -> bool:
     return not is_terminal_pad_frame(frame, config)
 
 
+def _is_valid_number(value: Any, rule: _NumberRule) -> bool:
+    """Whether ``value`` satisfies ``rule``; never raises.
+
+    Any ``numbers.Integral``/``numbers.Real`` counts (so numpy scalars do), but
+    not a bool. NaN fails both range comparisons. The range is checked before
+    ``math.isfinite``, which raises OverflowError for an int too large for a
+    float (10**400) while the comparisons are exact.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return False
+    if not isinstance(value, numbers.Integral if rule.integer else numbers.Real):
+        return False
+    above = value >= rule.minimum if rule.minimum_inclusive else value > rule.minimum
+    if not (above and value <= rule.maximum):
+        return False
+    if rule.integer:
+        return True
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _require_number(name: str, value: Any, rule: _NumberRule) -> None:
+    if not _is_valid_number(value, rule):
+        raise ValueError(f"{name} must be {rule.describe()}, got {value!r}")
+
+
 def _require_valid_overrides(**overrides: Any) -> None:
-    """Reject a per-request override that is not ``None`` or a valid positive number.
+    """Reject a per-request override that is neither ``None`` nor valid (``_OVERRIDE_RULES``).
 
     ``None`` means the default. Translating the wire's "use the default" values
     (such as ``max_new_tokens: 0``) into ``None`` is the API boundary's job, so
     anything else invalid here is a caller bug and is not coerced: a non-number
-    or a bool raises ``ValueError`` like any other bad value. NaN compares False
-    against everything and inf survives until softmax, so both would otherwise
-    reach torch.multinomial as an invalid distribution mid-stream.
+    or a bool raises ``ValueError`` like any other bad value. NaN and inf would
+    otherwise reach torch.multinomial as an invalid distribution mid-stream.
     """
     for name, value in overrides.items():
-        if value is None:
-            continue
-        maximum = _OVERRIDE_MAXIMUMS.get(name, math.inf)
-        if isinstance(value, bool):
-            valid = False
-        elif name in _INTEGER_OVERRIDES:
-            valid = isinstance(value, int) and value > 0
-        else:
-            valid = (
-                isinstance(value, (int, float))
-                and math.isfinite(value)
-                and 0 < value <= maximum
+        if value is not None and not _is_valid_number(value, _OVERRIDE_RULES[name]):
+            raise ValueError(
+                f"{name} must be {_OVERRIDE_RULES[name].describe()} or None, "
+                f"got {value!r}"
             )
-        if not valid:
-            if name in _INTEGER_OVERRIDES:
-                expected = "a positive integer"
-            elif maximum < math.inf:
-                expected = f"a finite number in (0, {maximum:g}]"
-            else:
-                expected = "a finite number > 0"
-            raise ValueError(f"{name} must be {expected} or None, got {value!r}")
 
 
-def _branch_shape(inputs: dict[str, Any]) -> tuple[FastCfgSelection, int, int]:
+class _BranchShape(NamedTuple):
+    cfg: FastCfgSelection
+    branch_batch_size: int
+    seq_len: int
+
+
+def _branch_shape(inputs: dict[str, Any]) -> _BranchShape:
     """``(cfg, branch_batch_size, seq_len)`` of the backbone batch for ``inputs``.
 
     The one place that says which prompts run: ``cfg_scale`` 0 runs the
@@ -209,14 +271,16 @@ def _branch_shape(inputs: dict[str, Any]) -> tuple[FastCfgSelection, int, int]:
     """
     cfg = select_fast_cfg(inputs)
     if cfg.use_negative_as_main:
-        return cfg, 1, int(inputs["cfg_negative_prompt_attention_mask"].shape[1])
+        return _BranchShape(
+            cfg, 1, int(inputs["cfg_negative_prompt_attention_mask"].shape[1])
+        )
     if cfg.mode == "no_cfg":
-        return cfg, 1, int(inputs["attention_mask"].shape[1])
+        return _BranchShape(cfg, 1, int(inputs["attention_mask"].shape[1]))
     seq_len = max(
         int(inputs["attention_mask"].shape[1]),
         int(inputs["cfg_negative_prompt_attention_mask"].shape[1]),
     )
-    return cfg, 2, seq_len
+    return _BranchShape(cfg, 2, seq_len)
 
 
 def _get_device(model: torch.nn.Module) -> torch.device:
@@ -299,8 +363,33 @@ class FastBreezeStreamingRuntime:
 
         if self.device.type != "cuda":
             raise RuntimeError("fast streaming requires a CUDA device")
-        if self.config.repetition_penalty <= 0:
-            raise ValueError("repetition_penalty must be > 0")
+        # FastStreamingConfig validates its own fields when it is built.
+        self._validate_model_defaults()
+
+    def _validate_model_defaults(self) -> None:
+        """Reject invalid sampling defaults in the model's generation configs at load.
+
+        They reach the sampler on every request that doesn't override them, so
+        a NaN or out-of-range default must fail here, not mid-stream.
+        """
+        rules = (
+            ("temperature", _OVERRIDE_RULES["temperature"]),
+            ("top_k", _DEFAULT_TOP_K_RULE),
+            ("top_p", _OVERRIDE_RULES["top_p"]),
+        )
+        for label, generation_config in (
+            ("generation_config", self.model.generation_config),
+            ("depth_decoder.generation_config", self.model.depth_decoder.generation_config),
+        ):
+            for name, rule in rules:
+                value = getattr(generation_config, name, None)
+                if value is not None:
+                    _require_number(f"{label}.{name}", value, rule)
+        length = getattr(self.model.generation_config, "max_new_tokens", None)
+        if length is not None:
+            _require_number(
+                "generation_config.max_new_tokens", length, _POSITIVE_INTEGER_RULE
+            )
 
     @property
     def sample_rate(self) -> int:
@@ -444,9 +533,13 @@ class FastBreezeStreamingRuntime:
         return merged["inputs_embeds"], attention_mask
 
     def _merge_cfg_branches(
-        self, inputs: dict[str, Any]
+        self, inputs: dict[str, Any], seq_len: int
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Merge cond/uncond together so their text segments use one batched graph."""
+        """Merge cond/uncond together so their text segments use one batched graph.
+
+        Both rows are left-padded to ``seq_len``, the shared ``_branch_shape``
+        length.
+        """
         cond_values = inputs.get("input_values")
         uncond_values = inputs.get("cfg_negative_input_values")
         if (cond_values is None) != (uncond_values is None):
@@ -460,27 +553,26 @@ class FastBreezeStreamingRuntime:
         uncond_ids = inputs["cfg_negative_prompt_ids"]
         if cond_ids.shape[0] != 1 or uncond_ids.shape[0] != 1:
             return None
-        max_len = max(cond_ids.shape[1], uncond_ids.shape[1])
         input_ids = torch.cat(
             [
-                _left_pad_tensor(cond_ids, max_len, 0),
-                _left_pad_tensor(uncond_ids, max_len, 0),
+                _left_pad_tensor(cond_ids, seq_len, 0),
+                _left_pad_tensor(uncond_ids, seq_len, 0),
             ],
             dim=0,
         )
         attention_mask = torch.cat(
             [
-                _left_pad_tensor(inputs["attention_mask"], max_len, 0),
+                _left_pad_tensor(inputs["attention_mask"], seq_len, 0),
                 _left_pad_tensor(
-                    inputs["cfg_negative_prompt_attention_mask"], max_len, 0
+                    inputs["cfg_negative_prompt_attention_mask"], seq_len, 0
                 ),
             ],
             dim=0,
         )
         text_ids_mask = torch.cat(
             [
-                _left_pad_tensor(inputs["text_ids_mask"], max_len, False),
-                _left_pad_tensor(inputs["cfg_negative_text_ids_mask"], max_len, False),
+                _left_pad_tensor(inputs["text_ids_mask"], seq_len, False),
+                _left_pad_tensor(inputs["cfg_negative_text_ids_mask"], seq_len, False),
             ],
             dim=0,
         )
@@ -501,8 +593,11 @@ class FastBreezeStreamingRuntime:
         )
         return merged["inputs_embeds"].contiguous(), attention_mask.contiguous()
 
-    def _build_branch_batch(self, inputs: dict[str, Any]) -> _BranchBatch:
-        cfg, branch_batch_size, seq_len = _branch_shape(inputs)
+    def _build_branch_batch(
+        self, inputs: dict[str, Any], shape: _BranchShape
+    ) -> _BranchBatch:
+        """Build the backbone batch for ``inputs``; ``shape`` is its ``_branch_shape``."""
+        cfg, branch_batch_size, seq_len = shape
         if cfg.use_negative_as_main:
             embeds, mask = self._merge_branch(
                 input_ids=inputs["cfg_negative_prompt_ids"],
@@ -527,7 +622,9 @@ class FastBreezeStreamingRuntime:
                 cond_embeds.contiguous(), cond_mask.contiguous(), branch_batch_size, cfg
             )
 
-        joint = self._merge_cfg_branches(inputs) if self._fast_text_encoder else None
+        joint = (
+            self._merge_cfg_branches(inputs, seq_len) if self._fast_text_encoder else None
+        )
         if joint is not None:
             inputs_embeds, attention_mask = joint
             return _BranchBatch(inputs_embeds, attention_mask, branch_batch_size, cfg)
@@ -975,11 +1072,12 @@ class FastBreezeStreamingRuntime:
         means the piece will be clamped; ``<= 0`` means no room to generate.
         """
         _require_valid_overrides(max_new_tokens=requested)
-        return min(self._frame_cap(requested), self._context_room(inputs, prefix_len))
+        room = self._context_room(_branch_shape(inputs), prefix_len)
+        return min(self._frame_cap(requested), room)
 
-    def _context_room(self, inputs: dict[str, Any], prefix_len: int) -> int:
-        """Frames the context leaves after the prefill of ``inputs`` (``<= 0``: none)."""
-        _, branch_batch_size, seq_len = _branch_shape(inputs)
+    def _context_room(self, shape: _BranchShape, prefix_len: int) -> int:
+        """Frames the context leaves after a prefill of ``shape`` (``<= 0``: none)."""
+        _, branch_batch_size, seq_len = shape
         _, prefill_len = self._prefill_plan(branch_batch_size, seq_len, prefix_len)
         return self.config.max_seq_len - prefill_len - 1
 
@@ -1000,13 +1098,15 @@ class FastBreezeStreamingRuntime:
         prefix_len = int(mask.shape[1])
         if int(mask.sum().item()) != prefix_len or embeds.shape[0] != 1:
             raise ValueError("reference prefix must be a single unpadded row")
-        # Only reject a prefix no request could ever continue: one without room
-        # for the smallest suffix and a frame. How much room a request really
-        # has depends on its own suffix and cap, which max_new_tokens_room
-        # checks per request.
+        # Reject a prefix (so the voice is refused at registration) that leaves
+        # no room for a default-instruction suffix and about 1 s of audio
+        # (MIN_SUFFIX_ROOM). Each request's real room depends on its own
+        # suffix and cap, which max_new_tokens_room checks per request.
         if prefix_len > self.config.max_seq_len - 1 - MIN_SUFFIX_ROOM:
             raise ValueError(
-                f"reference prefix of {prefix_len} tokens leaves no room to generate"
+                f"reference prefix of {prefix_len} tokens leaves no room to generate "
+                f"{MIN_SUFFIX_FRAMES} frames after the shortest default-instruction "
+                f"suffix in the {self.config.max_seq_len}-token context"
             )
 
         keys: list[torch.Tensor] = []
@@ -1163,21 +1263,21 @@ class FastBreezeStreamingRuntime:
             repetition_penalty=repetition_penalty,
             max_new_tokens=max_new_tokens,
         )
+        shape = _branch_shape(inputs)
         prefix_len = 0 if prefix is None else int(prefix.prefix_len)
-        if self._context_room(inputs, prefix_len) <= 0:
+        if self._context_room(shape, prefix_len) <= 0:
             raise ValueError(
                 "prompt leaves no room to generate in the "
                 f"{self.config.max_seq_len}-token context"
             )
-        cfg, branch_batch_size, _ = _branch_shape(inputs)
-        self._ensure_graphs(branch_batch_size, cfg.guidance_scale)
+        self._ensure_graphs(shape.branch_batch_size, shape.cfg.guidance_scale)
         assert self._backbone_graph is not None
         assert self._depth_decoder_graph is not None
 
         # Everything that can fail runs before the codec request is opened, and
         # the try that closes it starts right after, so no failure leaks one.
         codec = self._codec()
-        branch = self._build_branch_batch(inputs)
+        branch = self._build_branch_batch(inputs, shape)
         request_id = request_id or f"local-{uuid.uuid4().hex}"
 
         # Backbone sampling runs eagerly (outside every captured graph), so
@@ -1186,7 +1286,7 @@ class FastBreezeStreamingRuntime:
         if temperature is not None:
             backbone_params["temperature"] = float(temperature)
         if top_k is not None:
-            backbone_params["top_k"] = top_k
+            backbone_params["top_k"] = int(top_k)
         if top_p is not None:
             backbone_params["top_p"] = float(top_p)
         backbone_repetition_penalty = (

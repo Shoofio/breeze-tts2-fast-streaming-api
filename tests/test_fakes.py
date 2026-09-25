@@ -131,9 +131,19 @@ def test_max_new_tokens_room_rejects_invalid_requested() -> None:
         FakeRuntime().max_new_tokens_room(2.5, _room_inputs(10))
 
 
+def test_fake_config_defaults_match_the_real_config() -> None:
+    from models.fast_streaming import FastStreamingConfig
+
+    real = FastStreamingConfig()
+    fake = FakeStreamingConfig()
+    assert (fake.max_new_tokens, fake.max_seq_len) == (1500, real.max_seq_len)
+    assert fake.max_new_tokens == real.max_new_tokens
+
+
 def test_max_new_tokens_room_none_uses_default_then_config_ceiling() -> None:
-    # No default_max_new_tokens given: falls back to config.max_new_tokens (750).
-    assert FakeRuntime().max_new_tokens_room(None, _room_inputs(10)) == 750
+    # No default_max_new_tokens given: falls back to config.max_new_tokens (1500).
+    runtime = FakeRuntime(config=FakeStreamingConfig(max_seq_len=2048))
+    assert runtime.max_new_tokens_room(None, _room_inputs(10)) == 1500
     # An explicit model default (mirrors model.generation_config.max_new_tokens) is used
     # instead, same as the real runtime's _frame_cap.
     runtime = FakeRuntime(default_max_new_tokens=5)
@@ -153,6 +163,31 @@ def test_max_new_tokens_room_shrinks_with_prompt_and_prefix_length() -> None:
     assert room_short == 1500  # plenty of context room
     assert room_long < room_short
     assert room_with_prefix < room_short
+
+
+def test_max_new_tokens_room_measures_the_negative_prompt_when_cfg_is_zero() -> None:
+    # cfg_scale 0 runs the negative prompt alone (the real _branch_shape): 100
+    # tokens pad to 128, so 256 - 128 - 1 frames remain, not 256 - 32 - 1.
+    runtime = FakeRuntime(config=FakeStreamingConfig(max_seq_len=256))
+    inputs = {
+        **_room_inputs(10),
+        "cfg_scale": 0.0,
+        "cfg_negative_prompt_ids": np.ones((1, 100)),
+        "cfg_negative_prompt_attention_mask": np.ones((1, 100)),
+    }
+    assert runtime.max_new_tokens_room(1500, inputs) == 127
+
+
+def test_iter_audio_chunks_raises_like_the_real_runtime_when_there_is_no_room() -> None:
+    runtime = FakeRuntime(chunks=1, config=FakeStreamingConfig(max_seq_len=128))
+    # 127 tokens pad to 128 > max_seq_len, so the exact length is used: room 0.
+    gen = runtime.iter_audio_chunks(_room_inputs(127))
+
+    with pytest.raises(ValueError, match="no room"):
+        next(gen)
+    assert runtime.calls == []
+    # 95 tokens pad to 96, leaving 31 frames.
+    assert len(_drain(runtime, inputs=_room_inputs(95))) == 1
 
 
 def test_flush_frames_must_be_smaller_than_a_full_chunk() -> None:

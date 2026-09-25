@@ -277,7 +277,7 @@ class FakeStreamingConfig:
     ``FastStreamingConfig``'s own defaults.
     """
 
-    max_new_tokens: int = 750
+    max_new_tokens: int = 1500
     max_seq_len: int = 1024
 
 
@@ -359,13 +359,16 @@ class FakeRuntime:
       does, by calling that same function (imported lazily, like ``FastStreamingChunk``
       below, so constructing or draining a `FakeRuntime` that never overrides anything
       still never pays to import ``models.fast_streaming``): ``None`` is the default,
-      anything else must be finite and > 0, and ``top_k``/``max_new_tokens`` must be a
-      non-bool ``int``. Since ``iter_audio_chunks`` is a generator function, validation
+      anything else must satisfy the real per-override rules (``_OVERRIDE_RULES``: a
+      range, and an integer for ``top_k``/``max_new_tokens``, never a bool). Since ``iter_audio_chunks`` is a generator function, validation
       -- here and on the real runtime -- runs on the first ``next()``, not at call time.
     - ``max_new_tokens_room`` approximates the real method's room estimate (frame cap via
       ``config``/``default_max_new_tokens``, then the context room from a bucket-padded
       prefill length) by calling the real ``_require_valid_overrides`` and
-      ``select_fast_cfg`` helpers and porting ``_frame_cap``'s two-line rule directly.
+      ``_branch_shape`` helpers and porting ``_frame_cap``'s two-line rule directly.
+      ``iter_audio_chunks`` raises the real runtime's ``ValueError`` when that context
+      room is ``<= 0``, before recording the call. Inputs with no ``attention_mask``
+      (the bare ``{}`` many tests pass) carry no prompt to measure and skip that check.
       **Approximation gap**: the real ``_prefill_plan`` bucket-pads the prefill only when
       the runtime's fast backbone-prefill path is enabled, and a frozen warmup cache can
       refuse an unwarmed bucket and fall back to an exact-length eager prefill instead
@@ -464,31 +467,23 @@ class FakeRuntime:
         class docstring's "Approximation gap" paragraph for what this can't reproduce
         without real captured prefill graphs."""
         # Lazy for the same reason as in iter_audio_chunks below (finding #8).
-        from models.fast_streaming import (
-            _PREFILL_TOKEN_GRANULARITY,
-            _require_valid_overrides,
-            select_fast_cfg,
-        )
+        from models.fast_streaming import _require_valid_overrides
 
         _require_valid_overrides(max_new_tokens=requested)
-        cfg = select_fast_cfg(inputs)
-        if cfg.use_negative_as_main:
-            seq_len = int(inputs["cfg_negative_prompt_attention_mask"].shape[1])
-        elif cfg.mode == "no_cfg":
-            seq_len = int(inputs["attention_mask"].shape[1])
-        else:
-            seq_len = max(
-                int(inputs["attention_mask"].shape[1]),
-                int(inputs["cfg_negative_prompt_attention_mask"].shape[1]),
-            )
+        return min(self._frame_cap(requested), self._context_room(inputs, prefix_len))
+
+    def _context_room(self, inputs: dict[str, Any], prefix_len: int) -> int:
+        """The real ``_context_room`` rule, with the fake's always-bucketed prefill."""
+        from models.fast_streaming import _PREFILL_TOKEN_GRANULARITY, _branch_shape
+
+        seq_len = _branch_shape(inputs).seq_len
         exact_len = prefix_len + seq_len
         bucketed_len = (
             prefix_len
             + -(-seq_len // _PREFILL_TOKEN_GRANULARITY) * _PREFILL_TOKEN_GRANULARITY
         )
         prefill_len = bucketed_len if bucketed_len <= self.config.max_seq_len else exact_len
-        room = self.config.max_seq_len - prefill_len - 1
-        return min(self._frame_cap(requested), room)
+        return self.config.max_seq_len - prefill_len - 1
 
     def iter_audio_chunks(
         self,
@@ -519,6 +514,13 @@ class FakeRuntime:
             repetition_penalty=repetition_penalty,
             max_new_tokens=max_new_tokens,
         )
+        prefix_len = 0 if prefix is None else int(getattr(prefix, "prefix_len", 0))
+        if "attention_mask" in inputs and self._context_room(inputs, prefix_len) <= 0:
+            # The real runtime's message, so tests match on the same text.
+            raise ValueError(
+                "prompt leaves no room to generate in the "
+                f"{self.config.max_seq_len}-token context"
+            )
 
         call_index = len(self.calls)
         self.calls.append(

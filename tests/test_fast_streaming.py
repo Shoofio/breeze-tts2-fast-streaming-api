@@ -8,8 +8,15 @@ import pytest
 import torch
 
 from breeze_infer.templates import get_template
-from models.cudagraph.sampling import MIN_TEMPERATURE, sample_logits
+from models.cudagraph.sampling import (
+    MAX_TEMPERATURE,
+    MIN_REPETITION_PENALTY,
+    MIN_TEMPERATURE,
+    apply_repetition_penalty,
+    sample_logits,
+)
 from models.fast_streaming import (
+    MIN_SUFFIX_FRAMES,
     MIN_SUFFIX_ROOM,
     FastBreezeStreamingRuntime,
     FastStreamingChunk,
@@ -51,6 +58,68 @@ def test_fast_streaming_defaults_to_repetition_penalty_1p1() -> None:
 def test_fast_streaming_ceiling_defaults_to_the_server_maximum() -> None:
     # R12: 750 is the per-request default (from the model); 1500 the ceiling.
     assert FastStreamingConfig().max_new_tokens == 1500
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"temperature": float("nan")},
+        {"temperature": 0.0},
+        {"temperature": float("inf")},
+        {"top_p": float("nan")},
+        {"top_k": -1},
+        {"top_k": 2.5},
+        {"repetition_penalty": 0.0},
+        {"repetition_penalty": float("nan")},
+        {"repetition_penalty": 1e-40},
+        {"max_new_tokens": 0},
+        {"max_new_tokens": True},
+        {"max_seq_len": 0},
+    ],
+)
+def test_fast_streaming_config_rejects_invalid_fields(fields) -> None:
+    with pytest.raises(ValueError, match=next(iter(fields))):
+        FastStreamingConfig(**fields)
+
+
+def test_fast_streaming_config_accepts_top_k_zero_as_disabled() -> None:
+    assert FastStreamingConfig(top_k=0).top_k == 0
+
+
+def _defaults_runtime(backbone: dict, depth: dict | None = None):
+    runtime = object.__new__(FastBreezeStreamingRuntime)
+    runtime.config = FastStreamingConfig()
+    valid = {"temperature": 0.9, "top_k": 50, "top_p": 1.0, "do_sample": True}
+    runtime.model = SimpleNamespace(
+        generation_config=SimpleNamespace(**{**valid, "max_new_tokens": 750, **backbone}),
+        depth_decoder=SimpleNamespace(
+            generation_config=SimpleNamespace(**{**valid, **(depth or {})})
+        ),
+    )
+    return runtime
+
+
+def test_valid_model_generation_defaults_pass() -> None:
+    _defaults_runtime({})._validate_model_defaults()
+    # A model without its own length default falls back to the ceiling.
+    _defaults_runtime({"max_new_tokens": None})._validate_model_defaults()
+
+
+@pytest.mark.parametrize(
+    ("backbone", "depth", "name"),
+    [
+        ({"temperature": float("nan")}, None, "temperature"),
+        ({"top_p": float("nan")}, None, "top_p"),
+        ({"top_k": -5}, None, "top_k"),
+        ({"max_new_tokens": 0}, None, "max_new_tokens"),
+        ({"max_new_tokens": 2.5}, None, "max_new_tokens"),
+        ({}, {"temperature": float("nan")}, "temperature"),
+        ({}, {"top_p": 0.0}, "top_p"),
+    ],
+)
+def test_invalid_model_generation_defaults_are_rejected(backbone, depth, name) -> None:
+    with pytest.raises(ValueError, match=name):
+        _defaults_runtime(backbone, depth)._validate_model_defaults()
 
 
 def test_fast_streaming_exposes_master_and_one_switch_per_stage() -> None:
@@ -175,7 +244,7 @@ def test_single_cfg_merges_cond_and_uncond_in_one_batched_text_path() -> None:
         "cfg_negative_text_ids_len": torch.tensor([2]),
     }
 
-    branch = runtime._build_branch_batch(inputs)
+    branch = runtime._build_branch_batch(inputs, _branch_shape(inputs))
 
     assert branch.branch_batch_size == 2
     assert len(runtime.model.calls) == 1
@@ -187,7 +256,7 @@ def test_single_cfg_merges_cond_and_uncond_in_one_batched_text_path() -> None:
 
     runtime.model.calls.clear()
     runtime._fast_text_encoder = False
-    eager_branch = runtime._build_branch_batch(inputs)
+    eager_branch = runtime._build_branch_batch(inputs, _branch_shape(inputs))
 
     assert eager_branch.branch_batch_size == 2
     assert len(runtime.model.calls) == 2
@@ -244,7 +313,7 @@ class _RecordingDecodeRuntime:
             open_request=lambda *args, **kwargs: self.codec_events.append("open"),
             close_request=lambda *args, **kwargs: self.codec_events.append("close"),
         )
-        runtime._build_branch_batch = lambda inputs: _BranchBatch(
+        runtime._build_branch_batch = lambda inputs, shape: _BranchBatch(
             hidden, torch.ones(1, 1, dtype=torch.long), 1, select_fast_cfg(inputs)
         )
         runtime._run_prefill = lambda branch, prefix: (
@@ -417,12 +486,97 @@ def test_tiny_temperature_override_is_passed_through_not_rejected(
     assert all(call["temperature"] == 0.7 for call in harness.depth_calls)
 
 
-def test_override_upper_bounds_are_inclusive(monkeypatch) -> None:
+def test_override_bounds_are_inclusive(monkeypatch) -> None:
     harness = _RecordingDecodeRuntime(
         monkeypatch, FastStreamingConfig(max_new_tokens=2)
     )
 
     assert _frames(harness.run(temperature=1e4, repetition_penalty=1e4)) == 2
+    assert _frames(harness.run(repetition_penalty=MIN_REPETITION_PENALTY)) == 2
+
+
+def test_sampling_caps_the_temperature_at_the_override_maximum() -> None:
+    # Uncapped, 1e9 flattens [1e6, 0] to near-uniform; capped at 1e4 it stays
+    # e^100 : 1, so token 0 wins every draw.
+    assert MAX_TEMPERATURE == 1e4
+    torch.manual_seed(0)
+    logits = torch.tensor([[1e6, 0.0]])
+
+    tokens = {
+        int(sample_logits(logits, temperature=1e9, top_k=0, top_p=1.0, do_sample=True))
+        for _ in range(50)
+    }
+
+    assert tokens == {0}
+
+
+def test_tiny_repetition_penalty_is_floored() -> None:
+    # 30 / 1e-40 overflows float32 to inf, and softmax turns it into NaN.
+    logits = torch.tensor([[30.0, -30.0, 29.0, 0.0]])
+    history = torch.tensor([0, 1])
+
+    floored = apply_repetition_penalty(logits.clone(), history, 1e-40)
+    expected = apply_repetition_penalty(logits.clone(), history, MIN_REPETITION_PENALTY)
+
+    assert torch.isfinite(floored).all()
+    assert torch.equal(floored, expected)
+    token = sample_logits(
+        logits,
+        temperature=1.0,
+        top_k=0,
+        top_p=1.0,
+        do_sample=True,
+        token_history=history,
+        repetition_penalty=1e-40,
+    )
+    assert token.tolist()[0] in (0, 1, 2, 3)
+
+
+def test_nan_sampling_parameters_are_rejected() -> None:
+    logits = torch.tensor([[1.0, 2.0]])
+    with pytest.raises(ValueError, match="temperature"):
+        sample_logits(
+            logits, temperature=float("nan"), top_k=0, top_p=1.0, do_sample=True
+        )
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        apply_repetition_penalty(logits, torch.tensor([0]), float("nan"))
+
+
+def test_numpy_scalar_overrides_are_accepted(monkeypatch) -> None:
+    harness = _RecordingDecodeRuntime(
+        monkeypatch, FastStreamingConfig(max_new_tokens=1500)
+    )
+
+    chunks = harness.run(
+        temperature=np.float32(0.5),
+        top_k=np.int64(7),
+        top_p=np.float64(0.9),
+        repetition_penalty=np.float32(1.25),
+        max_new_tokens=np.int64(3),
+    )
+
+    assert _frames(chunks) == 3
+    call = harness.sample_calls[-1]
+    assert (call["temperature"], call["top_k"], call["top_p"]) == (0.5, 7, 0.9)
+    assert type(call["top_k"]) is int
+    assert call["repetition_penalty"] == 1.25
+    assert _room_runtime().max_new_tokens_room(np.int64(5), _prompt(10)) == 5
+
+
+def test_branch_shape_is_computed_once_per_request(monkeypatch) -> None:
+    harness = _RecordingDecodeRuntime(
+        monkeypatch, FastStreamingConfig(max_new_tokens=2)
+    )
+    calls = []
+
+    def counting(inputs):
+        calls.append(inputs)
+        return _branch_shape(inputs)
+
+    monkeypatch.setattr("models.fast_streaming._branch_shape", counting)
+    harness.run()
+
+    assert len(calls) == 1
 
 
 _INVALID_OVERRIDES = [
@@ -458,6 +612,15 @@ _INVALID_OVERRIDES = [
     {"repetition_penalty": False},
     {"top_k": True},
     {"max_new_tokens": True},
+    {"temperature": np.bool_(True)},
+    {"top_k": np.bool_(True)},
+    # Below the floor a penalty overflows the logits it divides.
+    {"repetition_penalty": 1e-40},
+    {"repetition_penalty": MIN_REPETITION_PENALTY * (1 - 1e-9)},
+    # Too large for a float: rejected, not an OverflowError.
+    {"temperature": 10**400},
+    {"top_p": 10**400},
+    {"repetition_penalty": -(10**400)},
 ]
 
 
@@ -503,7 +666,7 @@ def test_prompt_that_leaves_no_room_raises_before_streaming(monkeypatch) -> None
     runtime = harness.runtime
     hidden = torch.zeros(1, 1, 4)
     logits = torch.zeros(1, harness.VOCAB + 1)
-    runtime._build_branch_batch = lambda inputs: _BranchBatch(
+    runtime._build_branch_batch = lambda inputs, shape: _BranchBatch(
         hidden, inputs["attention_mask"], 1, select_fast_cfg(inputs)
     )
     runtime._run_prefill = lambda branch, prefix: (
@@ -567,8 +730,12 @@ def test_room_without_a_request_uses_the_generation_config_default() -> None:
     )
 
 
+def test_room_accepts_a_huge_integer_request_and_clamps_it() -> None:
+    assert _room_runtime().max_new_tokens_room(10**400, _prompt(100)) == 1500
+
+
 @pytest.mark.parametrize(
-    "requested", [0, -3, float("nan"), float("inf"), 2.5, "5", True]
+    "requested", [0, -3, float("nan"), float("inf"), 2.5, "5", True, np.bool_(True)]
 )
 def test_room_rejects_an_invalid_request(requested) -> None:
     # Mapping the wire's 0 to "use the default" is the boundary's job.
@@ -731,7 +898,7 @@ def test_room_is_exactly_the_frames_the_decode_loop_produces(
     runtime._backbone_prefill_graphs = {}
     hidden = torch.zeros(1, 1, 4)
     logits = torch.zeros(1, harness.VOCAB + 1)
-    runtime._build_branch_batch = lambda inputs: _BranchBatch(
+    runtime._build_branch_batch = lambda inputs, shape: _BranchBatch(
         hidden, inputs["attention_mask"], 1, select_fast_cfg(inputs)
     )
 
@@ -803,9 +970,16 @@ _PREFIX_INPUTS = dict.fromkeys(
 )
 
 
-# The longest prefix that still leaves room for the smallest suffix and one
-# frame: the decode loop needs prefix + suffix + 1 <= max_seq_len - 1.
+# The longest prefix that still leaves room for the default-instruction suffix
+# and MIN_SUFFIX_FRAMES frames: the decode loop needs
+# prefix + suffix + frames <= max_seq_len - 1.
 _LONGEST_PREFIX = 2048 - 1 - MIN_SUFFIX_ROOM
+
+
+def test_min_suffix_room_leaves_about_a_second_of_audio() -> None:
+    # 12 frames at the codec's 12.5 Hz is about 1 s.
+    assert MIN_SUFFIX_FRAMES == 12
+    assert MIN_SUFFIX_ROOM > MIN_SUFFIX_FRAMES
 
 
 def test_reference_prefix_is_not_limited_by_the_max_new_tokens_ceiling() -> None:
@@ -817,7 +991,7 @@ def test_reference_prefix_is_not_limited_by_the_max_new_tokens_ceiling() -> None
     assert longest.prefix_len == _LONGEST_PREFIX
 
 
-@pytest.mark.parametrize("prefix_len", [_LONGEST_PREFIX + 1, 2046, 2047])
+@pytest.mark.parametrize("prefix_len", [_LONGEST_PREFIX + 1, 2040, 2046, 2047])
 def test_reference_prefix_without_room_for_a_minimal_suffix_is_rejected(
     prefix_len,
 ) -> None:

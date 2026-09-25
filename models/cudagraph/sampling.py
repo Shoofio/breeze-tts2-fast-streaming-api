@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import random
 from collections.abc import Iterable
@@ -14,9 +15,24 @@ import torch.nn.functional as F
 # overflows float32 to inf and softmax turns it into NaN; sampling there is
 # already effectively greedy, so the floor changes nothing observable. Above
 # float32 max, t itself becomes inf once it meets the float32 logits, and a
-# suppressed token's -inf / inf is NaN. Either NaN makes torch.multinomial raise.
+# suppressed token's -inf / inf is NaN. Either NaN makes torch.multinomial
+# raise. The cap is 1e4, the same as the runtime's override limit, far below
+# that overflow and already a near-uniform distribution.
 MIN_TEMPERATURE = 1e-5
-MAX_TEMPERATURE = float(torch.finfo(torch.float32).max)
+MAX_TEMPERATURE = 1e4
+
+# The smallest repetition penalty apply_repetition_penalty uses. A positive
+# logit is divided by the penalty, so 1e-40 overflows it to inf (then NaN);
+# at 1e-4 a logit of 30 becomes 3e5, still finite. The runtime rejects
+# overrides below it.
+MIN_REPETITION_PENALTY = 1e-4
+
+
+def _require_not_nan(name: str, value: float) -> None:
+    # NaN compares False against everything, so min/max clamps pass it through
+    # unchanged; it must be rejected explicitly.
+    if math.isnan(value):
+        raise ValueError(f"{name} must not be NaN")
 
 
 def apply_repetition_penalty(
@@ -34,8 +50,11 @@ def apply_repetition_penalty(
     Args:
         logits: Tensor shaped [1, 1, vocab] or [1, vocab].
         token_history: 1-D tensor of previously generated token ids.
-        repetition_penalty: HF-style repetition penalty (>1.0).
+        repetition_penalty: HF-style repetition penalty (>1.0). Values below
+            ``MIN_REPETITION_PENALTY`` are raised to it; NaN raises ``ValueError``.
     """
+    _require_not_nan("repetition_penalty", repetition_penalty)
+    repetition_penalty = max(repetition_penalty, MIN_REPETITION_PENALTY)
     if repetition_penalty == 1.0 or token_history.numel() == 0:
         return logits
     unique_toks = token_history.unique()
@@ -62,8 +81,10 @@ def sample_logits(
 
     HF-compatible order: suppress -> temperature -> top_k -> top_p -> softmax -> sample.
     Matches transformers logits_processor (TemperatureLogitsWarper, TopKLogitsWarper,
-    TopPLogitsWarper) followed by softmax + multinomial.
+    TopPLogitsWarper) followed by softmax + multinomial. The temperature is
+    clamped to ``[MIN_TEMPERATURE, MAX_TEMPERATURE]``; NaN raises ``ValueError``.
     """
+    _require_not_nan("temperature", temperature)
     logits = logits.clone().float()
     if token_history is not None:
         apply_repetition_penalty(logits, token_history, repetition_penalty)

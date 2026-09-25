@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from breeze_infer.http_fields import DEFAULT_INSTRUCTION
 from breeze_infer.runtime import set_all_seeds
 from breeze_infer.templates import (
     get_template,
@@ -18,7 +19,8 @@ from breeze_infer.templates import (
     prepare_prefix_inputs,
     prepare_suffix_inputs,
 )
-from models.fast_streaming import MIN_SUFFIX_ROOM
+from models.cudagraph.sampling import MIN_REPETITION_PENALTY
+from models.fast_streaming import MIN_SUFFIX_FRAMES, MIN_SUFFIX_ROOM
 
 pytestmark = pytest.mark.gpu
 
@@ -198,21 +200,40 @@ def test_largest_allowed_temperature_and_penalty_still_sample(gpu_env) -> None:
     assert sum(chunk.audio.size for chunk in chunks) > 0
 
 
-def test_min_suffix_room_is_the_smallest_real_suffix_plus_one_frame(gpu_env) -> None:
-    # The smallest suffix a cached prefix can be continued with: a one-word
-    # text on the unguided branch, which cfg_scale 0 runs on its own. The
-    # guided branch always adds the instruction, so it is longer.
-    env = gpu_env
-    request = {
-        "id": "min-suffix",
-        "speaker": "S0",
-        "ref_text": "x",
-        "text": "a",
-        "instruction": "a",
-    }
-    inputs = prepare_suffix_inputs(env.tokenizer, env.model, request, guidance_scale=0.0)
-    unguided = int(inputs["cfg_negative_prompt_attention_mask"].shape[1])
-    guided = int(inputs["attention_mask"].shape[1])
+def test_smallest_allowed_repetition_penalty_still_samples(gpu_env) -> None:
+    # MIN_REPETITION_PENALTY multiplies the real positive logits of repeated
+    # tokens by 1e4; they must stay finite for the whole stream.
+    inputs = _inputs(gpu_env, "The cat sat on the mat.")
 
-    assert MIN_SUFFIX_ROOM == unguided + 1
-    assert guided > unguided
+    chunks, frames = _run(
+        gpu_env, inputs, repetition_penalty=MIN_REPETITION_PENALTY, max_new_tokens=8
+    )
+
+    assert 0 < len(frames) <= 8
+    assert sum(chunk.audio.size for chunk in chunks) > 0
+
+
+def test_min_suffix_room_is_the_default_instruction_suffix_plus_min_frames(
+    gpu_env,
+) -> None:
+    # The suffix a registered voice must leave room for: a one-word text with
+    # the default instruction on the guided branch, plus about 1 s of frames.
+    env = gpu_env
+    for text in ("a", "Hi", "嗨"):
+        request = {
+            "id": "min-suffix",
+            "speaker": "S0",
+            "ref_text": "x",
+            # The suffix carries no audio; the codes only have to be present.
+            "ref_audio_codes": torch.zeros(
+                1, env.model.config.num_codebooks, dtype=torch.long
+            ),
+            "text": text,
+            "instruction": DEFAULT_INSTRUCTION,
+        }
+        inputs = prepare_suffix_inputs(
+            env.tokenizer, env.model, request, guidance_scale=1.0
+        )
+        guided = int(inputs["attention_mask"].shape[1])
+
+        assert MIN_SUFFIX_ROOM == guided + MIN_SUFFIX_FRAMES, text
