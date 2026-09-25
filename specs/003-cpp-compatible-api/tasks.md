@@ -421,8 +421,10 @@ the GPU smoke test.
   - Move `_pcm16` from the old `api.py` to `audio.pcm16`.
   - Remove `encode_prompt_audio(path)` and the temporary-file upload path.
 - [ ] T036 [P] [US1] Create `breeze_infer/reference_audio.py` (R9):
-  - `decode(blob) -> DecodedAudio`: `sf.info` checks the header (format, 1–8 channels, 8–192 kHz,
-    ≤ 30 s), then `sf.read(float32, always_2d)` and a downmix to mono.
+  - `decode(blob) -> DecodedAudio`: open with `sf.SoundFile` and check the header (format, 1–8
+    channels, 8–192 kHz). A trustworthy, over-30 s frame count is rejected without decoding;
+    otherwise decode in bounded blocks (capped at 30 s + 1 sample) and let the actual decoded
+    length decide, downmixing to mono in float64 as each block arrives.
   - `predicted_frames(duration, sample_rate)`, using the 12 Hz codec's frame arithmetic. Document
     the formula; it is asserted against the real encode in T049.
   - Errors are `ApiError(400, invalid_audio | audio_too_long | audio_too_short)`.

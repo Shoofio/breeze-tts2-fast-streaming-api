@@ -93,16 +93,28 @@ predicted frame count.
 The header checks run before anything is decoded:
 - format is WAV, WAVEX, FLAC or OGG;
 - 1–8 channels;
-- 8,000–192,000 Hz;
-- 30 s or less.
+- 8,000–192,000 Hz.
+
+The header's own frame count decides duration up front only when it's trustworthy: a real file
+never reports anywhere near libsndfile's own "unknown length" sentinel (observed as `INT64_MAX`
+for a FLAC whose STREAMINFO `total_samples` was left at 0 -- what a streaming encoder emits, e.g.
+one piped through `ffmpeg`). A trustworthy count over 30 s is rejected without decoding.
+Otherwise the actual decoded length decides instead: the decode is bounded at one sample past
+30 s, so an untrustworthy-length file still can't allocate or read past that regardless of what
+its header claims, and ending early there is expected rather than an error.
 
 Failures:
 - empty upload gives `invalid_audio`;
-- any of these header checks failing gives `invalid_audio`;
-- more than 30 s gives `audio_too_long`;
-- shorter than one full codec frame (80 ms: fewer than 1,920 samples once resampled to 24 kHz)
-  gives `audio_too_short`. The codec itself rounds a partial frame up, so without this minimum a
-  1-sample clip would become one frame of mostly padding (decided with the user, 2026-09-25).
+- any of the header checks above failing gives `invalid_audio`;
+- unreadable audio gives `invalid_audio` (a genuine decode failure, distinct from a stream that
+  legitimately ends early because its length was never known);
+- non-finite or absurdly large samples (`|sample| > 8.0` after the downmix) give `invalid_audio`;
+- more than 30 s -- whether known from a trustworthy header or from the actual decoded length --
+  gives `audio_too_long`;
+- shorter than one full codec frame gives `audio_too_short`: exactly 80 ms, checked as
+  `n_samples * 24000 < 1920 * sample_rate` in integer arithmetic on the native sample count. The
+  codec itself rounds a partial frame up, so without this minimum a 1-sample clip would become
+  one frame of mostly padding (decided with the user, 2026-09-25).
 
 ## Reference (synthesis-internal)
 

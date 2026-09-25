@@ -202,19 +202,37 @@ headers on `500`s).
 
 ## R9. Reference audio decoding
 
-**Decision**: `soundfile` (libsndfile 1.2.2) on a `BytesIO`, in three steps:
+**Decision**: `soundfile` (libsndfile 1.2.2) on a `BytesIO`:
 1. Enforce the size cap.
-2. Call `sf.info` and check the header: the format is in {WAV, WAVEX, FLAC, OGG}, channels are
-   1–8, the sample rate is 8,000–192,000 Hz, and the duration is 30 s or less.
-3. Only then call `sf.read(dtype="float32", always_2d=True)`, downmix, and hand the result to the
-   codec's own resampler.
+2. Open with `sf.SoundFile` and check the header: the format is in {WAV, WAVEX, FLAC, OGG},
+   channels are 1–8, and the sample rate is 8,000–192,000 Hz. The header's own frame count
+   rejects an over-30 s file immediately, without decoding it -- but only when that count is
+   trustworthy. A FLAC written by a streaming encoder with no known length upfront (STREAMINFO
+   `total_samples` left at 0, e.g. one piped from `ffmpeg`) makes libsndfile report `frames` as
+   `INT64_MAX` instead of raising; a real file never comes anywhere near that, so any frame count
+   above a generous, clearly-implausible ceiling is treated as unknown rather than trusted.
+3. For a trustworthy, in-bounds count, decode directly. For an untrustworthy one, decode in
+   small, bounded blocks straight into a preallocated mono buffer -- downmixing each block in
+   float64, since two channels near float32's max would overflow a float32 sum -- and stop at one
+   sample past the 30 s cap, so neither the length claim nor an enormous real file can force
+   reading or allocating past it. Ending early there is expected for such a file (the encoder
+   never promised a length); libsndfile raises a specific internal error once such a stream's
+   real end is reached, tolerated once at least one block has already been read successfully. A
+   genuine decode failure still raises normally either way.
+4. Reject non-finite or absurdly large (`|sample| > 8.0`) samples, then hand the mono float32
+   result to the codec's own resampler -- except a clip under 80 ms (`n_samples * 24000 <
+   1920 * sample_rate`, exact integer arithmetic on the native sample count), which is rejected
+   outright rather than handed to the codec: the codec rounds a partial frame up, so without this
+   minimum a 1-sample clip would become one frame of mostly padding.
 
 A `RuntimeError` (the base of `LibsndfileError`) maps to `400 invalid_audio`.
 
 **Rationale**: Every malformed case was rejected cleanly:
 - a data length of `0xFFFFFFFF` was clamped to the real size;
 - a truncated `fmt` chunk, zero channels, zero bits or a zero sample rate each raised an error;
-- 18,000 random mutations produced no crash, and memory peaked at 41 MiB.
+- 18,000 random mutations produced no crash, and memory peaked at 41 MiB; a later, more targeted
+  fuzzing pass (4,200 files) found the streaming-FLAC-length and float-overflow cases above, both
+  fixed the same way -- nothing escaped after.
 
 libsndfile does accept a sample rate of 1, which is why the header checks are ours. MP3 is
 excluded: it isn't needed, and libmpg123 writes to stderr on bad input. Tests use soundfile for

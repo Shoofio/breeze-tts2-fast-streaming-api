@@ -12,6 +12,7 @@ used here for real rather than faked) so the round trip through libsndfile is re
 from __future__ import annotations
 
 import io
+import warnings
 
 import librosa
 import numpy as np
@@ -44,9 +45,9 @@ def _write(wav: np.ndarray, sample_rate: int, *, format: str, subtype: str | Non
 
 def _flac_with_bogus_total_samples(wav: np.ndarray, sample_rate: int) -> bytes:
     """A real FLAC whose STREAMINFO ``total_samples`` field is zeroed out, which is
-    what a streaming FLAC writer emits when the length isn't known upfront. libsndfile
-    then reports ``frames`` as ``INT64_MAX`` (9223372036854775807) rather than raising
-    -- confirmed empirically, this is review-agent's finding #3.
+    what a streaming FLAC writer emits when the length isn't known upfront (e.g. one
+    piped from ``ffmpeg``). libsndfile then reports ``frames`` as ``INT64_MAX``
+    (9223372036854775807) rather than raising -- confirmed empirically.
 
     Byte layout (https://xiph.org/flac/format.html#metadata_block_streaminfo): the
     ``fLaC`` magic (4 bytes) and one metadata block header (4 bytes) precede a fixed
@@ -83,13 +84,13 @@ def test_decodes_wav_pcm_and_float_subtypes_to_mono_float32(subtype: str) -> Non
 
 
 def test_decodes_stereo_44100hz_downmixed_to_mono() -> None:
-    """7: opposite-signed channels prove the downmix actually averages -- identical
-    channels (the old fixture) would still pass a downmix that silently just took one
-    channel and ignored the other."""
+    """Distinct, unequal channel values prove the downmix actually averages both
+    channels -- identical channels would still pass a downmix that silently just took
+    one channel and ignored the other."""
     num_samples = int(0.5 * 44100)
     wav = np.empty((num_samples, 2), dtype=np.float64)
-    wav[:, 0] = 0.2
-    wav[:, 1] = -0.2
+    wav[:, 0] = 0.3
+    wav[:, 1] = 0.1
     blob = _write(wav, 44100, format="WAV", subtype="PCM_16")
 
     audio = decode(blob)
@@ -97,10 +98,9 @@ def test_decodes_stereo_44100hz_downmixed_to_mono() -> None:
     assert audio.samples.ndim == 1
     assert audio.sample_rate == 44100
     assert audio.samples.shape[0] == num_samples
-    # Mean of +0.2 and -0.2 is 0; PCM_16 quantizes each channel independently, so the
-    # tolerance is one quantization step (1/32768), not exact -- still two orders of
-    # magnitude tighter than "silently took one channel" (which would fail at ~0.2).
-    assert np.abs(audio.samples).max() < 1e-4
+    # Mean of 0.3 and 0.1 is 0.2; PCM_16 quantizes each channel independently, so the
+    # tolerance is a couple of quantization steps (1/32768 each), not exact.
+    assert np.abs(audio.samples - 0.2).max() < 1e-4
 
 
 def test_decodes_flac() -> None:
@@ -187,10 +187,10 @@ def test_one_hertz_sample_rate_is_invalid_audio() -> None:
 
 
 def test_truncated_flac_is_invalid_audio() -> None:
-    """1 HIGH: a FLAC whose STREAMINFO metadata parses fine but whose audio-frame data
-    is cut off mid-stream fails during the *read*, not the open -- libsndfile's own
-    wording is "flac decoder lost sync". Confirms the single try/except covers both
-    the open and the read, not just the header-only stage."""
+    """A FLAC whose STREAMINFO metadata parses fine (and reports a normal, trustworthy
+    length) but whose audio-frame data is cut off mid-stream fails during the read,
+    not the open, since the metadata block itself is intact. This confirms the single
+    try/except covers both the open and the read, not just the header-only stage."""
     wav = _sine(1.0, _SR)
     blob = _write(wav, _SR, format="FLAC", subtype="PCM_16")
     truncated = blob[: len(blob) // 2]
@@ -201,9 +201,9 @@ def test_truncated_flac_is_invalid_audio() -> None:
 
 
 def test_truncated_ogg_is_invalid_audio() -> None:
-    """1 HIGH: an OGG truncated mid-stream fails to even open ("Supported file format
-    but file is malformed") -- the other of the two failure points the combined
-    except clause has to cover, alongside the FLAC read-time failure above."""
+    """An OGG truncated mid-stream fails to even open ("Supported file format but
+    file is malformed"), the other of the two failure points the combined
+    try/except has to cover alongside a FLAC's read-time failure."""
     wav = _sine(1.0, _SR)
     blob = _write(wav, _SR, format="OGG", subtype="VORBIS")
     truncated = blob[: len(blob) // 2]
@@ -213,28 +213,39 @@ def test_truncated_ogg_is_invalid_audio() -> None:
     assert exc_info.value.code == "invalid_audio"
 
 
-def test_flac_streaminfo_claiming_more_than_its_data_is_invalid_audio() -> None:
-    """1 HIGH: a short, real FLAC whose STREAMINFO total_samples is corrupted to claim
-    far more data than actually follows it. libsndfile can't cleanly signal EOF for
-    this case -- walking past the real end of stream raises "Internal psf_fseek()
-    failed" instead of returning a short read -- so it must map to invalid_audio via
-    the same except clause as lost-sync above, not be treated as a stream we can
-    happily read to EOF (that's the genuinely-long-file case below)."""
-    wav = _sine(1.0, _SR)  # far below any cap; the point is the header, not the length
+def test_flac_unknown_length_short_clip_is_accepted() -> None:
+    """A FLAC whose STREAMINFO total_samples is left at 0 -- what a streaming encoder
+    emits when it doesn't know the length upfront -- decodes normally when the real
+    underlying audio is well within the length limit, rather than being rejected just
+    because its header can't be trusted to state its own length."""
+    wav = _sine(1.0, _SR)
     blob = _flac_with_bogus_total_samples(wav, _SR)
 
-    with pytest.raises(ApiError) as exc_info:
-        decode(blob)
-    assert exc_info.value.code == "invalid_audio"
+    audio = decode(blob)
+
+    assert audio.sample_rate == _SR
+    # The tolerant read can lose part of one internal read block at the true end of
+    # an unknown-length stream; a couple of block-widths is a generous bound on that.
+    assert audio.duration_seconds == pytest.approx(1.0, abs=0.05)
 
 
-def test_flac_unknown_length_header_enforces_actual_decoded_length() -> None:
-    """3: STREAMINFO total_samples=0 makes libsndfile report frames as INT64_MAX -- an
-    implausible value that must never be trusted for sizing. When the *real*
-    underlying audio genuinely exceeds MAX_REF_SECONDS, the bounded read (capped at
-    30 s + 1 sample, regardless of what the header claims) still catches it, without
-    reading -- or allocating memory for -- anything like the INT64_MAX the header
-    reports."""
+def test_flac_unknown_length_at_exactly_max_ref_seconds_is_accepted() -> None:
+    """The same unknown-length header, with real audio right at the limit: exactly
+    MAX_REF_SECONDS of real data is still accepted."""
+    wav = _sine(MAX_REF_SECONDS, _SR)
+    blob = _flac_with_bogus_total_samples(wav, _SR)
+
+    audio = decode(blob)
+
+    assert audio.duration_seconds == pytest.approx(MAX_REF_SECONDS, abs=0.05)
+
+
+def test_flac_unknown_length_over_max_ref_seconds_is_audio_too_long() -> None:
+    """STREAMINFO total_samples=0 makes libsndfile report frames as an implausible
+    sentinel value that must never be trusted for sizing. When the real underlying
+    audio genuinely exceeds MAX_REF_SECONDS, the bounded read (capped at 30 s + 1
+    sample, regardless of what the header claims) still catches it, without reading
+    -- or allocating memory for -- anything like the length the header reports."""
     wav = _sine(MAX_REF_SECONDS + 1, _SR)
     blob = _flac_with_bogus_total_samples(wav, _SR)
 
@@ -247,9 +258,9 @@ def test_flac_unknown_length_header_enforces_actual_decoded_length() -> None:
 
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
 def test_non_finite_samples_is_invalid_audio(bad_value: float) -> None:
-    """2 HIGH: a float WAV can carry NaN/Inf verbatim -- soundfile doesn't reject it on
-    write or read -- so decode() must reject it, rather than handing the codec
-    non-finite input."""
+    """A float WAV can carry NaN/Inf verbatim -- soundfile doesn't reject it on write
+    or read -- so decode() must reject it, rather than handing the codec non-finite
+    input."""
     wav = _sine(0.1, _SR)
     wav[len(wav) // 2, 0] = bad_value
     blob = _write(wav, _SR, format="WAV", subtype="FLOAT")
@@ -261,9 +272,42 @@ def test_non_finite_samples_is_invalid_audio(bad_value: float) -> None:
     assert exc_info.value.message == "could not read ref_audio"
 
 
+def test_absurdly_large_sample_is_invalid_audio() -> None:
+    """A finite but wildly out-of-range sample (real reference audio stays within
+    +/-1.0) would overflow arithmetic downstream in the codec, so it's rejected here
+    instead, the same as a non-finite one."""
+    wav = _sine(0.1, _SR)
+    wav[len(wav) // 2, 0] = 100.0
+    blob = _write(wav, _SR, format="WAV", subtype="FLOAT")
+
+    with pytest.raises(ApiError) as exc_info:
+        decode(blob)
+    assert exc_info.value.status == 400
+    assert exc_info.value.code == "invalid_audio"
+    assert exc_info.value.message == "could not read ref_audio"
+
+
+def test_near_float32_max_samples_on_two_channels_is_invalid_audio_without_warning() -> None:
+    """Two channels each near float32's ~3.4e38 max would overflow a naive float32
+    sum during the downmix before any magnitude check could even run -- the decode
+    must accumulate in float64 instead, so this is rejected cleanly (as absurdly
+    large, not as non-finite) and raises no RuntimeWarning."""
+    num_samples = int(0.1 * _SR)
+    wav = np.full((num_samples, 2), 3e38, dtype=np.float64)
+    blob = _write(wav, _SR, format="WAV", subtype="FLOAT")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ApiError) as exc_info:
+            decode(blob)
+    assert exc_info.value.status == 400
+    assert exc_info.value.code == "invalid_audio"
+    assert exc_info.value.message == "could not read ref_audio"
+
+
 def test_reads_across_internal_block_boundaries_correctly() -> None:
-    """4: the decode loop reads in bounded blocks rather than one large sf.read call,
-    so a clip spanning several block boundaries -- at the max channel count, where a
+    """The decode loop reads in bounded blocks rather than one large sf.read call, so
+    a clip spanning several block boundaries -- at the max channel count, where a
     downmix bug would be easiest to hide -- must still downmix to the exact right
     values everywhere, not just within the first block."""
     num_samples = 200_000  # several times any reasonable internal block size
@@ -306,7 +350,7 @@ def test_over_max_ref_seconds_is_audio_too_long() -> None:
 
 
 def test_exactly_max_ref_seconds_is_accepted() -> None:
-    """9: the boundary itself must decode, not just anything strictly under it."""
+    """The boundary itself must decode, not just anything strictly under it."""
     wav = _sine(MAX_REF_SECONDS, _SR)
     blob = _write(wav, _SR, format="WAV", subtype="PCM_16")
 
@@ -317,9 +361,9 @@ def test_exactly_max_ref_seconds_is_accepted() -> None:
 
 
 def test_one_sample_over_max_ref_seconds_is_audio_too_long() -> None:
-    """9: the very next sample past the boundary must already be rejected -- the
-    bounded read stops at 30 s + 1 sample specifically so this is detectable without
-    reading (or trusting the header for) anything longer."""
+    """The very next sample past the boundary must already be rejected -- the bounded
+    read stops at 30 s + 1 sample specifically so this is detectable without reading
+    (or trusting the header for) anything longer."""
     num_samples = MAX_REF_SECONDS * _SR + 1
     wav = np.full((num_samples, 1), 0.1, dtype=np.float64)
     blob = _write(wav, _SR, format="WAV", subtype="PCM_16")
@@ -332,8 +376,8 @@ def test_one_sample_over_max_ref_seconds_is_audio_too_long() -> None:
 def test_zero_samples_is_audio_too_short() -> None:
     """BC-16: a clip too short for even one codec frame must be a 400, not a
     silently-ignored reference. A well-formed header around no sample data at all is
-    distinct from the empty-blob and garbage-bytes cases above (both of which fail
-    before any header is even parsed)."""
+    distinct from an empty upload or garbage bytes, both of which fail before any
+    header is even parsed."""
     wav = np.zeros((0, 1), dtype=np.float64)
     blob = _write(wav, _SR, format="WAV", subtype="PCM_16")
 
@@ -345,14 +389,15 @@ def test_zero_samples_is_audio_too_short() -> None:
 
 
 def test_minimum_clip_length_boundary_at_24khz() -> None:
-    """9 / USER DECISION (BC-16): the minimum reference clip is one full 80 ms codec
-    frame -- 1,920 samples at the 24 kHz-equivalent (resampled) length. `predicted_frames`
-    itself still rounds up (a single sample predicts 1 frame), so this minimum is its
-    own, separate check, not derived from `predicted_frames < 1`. At 24 kHz there's no
-    resampling, so the boundary is a direct sample count: one sample short is rejected,
-    the boundary itself decodes."""
-    below = np.full((CODEC_SAMPLES_PER_FRAME - 1, 1), 0.1, dtype=np.float64)
-    at_boundary = np.full((CODEC_SAMPLES_PER_FRAME, 1), 0.1, dtype=np.float64)
+    """BC-16 (spec decision): the minimum reference clip is exactly 80 ms, checked in
+    integer arithmetic on the native sample count -- reject when
+    ``n_samples * 24000 < 1920 * sample_rate`` -- rather than through the (rounding)
+    resample step: `predicted_frames` alone can't express this minimum, since its two
+    nested ceiling divisions mean it never reports fewer than 1 frame for any nonzero
+    input. At 24 kHz the check reduces to a direct sample count: one sample short of
+    1,920 is rejected, 1,920 itself decodes."""
+    below = np.full((1919, 1), 0.1, dtype=np.float64)
+    at_boundary = np.full((1920, 1), 0.1, dtype=np.float64)
 
     with pytest.raises(ApiError) as exc_info:
         decode(_write(below, CODEC_SAMPLE_RATE, format="WAV", subtype="PCM_16"))
@@ -360,30 +405,37 @@ def test_minimum_clip_length_boundary_at_24khz() -> None:
     assert exc_info.value.message == "ref_audio is too short"
 
     audio = decode(_write(at_boundary, CODEC_SAMPLE_RATE, format="WAV", subtype="PCM_16"))
-    assert audio.predicted_frames == 1
+    assert audio.samples.shape[0] == 1920
 
 
 def test_minimum_clip_length_boundary_at_44100hz() -> None:
-    """9: the same 1,920-sample minimum, but at a rate that actually has to resample
-    first. The native sample count at the boundary is found by searching real
-    `librosa.resample` output (not the module under test), the same technique
-    `test_predicted_frames_matches_actual_librosa_resample` above uses."""
-    sample_rate = 44100
-    n = 1
-    while (
-        len(librosa.resample(y=np.zeros(n, dtype=np.float32), orig_sr=sample_rate, target_sr=CODEC_SAMPLE_RATE))
-        < CODEC_SAMPLES_PER_FRAME
-    ):
-        n += 1
-    below = np.full((n - 1, 1), 0.1, dtype=np.float64)
-    at_boundary = np.full((n, 1), 0.1, dtype=np.float64)
+    """The same exact boundary at a rate where the cross-multiplication actually
+    matters: ``3528 * 24000 == 1920 * 44100`` exactly, so 3,527 samples is rejected
+    and 3,528 decodes."""
+    below = np.full((3527, 1), 0.1, dtype=np.float64)
+    at_boundary = np.full((3528, 1), 0.1, dtype=np.float64)
 
     with pytest.raises(ApiError) as exc_info:
-        decode(_write(below, sample_rate, format="WAV", subtype="PCM_16"))
+        decode(_write(below, 44100, format="WAV", subtype="PCM_16"))
     assert exc_info.value.code == "audio_too_short"
 
-    audio = decode(_write(at_boundary, sample_rate, format="WAV", subtype="PCM_16"))
-    assert audio.predicted_frames == 1
+    audio = decode(_write(at_boundary, 44100, format="WAV", subtype="PCM_16"))
+    assert audio.samples.shape[0] == 3528
+
+
+def test_minimum_clip_length_boundary_at_192khz() -> None:
+    """The same boundary at the maximum allowed sample rate:
+    ``15360 * 24000 == 1920 * 192000`` exactly, so 15,359 samples is rejected and
+    15,360 decodes."""
+    below = np.full((15359, 1), 0.1, dtype=np.float64)
+    at_boundary = np.full((15360, 1), 0.1, dtype=np.float64)
+
+    with pytest.raises(ApiError) as exc_info:
+        decode(_write(below, 192000, format="WAV", subtype="PCM_16"))
+    assert exc_info.value.code == "audio_too_short"
+
+    audio = decode(_write(at_boundary, 192000, format="WAV", subtype="PCM_16"))
+    assert audio.samples.shape[0] == 15360
 
 
 # --- predicted_frames must agree with the fake codec's own formula ----------------
