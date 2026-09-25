@@ -668,7 +668,12 @@ def test_a_huge_body_of_many_pairs_fails_fast_on_the_field_cap(tmp_path: Path) -
 
 def test_ref_audio_text_then_file_gets_400(tmp_path: Path) -> None:
     """`form.get("ref_audio")` alone only sees the *last* same-named entry -- a valid file,
-    here -- which would silently hide an earlier, invalid text `ref_audio` sent first."""
+    here -- which would silently hide an earlier, invalid text `ref_audio` sent first.
+
+    Two parts named `ref_audio`, regardless of their types, is also two occurrences of the
+    same key -- BC-08's duplicate-field pass runs before any per-field check, including the
+    file-vs-text one that would otherwise explain *which* `ref_audio` was invalid, so this
+    is `400 duplicate_field`, not `invalid_field`."""
     body = (
         _multipart_field_part("ref_audio", "not a file")
         + (
@@ -686,8 +691,8 @@ def test_ref_audio_text_then_file_gets_400(tmp_path: Path) -> None:
 
     assert response.status_code == 400
     assert response.json() == {
-        "error": "ref_audio must be a file part",
-        "code": "invalid_field",
+        "error": "ref_audio was given more than once",
+        "code": "duplicate_field",
     }
 
 
@@ -1357,12 +1362,14 @@ def test_blank_ref_text_counts_as_absent_needing_ref_text_required_with_ref_audi
 
 
 def test_bc_01_decimal_with_huge_exponent_gets_400(tmp_path: Path) -> None:
-    """BC-01: a decimal literal with an enormous exponent is rejected with 400 -- the
-    grammar itself bounds an exponent to at most 4 digits, so a literal like this never
-    reaches decimal.Decimal's own construction, which would otherwise raise
-    InvalidOperation, unhandled, for an exponent outside its context's range (~999999). The
-    C++ server's strtod-family parsing has no such limit and would just saturate to
-    infinity instead of raising.
+    """BC-01: a decimal literal with an enormous exponent is rejected with 400, not left to
+    crash. DECISION (final review): the grammar doesn't cap the exponent's digit count --
+    the contract's own grammar allows any exponent, and this shouldn't be stricter than the
+    contract -- so a literal like this reaches `_check_decimal_range`, whose own
+    `decimal.Decimal(literal)` call is guarded by `try`/`except InvalidOperation`
+    (`Decimal`'s default context bounds an exponent to roughly +/-999999 and would otherwise
+    raise, unhandled, for one outside that). The C++ server's strtod-family parsing has no
+    such limit and would just saturate to infinity instead of raising.
     """
     response = _client(tmp_path).post(
         "/speech", data={"text": "hi", "cfg_scale": "1e1000000000000000000"}
@@ -1372,27 +1379,29 @@ def test_bc_01_decimal_with_huge_exponent_gets_400(tmp_path: Path) -> None:
     assert response.json()["code"] == "invalid_field"
 
 
-def test_decimal_range_check_survives_invalid_operation_from_a_bypassed_literal() -> None:
-    """The grammar's 4-digit exponent bound is what a real request always goes through, but
-    _check_decimal_range's own decimal.Decimal(literal) call is guarded independently too --
-    called directly here with a literal the grammar would never let through, to prove the
-    guard itself (not just the grammar) is what stands between a pathological literal and an
-    unhandled 500.
-    """
-    with pytest.raises(http_fields.ApiError) as exc_info:
-        http_fields._check_decimal_range(
-            "1e" + "9" * 20,
-            0.0,
-            "cfg_scale",
-            "0",
-            "100",
-            low_inclusive=True,
-            rule="finite and between 0 and 100",
-        )
+def test_decimal_zero_with_huge_exponent_still_means_the_default(tmp_path: Path) -> None:
+    """`_is_zero_literal` decides the "0 means default" sentinel from the literal's digits
+    before `_check_decimal_range` -- and therefore `decimal.Decimal` -- ever sees it: a zero
+    mantissa with an exponent too large for `Decimal`'s own context (e.g. `0e99999`, though
+    this one alone fits) never has to construct a `Decimal` at all to know it's zero."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "temperature": "0e99999"}
+    )
 
-    assert exc_info.value.status == 400
-    assert exc_info.value.code == "invalid_field"
-    assert exc_info.value.message == "cfg_scale must be finite and between 0 and 100"
+    assert response.status_code == 200
+    assert response.json()["temperature"] is None
+
+
+def test_decimal_boundary_value_with_a_padded_exponent_is_accepted(tmp_path: Path) -> None:
+    """`temperature=1e00001` is exactly `10.0` (temperature's inclusive upper bound) --
+    written with a padded, multi-digit exponent, to prove the grammar really does accept any
+    exponent width now, not just up to some digit count."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "temperature": "1e00001"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["temperature"] == 10.0
 
 
 def test_bc_01_leading_zeros_dont_count_against_the_digit_cap(tmp_path: Path) -> None:
@@ -1498,24 +1507,21 @@ def test_text_length_is_checked_before_control_characters(tmp_path: Path) -> Non
     assert response.json() == {"error": "text is too long", "code": "text_too_long"}
 
 
-def test_instruction_length_is_checked_before_the_blank_check(tmp_path: Path) -> None:
-    """An instruction so long it exceeds the limit is rejected even when it's entirely
-    whitespace -- length is checked before deciding whether the value counts as blank (and
-    so gets the default instead)."""
+def test_instruction_blank_check_runs_before_the_length_check(tmp_path: Path) -> None:
+    """DECISION (final review): length-before-blank is specific to `text`; `instruction`
+    keeps blank-before-length -- a whitespace-only instruction still means the default no
+    matter how long it is, not `invalid_field`."""
     response = _client(tmp_path).post(
         "/speech", data={"text": "hi", "instruction": " " * (MAX_INSTRUCTION_CHARS + 1)}
     )
 
-    assert response.status_code == 400
-    assert response.json() == {
-        "error": f"instruction must be at most {MAX_INSTRUCTION_CHARS:,} characters",
-        "code": "invalid_field",
-    }
+    assert response.status_code == 200
+    assert response.json()["instruction"] == DEFAULT_INSTRUCTION
 
 
-def test_ref_text_length_is_checked_before_the_blank_check(tmp_path: Path) -> None:
-    """Same ordering as instruction: an over-length, all-whitespace ref_text is rejected as
-    too long, not treated as absent."""
+def test_ref_text_blank_check_runs_before_the_length_check(tmp_path: Path) -> None:
+    """Same restored ordering as instruction: a whitespace-only ref_text still counts as
+    absent no matter how long it is, not `invalid_field`."""
     response = _client(tmp_path).post(
         "/speech",
         data={
@@ -1525,11 +1531,8 @@ def test_ref_text_length_is_checked_before_the_blank_check(tmp_path: Path) -> No
         },
     )
 
-    assert response.status_code == 400
-    assert response.json() == {
-        "error": f"ref_text must be at most {MAX_REF_TEXT_CHARS:,} characters",
-        "code": "invalid_field",
-    }
+    assert response.status_code == 200
+    assert response.json()["reference"]["ref_text_override"] is None
 
 
 def test_voice_id_uppercase_v_prefix_is_rejected(tmp_path: Path) -> None:
@@ -1574,3 +1577,36 @@ def test_unspeakable_text_gets_text_required_before_reference_checks(tmp_path: P
 
     assert response.status_code == 400
     assert response.json() == {"error": "text is required", "code": "text_required"}
+
+
+def test_bc_01_integer_literal_over_4300_raw_digits_doesnt_crash(tmp_path: Path) -> None:
+    """Regression: the digit cap (test_bc_01_integer_longer_than_20_digits_gets_400) counts
+    significant digits, but a fix that only fixed the counting -- and still called int() on
+    the original, unstripped literal -- would still crash for a literal with more raw digits
+    than sys.get_int_max_str_digits() (4,300 by default), even though its actual value is
+    tiny. int() must only ever be called on the stripped digits."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "seed": "0" * 5000 + "1"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["seed"] == 1
+
+
+def test_bc_08_duplicate_pass_runs_before_ref_audio_as_text_check(tmp_path: Path) -> None:
+    """BC-08: the duplicate-field pass runs first, over the raw query and body keys, before
+    any per-field check -- including `ref_audio`-as-text, which would otherwise fire first
+    and hide an unrelated duplicated `seed` in the body. The C++ server checked neither
+    duplicates nor `ref_audio`'s shape this strictly at all."""
+    response = _client(tmp_path).post(
+        "/speech",
+        content=b"seed=1&seed=2",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        params={"ref_audio": "x"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "seed was given more than once",
+        "code": "duplicate_field",
+    }

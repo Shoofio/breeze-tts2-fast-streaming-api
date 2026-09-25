@@ -26,6 +26,7 @@ has landed, so every item below is asserted for real -- nothing here is `xfail`.
 
 from __future__ import annotations
 
+import hashlib
 import struct
 from typing import NamedTuple
 
@@ -468,18 +469,37 @@ def test_corpus_names_are_unique() -> None:
     assert len(names) == len(set(names)), names
 
 
+def _fingerprint(value: object) -> object:
+    """A hashable, exact stand-in for `value`, used to fingerprint a corpus item's request
+    kwargs (`test_corpus_requests_are_distinct` below).
+
+    `bytes` (a `files`/`content` payload -- some of this corpus's WAV fixtures run well past
+    25 MiB) is digested with `hashlib.sha256` rather than `repr()`'d: `repr()` of a large
+    `bytes` object escapes every byte into the resulting string, which is slow and
+    memory-hungry for a fixture this size, where a digest is cheap and exact either way.
+    `dict`/`list`/`tuple` are walked recursively (into the exact `files` shape --
+    `{"ref_audio": (filename, bytes, content_type)}` -- and anything else this corpus's
+    kwargs ever nest bytes inside), converted to something hashable and order-stable;
+    everything else (`str`, `int`, `None`, ...) is returned as-is, `repr()` never entering
+    into it at all.
+    """
+    if isinstance(value, bytes):
+        return ("bytes", hashlib.sha256(value).hexdigest())
+    if isinstance(value, dict):
+        return tuple(sorted((k, _fingerprint(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_fingerprint(v) for v in value)
+    return value
+
+
 def test_corpus_requests_are_distinct() -> None:
     """review finding 3: the corpus counts *distinct* requests, not just distinct
     names -- two items with the same name would already fail the uniqueness test above,
     but two different names sending the byte-for-byte identical request (as
     "voice_id_and_ref_audio" and "voice_id_ref_audio_and_ref_text" used to) would not."""
-    seen: set[tuple[object, ...]] = set()
+    seen: set[object] = set()
     for item in _CORPUS:
-        # `files` holds real bytes, which aren't hashable as part of a dict repr
-        # comparison across different WAV fixtures reliably, so the request is
-        # identified by its resolved kwargs' repr -- stable and exact for this
-        # corpus's own kwargs shapes (data/params/content/headers/files).
-        fingerprint = repr(sorted(item.kwargs.items(), key=lambda kv: kv[0]))
+        fingerprint = _fingerprint(sorted(item.kwargs.items(), key=lambda kv: kv[0]))
         assert fingerprint not in seen, f"{item.name} duplicates an earlier request"
         seen.add(fingerprint)
 

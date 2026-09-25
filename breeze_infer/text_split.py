@@ -71,7 +71,14 @@ def _char_weight(ch: str) -> int:
     return 1 if ord(ch) < 128 else 3
 
 
-def _speakable(text: str) -> bool:
+def speakable(text: str) -> bool:
+    """Whether `text` has at least one letter or digit (Unicode category `L*` or `N*`).
+
+    TTS can't speak punctuation-only or emoji-only text: `split_text` drops any piece this
+    is `False` for (module docstring). Public so `http_fields.py` can apply the same rule to
+    a whole (unsplit) request's `text` at the HTTP field-validation stage, before splitting
+    ever runs, instead of keeping its own separate copy of this one-line rule.
+    """
     return any(unicodedata.category(ch)[0] in "LN" for ch in text)
 
 
@@ -337,7 +344,7 @@ def _pack(units: list[tuple[str, bool]], budget: int, first_budget: int) -> list
             cur = ""
             cw = 0
             limit = budget
-        if not cur and not _speakable(unit):
+        if not cur and not speakable(unit):
             continue
         cur += unit
         cw += w
@@ -378,7 +385,7 @@ def segment(
     rest = buffer[cut:]
     if budget > 0:
         # The rest holds the opening piece only when nothing before it is spoken now.
-        opening = 0 if _speakable(buffer[:cut]) or first_budget >= budget else first_budget
+        opening = 0 if speakable(buffer[:cut]) or first_budget >= budget else first_budget
         closed, rest = _split_clauses(rest, budget, 2 * budget, opening)
         units += [(c, True) for c in closed]
     return _pack(units, budget, first_budget), rest

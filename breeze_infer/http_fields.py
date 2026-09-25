@@ -5,13 +5,15 @@ instruction means the default), BC-10 (missing/blank text is `400 text_required`
 FR-006's `0` -> `None` for the sampling fields. T048 (contracts/http-api.md, data-model.md
 `SpeechRequest`) completes it: the strict ASCII-only number grammar with ranges (T048's
 `_INT_LITERAL`/`_DECIMAL_LITERAL` below), duplicate-field detection (BC-08,
-`_check_no_duplicate_fields`, run once in `read_fields` before `Fields` is ever handed to a
-caller), length limits and the control-character rule (BC-05, BC-46), and the full
-`reference_conflict` / `ref_text_required` / `reference_required` ordering (`_build_reference`).
-`Fields` keeps the form and the query string as separate multi-dicts specifically so
-`_check_no_duplicate_fields` can tell "given twice in the form", "given twice in the
-query" and "given in both" apart for `duplicate_field`'s own message, without needing to
-know which source a value came from.
+`_check_no_duplicate_names`, run first in `read_fields`, over the raw names from the query
+string and the body combined, before any other check -- including `_reject_ref_audio_text`
+and `_split_multipart_fields`'s own file-vs-text check -- ever runs), length limits and the
+control-character rule (BC-05, BC-46), and the full `reference_conflict` /
+`ref_text_required` / `reference_required` ordering (`_build_reference`). `Fields` itself
+keeps the form and the query string as separate multi-dicts so `_first` can read "the one
+value" from either source without needing to merge them first -- by the time `Fields` is
+built, `_check_no_duplicate_names` has already ruled out either one holding more than one
+value for the same name.
 
 research.md R1: no `Form(...)` parameters -- FastAPI's silently keeps the last of a
 duplicate field, and its parser limits can't be changed. research.md R6: a truncated
@@ -59,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qsl
@@ -77,6 +80,7 @@ from breeze_infer.limits import (
     MAX_TEXT_CHARS,
 )
 from breeze_infer.settings import Settings
+from breeze_infer.text_split import speakable
 
 # contracts/http-api.md "Fields": the defaults for POST /v1/audio/speech.
 DEFAULT_INSTRUCTION = "Speak clearly and naturally."
@@ -130,10 +134,10 @@ class Fields:
     one. `form` and `query` here are both freshly built `QueryParams` over already-decoded,
     already-validated strings.
 
-    `form` and `query` are kept apart rather than merged into one mapping so the duplicate
-    check -- "`getlist(k)` has more than one value in the form or the query string, or the
-    same key appears in both" (research.md R6, BC-08) -- can be built directly from them
-    instead of reconstructing which source each value came from.
+    `form` and `query` are kept apart, rather than merged into one mapping, purely so a
+    caller reading a field (`_first`) can tell which source's `getlist` to consult -- by
+    construction time, `read_fields`'s own `_check_no_duplicate_names` has already ruled out
+    either one holding more than one value for the same name (research.md R6, BC-08).
     """
 
     form: QueryParams
@@ -154,24 +158,40 @@ async def read_fields(request: Request) -> Fields:
     with no body has no content type worth trusting, and still has to work (review 1
     finding #7, review 2 finding #8).
 
-    BC-08's duplicate-field check (`_check_no_duplicate_fields`) runs here, right before
-    returning -- the earliest point `form` and `query` are both known, and before any
-    caller (today, only `parse_speech`) gets to run a single field's own syntax check. A
-    request whose `text` happens to be too long but whose unrelated `seed` is duplicated
-    must still get `duplicate_field`, not `text_too_long`, which only holds if every key is
-    checked before any one field's own validation is.
+    BC-08's duplicate-field check (`_check_no_duplicate_names`) runs first in every branch
+    below, over the raw names from the query string and the body combined -- before
+    `_reject_ref_audio_text`, `_split_multipart_fields`'s own file-vs-text check, or any
+    check in `parse_speech` ever runs. A request whose `text` happens to be too long but
+    whose unrelated `seed` is duplicated must still get `duplicate_field`, not
+    `text_too_long`; a `ref_audio` given as text in the query string alongside an unrelated
+    duplicated `seed` in the body must still get `duplicate_field`, not `ref_audio must be a
+    file part` -- neither holds unless every name is checked before any single one's own
+    syntax is.
     """
     query_pairs = await _parse_urlencoded_bytes(request.scope["query_string"])
-    _reject_ref_audio_text(query_pairs)
+    query_names = [name for name, _ in query_pairs]
 
     media_type, charset = _content_type(request)
     if media_type == "multipart/form-data":
-        pairs, ref_audio = await _read_multipart_fields(request)
+        form = await _parse_multipart_form(request)
+        try:
+            raw_items = list(form.multi_items())
+            _check_no_duplicate_names(query_names + [name for name, _ in raw_items])
+            _reject_ref_audio_text(query_pairs)
+            pairs, ref_audio_part = _split_multipart_fields(raw_items)
+            ref_audio = await _read_ref_audio_bytes(ref_audio_part)
+        finally:
+            # Every UploadFile this form holds -- ref_audio's, and any file wrongly sent
+            # under another field's name -- is closed before returning. `Fields` never
+            # holds `form`.
+            await form.close()
     elif media_type == "application/x-www-form-urlencoded":
         if not _is_utf8_charset(charset):
             raise ApiError(400, "invalid_field", "request body must be UTF-8 text")
         body = await request.body()  # already bounded by BodyLimitMiddleware
         pairs = await _parse_urlencoded_bytes(body)
+        _check_no_duplicate_names(query_names + [name for name, _ in pairs])
+        _reject_ref_audio_text(query_pairs)
         _reject_ref_audio_text(pairs)
         ref_audio = None
     else:
@@ -183,10 +203,10 @@ async def read_fields(request: Request) -> Fields:
                 "application/x-www-form-urlencoded",
             )
         pairs, ref_audio = [], None
+        _check_no_duplicate_names(query_names)
+        _reject_ref_audio_text(query_pairs)
 
-    fields = Fields(form=QueryParams(pairs), query=QueryParams(query_pairs), ref_audio=ref_audio)
-    _check_no_duplicate_fields(fields)
-    return fields
+    return Fields(form=QueryParams(pairs), query=QueryParams(query_pairs), ref_audio=ref_audio)
 
 
 def _content_type(request: Request) -> tuple[str, str]:
@@ -316,7 +336,7 @@ class _StrictMultiPartParser(MultiPartParser):
         self.items.append((field_name, value))
 
 
-async def _read_multipart_fields(request: Request) -> tuple[list[tuple[str, str]], bytes | None]:
+async def _parse_multipart_form(request: Request) -> FormData:
     """`multipart/form-data`, via `_StrictMultiPartParser` -- not `request.form()`, which
     constructs the base (silently-lossy) parser and gives no way to swap it in.
 
@@ -326,6 +346,13 @@ async def _read_multipart_fields(request: Request) -> tuple[list[tuple[str, str]
     `python_multipart.exceptions.FormParserError`, which `errors.py` already maps to `400`
     for the lower-level parser's own malformed-syntax errors, which still propagate
     unchanged since this module never catches them).
+
+    Only parses -- doesn't validate which parts are text and which are `ref_audio`, and
+    doesn't check for duplicates: `read_fields` needs the raw `(name, value)` pairs this
+    produces (via `form.multi_items()`) to run the duplicate-field pass first, over every
+    name from both the query string and this form, before any of that per-field validation
+    (`_split_multipart_fields`) runs. The caller owns `form`'s lifetime (`await
+    form.close()`), same as before.
     """
     parser = _StrictMultiPartParser(
         request.headers,
@@ -335,41 +362,32 @@ async def _read_multipart_fields(request: Request) -> tuple[list[tuple[str, str]
         max_part_size=FORM_MAX_PART_SIZE,
     )
     try:
-        form = await parser.parse()
+        return await parser.parse()
     except MultiPartException as exc:
         raise ApiError(400, "invalid_field", "could not parse the request body") from exc
 
-    try:
-        pairs, ref_audio_part = _split_multipart_fields(form)
-        ref_audio = await _read_ref_audio_bytes(ref_audio_part)
-    finally:
-        # Every UploadFile this form holds -- ref_audio's, and any file wrongly sent under
-        # another field's name -- is closed before returning. `Fields` never holds `form`.
-        await form.close()
 
-    return pairs, ref_audio
-
-
-def _split_multipart_fields(form: FormData) -> tuple[list[tuple[str, str]], UploadFile | None]:
+def _split_multipart_fields(
+    raw_items: list[tuple[str, str | UploadFile]],
+) -> tuple[list[tuple[str, str]], UploadFile | None]:
     """One pass over every part, in wire order (review 2 finding #3): every `ref_audio`
     entry must be a file, checked as it's encountered, not just the *last* one --
     `form.get("ref_audio")` alone would miss an earlier, invalid text `ref_audio` sent
     before a later, valid file part under the same name. Every other field must be text
     (review 1 finding #1): a file part sent under any other field name is rejected outright.
 
-    A second (or third) valid `ref_audio` file part is `400 duplicate_field`, not silently
-    the last-one-wins `form.get` would give -- `FORM_MAX_FILES` gives this loop enough
-    headroom to actually see a few extra parts and say so, rather than Starlette's own
-    parser rejecting them first with its own generic "too many files" error.
+    A *second* `ref_audio` part -- file or text -- never reaches this loop at all: BC-08's
+    duplicate-field pass (`_check_no_duplicate_names`, run by `read_fields` before this is
+    ever called) already rejects any name given more than once, `ref_audio` included, as
+    `400 duplicate_field`. This only has to tell a single `ref_audio` part's type apart from
+    every other field's.
     """
     pairs: list[tuple[str, str]] = []
     ref_audio_part: UploadFile | None = None
-    for name, value in form.multi_items():
+    for name, value in raw_items:
         if name == "ref_audio":
             if not isinstance(value, UploadFile):
                 raise ApiError(400, "invalid_field", "ref_audio must be a file part")
-            if ref_audio_part is not None:
-                raise ApiError(400, "duplicate_field", "ref_audio was given more than once")
             ref_audio_part = value
             continue
         if isinstance(value, UploadFile):
@@ -387,35 +405,33 @@ async def _read_ref_audio_bytes(part: UploadFile | None) -> bytes | None:
     return await part.read(MAX_AUDIO_BYTES + 1)
 
 
-def _check_no_duplicate_fields(fields: Fields) -> None:
-    """BC-08: one upfront pass over every key actually present in the form or the query
-    string -- known to this contract or not (`foo=1&foo=2` is `400 duplicate_field` even
-    though `foo` isn't a field `parse_speech` ever reads) -- called by `read_fields`, before
-    any per-field check ever runs.
+def _check_no_duplicate_names(names: list[str]) -> None:
+    """BC-08: every key given more than once -- across the query string and the body
+    combined, known to this contract or not (`foo=1&foo=2` is `400 duplicate_field` even
+    though `foo` isn't a field `parse_speech` ever reads) -- called by `read_fields`, first,
+    before any per-field check runs: `_reject_ref_audio_text`, `_split_multipart_fields`'s
+    own file-vs-text check, and every check in `parse_speech` all come after this.
 
-    This has to run first: a request whose `text` happens to be too long but whose unrelated
-    `seed` is duplicated must still get `duplicate_field`, not `text_too_long` -- which only
-    holds if every key is checked before any single field's own syntax is.
-
-    `ref_audio` is a separate concern, handled where it's actually read
-    (`_split_multipart_fields`'s own duplicate check): it's a file part, never a member of
-    `fields.form`/`fields.query`, so it can't be seen from here.
+    `names` is the plain list of every name seen, from both sources, in wire order, with
+    repeats -- not deduplicated first -- so a name repeated only within one source (twice in
+    the query, say) is counted the same way as one split across both. `Counter` finds
+    whichever of those is true for a given name; the loop over `names` (not `counts`) keeps
+    the error naming whichever duplicated name appears *first* on the wire, deterministically.
     """
-    names = dict.fromkeys([*fields.form.keys(), *fields.query.keys()])
+    counts = Counter(names)
     for name in names:
-        form_count = len(fields.form.getlist(name))
-        query_count = len(fields.query.getlist(name))
-        if form_count > 1 or query_count > 1 or (form_count and query_count):
+        if counts[name] > 1:
             raise ApiError(400, "duplicate_field", f"{_label(name)} was given more than once")
 
 
 def _first(fields: Fields, name: str) -> str | None:
     """The field's value, or `None` when it's absent or empty (BC-02).
 
-    Duplicate detection (BC-08) already ran once, upfront, over every key present
-    (`_check_no_duplicate_fields`, called first thing in `parse_speech`) -- by the time this
-    runs, `name` is already known to have at most one value between the form and the query
-    string, so this is purely "the one value, empty means absent".
+    Duplicate detection (BC-08) already ran once, upfront, over every raw name present in
+    both the query string and the body (`_check_no_duplicate_names`, called by `read_fields`
+    before `Fields` is ever built) -- by the time this runs, `name` is already known to have
+    at most one value between the form and the query string, so this is purely "the one
+    value, empty means absent".
     """
     values = [*fields.form.getlist(name), *fields.query.getlist(name)]
     if not values or values[0] == "":
@@ -431,15 +447,16 @@ def _first(fields: Fields, name: str) -> str | None:
 # in Python, a bare `$` also matches just before one trailing newline, which would let
 # "12\n" slip through where the contract means it not to.
 #
-# The exponent is capped at 4 digits (an exponent magnitude up to 9999 -- vastly more than
-# any field's own range could ever need): `decimal.Decimal`'s default context bounds an
-# exponent to roughly +/-999999 (`Emax`/`Emin`) and raises `InvalidOperation`, unhandled,
-# for one outside that -- e.g. `Decimal("1e1000000000000000000")` -- which would otherwise
-# reach the client as a bare `500` from `_check_decimal_range` below. Capping the grammar
-# rejects a literal like that here, as an ordinary `400 invalid_field` ("too many exponent
-# digits" reads the same as any other grammar mismatch), before it can ever reach `Decimal`.
+# DECISION (final review): the exponent is *not* capped -- the contract's own grammar
+# (`^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$`) allows any number of exponent digits, and nothing
+# here should be stricter than the contract itself. A literal with an exponent
+# `decimal.Decimal`'s default context can't represent (`Emax`/`Emin`, roughly +/-999999) --
+# e.g. `Decimal("1e1000000000000000000")` -- is instead handled by `_check_decimal_range`
+# below, which catches `decimal.InvalidOperation` directly; `_is_zero_literal` separately
+# means a literal like `0e99999` is still just the zero sentinel, never reaching `Decimal`
+# construction for its enormous exponent at all.
 _INT_LITERAL = re.compile(r"[+-]?\d+", re.ASCII)
-_DECIMAL_LITERAL = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d{1,4})?", re.ASCII)
+_DECIMAL_LITERAL = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", re.ASCII)
 
 # Python 3.11+ refuses to convert a digit string longer than
 # `sys.get_int_max_str_digits()` (4,300 by default) to `int` at all -- it raises
@@ -467,13 +484,22 @@ def _parse_int(value: str, field: str, rule: str) -> int:
     `"0"`, via the `or "0"` fallback for when stripping leaves nothing at all): a literal
     padded with zeros must be judged by its actual magnitude, not by how long it happens to
     be on the wire.
+
+    Regression (final review): `int()` is called on `sign + significant_digits`, the
+    stripped result, never on the original `value`. Calling it on `value` instead -- even
+    after the digit count above had already confirmed the *significant* digit count was
+    within bounds -- would still hand `int()` the original, unstripped literal: for
+    something like `"0" * 5000 + "1"`, over `sys.get_int_max_str_digits()` (4,300 by
+    default) raw digits even though its value is just `1`, that call alone raises
+    `ValueError`, unhandled, the same `500` this whole digit cap exists to prevent.
     """
     if _INT_LITERAL.fullmatch(value) is None:
         raise ApiError(400, "invalid_field", f"{field} must be an integer")
+    sign = "-" if value.startswith("-") else ""
     significant_digits = value.lstrip("+-").lstrip("0") or "0"
     if len(significant_digits) > _MAX_INT_LITERAL_DIGITS:
         raise ApiError(400, "invalid_field", f"{field} must be {rule}")
-    return int(value)
+    return int(sign + significant_digits)
 
 
 def _parse_decimal(value: str, field: str) -> float:
@@ -619,63 +645,29 @@ def _check_no_control_characters(value: str, field: str) -> None:
             raise ApiError(400, "invalid_field", f"{field} must be free of control characters")
 
 
-def _check_length_then_control_characters(value: str, field: str, max_chars: int) -> None:
-    """Shared order for `text`, `instruction` and `ref_text`: length first (a cheap `len()`
-    bound), then control characters (an `O(n)` scan) -- an over-length value is rejected
-    without ever having to scan the whole thing for control characters.
-
-    Both checks always run before any "is this blank?" check the caller applies afterward:
-    `str.strip()`/`str.isspace()` treats several `Cc` control characters (`\\x1c`-`\\x1f`,
-    `\\x85` NEL) as whitespace, so a value consisting only of one of those must never reach
-    a blank check before this has had the chance to reject it as what it actually is.
-
-    Raises `text_too_long` for `text` specifically (its own code, per the contract's error
-    table); every other caller -- `instruction`, `ref_text` -- gets the ordinary
-    `invalid_field` length message, since only `text` has a dedicated code for this.
-    """
-    if len(value) > max_chars:
-        if field == "text":
-            raise ApiError(400, "text_too_long", "text is too long")
-        raise ApiError(400, "invalid_field", f"{field} must be at most {max_chars:,} characters")
-    _check_no_control_characters(value, field)
-
-
 def _validated_text_field(fields: Fields, name: str, max_chars: int) -> str | None:
-    """A text field's value (`None` when absent, BC-02), length- and control-character-
-    checked (BC-05/BC-46, `_check_length_then_control_characters`) -- shared by `ref_text`,
-    and (via their own copies of this same order, wrapped around their own blank-handling)
-    `text`/`instruction` in `parse_speech`.
-
-    A value that's blank once the checks above have passed (e.g. all spaces, or empty)
-    counts as absent here, the same as `ref_text`'s general BC-02 "empty means absent" --
-    `text` and `instruction` apply their own, different meaning of "blank" (`text_required`,
-    or `instruction`'s default) around their own copies of this function's ordering instead.
+    """`ref_text`'s value (`None` when absent, BC-02), control-character- and length-checked
+    (BC-46/BC-05), in that order: control characters first, since `str.strip()` (and
+    `str.isspace()`) treats several `Cc` control characters (`\\x1c`-`\\x1f`, `\\x85` NEL) as
+    whitespace, so checking blank-ness first would let a value that's *only* one of those
+    slip through as "blank" instead of being caught as the control-character violation it
+    actually is; then blank (a whitespace-only value counts as absent here, the same as the
+    general BC-02 "empty means absent"); only once it's known to be a real, non-blank value
+    is its length checked -- a whitespace-only value of any length is still absent, not
+    "too long". `instruction`, in `parse_speech`, applies this same order (control, then
+    blank -- with its own meaning, the default -- then length); `text` is the one exception,
+    checking length before control characters, since only it has a dedicated `text_too_long`
+    code cheap enough to short-circuit an over-length scan for control characters.
     """
     raw = _first(fields, name)
     if raw is None:
         return None
-    _check_length_then_control_characters(raw, name, max_chars)
+    _check_no_control_characters(raw, name)
     if not raw.strip():
         return None
+    if len(raw) > max_chars:
+        raise ApiError(400, "invalid_field", f"{name} must be at most {max_chars:,} characters")
     return raw
-
-
-def _has_speakable_content(text: str) -> bool:
-    """Mirrors `text_split.py`'s own `_speakable` rule exactly (`any(unicodedata.category(ch)
-    [0] in "LN" for ch in text)`): a piece with no letter or digit -- punctuation-only or
-    emoji-only -- can't be spoken, and `split_text` silently drops it. Checked again here,
-    on the whole (unsplit) `text`, so that outcome is `400 text_required` at the field
-    stage, not something that only shows up once splitting has already discarded everything
-    there was.
-
-    A local mirror rather than an import from `text_split`: that module's rule is private
-    (`_speakable`, no public wrapper) and pure text-segmentation machinery unrelated to this
-    module's own concerns; duplicating its one-line rule here keeps this module's only
-    dependency on `text_split` at zero, at the cost of the two needing to be kept in sync if
-    the rule ever changes (both live in the same breaking-change spec, so a change to one is
-    expected to prompt a look at the other).
-    """
-    return any(unicodedata.category(ch)[0] in "LN" for ch in text)
 
 
 @dataclass(frozen=True)
@@ -804,38 +796,44 @@ def parse_speech(fields: Fields, settings: Settings) -> SpeechRequest:
     called -- every field this function reads is already known to have at most one value.
     """
     text = _first(fields, "text")
-    # Length, then control characters (`_check_length_then_control_characters`), before the
-    # blank check below: str.strip() treats several Cc control characters (\x1c-\x1f, \x85
-    # NEL) as whitespace, so checking blank-ness first would let a `text` that is *only*
-    # one of those silently become "blank" (text_required) instead of the BC-46 violation
-    # it actually is.
+    # DECISION (final review): text is the one field checked length-before-control -- a
+    # cheap len() bound, before ever scanning the whole string for control characters -- but
+    # the blank check (BC-10) still runs last, after both: str.strip() treats several Cc
+    # control characters (\x1c-\x1f, \x85 NEL) as whitespace, so checking blank-ness before
+    # control characters would let a `text` that is *only* one of those silently become
+    # "blank" (text_required) instead of the BC-46 violation it actually is.
     if text is not None:
-        _check_length_then_control_characters(text, "text", MAX_TEXT_CHARS)  # BC-05, BC-46
+        if len(text) > MAX_TEXT_CHARS:  # BC-05
+            raise ApiError(400, "text_too_long", "text is too long")
+        _check_no_control_characters(text, "text")  # BC-46
     if text is None or not text.strip():
         raise ApiError(400, "text_required", "text is required")  # BC-10
-    if not _has_speakable_content(text):
-        # text_split.py's own `_speakable` rule, mirrored here: a piece with no letter or
-        # digit (Unicode category L* or N*) can't be spoken, so split_text drops it. Caught
-        # here, at the field stage, so a text like "..." is 400 text_required before the
-        # reference-consistency checks below ever run (FR-007's order) -- not left to
-        # surface only once splitting has silently discarded the only piece there was.
+    if not speakable(text):
+        # text_split.py's own rule: a piece with no letter or digit (Unicode category L* or
+        # N*) can't be spoken, so split_text drops it. Caught here, at the field stage, so a
+        # text like "..." is 400 text_required before the reference-consistency checks below
+        # ever run (FR-007's order) -- not left to surface only once splitting has silently
+        # discarded the only piece there was.
         raise ApiError(400, "text_required", "text is required")
 
     # BC-09: a blank (or absent) instruction uses the default; a non-blank one is kept
-    # exactly as given, not stripped. Length and control characters are checked
-    # unconditionally, same order and same reason as `text` above, before deciding whether
-    # the value counts as blank -- an instruction over the limit is rejected as too long
-    # even when it's entirely whitespace.
+    # exactly as given, not stripped. DECISION (final review): unlike `text`, instruction
+    # keeps blank-before-length -- a whitespace-only instruction of any length still means
+    # the default, not "too long" -- but control characters still run before the blank
+    # check, same reason as `text` above.
     instruction_raw = _first(fields, "instruction")
     if instruction_raw is not None:
-        _check_length_then_control_characters(
-            instruction_raw, "instruction", MAX_INSTRUCTION_CHARS
-        )
-    instruction = (
-        DEFAULT_INSTRUCTION
-        if instruction_raw is None or not instruction_raw.strip()
-        else instruction_raw
-    )
+        _check_no_control_characters(instruction_raw, "instruction")  # BC-46
+    if instruction_raw is None or not instruction_raw.strip():
+        instruction = DEFAULT_INSTRUCTION
+    else:
+        if len(instruction_raw) > MAX_INSTRUCTION_CHARS:
+            raise ApiError(
+                400,
+                "invalid_field",
+                f"instruction must be at most {MAX_INSTRUCTION_CHARS:,} characters",
+            )
+        instruction = instruction_raw
 
     cfg_scale_raw = _first(fields, "cfg_scale")
     if cfg_scale_raw is None:
