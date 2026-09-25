@@ -229,7 +229,12 @@ is the client message type that caused it. The full code catalog is in
 
 ## Events (structured telemetry)
 
-JSON lines produced by `events.emit(name, **fields)`. The clock and output stream are injected.
+JSON lines produced by `Emitter(sink, clock).emit(name, *, level="info", **fields)`. The sink and
+clock are injected at construction (no module-level global emitter); `level` is one of `debug`,
+`info`, `warning`, `error`. A field that collides with a reserved key (`ts`, `event_schema`,
+`event`, `level`) or an invalid `level` raises `ValueError`; a field value that can't be
+serialised (NaN/inf, an unencodable type) does not raise — the line written is an
+`event.invalid` record instead, so one bad field never breaks the request emitting it.
 
 - Every request event carries `request_id`; WebSocket events also carry `session_id` and
   `piece_index`.
