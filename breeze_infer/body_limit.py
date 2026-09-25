@@ -17,10 +17,9 @@ points where an oversized body can be discovered:
 
 from __future__ import annotations
 
-from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from breeze_infer.errors import ApiError
+from breeze_infer.errors import ApiError, api_error_response
 from breeze_infer.limits import MAX_BODY_BYTES
 
 _STATUS = 413
@@ -39,17 +38,15 @@ def _content_length(scope: Scope) -> int | None:
 
 
 async def _reject_immediately(scope: Scope, receive: Receive, send: Send) -> None:
-    """Send the envelope directly: this runs before the wrapped app does.
+    """Send the envelope directly: this runs before the wrapped app does, so there's no installed
+    exception handler yet for anything to reach.
 
-    Built via `JSONResponse` (research.md R7) rather than hand-rolled headers and body, so the
-    bytes on the wire match the `ApiError` handler's 413 response exactly -- both 413 paths need
-    `Connection: close` (R8), and hand-rolling risks the two drifting apart.
+    Built via `errors.api_error_response` -- the same helper the `ApiError` exception handler
+    uses -- so this path and the one below (a body that grows past the limit mid-stream, raised
+    as `ApiError` from `counting_receive` and caught by that installed handler) produce
+    byte-for-byte identical responses.
     """
-    response = JSONResponse(
-        {"error": _MESSAGE, "code": _CODE},
-        status_code=_STATUS,
-        headers={"Connection": "close"},
-    )
+    response = api_error_response(ApiError(_STATUS, _CODE, _MESSAGE))
     await response(scope, receive, send)
 
 

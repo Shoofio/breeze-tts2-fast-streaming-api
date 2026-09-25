@@ -23,21 +23,12 @@ from fastapi.testclient import TestClient
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from breeze_infer.errors import ApiError, install_error_handlers
+from tests.fakes import RecordingEvents
 
 
-class _RecordingEvents:
-    """A small fake for the `events` argument: records every emitted event."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, object]]] = []
-
-    def emit(self, name: str, **fields: object) -> None:
-        self.calls.append((name, fields))
-
-
-def _app(events: _RecordingEvents | None = None) -> FastAPI:
+def _app(events: RecordingEvents | None = None) -> FastAPI:
     app = FastAPI()
-    install_error_handlers(app, events if events is not None else _RecordingEvents())
+    install_error_handlers(app, events if events is not None else RecordingEvents())
 
     @app.get("/boom")
     async def boom() -> None:
@@ -54,7 +45,7 @@ def _app(events: _RecordingEvents | None = None) -> FastAPI:
     return app
 
 
-def _client(events: _RecordingEvents | None = None) -> TestClient:
+def _client(events: RecordingEvents | None = None) -> TestClient:
     return TestClient(_app(events), raise_server_exceptions=False)
 
 
@@ -76,7 +67,7 @@ def test_bc_18_unhandled_exception_does_not_leak_the_exception_message() -> None
 
 def test_bc_18_unhandled_exception_emits_request_failed_with_a_request_id() -> None:
     """BC-18: unlike a C++ crash, a 500 here still has to leave an audit trail."""
-    events = _RecordingEvents()
+    events = RecordingEvents()
 
     _client(events).get("/boom")
 
@@ -131,17 +122,19 @@ def test_http_exception_detail_is_ignored_for_mapped_statuses() -> None:
     }
 
 
-def test_http_exception_with_unmapped_status_falls_back_to_internal_error() -> None:
-    # Only 400/404/405/413 have entries in the fixed table; this app never itself raises a bare
-    # `StarletteHTTPException` for any other status, but the handler still needs to do something
-    # sane for one, and it must not guess a message from `exc.detail`.
+def test_http_exception_with_unmapped_status_falls_back_to_a_500_internal_error() -> None:
+    # R4: only 400/404/405/413 have entries in the fixed table; this app never itself raises a
+    # bare `StarletteHTTPException` for any other status, but the handler still needs to do
+    # something sane for one. That's a genuine 500 (not the original status paired with
+    # `internal_error`) -- an uncovered status means something the contract doesn't otherwise
+    # produce is going on, which is exactly what `internal_error` means elsewhere in this module.
     app = _app()
     handler = app.exception_handlers[StarletteHTTPException]
     exc = StarletteHTTPException(status_code=401, detail="should not leak")
 
     response = asyncio.run(handler(None, exc))  # type: ignore[arg-type]
 
-    assert response.status_code == 401
+    assert response.status_code == 500
     assert json.loads(response.body) == {"error": "internal error", "code": "internal_error"}
 
 

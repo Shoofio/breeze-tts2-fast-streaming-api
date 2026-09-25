@@ -23,25 +23,23 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from breeze_infer.events import Emitter
 
 
-class ApiError(StarletteHTTPException):
+class ApiError(Exception):
     """An error whose body is the standard envelope: `{"error", "code"}`.
 
-    Subclasses Starlette's `HTTPException` (research.md R1) rather than plain `Exception`.
-    FastAPI's own body-parsing code (`fastapi/routing.py`, around the `request.form()`/
-    `request.json()` call it makes for `Form(...)`-typed parameters) catches `HTTPException`
-    and re-raises it unchanged, but wraps any *other* exception into a generic
-    `400 "There was an error parsing the body"`. Without this base class, an `ApiError` raised
-    from `counting_receive` (body_limit.py) while FastAPI parsed a `Form(...)` route's body got
-    silently rewrapped, turning a `413` into a `400`.
-
-    This doesn't hand the response to the generic `StarletteHTTPException` handler below:
-    Starlette looks up exception handlers by walking `type(exc).__mro__` and using the first
-    match (`starlette/_exception_handler.py:_lookup_exception_handler`), and `ApiError` itself
-    is registered first in that MRO, so the handler registered for `ApiError` still wins.
+    A plain `Exception`, not a Starlette `HTTPException`: this codebase never uses `Form(...)`
+    parameters (research.md R1 -- endpoints take `Request` and parse forms themselves), so there
+    is no FastAPI body-parsing code that would rewrap an exception raised mid-`request.form()`.
+    Subclassing `HTTPException` was tried and reverted: it makes `isinstance(exc, HTTPException)`
+    true, which routes an `ApiError` through Starlette's status-code handler lookup
+    (`status_handlers`, keyed by int, from `@app.exception_handler(<int>)`) *before* the
+    class-based lookup that finds this module's own `ApiError` handler -- a handler some other
+    part of the app registers for a bare status code could silently steal the response. Plain
+    `Exception` avoids that, and also keeps `str`/`repr` showing the message, not
+    `HTTPException`'s own `"<status>: <detail>"` form.
     """
 
     def __init__(self, status: int, code: str, message: str) -> None:
-        super().__init__(status_code=status, detail=message)
+        super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
@@ -51,22 +49,33 @@ def _envelope(message: str, code: str) -> dict[str, str]:
     return {"error": message, "code": code}
 
 
+def api_error_response(exc: ApiError) -> JSONResponse:
+    """Build the one response shape every `ApiError` produces.
+
+    Shared by the `ApiError` exception handler below and `body_limit.py`'s immediate-rejection
+    path (which runs before the app does, so no exception handler is installed yet to catch
+    anything raised there) -- both 413s the body-limit middleware can produce must be
+    byte-for-byte the same response, and building them from one place is how that's kept true
+    rather than merely asserted.
+    """
+    return JSONResponse(_envelope(exc.message, exc.code), status_code=exc.status)
+
+
 # A fixed status -> (code, message) table for bare `StarletteHTTPException`s -- i.e. ones this
 # codebase never raises itself (`ApiError` is used instead): no matching route, wrong method,
 # and Starlette's own multipart limits (`starlette/requests.py`, raised as
 # `HTTPException(400, detail=...)` for too many files/fields, an oversized part, or a missing
 # boundary). `exc.detail` is intentionally never surfaced for a mapped status: it can be
 # Starlette's own internal wording, which isn't this API's documented message, and for the
-# generic-phrase case (no detail given) there's nothing informative in it anyway. Anything not
-# in the table is a status this contract doesn't otherwise produce; it gets a generic 500-style
-# envelope rather than guessing at a message from `exc.detail`.
+# generic-phrase case (no detail given) there's nothing informative in it anyway. A status not
+# in the table is one this contract doesn't otherwise produce; it falls back to a genuine
+# `500 internal_error` rather than pairing the unmapped status with a guessed message.
 _HTTP_EXCEPTION_RESPONSES: dict[int, tuple[str, str]] = {
     400: ("invalid_field", "could not parse the request body"),
     404: ("not_found", "not found"),
     405: ("method_not_allowed", "method not allowed"),
     413: ("payload_too_large", "request body is too large"),
 }
-_FALLBACK_CODE_AND_MESSAGE = ("internal_error", "internal error")
 
 
 def install_error_handlers(app: FastAPI, events: Emitter) -> None:
@@ -80,19 +89,19 @@ def install_error_handlers(app: FastAPI, events: Emitter) -> None:
         # (never `ApiError`), each carrying whatever `headers` the raiser set -- e.g. a 405's
         # `Allow` header -- which must reach the client. `exc.detail` is not: see
         # `_HTTP_EXCEPTION_RESPONSES` above.
-        code, message = _HTTP_EXCEPTION_RESPONSES.get(exc.status_code, _FALLBACK_CODE_AND_MESSAGE)
+        mapped = _HTTP_EXCEPTION_RESPONSES.get(exc.status_code)
+        if mapped is None:
+            return JSONResponse(
+                _envelope("internal error", "internal_error"), status_code=500, headers=exc.headers
+            )
+        code, message = mapped
         return JSONResponse(
             _envelope(message, code), status_code=exc.status_code, headers=exc.headers
         )
 
     @app.exception_handler(ApiError)
     async def _api_error_handler(_: Request, exc: ApiError) -> JSONResponse:
-        # R8: a 413 closes the connection, matching body_limit.py's immediate-rejection path
-        # (the client is mid-upload; the server isn't going to read and discard the rest).
-        headers = {"Connection": "close"} if exc.status == 413 else None
-        return JSONResponse(
-            _envelope(exc.message, exc.code), status_code=exc.status, headers=headers
-        )
+        return api_error_response(exc)
 
     @app.exception_handler(FormParserError)
     async def _form_parser_error_handler(
