@@ -4,7 +4,7 @@ Table-driven tests for the malformed corpus (bad numbers, ranges, duplicates, co
 characters) arrive with T044/T048; this file only checks that valid input parses to the
 defaults and values the contract promises, and that the handful of rules T037 already
 owns (BC-02 empty-means-absent, BC-09 blank instruction, BC-10 required text, FR-006's
-`0` -> `None`) hold.
+`0` -> `None`) hold, plus the T037 review 1 findings listed below `# --- review 1 findings`.
 
 A tiny FastAPI app drives `read_fields` through a real `Request`, exercising both
 `multipart/form-data` (with a real file part for `ref_audio`) and
@@ -16,17 +16,20 @@ hand and skipping that parsing entirely.
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+from breeze_infer import http_fields
 from breeze_infer.errors import install_error_handlers
 from breeze_infer.http_fields import (
     DEFAULT_CFG_SCALE,
     DEFAULT_INSTRUCTION,
     DEFAULT_SEED,
+    FORM_MAX_PART_SIZE,
     InlineRef,
     NoReference,
     ReferenceSpec,
@@ -35,6 +38,7 @@ from breeze_infer.http_fields import (
     parse_speech,
     read_fields,
 )
+from breeze_infer.limits import MAX_TEXT_CHARS
 from breeze_infer.settings import Settings, settings_from_args
 from tests.fakes import RecordingEvents
 
@@ -326,3 +330,243 @@ def test_ref_text_alone_gets_reference_required(tmp_path: Path) -> None:
         "error": "ref_text needs ref_audio or voice_id",
         "code": "reference_required",
     }
+
+
+# --- review 1 findings ---------------------------------------------------------------
+
+
+def _multipart_body(fields: dict[str, bytes]) -> tuple[bytes, str]:
+    """A hand-built `multipart/form-data` body with raw byte field values -- so a test can
+    send bytes httpx's own multipart encoder would never produce (invalid UTF-8), the same
+    way `tests/test_body_limit.py`'s `_oversize_multipart_body` does."""
+    boundary = "xxxxBOUNDARYxxxx"
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'.encode("ascii")
+        + value
+        + b"\r\n"
+        for name, value in fields.items()
+    ]
+    body = b"".join(parts) + f"--{boundary}--\r\n".encode("ascii")
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+# finding #1 (HIGH): a file part under any field name other than ref_audio is rejected.
+
+
+@pytest.mark.parametrize(
+    "field", ["text", "instruction", "voice_id", "ref_text", "seed"]
+)
+def test_file_part_under_a_text_field_name_gets_400(tmp_path: Path, field: str) -> None:
+    response = _client(tmp_path).post(
+        "/speech",
+        data={"text": "hi"} if field != "text" else {},
+        files={field: ("f.txt", b"not text", "text/plain")},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": f"{field} must be a text field",
+        "code": "invalid_field",
+    }
+
+
+# finding #2: a string ref_audio (form field or query string) is rejected.
+
+
+def test_ref_audio_as_a_multipart_text_field_gets_400(tmp_path: Path) -> None:
+    body, content_type = _multipart_body({"text": b"hi", "ref_audio": b"not a file"})
+
+    response = _client(tmp_path).post(
+        "/speech", content=body, headers={"content-type": content_type}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio must be a file part",
+        "code": "invalid_field",
+    }
+
+
+def test_ref_audio_as_a_urlencoded_field_gets_400(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "ref_audio": "not a file"}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio must be a file part",
+        "code": "invalid_field",
+    }
+
+
+def test_ref_audio_in_the_query_string_gets_400(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi"}, params={"ref_audio": "not a file"}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio must be a file part",
+        "code": "invalid_field",
+    }
+
+
+# finding #3: FORM_MAX_PART_SIZE is derived so a full-length CJK/emoji text field's
+# percent-encoded urlencoded form fits.
+
+
+def test_form_max_part_size_is_derived_from_max_text_chars() -> None:
+    assert FORM_MAX_PART_SIZE == MAX_TEXT_CHARS * 12
+
+
+def test_a_full_length_four_byte_char_text_field_fits_urlencoded(tmp_path: Path) -> None:
+    # "🎉" is a 4-byte UTF-8 code point; percent-encoded it's exactly 12 ASCII bytes
+    # ("%XX" x 4), so MAX_TEXT_CHARS of them is exactly at FORM_MAX_PART_SIZE.
+    text = "\U0001f389" * MAX_TEXT_CHARS
+    encoded_value = quote(text, safe="")
+    assert len(encoded_value) == FORM_MAX_PART_SIZE
+    body = f"text={encoded_value}".encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["text"] == text
+
+
+def test_an_oversize_urlencoded_value_gets_400(tmp_path: Path) -> None:
+    encoded_value = quote("a" * (FORM_MAX_PART_SIZE + 1), safe="")
+    body = f"text={encoded_value}".encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+
+
+# finding #4: strict UTF-8, for both content types, plus a declared non-UTF-8 multipart
+# charset.
+
+
+def test_valid_cjk_text_round_trips_urlencoded(tmp_path: Path) -> None:
+    response = _client(tmp_path).post("/speech", data={"text": "你好"})
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "你好"
+
+
+def test_valid_cjk_text_round_trips_multipart(tmp_path: Path) -> None:
+    body, content_type = _multipart_body({"text": "你好".encode()})
+
+    response = _client(tmp_path).post(
+        "/speech", content=body, headers={"content-type": content_type}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "你好"
+
+
+def test_invalid_utf8_urlencoded_value_gets_400(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech",
+        content=b"text=%FF%FE",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "text must be UTF-8 text", "code": "invalid_field"}
+
+
+def test_invalid_utf8_multipart_value_gets_400(tmp_path: Path) -> None:
+    body, content_type = _multipart_body({"text": b"\xff\xfe"})
+
+    response = _client(tmp_path).post(
+        "/speech", content=body, headers={"content-type": content_type}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "text must be UTF-8 text", "code": "invalid_field"}
+
+
+def test_multipart_declaring_a_non_utf8_charset_gets_400(tmp_path: Path) -> None:
+    boundary = "xxxxBOUNDARYxxxx"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="text"\r\n\r\n'
+        "hi"
+        f"\r\n--{boundary}--\r\n"
+    ).encode("ascii")
+    content_type = f"multipart/form-data; boundary={boundary}; charset=iso-8859-1"
+
+    response = _client(tmp_path).post(
+        "/speech", content=body, headers={"content-type": content_type}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "text must be UTF-8 text", "code": "invalid_field"}
+
+
+# finding #5/#6: the form and its UploadFile are closed after reading, and ref_audio is
+# read bounded to MAX_AUDIO_BYTES + 1.
+
+
+def test_ref_audio_read_is_bounded_to_max_audio_bytes_plus_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(http_fields, "MAX_AUDIO_BYTES", 10)
+
+    response = _client(tmp_path).post(
+        "/speech",
+        data={"text": "hi", "ref_text": "hello"},
+        files={"ref_audio": ("ref.wav", b"x" * 100, "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    audio_bytes = response.json()["reference"]["audio_bytes"]
+    assert len(audio_bytes) == 11  # MAX_AUDIO_BYTES (patched to 10) + 1
+
+
+# finding #7: an unsupported content type with a body is rejected; query-only still works.
+
+
+def test_unsupported_content_type_with_a_body_gets_400(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech", content=b'{"text": "hi"}', headers={"content-type": "application/json"}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "unsupported content type",
+        "code": "invalid_field",
+    }
+
+
+def test_query_only_request_with_no_body_still_works(tmp_path: Path) -> None:
+    response = _client(tmp_path).post("/speech", params={"text": "hi"})
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "hi"
+
+
+# finding #9: _optional_number's TypeVar keeps int/float sampling fields distinct -- a
+# type-checker concern, verified here only by the existing zero-means-default tests still
+# passing for both an int field (top_k) and a float field (temperature).
+
+
+# finding #10: form values take precedence over query values (no duplicate check yet).
+
+
+def test_form_value_takes_precedence_over_query_value(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "seed": "111"}, params={"seed": "222"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["seed"] == 111

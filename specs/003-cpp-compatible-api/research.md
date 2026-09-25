@@ -117,8 +117,20 @@ frees a socket whose peer vanished, and it was the only mechanism that did so in
 - **Body limit:** a pure-ASGI `BodyLimitMiddleware` rejects up front using `Content-Length`, then
   wraps `receive` to count bytes. It returns `413` with the envelope above **26 MiB** (25 MiB audio
   plus room for fields).
-- **Form parsing:** endpoints call
-  `request.form(max_files=1, max_fields=32, max_part_size=64 KiB)`.
+- **Form parsing:** `breeze_infer/http_fields.py`'s `read_fields` parses the body itself rather
+  than calling `request.form()` (T037 review 1): Starlette's own parser is silently lossy on
+  invalid UTF-8 (its urlencoded parser calls `unquote_plus` with the default `errors="replace"`,
+  and its multipart parser's `_user_safe_decode` falls back to latin-1 on a decode failure), so
+  neither path can tell a corrupt body from a valid one. `multipart/form-data` goes through
+  `_StrictMultiPartParser`, a subclass overriding only the one callback that decodes a text part,
+  with `errors="strict"` and the declared charset pinned to `utf-8`;
+  `application/x-www-form-urlencoded` is hand-parsed with `urllib.parse.unquote_plus(...,
+  errors="strict")`. Limits: `max_files=1`, `max_fields=32`,
+  `max_part_size = MAX_TEXT_CHARS * 12 = 120,000` bytes -- derived, not copied from this
+  document's earlier 64 KiB example: a 4-byte UTF-8 code point (an emoji, or a CJK Extension-B
+  character) percent-encodes to 12 ASCII bytes (`%XX` x 4), so `MAX_TEXT_CHARS` (10,000) of them
+  needs up to 120,000 bytes on the wire. At 64 KiB that text would have been cut off as a generic
+  parser error before the field-level length check (T048's `text_too_long`) ever got to run.
 - **Duplicates:** a field is a duplicate when `getlist(k)` has more than one value in the form or
   the query string, or when the same key appears in both (`400 duplicate_field`).
 - **Parser errors:** python-multipart's `FormParserError` maps to `400`. Without that mapping it
