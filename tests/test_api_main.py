@@ -32,7 +32,13 @@ from breeze_infer.api import (
     serve,
 )
 from breeze_infer.events import Emitter
-from breeze_infer.gpu import GpuGate, GpuSession, GpuThread, report_close_failed
+from breeze_infer.gpu import (
+    GpuGate,
+    GpuSession,
+    GpuThread,
+    GpuUnavailable,
+    report_close_failed,
+)
 from breeze_infer.limits import MAX_BODY_BYTES, TCP_USER_TIMEOUT_MS
 from breeze_infer.model_loading import LoadedModel
 from breeze_infer.routes_health import Readiness
@@ -377,7 +383,7 @@ def test_serve_loads_in_the_background_then_stops_cleanly_on_sigterm() -> None:
     assert loaded["device"] == "cpu"
     with pytest.raises(RuntimeError):  # serve() shut the GPU thread down
         asyncio.run(components.gpu.run(lambda: None))
-    with pytest.raises(RuntimeError):  # and the CPU tokenizer's executor
+    with pytest.raises(GpuUnavailable):  # and the CPU tokenizer's executor, which answers 503
         asyncio.run(components.cpu_tokenizer.run(lambda _tokenizer: None))
 
 

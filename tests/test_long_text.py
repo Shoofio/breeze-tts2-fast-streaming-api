@@ -12,7 +12,9 @@ from the runtime's `inputs` themselves (the anchor's codes can, from `input_valu
 
 from __future__ import annotations
 
+import asyncio
 import threading
+import time
 from collections.abc import Iterator
 from typing import Any
 
@@ -22,7 +24,7 @@ import torch
 
 from breeze_infer import routes_speech
 from breeze_infer.api import Components, create_app
-from breeze_infer.gpu import GpuGate
+from breeze_infer.gpu import GpuGate, GpuUnavailable
 from breeze_infer.limits import ANCHOR_CHARS
 from breeze_infer.routes_health import Readiness
 from breeze_infer.synthesis import CodesRef, NoRef, anchor_codes, prepare_piece
@@ -194,12 +196,13 @@ def test_later_pieces_are_prepared_one_at_a_time_as_the_stream_reaches_them(
     assert started_before == [(text, index) for index, text in enumerate(pieces)]
 
 
-def test_later_pieces_are_sized_before_the_gate_on_the_cpu_executor(
+def test_later_pieces_are_sized_after_the_lease_on_the_cpu_executor(
     envs: list[Env], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The anchor decision needs every later piece's length. Those are measured once, on the
-    CPU copy's own thread and before the gate is taken, not on the GPU thread between
-    piece 0 and piece 1."""
+    CPU copy's own thread, and -- since review #2 on 2d9070a moved it -- only after the lease
+    is taken, not before the busy check: a long no-reference request must not hold the one
+    shared CPU executor for the whole text while it is still about to get a `409`."""
     runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(6), _frame(7)])
     env = _env(envs, runtime, split_chars=100)
     sized: list[tuple[str, bool, list[str]]] = []
@@ -221,8 +224,62 @@ def test_later_pieces_are_sized_before_the_gate_on_the_cpu_executor(
     assert response.status_code == 200
     [(thread, gate_free, later)] = sized
     assert thread.startswith("breeze-cpu-tokenizer")
-    assert gate_free  # before the gate: a busy server still answers 400s first
+    assert not gate_free  # after the lease: this request's own lease still holds it
     assert later == pieces[1:]
+
+
+def test_a_busy_request_never_sizes_the_later_pieces(
+    envs: list[Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request that gets `409 busy` never reaches `_start_anchor_sizing` at all (review #2
+    on 2d9070a): the lease it would have been queued under is never acquired."""
+    runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(6), _frame(7)])
+    env = _env(envs, runtime, split_chars=100)
+    sized: list[Any] = []
+    real_sizing = routes_speech.anchor_sizing
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        sized.append(args)
+        return real_sizing(*args, **kwargs)
+
+    monkeypatch.setattr(routes_speech, "anchor_sizing", spy)
+    lease = env.components.gate.try_acquire()
+    assert lease is not None
+
+    response = env.speak(text=SENTENCES)
+
+    assert response.status_code == 409
+    assert sized == []
+
+
+def test_the_anchor_decision_waits_for_a_slow_sizing_result(
+    envs: list[Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Queuing the sizing right after the lease (review #2 on 2d9070a) lets it run on the CPU
+    while piece 0 itself prepares and generates on the GPU thread -- but if it is still
+    running once piece 0 finishes, `_anchor_for_later_pieces` must block for the real result
+    rather than press on without it. Proven with an artificially slow `anchor_sizing`: the
+    request still completes, correctly anchored, and takes at least as long as the delay."""
+    runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(6), _frame(7)])
+    env = _env(envs, runtime, split_chars=100)
+    real_sizing = routes_speech.anchor_sizing
+    delay_seconds = 0.2
+
+    def slow_sizing(sizing_runtime, tokenizer, anchor_text, later_texts, instruction, cfg_scale):
+        time.sleep(delay_seconds)
+        return real_sizing(
+            sizing_runtime, tokenizer, anchor_text, later_texts, instruction, cfg_scale
+        )
+
+    monkeypatch.setattr(routes_speech, "anchor_sizing", slow_sizing)
+
+    started = time.monotonic()
+    response = env.speak(text=SENTENCES)
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 200
+    assert elapsed >= delay_seconds  # the anchor decision actually waited for the real result
+    assert _events(env.events, "speech.anchor_skipped") == []
 
 
 class _CallRecordingTokenizer(FakeTokenizer):
@@ -449,42 +506,89 @@ SHORT_THEN_LONG = "Short one. " + " ".join(
 )
 
 
-def test_partial_room_clamps_and_emits_piece_clamped(envs: list[Env]) -> None:
-    """FR-036a: piece 1 has room to start but less than its cap, with the anchor and without
-    it, so the anchor is kept (a piece clamped either way doesn't count against it). It is
-    generated up to the room, ends normally, and the server records `speech.piece_clamped`
-    with the client's `requested`, the server's `cap` and the `room`."""
-    frames = [_frame(n) for n in range(1, 41)]
+def test_an_anchor_clamped_more_than_without_it_is_skipped(envs: list[Env]) -> None:
+    """The broader `no_room` rule (decided with the user, 2026-09-25): piece 1 already has
+    less than its cap *without* the anchor -- its own long sentence fills most of the
+    context -- and the anchor would leave it with even less room, not the same. The old
+    rule only compared an anchored room to the cap, so a piece already clamped without the
+    anchor never even entered the comparison; it would have kept the anchor here and let it
+    shrink an already-clamped piece further. Now the anchor is skipped
+    (`speech.anchor_skipped`, `no_room`), and every later piece is generated -- and clamped
+    -- at the room it has without the anchor, exactly as `speech.piece_clamped` records it.
+
+    `chunks` (the fake's own natural completion length, decoupled here from the anchor's own
+    4 frames -- `FakeRuntime` only ever observes as many real frames as `frames` holds,
+    whatever `chunks` is) is picked comfortably above every room below, so it is the room,
+    not the fake just running out of frames on its own, that actually clamps each piece.
+    """
+    frames = [_frame(n) for n in range(1, 5)]
     pieces = _no_reference_pieces(SHORT_THEN_LONG, 100)
     assert pieces[0] == "Short one." and len(pieces) == 5
     anchor = CodesRef(codes=torch.stack(frames), ref_text=pieces[0])
-    room = 30
-    max_seq_len = _seq_len(anchor, pieces[1]) + 1 + room
+    room_with_anchor = 15
+    max_seq_len = _seq_len(anchor, pieces[1]) + 1 + room_with_anchor
     room_without_anchor = max_seq_len - _seq_len(NoRef(), pieces[1]) - 1
-    cap = room_without_anchor + 1  # clamped without the anchor too
-    # Piece 0's prompt is much shorter, so it keeps its full cap; only later pieces clamp.
-    assert max_seq_len - _seq_len(NoRef(), pieces[0]) - 1 >= cap
+    assert room_without_anchor > room_with_anchor  # shorter with the anchor, not the same
+    chunks = 300
     runtime = _fake_runtime(
-        chunks=40, frames=frames, config=FakeStreamingConfig(max_seq_len=max_seq_len)
+        chunks=chunks, frames=frames, config=FakeStreamingConfig(max_seq_len=max_seq_len)
     )
     env = _env(envs, runtime, split_chars=100)
 
-    response = env.speak(text=SHORT_THEN_LONG, max_new_tokens=str(cap))
+    response = env.speak(text=SHORT_THEN_LONG)
 
     assert response.status_code == 200
-    assert _events(env.events, "speech.anchor_skipped") == []
-    clamped = _events(env.events, "speech.piece_clamped")
-    assert [(e["piece_index"], e["requested"], e["cap"], e["room"]) for e in clamped] == [
-        (index, cap, cap, room) for index in range(1, len(pieces))
-    ]
-    assert clamped[0]["request_id"] == response.headers["x-request-id"]
-    assert runtime.calls[0]["max_new_tokens"] == cap
-    assert runtime.calls[1]["max_new_tokens"] == room
-    assert runtime.calls[1]["inputs"]["input_values"] is not None  # anchored
+    [skipped] = _events(env.events, "speech.anchor_skipped")
+    assert skipped["reason"] == "no_room"
+    clamped = {e["piece_index"]: e for e in _events(env.events, "speech.piece_clamped")}
+    for index in range(1, len(pieces)):
+        assert clamped[index]["room"] == room_without_anchor
+    assert clamped[1]["request_id"] == response.headers["x-request-id"]
+    assert runtime.calls[1]["max_new_tokens"] == room_without_anchor
+    assert runtime.calls[1]["inputs"]["input_values"] is None  # not anchored
     done = {e["piece_index"]: e["frames"] for e in _events(env.events, "speech.piece_done")}
-    assert done[0] == 40
-    assert done[1] == room
+    for index in range(1, len(pieces)):
+        assert done[index] == room_without_anchor
     assert len(_events(env.events, "speech.completed")) == 1
+
+
+def test_an_anchor_that_would_leave_an_already_clamped_piece_no_room_is_skipped(
+    envs: list[Env],
+) -> None:
+    """The gap the old floor missed (decided with the user, 2026-09-25): piece 1 is already
+    clamped to a small room *without* the anchor; the anchor's own frames would use up the
+    rest of the context, leaving it zero or less. The old rule never compared this piece's
+    anchored room to anything -- it only checked pieces that had their full cap without the
+    anchor -- so it would have kept the anchor, driven piece 1's room to zero or below, and
+    (BC-47) aborted the stream after the `200` instead of completing it.
+    """
+    frames = [_frame(n) for n in range(1, 5)]
+    pieces = _no_reference_pieces(SHORT_THEN_LONG, 100)
+    assert pieces[0] == "Short one." and len(pieces) == 5
+    anchor = CodesRef(codes=torch.stack(frames), ref_text=pieces[0])
+    room_without_anchor = 5
+    max_seq_len = _seq_len(NoRef(), pieces[1]) + 1 + room_without_anchor
+    room_with_anchor = max_seq_len - _seq_len(anchor, pieces[1]) - 1
+    assert room_with_anchor <= 0  # the anchor's own frames use up the rest of the context
+    chunks = 300  # comfortably above room_without_anchor, so room -- not the fake's own
+    # natural completion -- is what clamps piece 1 (see the other test's own docstring).
+    runtime = _fake_runtime(
+        chunks=chunks, frames=frames, config=FakeStreamingConfig(max_seq_len=max_seq_len)
+    )
+    env = _env(envs, runtime, split_chars=100)
+
+    response = env.speak(text=SHORT_THEN_LONG)
+
+    assert response.status_code == 200
+    [skipped] = _events(env.events, "speech.anchor_skipped")
+    assert skipped["reason"] == "no_room"
+    clamped = {e["piece_index"]: e["room"] for e in _events(env.events, "speech.piece_clamped")}
+    for index in range(1, len(pieces)):
+        assert clamped[index] == room_without_anchor
+    assert runtime.calls[1]["max_new_tokens"] == room_without_anchor
+    assert runtime.calls[1]["inputs"]["input_values"] is None  # not anchored
+    assert len(_events(env.events, "speech.completed")) == 1
+    assert _events(env.events, "speech.failed") == []
 
 
 # --- when piece 0 is not used as the anchor (review 26b #2, #4) --------------------------------
@@ -573,3 +677,67 @@ def test_split_chars_below_the_opening_budget_does_not_make_piece_0_the_largest(
     assert len(lengths) > 2
     assert lengths[0] <= 100
     assert lengths[0] <= max(lengths[1:])
+
+
+# --- CpuTokenizer shutdown races (review #3 on 2d9070a) ---------------------------------------
+#
+# Direct unit tests against `routes_speech.CpuTokenizer` itself, not through the HTTP route:
+# `api._drain_gpu` cancels every request it already knows about before calling `shutdown()`, so
+# reaching this race through a live request would need timing this precise anyway.
+
+
+def test_cpu_tokenizer_run_after_shutdown_raises_gpu_unavailable() -> None:
+    """A call arriving after `shutdown()` hits `ThreadPoolExecutor`'s own `RuntimeError`
+    ("cannot schedule new futures after shutdown"), mapped to the same `GpuUnavailable` a
+    poisoned gate answers with (`503 gpu_unavailable`) -- not left to surface as a `500`."""
+    tokenizer = routes_speech.CpuTokenizer()
+    tokenizer.install(object())
+    tokenizer.shutdown()
+
+    with pytest.raises(GpuUnavailable):
+        asyncio.run(tokenizer.run(lambda _tokenizer: None))
+
+
+def test_cpu_tokenizer_submit_after_shutdown_raises_gpu_unavailable() -> None:
+    """`submit` (the GPU thread's own entry point, `_start_anchor_sizing`) maps the same
+    executor `RuntimeError` the same way, even though nothing here is `await`ed."""
+    tokenizer = routes_speech.CpuTokenizer()
+    tokenizer.install(object())
+    tokenizer.shutdown()
+
+    with pytest.raises(GpuUnavailable):
+        tokenizer.submit(lambda _tokenizer: None)
+
+
+def test_cpu_tokenizer_run_queued_call_cancelled_by_shutdown_raises_gpu_unavailable() -> None:
+    """A call still queued -- behind another one already running, since the executor has one
+    worker -- when `shutdown(cancel_futures=True)` runs is cancelled. Told apart from a real
+    cancellation of the awaiting task by its own cancel count staying at zero (confirmed
+    directly below), it is mapped to the same `GpuUnavailable`, not left to surface as a bare
+    `asyncio.CancelledError` indistinguishable from a client disconnect."""
+    tokenizer = routes_speech.CpuTokenizer()
+    tokenizer.install(object())
+    running = threading.Event()
+    release = threading.Event()
+
+    def block(_tokenizer: Any) -> None:
+        running.set()
+        release.wait(timeout=5)
+
+    async def scenario() -> None:
+        first = asyncio.ensure_future(tokenizer.run(block))
+        await asyncio.to_thread(running.wait, 5)
+        task = asyncio.current_task()
+        assert task is not None
+        cancelling_before = task.cancelling()
+        # The executor's one worker is now busy with `first`; this second call queues.
+        second = asyncio.ensure_future(tokenizer.run(lambda _tokenizer: None))
+        await asyncio.sleep(0)  # let `second` reach `self._executor.submit(...)` and queue
+        tokenizer.shutdown()  # cancels `second` while it is still queued, not yet running
+        release.set()
+        await first
+        with pytest.raises(GpuUnavailable):
+            await second
+        assert task.cancelling() == cancelling_before  # never itself cancelled
+
+    asyncio.run(scenario())

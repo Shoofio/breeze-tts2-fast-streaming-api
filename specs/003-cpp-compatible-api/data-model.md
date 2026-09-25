@@ -141,15 +141,15 @@ frame. It never happens on cancel, on failure, or when piece 0 produced zero fra
 skipped, with `speech.anchor_skipped` (`piece_index` 0, `reason`), when:
 - `piece_truncated`: piece 0 used its whole frame limit (its cap or its room), so it stopped
   there rather than at EOS;
-- `no_room`: some later piece would get less room than its cap with the anchor as its reference,
-  while it would get its full cap without it. A piece whose room is below its cap either way
-  doesn't count: it is clamped whatever piece 0 does. The anchor is never trimmed to fit: its
-  codes must stay paired with its text.
+- `no_room`: any later piece would end up with a smaller effective frame limit --
+  `min(cap, room)` -- with the anchor than without it, whether or not either room already
+  clamped it below its cap (decided with the user, 2026-09-25). The anchor is never trimmed
+  to fit: its codes must stay paired with its text.
   Every later piece's prompt length without an anchor, and what the anchor's text and each of
-  its frames add, are measured on the CPU before the GPU gate is taken; no prompt is kept. Once
-  piece 0 has finished, and before piece 1 starts, the decision is arithmetic on those lengths
-  plus the anchor's frame count, with each room taken from the runtime (CFG rows and prefill
-  bucket padding included).
+  its frames add, are measured on the CPU right after the GPU gate is taken, alongside piece 0's
+  own preparation and generation on the GPU thread; no prompt is kept. Once piece 0 has finished,
+  and before piece 1 starts, the decision is arithmetic on those lengths plus the anchor's frame
+  count, with each room taken from the runtime (CFG rows and prefill bucket padding included).
 
 A skipped anchor leaves the later pieces as voice design.
 

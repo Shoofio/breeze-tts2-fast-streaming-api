@@ -25,10 +25,12 @@ actual verification that no such device/stream mismatch exists in practice.
 
 from __future__ import annotations
 
+import copy
 import os
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -71,11 +73,35 @@ TERMINAL_EVENTS = ("speech.completed", "speech.aborted", "speech.failed")
 EVENT_POLL_TIMEOUT_SECONDS = 5.0
 
 
+_cpu_tokenizer_copy: Any = None
+
+
+def _shared_cpu_tokenizer_copy(runtime: Any) -> Any:
+    """One `copy.deepcopy(runtime.tokenizer)` for the whole test session (review 32,
+    review-of-2d9070a #7 in the same pass), not one per `_components` call.
+
+    `LoadedModel.from_runtime` makes a fresh copy every time -- deliberately, in production,
+    where it runs once before the server ever reports ready (its own docstring: "a deep copy
+    of a real one can take hundreds of ms"). Here, every GPU test in this session shares the
+    same session-scoped, already-warmed `gpu_env.runtime`, whose tokenizer never changes
+    underneath it, and `_components` is called once per test -- `test_speech_long_text.py`'s
+    own multi-run test even calls it once per run -- so repeating that deep copy each time
+    only adds test wall-clock for no safety benefit: `CpuTokenizer` docstring's "one thread at
+    a time" rule is about concurrent use, not object identity, and these tests never run two
+    GPU tests at once.
+    """
+    global _cpu_tokenizer_copy
+    if _cpu_tokenizer_copy is None:
+        _cpu_tokenizer_copy = copy.deepcopy(runtime.tokenizer)
+    return _cpu_tokenizer_copy
+
+
 def _components(gpu_env) -> tuple[Components, RecordingEvents]:
     # The model directory is never opened here (nothing loads through Settings): the
     # components are marked ready with `gpu_env.runtime` by the same step the server's own
     # load ends with (`Components.mark_ready`), which also installs the speech route's CPU
-    # tokenizer copy, made here as `model_loading.load_model` makes it.
+    # tokenizer copy -- the session-shared one above, not a fresh `LoadedModel.from_runtime`
+    # copy per call.
     events = RecordingEvents()
     device = resolve_device()
     components = Components(
@@ -87,7 +113,13 @@ def _components(gpu_env) -> tuple[Components, RecordingEvents]:
         ws_port=lambda: 0,
         cpu_tokenizer=CpuTokenizer(),
     )
-    components.mark_ready(LoadedModel.from_runtime(gpu_env.runtime, {}))
+    components.mark_ready(
+        LoadedModel(
+            runtime=gpu_env.runtime,
+            report={},
+            cpu_tokenizer=_shared_cpu_tokenizer_copy(gpu_env.runtime),
+        )
+    )
     return components, events
 
 
@@ -98,8 +130,13 @@ def speech_app(gpu_env) -> Iterator[tuple[TestClient, RecordingEvents]]:
     try:
         yield client, events
     finally:
-        components.gpu.shutdown()
-        components.cpu_tokenizer.shutdown()
+        # Nested, not sequential (review 32, review-of-2d9070a #4/#7 in the same pass): a
+        # `gpu.shutdown()` failure must not leave the CPU tokenizer's own executor running
+        # past the test.
+        try:
+            components.gpu.shutdown()
+        finally:
+            components.cpu_tokenizer.shutdown()
 
 
 def _pcm_stats(body: bytes) -> tuple[int, bool]:

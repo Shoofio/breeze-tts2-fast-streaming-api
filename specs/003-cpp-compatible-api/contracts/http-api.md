@@ -114,8 +114,8 @@ Long text is split with the shared segmenter, using `budget = split_chars`.
   that is smaller). Its generated audio and text then become the reference for every later
   piece. Anchoring is skipped, and the later pieces stay voice design, when the first piece was
   truncated (it stopped at its token cap or room, not at its natural end), or when the anchor
-  would cut a later piece below its token cap while that piece would get its full cap without it
-  (a piece limited by the context either way doesn't count).
+  would leave any later piece a smaller effective frame limit than it would have without the
+  anchor.
 - Piece `i` is generated with seed `(seed + i) mod 2^32`.
 
 ### `200` response

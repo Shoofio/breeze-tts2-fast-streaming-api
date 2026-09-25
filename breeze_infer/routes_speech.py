@@ -21,13 +21,16 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
    the stub lookup);
 5. an `InlineRef`'s bytes are decoded (`reference_audio.decode`) on a worker thread
    (`asyncio.to_thread`), never the event loop -- libsndfile's decode is blocking CPU work;
-5a. piece 0's room is checked on the CPU, on the CPU tokenizer's own thread (`_size_pieces`:
+5a. piece 0's room is checked on the CPU, on the CPU tokenizer's own thread (`_size_first_piece`:
    its tokenized text plus the reference's *predicted* frames), so "no room" is a `400
-   text_too_long` even while the GPU is busy -- the "first piece has no room" half of BC-47.
-   With no reference, the same step measures every later piece's prompt length for the anchor
-   decision after piece 0 (`_anchor_for_later_pieces`), which is then arithmetic;
+   text_too_long` even while the GPU is busy -- the "first piece has no room" half of BC-47;
 6. `gate.try_acquire()`, else `409 busy` -- or `GpuUnavailable` if the gate is poisoned,
    which propagates past this route to `errors.py`'s own handler (`503 gpu_unavailable`);
+6a. with no reference and more than one piece, every later piece's prompt length is queued
+   on the CPU tokenizer's executor right after the lease (`_start_anchor_sizing`), not before
+   the busy check (review #2 on 2d9070a): it runs on the CPU while piece 0 itself prepares and
+   generates on the `GpuThread` below, and `_anchor_for_later_pieces` only blocks on the result
+   once piece 0 has actually finished, by which point it has usually already;
 7. reference resolution and piece 0's preparation run on the `GpuThread` (`synthesis.py`),
    each awaited through `asyncio.shield` (finding 7): a cancelled or failed request must not
    release the lease while that GPU-thread call is still actually running -- the executor is
@@ -69,7 +72,8 @@ itself since no `SpeechResponse` is ever built for it.
 # same, for the same reason).
 import asyncio
 from collections.abc import AsyncGenerator, Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError as FutureCancelledError
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Annotated, Any, Protocol, TypeVar
 
 from fastapi import Depends, FastAPI, Request
@@ -84,6 +88,7 @@ from breeze_infer.gpu import (
     GpuGate,
     GpuSession,
     GpuThread,
+    GpuUnavailable,
     report_close_failed,
 )
 from breeze_infer.http_fields import (
@@ -123,23 +128,29 @@ from models.fast_streaming import NoRoomError
 _T = TypeVar("_T")
 
 
+_SHUTDOWN_MESSAGE = "cannot schedule new futures after shutdown"
+
+
 class CpuTokenizer:
     """The tokenizer the CPU-side sizing uses -- a copy of the runtime's, never the same
     object -- and the one thread that uses it.
 
-    `_size_pieces` tokenizes before the gate, while the GPU thread may be using the runtime's
-    tokenizer for another request's piece. A Hugging Face fast tokenizer is one Rust object
-    behind a borrow checker, and using it from two threads at once can fail with "Already
-    borrowed", so the sizing gets its own instance. The model load makes the copy
-    (`LoadedModel.from_runtime`), and `api.Components.mark_ready` installs it together with the
-    runtime, so no request ever waits for a copy.
+    `_size_first_piece` tokenizes before the gate, and `_start_anchor_sizing` right after it,
+    while the GPU thread may be using the runtime's tokenizer for another request's piece. A
+    Hugging Face fast tokenizer is one Rust object behind a borrow checker, and using it from
+    two threads at once can fail with "Already borrowed", so the sizing gets its own instance.
+    The model load makes the copy (`LoadedModel.from_runtime`), and `api.Components.mark_ready`
+    installs it together with the runtime, so no request ever waits for a copy.
 
     Two requests can size at once, before the busy check, so the copy must not be shared
     between them either: every use runs on this object's own single-worker executor, which
     queues them, with no lock. Its own executor rather than asyncio's default one, because that
     pool is shared with the reference decode, form parsing and `gpu.shutdown`: a burst of
     requests blocked on one tokenizer would fill it. `api._drain_gpu` shuts it down at server
-    stop.
+    stop, after cancelling every request it already knows about -- but a request that arrived
+    just as the drain started might not be one of them (review #3 on 2d9070a); `run` and
+    `submit` answer that race with `GpuUnavailable` (the same `503 gpu_unavailable` a poisoned
+    gate answers with) rather than a `500` or a silent cancellation.
     """
 
     def __init__(self) -> None:
@@ -154,9 +165,47 @@ class CpuTokenizer:
         self._tokenizer = tokenizer
 
     async def run(self, fn: Callable[..., _T], *args: Any) -> _T:
-        """`fn(tokenizer, *args)` on this object's thread, the only one that uses the copy."""
+        """`fn(tokenizer, *args)` on this object's thread, the only one that uses the copy.
+
+        A call still queued when `shutdown()` cancels it surfaces here as an ordinary
+        `asyncio.CancelledError` -- indistinguishable, by type alone, from this coroutine's
+        own task being cancelled for a real reason (a client disconnect, or `_drain_gpu`'s own
+        `task.cancel()` on a request it *did* know about). Told apart by this task's own
+        cancel count (`Task.cancelling()`): `shutdown()` cancelling a queued future out from
+        under an otherwise-uncancelled task can only be that race, never a real cancellation of
+        *this* task, so only that case is remapped to `GpuUnavailable`; a genuine one is
+        re-raised unchanged.
+        """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, self._call, fn, args)
+        task = asyncio.current_task()
+        cancelling_before = 0 if task is None else task.cancelling()
+        try:
+            return await loop.run_in_executor(self._executor, self._call, fn, args)
+        except RuntimeError as error:
+            if _SHUTDOWN_MESSAGE not in str(error):
+                raise
+            raise GpuUnavailable("the CPU tokenizer is shutting down") from error
+        except asyncio.CancelledError:
+            if task is not None and task.cancelling() > cancelling_before:
+                raise
+            raise GpuUnavailable("the CPU tokenizer is shutting down") from None
+
+    def submit(self, fn: Callable[..., _T], *args: Any) -> Future[_T]:
+        """`fn(tokenizer, *args)`, queued on this object's executor, for a caller on another
+        thread (the GPU thread) to block on with `.result()` -- `run`'s `await` needs the
+        event loop, which the GPU thread doesn't have.
+
+        Raises `GpuUnavailable` exactly as `run` does, for a call arriving after `shutdown()`.
+        A call `shutdown()` cancelled while still queued is the GPU-thread caller's own problem
+        (`.result()` raises `concurrent.futures.CancelledError`): there is no task here whose
+        cancel count could tell that apart from anything else, since nothing here is awaited.
+        """
+        try:
+            return self._executor.submit(self._call, fn, args)
+        except RuntimeError as error:
+            if _SHUTDOWN_MESSAGE not in str(error):
+                raise
+            raise GpuUnavailable("the CPU tokenizer is shutting down") from error
 
     def _call(self, fn: Callable[..., _T], args: tuple[Any, ...]) -> _T:
         if self._tokenizer is None:
@@ -232,16 +281,14 @@ def _opening_budget(request: SpeechRequest) -> int:
     return min(ANCHOR_CHARS, request.split_chars)
 
 
-async def _size_pieces(
+async def _size_first_piece(
     runtime: Any,
     cpu_tokenizer: CpuTokenizer,
     request: SpeechRequest,
     pieces: list[str],
     decoded_audio: reference_audio.DecodedAudio | None,
-) -> AnchorSizing | None:
-    """`400 text_too_long` if piece 0 has no room, decided before the GPU gate is taken, and,
-    with no reference and more than one piece, what the anchor decision after piece 0 needs
-    (`_anchor_for_later_pieces`); else `None`.
+) -> None:
+    """`400 text_too_long` if piece 0 has no room, decided before the GPU gate is taken.
 
     FR-007 puts every `400` before `409 busy`, so this can't wait for the codec: an inline
     reference is sized by its *predicted* frame count (`stand_in_reference`), and the inputs
@@ -251,30 +298,30 @@ async def _size_pieces(
     on the GPU thread once the reference is encoded (`_prepare_first_piece`), which covers a
     codec whose frame count differs from the prediction.
 
-    The later pieces are measured here too, rather than on the GPU thread between piece 0 and
-    piece 1, where a long text would hold up the stream while each one is tokenized.
+    The later pieces' own lengths, needed for the anchor decision, are measured after the
+    lease instead (`_start_anchor_sizing`, review #2 on 2d9070a): a long no-reference request
+    would otherwise hold this one shared CPU executor for the whole text even when it is about
+    to get a `409`, queuing every other request's own piece-0 check behind it.
     """
     stand_in = stand_in_reference(
         request.reference,
         None if decoded_audio is None else decoded_audio.predicted_frames,
         int(runtime.model.config.num_codebooks),
     )
-    room, sizing = await cpu_tokenizer.run(_measure, runtime, request, pieces, stand_in)
+    room = await cpu_tokenizer.run(_measure_first_piece, runtime, request, pieces, stand_in)
     if room.room <= 0:
         raise ApiError(400, "text_too_long", "text is too long")
-    return sizing
 
 
-def _measure(
+def _measure_first_piece(
     tokenizer: Any,
     runtime: Any,
     request: SpeechRequest,
     pieces: list[str],
     stand_in: Reference,
-) -> tuple[PieceRoom, AnchorSizing | None]:
-    """`_size_pieces`' blocking part, run by `CpuTokenizer.run` with its copy. The later
-    pieces are only measured when piece 0 fits and can become their anchor."""
-    room = predicted_room(
+) -> PieceRoom:
+    """`_size_first_piece`'s blocking part, run by `CpuTokenizer.run` with its copy."""
+    return predicted_room(
         runtime,
         tokenizer,
         stand_in,
@@ -283,12 +330,33 @@ def _measure(
         request.cfg_scale,
         request.max_new_tokens,
     )
-    if room.room <= 0 or not isinstance(stand_in, NoRef) or len(pieces) < 2:
-        return room, None
-    sizing = anchor_sizing(
+
+
+def _start_anchor_sizing(
+    runtime: Any, cpu_tokenizer: CpuTokenizer, request: SpeechRequest, pieces: list[str]
+) -> Future[AnchorSizing] | None:
+    """Queues what the anchor decision after piece 0 needs (`_anchor_for_later_pieces`) on the
+    CPU tokenizer's executor, right after the lease is taken (review #2 on 2d9070a) -- `None`
+    with a reference or a single piece: only piece 0 can ever anchor (data-model.md
+    "Reference"), and a single piece has no later ones to measure.
+
+    Queuing rather than awaiting here is the point: this runs on the CPU while piece 0 itself
+    prepares and generates on the `GpuThread` below, instead of serially before either. The
+    caller hands the returned `Future` to `_iter_pieces`, which blocks on it (`.result()`, on
+    the GPU thread, once piece 0 has actually finished) only when it is actually needed.
+    """
+    if not isinstance(request.reference, NoReference) or len(pieces) < 2:
+        return None
+    return cpu_tokenizer.submit(_size_later_pieces, runtime, request, pieces)
+
+
+def _size_later_pieces(
+    tokenizer: Any, runtime: Any, request: SpeechRequest, pieces: list[str]
+) -> AnchorSizing:
+    """`_start_anchor_sizing`'s queued part, run by `CpuTokenizer.submit` with its copy."""
+    return anchor_sizing(
         runtime, tokenizer, pieces[0], pieces[1:], request.instruction, request.cfg_scale
     )
-    return room, sizing
 
 
 def _prepare_first_piece(
@@ -327,7 +395,7 @@ def _iter_pieces(
     request_id: str,
     first_inputs: dict[str, Any],
     first_room: PieceRoom,
-    sizing: AnchorSizing | None,
+    sizing_future: Future[AnchorSizing] | None,
     events: Emitter,
     *,
     chunk_first: int,
@@ -356,10 +424,11 @@ def _iter_pieces(
     (BC-47). With no reference, piece 0's frames are collected through the runtime's
     `token_observer` and, once piece 0 has finished, become every later piece's reference
     together with its text, unless `_anchor_for_later_pieces` decides against it, from the
-    later pieces' lengths `sizing` measured before the gate (`None`: no anchoring, as with a
-    reference or a single piece); their inputs are still built here, one at a time. Only
-    piece 0 can anchor (data-model.md "Reference"); without an anchor the later pieces stay
-    voice design. A cancelled or failed piece 0 never reaches the anchoring step.
+    later pieces' lengths `sizing_future` is still measuring, queued right after the lease
+    (`None`: no anchoring, as with a reference or a single piece); their inputs are still built
+    here, one at a time. Only piece 0 can anchor (data-model.md "Reference"); without an anchor
+    the later pieces stay voice design. A cancelled or failed piece 0 never reaches the
+    anchoring step.
     """
     for index, text in enumerate(pieces):
         if index == 0:
@@ -381,7 +450,7 @@ def _iter_pieces(
             piece_index=index,
             requested=request.max_new_tokens,
         )
-        frames: list[Any] | None = [] if sizing is not None and index == 0 else None
+        frames: list[Any] | None = [] if sizing_future is not None and index == 0 else None
         piece_bytes = 0
         for chunk in generate_piece(
             runtime,
@@ -406,12 +475,12 @@ def _iter_pieces(
             piece_index=index,
             frames=piece_bytes // _PCM_BYTES_PER_SAMPLE // samples_per_frame,
         )
-        if frames is not None and sizing is not None:
+        if frames is not None:
             reference = _anchor_for_later_pieces(
                 runtime,
                 frames,
                 text,
-                sizing,
+                sizing_future,
                 request,
                 events,
                 request_id=request_id,
@@ -423,7 +492,7 @@ def _anchor_for_later_pieces(
     runtime: Any,
     frames: list[Any],
     text: str,
-    sizing: AnchorSizing,
+    sizing_future: Future[AnchorSizing],
     request: SpeechRequest,
     events: Emitter,
     *,
@@ -436,19 +505,29 @@ def _anchor_for_later_pieces(
     `max_new_tokens` it ran with. The anchor is skipped, with `speech.anchor_skipped`:
     - `piece_truncated`: piece 0 used its whole limit, so it stopped at its cap or room
       rather than at EOS, and its audio may end mid-word -- not a clean reference;
-    - `no_room`: the anchor would cost some later piece frames (`_anchor_costs_frames`). The
-      anchor is never trimmed to fit instead: its codes must stay paired with its text.
+    - `no_room`: the anchor would leave some later piece a smaller effective frame limit than
+      it would have without it (`_anchor_costs_frames`), or `sizing_future` never got to run at
+      all because `shutdown()` cancelled it while still queued (review #3 on 2d9070a) -- the
+      same 200 is already out by then, so "skip the anchor" is the only safe answer left.
+      The anchor is never trimmed to fit instead: its codes must stay paired with its text.
     Zero non-pad frames means there is nothing to anchor on; that needs no event.
 
     This runs on the GPU thread between piece 0 and piece 1, so it tokenizes nothing: every
-    later piece was measured before the gate (`sizing`), and the anchor's frame count is all
-    that was missing.
+    later piece's length was already queued right after the lease (`sizing_future`,
+    `_start_anchor_sizing`), running on the CPU while piece 0 itself generated here, and the
+    anchor's frame count is all that was missing -- `.result()` only blocks for whatever, if
+    anything, is left of that by now.
     """
     if len(frames) >= frame_limit:
         _skip_anchor(events, request_id, "piece_truncated")
         return NoRef()
     codes = anchor_codes(frames, int(runtime.model.config.codebook_pad_token_id))
     if codes is None:
+        return NoRef()
+    try:
+        sizing = sizing_future.result()
+    except FutureCancelledError:
+        _skip_anchor(events, request_id, "no_room")
         return NoRef()
     if _anchor_costs_frames(runtime, sizing, int(codes.shape[0]), request.max_new_tokens):
         _skip_anchor(events, request_id, "no_room")
@@ -459,19 +538,23 @@ def _anchor_for_later_pieces(
 def _anchor_costs_frames(
     runtime: Any, sizing: AnchorSizing, anchor_frames: int, requested: int | None
 ) -> bool:
-    """The `no_room` rule: some later piece would get its full cap without the anchor, but
-    less than its cap with it. A piece clamped either way doesn't count against the anchor:
-    it loses frames to the context whatever piece 0 does.
+    """The `no_room` rule (decided with the user, 2026-09-25): some later piece would get a
+    smaller effective frame limit -- `min(cap, room)` -- with the anchor than without it.
+    This also catches a piece already clamped below its cap *without* the anchor, whose room
+    the anchor can shrink further, even to zero (BC-47) -- the case the old floor missed by
+    only ever comparing an anchored room to the cap, never to the room the same piece would
+    have gotten without the anchor.
 
-    Rooms come from the runtime (`room_for_length`), so CFG rows and graph-bucket padding
-    count exactly as they will when the piece runs.
+    `room_for_length` is already the effective limit (`min(cap, context room)` --
+    `models/fast_streaming.py`'s own rule), so the comparison needs nothing else from `cap`
+    itself; CFG rows and graph-bucket padding count in it exactly as they will when the piece
+    runs.
     """
-    cap = runtime.frame_cap(requested)
     for length in sizing.later_lengths:
-        if runtime.room_for_length(requested, length) < cap:
-            continue
+        limit_without = runtime.room_for_length(requested, length)
         anchored = sizing.anchored(length, anchor_frames)
-        if runtime.room_for_length(requested, anchored) < cap:
+        limit_with = runtime.room_for_length(requested, anchored)
+        if limit_with < limit_without:
             return True
     return False
 
@@ -603,9 +686,7 @@ async def _serve_speech(
             reference_audio.decode, request.reference.audio_bytes
         )
 
-    sizing = await _size_pieces(
-        runtime, components.cpu_tokenizer, request, pieces, decoded_audio
-    )
+    await _size_first_piece(runtime, components.cpu_tokenizer, request, pieces, decoded_audio)
 
     # None means busy (409); a poisoned gate raises GpuUnavailable instead (gpu.py), which
     # propagates straight past this route to errors.py's own handler (503 gpu_unavailable).
@@ -616,6 +697,10 @@ async def _serve_speech(
     session: GpuSession[bytes] | None = None
     gpu_task: asyncio.Task[Any] | None = None
     try:
+        # Queued right after the lease (review #2 on 2d9070a), not before the busy check: a
+        # request that gets 409 above must never run this at all. `None` with a reference or a
+        # single piece (`_start_anchor_sizing`).
+        sizing_future = _start_anchor_sizing(runtime, components.cpu_tokenizer, request, pieces)
         gpu_task = asyncio.ensure_future(
             resolve_reference(
                 request.reference,
@@ -653,7 +738,7 @@ async def _serve_speech(
             request_id,
             first_inputs,
             first_room,
-            sizing,
+            sizing_future,
             components.events,
             chunk_first=components.settings.chunk_first,
             chunk_max=components.settings.chunk_max,

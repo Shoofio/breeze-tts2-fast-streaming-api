@@ -11,9 +11,11 @@ the old `A:` file's module-level `breeze_infer.api.app`, which this branch no lo
 Anchoring (tasks.md T050/T052/T053, commit `6bb3574`) has landed: with no reference and more than
 one piece, `breeze_infer/routes_speech.py`'s `_iter_pieces` collects piece 0's generated frames
 and turns them into a `synthesis.CodesRef` (`anchor_codes`) that every later piece is prepared
-against, so one speaker is heard throughout instead of a fresh voice design per piece. There is no
-dedicated event for this -- `breeze_infer/events.py` has no `speech.anchored` or similar, only
-`speech.piece_done{piece_index, frames}` and `speech.piece_clamped` -- so this test spies on
+against, so one speaker is heard throughout instead of a fresh voice design per piece, unless the
+decision instead declines it (`speech.anchor_skipped`, checked for directly below). There is no
+event for a *successful* anchor, though -- `breeze_infer/events.py` has `speech.piece_done
+{piece_index, frames}`, `speech.piece_clamped` and `speech.anchor_skipped` (the decline), but
+nothing like `speech.anchored` for the normal case -- so this test spies on
 `routes_speech.prepare_piece`'s `reference` argument (the same technique `tests/test_long_text.py`
 uses against `FakeRuntime`) to observe it directly: piece 0 must be prepared with `NoRef` (voice
 design) and every later piece with the `CodesRef` anchoring produced. If a future reviewer wants a
@@ -112,7 +114,9 @@ assert 2900 <= len(LONG_PASSAGE) <= 3200, f"passage is {len(LONG_PASSAGE)} chara
 # the split inputs are both constants), so every run must produce exactly this many pieces --
 # a silent change in piece count (e.g. a piece merging or an extra empty piece) would drop this
 # assertion rather than only be caught by a looser "at least one piece" check.
-EXPECTED_PIECES = split_text(LONG_PASSAGE, budget=DEFAULT_SPLIT_CHARS, first_budget=ANCHOR_CHARS)
+EXPECTED_PIECES = split_text(
+    LONG_PASSAGE, budget=DEFAULT_SPLIT_CHARS, first_budget=min(ANCHOR_CHARS, DEFAULT_SPLIT_CHARS)
+)
 assert len(EXPECTED_PIECES) > 1, (
     "the passage must split into more than one piece to exercise anchoring at all"
 )
@@ -149,8 +153,13 @@ def _run_once(
         return response.content, events.calls
     finally:
         routes_speech.prepare_piece = original_prepare_piece
-        components.gpu.shutdown()
-        components.cpu_tokenizer.shutdown()
+        try:
+            components.gpu.shutdown()
+        finally:
+            # Nested, not sequential (review 32, review-of-2d9070a #4/#7 in the same pass): a
+            # `gpu.shutdown()` failure must not leave the CPU tokenizer's own executor running
+            # past the test, which would leak its thread into the next one.
+            components.cpu_tokenizer.shutdown()
 
 
 def _save_wav(body: bytes) -> None:
@@ -165,8 +174,8 @@ def _save_wav(body: bytes) -> None:
 
 
 def test_long_voice_design_completes_every_run(gpu_env) -> None:
-    body_lengths: list[int] = []
     body_hashes: list[str] = []
+    per_run_piece_frames: list[list[int]] = []
 
     for run_index in range(RUNS):
         prepare_calls: list[Reference] = []
@@ -208,6 +217,16 @@ def test_long_voice_design_completes_every_run(gpu_env) -> None:
         assert all(fields["frames"] > 0 for fields in piece_events), (
             f"run {run_index}: a piece produced 0 frames: {piece_events}"
         )
+        per_run_piece_frames.append(
+            [fields["frames"] for fields in sorted(piece_events, key=lambda f: f["piece_index"])]
+        )
+
+        # Anchoring (review 32, review-of-2d9070a #1 in the same pass): confirm the anchor
+        # actually held before checking what it was, so a run that quietly declined it
+        # (`speech.anchor_skipped`) fails here with its reason, not on the `NoRef`-vs-`CodesRef`
+        # mismatch below, which would otherwise look like the same failure for a different cause.
+        skipped = by_name.get("speech.anchor_skipped", [])
+        assert not skipped, f"run {run_index}: anchor was skipped: {skipped}"
 
         # Anchoring (T050/T052/T053): piece 0 is voice design (`NoRef`); every later piece must
         # have been prepared against the `CodesRef` `anchor_codes` built from piece 0's own
@@ -242,7 +261,6 @@ def test_long_voice_design_completes_every_run(gpu_env) -> None:
         samples = np.frombuffer(body, dtype="<i2")
         assert np.abs(samples).max() > 0, f"run {run_index}: audio is entirely silence"
 
-        body_lengths.append(len(body))
         body_hashes.append(hashlib.sha256(body).hexdigest())
 
         # Each run costs real GPU minutes; print the numbers `-s` surfaces so a passing run still
@@ -258,19 +276,31 @@ def test_long_voice_design_completes_every_run(gpu_env) -> None:
             _save_wav(body)
 
     # The fixed text and fixed seed (the request's default) make the *shape* of every run
-    # identical -- confirmed above per run (same piece count, same frames>0 per piece, same
-    # anchoring) -- and that shows up here too: every run's audio is the same length. Verified
-    # empirically (this assertion used to also require the same sha256 hash across runs): the
-    # sample *values* are not bit-for-bit identical run to run, even with a matched seed on an
-    # already-warmed runtime. That's expected of CUDA kernels without
-    # `torch.use_deterministic_algorithms(True)` -- cuDNN's heuristic algorithm selection, TF32
-    # accumulation and CUDA-graph replay are not guaranteed bit-reproducible across invocations --
-    # not a bug this test should chase; forcing full determinism is a runtime-wide, production
-    # change (and would likely disable the CUDA graphs the fast path depends on), well outside a
-    # single test file. Each run's hash is still printed above so a real divergence in *shape*
-    # (a length change) is cheap to notice, and so anyone diffing runs by hand has the exact
-    # values to start from.
-    assert len(set(body_lengths)) == 1, f"runs produced different-length audio: {body_lengths}"
+    # close, but not required to be identical: the sample *values* are not bit-for-bit
+    # identical run to run, even with a matched seed on an already-warmed runtime (expected of
+    # CUDA kernels without `torch.use_deterministic_algorithms(True)` -- cuDNN's heuristic
+    # algorithm selection, TF32 accumulation and CUDA-graph replay are not guaranteed
+    # bit-reproducible across invocations -- not a bug this test should chase; forcing full
+    # determinism is a runtime-wide, production change, well outside a single test file). One
+    # flipped token can move a piece's EOS by a frame or more, and because piece 0's own audio
+    # anchors every later piece (T050/T052/T053), a change there can propagate to all of them,
+    # so an exact frame-count match per run is flaky (review 32, review-of-2d9070a #2 in the
+    # same pass). Comparing each run's per-piece `speech.piece_done` frame counts against the
+    # first run's, with a small tolerance, still catches a real divergence in shape (a piece
+    # actually cut short or overrun) without failing on ordinary kernel noise.
+    FRAME_TOLERANCE = 2
+    baseline = per_run_piece_frames[0]
+    for run_index, frames in enumerate(per_run_piece_frames):
+        mismatches = [
+            (piece_index, frames[piece_index], baseline[piece_index])
+            for piece_index in range(len(frames))
+            if abs(frames[piece_index] - baseline[piece_index]) > FRAME_TOLERANCE
+        ]
+        assert not mismatches, (
+            f"run {run_index} piece frames differ from run 0 by more than "
+            f"{FRAME_TOLERANCE} frames (piece_index, run_frames, run_0_frames): {mismatches}\n"
+            f"all runs' per-piece frames: {per_run_piece_frames}"
+        )
 
 
 @pytest.mark.parametrize("cfg_scale", [1.0, 3.0])

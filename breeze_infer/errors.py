@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -59,18 +60,94 @@ class StreamAborted(Exception):
     """
 
 
-# What `install_error_handlers` answers with a handler of its own -- a client's error, a
-# framework rejection, a poisoned GPU -- plus `StreamAborted`, whose response has already started
-# and whose outcome is already reported. None of them is a server failure to log as
-# `request.failed`; everything else that reaches the catch-all handler is.
-_NOT_REPORTED = (
-    ApiError,
-    StarletteHTTPException,
-    GpuUnavailable,
-    FormParserError,
-    RequestValidationError,
-    StreamAborted,
+async def _http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    # No route matched, wrong method, and Starlette's own multipart limits all raise this
+    # (never `ApiError`), each carrying whatever `headers` the raiser set -- e.g. a 405's
+    # `Allow` header -- which must reach the client. `exc.detail` is not: see
+    # `_HTTP_EXCEPTION_RESPONSES` below.
+    mapped = _HTTP_EXCEPTION_RESPONSES.get(exc.status_code)
+    if mapped is None:
+        return JSONResponse(
+            _envelope("internal error", "internal_error"),
+            status_code=500,
+            headers=exc.headers,
+        )
+    code, message = mapped
+    headers = exc.headers
+    # Starlette's own `Route.handle` set `exc.headers["Allow"]` from just the first matching
+    # route it found (review issue 4) -- recomputed here as the union across every route that
+    # matches this path, the same way `cors.py`'s preflight does. Only when `root_path` is
+    # still empty, though: once routing has passed through a `Mount`, `Mount.matches` has
+    # already extended `scope["root_path"]` by its own matched prefix, so re-matching against
+    # `request.app.router` (the *top-level* router) would check whatever text is left after
+    # stripping that prefix, not the original path -- liable to pick up an unrelated top-level
+    # route that happens to share that remainder, replacing a Mount-internal 405's own
+    # (correct) `Allow` with a wrong one (review-agent second-to-last pass, issue 3). There is
+    # no general way to find "the router that actually handled this path" from here, so this
+    # skips the recompute entirely in that case rather than risk a wrong answer.
+    if exc.status_code == 405 and not request.scope.get("root_path"):
+        matched, methods, _any_method = route_methods_for_path(request.app.router, request.scope)
+        if matched and methods:
+            headers = {**(headers or {}), "Allow": ", ".join(sorted(methods))}
+    return JSONResponse(
+        _envelope(message, code),
+        status_code=exc.status_code,
+        headers=headers,
+    )
+
+
+async def _api_error_handler(_: Request, exc: ApiError) -> JSONResponse:
+    return api_error_response(exc)
+
+
+async def _gpu_unavailable_handler(_: Request, __: GpuUnavailable) -> JSONResponse:
+    # A poisoned GpuGate (gpu.py): try_acquire/acquire raise this directly, rather than
+    # going through Readiness -- distinct from busy (409), and from routes_health.py's
+    # own GpuUnresponsive (raised by require_ready once Readiness.mark_unhealthy() has
+    # run), but the two are meant to look identical to a client.
+    return JSONResponse(dict(_GPU_UNAVAILABLE_BODY), status_code=503)
+
+
+async def _form_parser_error_handler(_: Request, exc: FormParserError) -> JSONResponse:
+    # python-multipart raises this (or a subclass, e.g. MultipartParseError) for
+    # a malformed body; without this handler it would fall through to the bare
+    # Exception handler below and come back as an opaque 500. The parser's own
+    # text describes its internals, so the client gets a fixed message.
+    del exc
+    return JSONResponse(
+        _envelope("could not parse the request body", "invalid_field"),
+        status_code=400,
+    )
+
+
+async def _validation_error_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+    # Reachable only via routes not yet ported to raw request/form parsing (see
+    # contracts/http-api.md); once ported, malformed input is coerced or rejected
+    # by the fields module instead, and this handler stops firing for them.
+    del exc
+    return JSONResponse(
+        _envelope("invalid request", "invalid_field"),
+        status_code=400,
+    )
+
+
+# The exception types `install_error_handlers` answers with a handler of its own, paired with
+# that handler -- built once here so its registrations and `_NOT_REPORTED` just below can never
+# drift apart (review #5 on 2d9070a: they used to be two separately hand-kept lists).
+_EXPLICIT_HANDLERS: tuple[tuple[type[Exception], Any], ...] = (
+    (StarletteHTTPException, _http_exception_handler),
+    (ApiError, _api_error_handler),
+    (GpuUnavailable, _gpu_unavailable_handler),
+    (FormParserError, _form_parser_error_handler),
+    (RequestValidationError, _validation_error_handler),
 )
+
+# `_EXPLICIT_HANDLERS`' own types, plus `StreamAborted`, whose response has already started and
+# whose outcome is already reported -- it has no handler here at all (its own docstring: the
+# catch-all handler below must neither answer nor report it a second time). None of them is a
+# server failure to log as `request.failed`; everything else that reaches the catch-all handler
+# is.
+_NOT_REPORTED = tuple(exc_type for exc_type, _handler in _EXPLICIT_HANDLERS) + (StreamAborted,)
 
 
 def report_unhandled(events: Emitter, request_id: str, exc: BaseException) -> None:
@@ -211,82 +288,14 @@ def route_methods_for_path(router: Router, scope: Scope) -> tuple[bool, set[str]
 
 
 def install_error_handlers(app: FastAPI, events: Emitter) -> None:
-    """Register every exception handler the contract needs (contracts/http-api.md)."""
+    """Register every exception handler the contract needs (contracts/http-api.md).
 
-    @app.exception_handler(StarletteHTTPException)
-    async def _http_exception_handler(
-        request: Request, exc: StarletteHTTPException
-    ) -> JSONResponse:
-        # No route matched, wrong method, and Starlette's own multipart limits all raise this
-        # (never `ApiError`), each carrying whatever `headers` the raiser set -- e.g. a 405's
-        # `Allow` header -- which must reach the client. `exc.detail` is not: see
-        # `_HTTP_EXCEPTION_RESPONSES` above.
-        mapped = _HTTP_EXCEPTION_RESPONSES.get(exc.status_code)
-        if mapped is None:
-            return JSONResponse(
-                _envelope("internal error", "internal_error"),
-                status_code=500,
-                headers=exc.headers,
-            )
-        code, message = mapped
-        headers = exc.headers
-        # Starlette's own `Route.handle` set `exc.headers["Allow"]` from just the first matching
-        # route it found (review issue 4) -- recomputed here as the union across every route that
-        # matches this path, the same way `cors.py`'s preflight does. Only when `root_path` is
-        # still empty, though: once routing has passed through a `Mount`, `Mount.matches` has
-        # already extended `scope["root_path"]` by its own matched prefix, so re-matching against
-        # `request.app.router` (the *top-level* router) would check whatever text is left after
-        # stripping that prefix, not the original path -- liable to pick up an unrelated top-level
-        # route that happens to share that remainder, replacing a Mount-internal 405's own
-        # (correct) `Allow` with a wrong one (review-agent second-to-last pass, issue 3). There is
-        # no general way to find "the router that actually handled this path" from here, so this
-        # skips the recompute entirely in that case rather than risk a wrong answer.
-        if exc.status_code == 405 and not request.scope.get("root_path"):
-            matched, methods, _any_method = route_methods_for_path(
-                request.app.router, request.scope
-            )
-            if matched and methods:
-                headers = {**(headers or {}), "Allow": ", ".join(sorted(methods))}
-        return JSONResponse(
-            _envelope(message, code),
-            status_code=exc.status_code,
-            headers=headers,
-        )
-
-    @app.exception_handler(ApiError)
-    async def _api_error_handler(_: Request, exc: ApiError) -> JSONResponse:
-        return api_error_response(exc)
-
-    @app.exception_handler(GpuUnavailable)
-    async def _gpu_unavailable_handler(_: Request, __: GpuUnavailable) -> JSONResponse:
-        # A poisoned GpuGate (gpu.py): try_acquire/acquire raise this directly, rather than
-        # going through Readiness -- distinct from busy (409), and from routes_health.py's
-        # own GpuUnresponsive (raised by require_ready once Readiness.mark_unhealthy() has
-        # run), but the two are meant to look identical to a client.
-        return JSONResponse(dict(_GPU_UNAVAILABLE_BODY), status_code=503)
-
-    @app.exception_handler(FormParserError)
-    async def _form_parser_error_handler(_: Request, exc: FormParserError) -> JSONResponse:
-        # python-multipart raises this (or a subclass, e.g. MultipartParseError) for
-        # a malformed body; without this handler it would fall through to the bare
-        # Exception handler below and come back as an opaque 500. The parser's own
-        # text describes its internals, so the client gets a fixed message.
-        del exc
-        return JSONResponse(
-            _envelope("could not parse the request body", "invalid_field"),
-            status_code=400,
-        )
-
-    @app.exception_handler(RequestValidationError)
-    async def _validation_error_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
-        # Reachable only via routes not yet ported to raw request/form parsing (see
-        # contracts/http-api.md); once ported, malformed input is coerced or rejected
-        # by the fields module instead, and this handler stops firing for them.
-        del exc
-        return JSONResponse(
-            _envelope("invalid request", "invalid_field"),
-            status_code=400,
-        )
+    Every type but the catch-all below comes from `_EXPLICIT_HANDLERS` (review #5 on
+    2d9070a): none of those five handlers need anything from `events` or this particular
+    `app`, unlike the catch-all, which reports through `events` and so stays a closure here.
+    """
+    for exc_type, handler in _EXPLICIT_HANDLERS:
+        app.add_exception_handler(exc_type, handler)
 
     @app.exception_handler(Exception)
     async def _unhandled_exception_handler(
