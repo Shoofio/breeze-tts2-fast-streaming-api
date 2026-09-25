@@ -15,13 +15,32 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Form, Request
 from fastapi.testclient import TestClient
 
 from breeze_infer.body_limit import BodyLimitMiddleware
 from breeze_infer.errors import install_error_handlers
 
 _LIMIT = 64
+
+
+def _chunked(data: bytes, chunk_size: int = 8) -> Iterator[bytes]:
+    """Split `data` into pieces so httpx sends it chunked (no `Content-Length` header)."""
+    for start in range(0, len(data), chunk_size):
+        yield data[start : start + chunk_size]
+
+
+def _oversize_multipart_body(field_value_len: int) -> tuple[bytes, str]:
+    """A well-formed `multipart/form-data` body whose single field is large enough to push the
+    request past `_LIMIT`, along with the matching `content-type` header value."""
+    boundary = "xxxxBOUNDARYxxxx"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="field"\r\n\r\n'
+        f"{'a' * field_value_len}"
+        f"\r\n--{boundary}--\r\n"
+    ).encode("ascii")
+    return body, f"multipart/form-data; boundary={boundary}"
 
 
 class _RecordingEvents:
@@ -37,6 +56,15 @@ def _client() -> TestClient:
     async def upload(request: Request) -> dict[str, int]:
         body = await request.body()
         return {"received": len(body)}
+
+    @app.post("/upload-form")
+    async def upload_form(request: Request) -> dict[str, int]:
+        form = await request.form()
+        return {"fields": len(form)}
+
+    @app.post("/upload-typed-form")
+    async def upload_typed_form(field: str = Form(...)) -> dict[str, str]:
+        return {"field": field}
 
     wrapped = BodyLimitMiddleware(app, limit=_LIMIT)
     return TestClient(wrapped, raise_server_exceptions=False)
@@ -87,3 +115,61 @@ def test_bc_06_body_exactly_at_the_limit_passes_through() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"received": len(body)}
+
+
+def test_r1_chunked_oversize_to_a_request_form_route_is_413() -> None:
+    """R1: an `ApiError` raised from `counting_receive` while `request.form()` reads a chunked,
+    oversized multipart body must still surface as `413` -- this is the route shape that already
+    worked (a plain `request.form()` call is application code, not framework body-parsing)."""
+    body, content_type = _oversize_multipart_body(field_value_len=200)
+
+    response = _client().post(
+        "/upload-form", content=_chunked(body), headers={"content-type": content_type}
+    )
+
+    assert response.request.headers.get("content-length") is None
+    assert response.status_code == 413
+    assert response.json() == {
+        "error": "request body is too large",
+        "code": "payload_too_large",
+    }
+
+
+def test_r1_chunked_oversize_to_a_form_typed_route_is_413() -> None:
+    """R1: same body, but to a `Form(...)`-typed parameter -- the route shape where FastAPI's own
+    `request_body_to_args` (fastapi/routing.py) calls `request.form()` internally. That code
+    catches `HTTPException` and re-raises it, but wrapped any *other* exception into a generic
+    400 -- exactly the bug this rejects: without `ApiError` subclassing `HTTPException`, this
+    came back as 400, not 413."""
+    body, content_type = _oversize_multipart_body(field_value_len=200)
+
+    response = _client().post(
+        "/upload-typed-form", content=_chunked(body), headers={"content-type": content_type}
+    )
+
+    assert response.request.headers.get("content-length") is None
+    assert response.status_code == 413
+    assert response.json() == {
+        "error": "request body is too large",
+        "code": "payload_too_large",
+    }
+
+
+def test_r6_malformed_content_length_falls_back_to_counting_the_body() -> None:
+    """A `Content-Length` that isn't a valid integer must not be trusted at face value -- the
+    body still has to be counted as it arrives, exactly like a chunked request, both under and
+    over the limit."""
+    under = b"z" * (_LIMIT - 1)
+    response = _client().post(
+        "/upload", content=under, headers={"content-length": "not-a-number"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"received": len(under)}
+
+    over = b"y" * (_LIMIT + 1)
+    response = _client().post("/upload", content=over, headers={"content-length": "not-a-number"})
+    assert response.status_code == 413
+    assert response.json() == {
+        "error": "request body is too large",
+        "code": "payload_too_large",
+    }

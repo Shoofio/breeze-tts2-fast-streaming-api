@@ -16,7 +16,6 @@ back as a response instead of re-raising the exception in the test process.
 from __future__ import annotations
 
 import asyncio
-import http
 import json
 
 from fastapi import FastAPI, Request
@@ -115,43 +114,35 @@ def test_bc_18_wrong_method_is_405_with_allow_header_and_json_envelope() -> None
     assert "GET" in response.headers["allow"]
 
 
-def test_http_exception_with_generic_detail_falls_back_to_lowercased_phrase() -> None:
-    # 413 has no hand-picked entry in `_DEFAULT_HTTP_CODES` (unlike 404/405), so a
-    # generic-detail 413 -- raised with no explicit `detail`, the way a
-    # framework-internal check would -- must fall back to computing a message from
-    # `http.HTTPStatus`'s own phrase rather than a hard-coded string: the exact
-    # phrase differs across Python versions (e.g. 413's phrase was renamed from
-    # "Request Entity Too Large" to "Content Too Large"), so this asserts against
-    # the phrase the *running* interpreter computes. In this app, 413 is actually
-    # raised as `ApiError` by `body_limit.py`, never as a bare `HTTPException`; this
-    # exercises the generic fallback path in isolation, using 413 only as a stand-in
-    # status the `_DEFAULT_HTTP_CODES` map doesn't special-case.
+def test_http_exception_detail_is_ignored_for_mapped_statuses() -> None:
+    # R2/R3: a bare `StarletteHTTPException` (never raised as such in this app for 400 --
+    # Starlette's own multipart limits do, e.g. too many files) must use the fixed table's
+    # message, not `exc.detail` -- even when the raiser set a specific, non-generic detail.
     app = _app()
     handler = app.exception_handlers[StarletteHTTPException]
-    phrase = http.HTTPStatus(413).phrase
-    exc = StarletteHTTPException(status_code=413)
-    assert exc.detail == phrase  # sanity: Starlette's own generic default
-
-    response = asyncio.run(handler(None, exc))  # type: ignore[arg-type]
-
-    assert response.status_code == 413
-    assert json.loads(response.body) == {"error": phrase.lower(), "code": "http_error"}
-
-
-def test_http_exception_with_specific_detail_is_passed_through() -> None:
-    # A non-generic detail (e.g. a multipart parse error's own message) must reach
-    # the client verbatim, not be replaced by the phrase fallback.
-    app = _app()
-    handler = app.exception_handlers[StarletteHTTPException]
-    exc = StarletteHTTPException(status_code=400, detail="malformed multipart body")
+    exc = StarletteHTTPException(status_code=400, detail="Too many files. Maximum number is 1.")
 
     response = asyncio.run(handler(None, exc))  # type: ignore[arg-type]
 
     assert response.status_code == 400
     assert json.loads(response.body) == {
-        "error": "malformed multipart body",
-        "code": "http_error",
+        "error": "could not parse the request body",
+        "code": "invalid_field",
     }
+
+
+def test_http_exception_with_unmapped_status_falls_back_to_internal_error() -> None:
+    # Only 400/404/405/413 have entries in the fixed table; this app never itself raises a bare
+    # `StarletteHTTPException` for any other status, but the handler still needs to do something
+    # sane for one, and it must not guess a message from `exc.detail`.
+    app = _app()
+    handler = app.exception_handlers[StarletteHTTPException]
+    exc = StarletteHTTPException(status_code=401, detail="should not leak")
+
+    response = asyncio.run(handler(None, exc))  # type: ignore[arg-type]
+
+    assert response.status_code == 401
+    assert json.loads(response.body) == {"error": "internal error", "code": "internal_error"}
 
 
 def test_bc_18_malformed_multipart_body_is_400_invalid_field() -> None:
@@ -174,6 +165,73 @@ def test_bc_18_malformed_multipart_body_is_400_invalid_field() -> None:
     body = response.json()
     assert body["code"] == "invalid_field"
     assert body["error"]  # python-multipart's own message, not paraphrased
+
+
+def test_starlette_multipart_too_many_files_is_400_invalid_field() -> None:
+    """R2/R3: Starlette's own `max_files` check raises a bare `HTTPException(400, detail=...)`
+    (`starlette/requests.py`); the fixed table's message must win over Starlette's wording."""
+    app = _app()
+
+    @app.post("/upload-limited")
+    async def upload_limited(request: Request) -> dict[str, object]:
+        form = await request.form(max_files=1)
+        return {"keys": list(form.keys())}
+
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/upload-limited", files=[("f1", ("a.txt", b"aaa")), ("f2", ("b.txt", b"bbb"))]
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "could not parse the request body",
+        "code": "invalid_field",
+    }
+
+
+def test_starlette_multipart_oversized_part_is_400_invalid_field() -> None:
+    """R2/R3: a part over `max_part_size` raises the same bare `HTTPException(400, ...)`."""
+    app = _app()
+
+    @app.post("/upload-limited")
+    async def upload_limited(request: Request) -> dict[str, object]:
+        form = await request.form(max_part_size=64 * 1024)
+        return {"keys": list(form.keys())}
+
+    client = TestClient(app, raise_server_exceptions=False)
+    # `files={name: (None, value)}` forces multipart encoding for a plain (non-file) field, so
+    # this exercises `max_part_size`, which doesn't apply to urlencoded bodies.
+    response = client.post("/upload-limited", files={"field": (None, "x" * (70 * 1024))})
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "could not parse the request body",
+        "code": "invalid_field",
+    }
+
+
+def test_starlette_multipart_missing_boundary_is_400_invalid_field() -> None:
+    """R2/R3: a `multipart/form-data` content-type with no boundary parameter raises the same
+    bare `HTTPException(400, ...)`."""
+    app = _app()
+
+    @app.post("/upload-limited")
+    async def upload_limited(request: Request) -> dict[str, object]:
+        form = await request.form()
+        return {"keys": list(form.keys())}
+
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        "/upload-limited",
+        content=b"anything",
+        headers={"content-type": "multipart/form-data"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "could not parse the request body",
+        "code": "invalid_field",
+    }
 
 
 def test_bc_18_pydantic_validation_error_is_400_invalid_field() -> None:

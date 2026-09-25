@@ -17,8 +17,7 @@ points where an oversized body can be discovered:
 
 from __future__ import annotations
 
-import json
-
+from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from breeze_infer.errors import ApiError
@@ -39,20 +38,19 @@ def _content_length(scope: Scope) -> int | None:
     return None
 
 
-async def _reject_immediately(send: Send) -> None:
-    """Send the envelope directly: this runs before the wrapped app does."""
-    body = json.dumps({"error": _MESSAGE, "code": _CODE}).encode("utf-8")
-    await send(
-        {
-            "type": "http.response.start",
-            "status": _STATUS,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode("ascii")),
-            ],
-        }
+async def _reject_immediately(scope: Scope, receive: Receive, send: Send) -> None:
+    """Send the envelope directly: this runs before the wrapped app does.
+
+    Built via `JSONResponse` (research.md R7) rather than hand-rolled headers and body, so the
+    bytes on the wire match the `ApiError` handler's 413 response exactly -- both 413 paths need
+    `Connection: close` (R8), and hand-rolling risks the two drifting apart.
+    """
+    response = JSONResponse(
+        {"error": _MESSAGE, "code": _CODE},
+        status_code=_STATUS,
+        headers={"Connection": "close"},
     )
-    await send({"type": "http.response.body", "body": body})
+    await response(scope, receive, send)
 
 
 class BodyLimitMiddleware:
@@ -69,7 +67,7 @@ class BodyLimitMiddleware:
 
         content_length = _content_length(scope)
         if content_length is not None and content_length > self.limit:
-            await _reject_immediately(send)
+            await _reject_immediately(scope, receive, send)
             return
 
         seen = 0
