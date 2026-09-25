@@ -204,6 +204,16 @@ What remains on a warm start is capture and its eager warmup passes (about 10 s 
 On Linux, Triton builds a small helper with `gcc` the first time it populates a cache directory. Run the server from a directory other than the repo root when doing that: gcc treats a `./specs` directory in its working directory as a spec file and aborts.
 
 
+## Development
+
+| Action | Command |
+| --- | --- |
+| SillyTavern live test | `node tests/live/sillytavern/run.mjs <health\|voices\|speech\|full>` |
+
+More commands are added here as the C++-compatible API work lands (see
+`specs/003-cpp-compatible-api/quickstart.md`).
+
+
 ## License and Responsible Use
 
 The source code is licensed under the [Apache License, Version 2.0](https://github.com/breezeblue-ai/breeze-tts/blob/main/LICENSE). The audio tokenizer is based on [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) by the Alibaba Qwen Team and is licensed under the Apache License, Version 2.0. Model weights, checkpoints, adapters, derivative models, and self-hosted outputs are governed separately by the [BreezeBlue Research and Non-Commercial License](https://huggingface.co/BreezeBlue/Breeze-TTS-2/blob/main/LICENSE). The Apache License does not grant rights to use the model commercially.
