@@ -25,6 +25,8 @@ actual verification that no such device/stream mismatch exists in practice.
 
 from __future__ import annotations
 
+import os
+import time
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -38,15 +40,33 @@ from breeze_infer.gpu import GpuGate, GpuThread
 from breeze_infer.limits import MAX_TEXT_CHARS
 from breeze_infer.routes_health import Readiness
 from breeze_infer.runtime import resolve_device
-from breeze_infer.settings import settings_from_args
+from breeze_infer.settings import DEFAULT_CHUNK_MAX, settings_from_args
+from breeze_infer.streaming import BYTES_PER_SAMPLE
 from tests.fakes import RecordingEvents
 
 pytestmark = pytest.mark.gpu
 
 SPEECH_PATH = "/v1/audio/speech"
 REPO_ROOT = Path(__file__).resolve().parents[2]
-VOICE_DIR = Path("$REFERENCE_VOICES_DIR/eric")
+# Overridable so a machine without the reference-voices directory can still run the rest of this
+# file; the inline-reference test skips (rather than erroring) when the sample is absent.
+REFERENCE_VOICES_DIR = Path(
+    os.environ.get("REFERENCE_VOICES_DIR", "$REFERENCE_VOICES_DIR")
+)
+VOICE_DIR = REFERENCE_VOICES_DIR / "eric"
 SAMPLE_RATE = 24000
+# contracts/http-api.md "Chunks grow from --chunk-first to --chunk-max codec frames (1,920
+# samples per frame)": the largest possible ramp flush, used as the tolerance for matching
+# a completed response's `audio_seconds_sent` against the body it actually sent.
+CODEC_FRAME_SAMPLES = 1920
+TERMINAL_EVENTS = ("speech.completed", "speech.aborted", "speech.failed")
+# `SpeechResponse.__call__`'s own `finally` (breeze_infer/streaming.py) closes the GPU
+# session and emits the outcome event only *after* the chunked terminator has already
+# reached the client; TestClient's ASGI transport can hand `response.content` back as soon
+# as it has seen that terminator, without waiting for the app task's `finally` to actually
+# run. So the event can still be a few loop iterations away even once `.post()` has
+# returned -- short deadline poll rather than an immediate assert.
+EVENT_POLL_TIMEOUT_SECONDS = 5.0
 
 
 def _components(gpu_env) -> tuple[Components, RecordingEvents]:
@@ -83,7 +103,24 @@ def _pcm_stats(body: bytes) -> tuple[int, bool]:
     return samples.size, bool(np.any(samples != 0))
 
 
-def _assert_plausible_speech(response) -> None:
+def _wait_for_terminal_event(events: RecordingEvents) -> None:
+    """Block (briefly) until `events` has recorded one of `TERMINAL_EVENTS`.
+
+    See `EVENT_POLL_TIMEOUT_SECONDS`'s comment: the response has already reached the test
+    client by the time `.post()` returns, but `SpeechResponse.__call__`'s cleanup -- which
+    is what actually emits the outcome event -- can still be a few loop iterations behind.
+    """
+    deadline = time.monotonic() + EVENT_POLL_TIMEOUT_SECONDS
+    while not any(name in TERMINAL_EVENTS for name, _ in events.calls):
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"no {TERMINAL_EVENTS} event within {EVENT_POLL_TIMEOUT_SECONDS}s "
+                f"(got: {events.calls})"
+            )
+        time.sleep(0.01)
+
+
+def _assert_plausible_speech(response, events: RecordingEvents) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"] == "audio/pcm"
     assert response.headers["x-sample-rate"] == str(SAMPLE_RATE)
@@ -95,27 +132,50 @@ def _assert_plausible_speech(response) -> None:
     assert 0.5 <= duration <= 20.0, f"implausible duration {duration:.2f}s for a short sentence"
     assert has_signal, "audio is entirely silence"
 
+    # Prove the stream actually finished (and, for the multi-piece test, that every piece
+    # ran): exactly one `speech.completed`, never a `speech.aborted`/`speech.failed`
+    # alongside or instead of it.
+    _wait_for_terminal_event(events)
+    completed = [fields for name, fields in events.calls if name == "speech.completed"]
+    aborted = [fields for name, fields in events.calls if name == "speech.aborted"]
+    failed = [fields for name, fields in events.calls if name == "speech.failed"]
+    assert len(completed) == 1, f"expected exactly one speech.completed, got {events.calls}"
+    assert not aborted and not failed, f"unexpected abort/failure events: {events.calls}"
+
+    expected_seconds = len(body) / BYTES_PER_SAMPLE / SAMPLE_RATE
+    tolerance_seconds = DEFAULT_CHUNK_MAX * CODEC_FRAME_SAMPLES / SAMPLE_RATE
+    assert completed[0]["audio_seconds_sent"] == pytest.approx(
+        expected_seconds, abs=tolerance_seconds
+    )
+
 
 def test_voice_design_returns_plausible_audio(speech_app) -> None:
-    client, _ = speech_app
+    client, events = speech_app
 
     response = client.post(SPEECH_PATH, data={"text": "Hello there, this is a short test."})
 
-    _assert_plausible_speech(response)
+    _assert_plausible_speech(response, events)
 
 
 def test_inline_reference_returns_plausible_audio(speech_app) -> None:
-    client, _ = speech_app
-    ref_text = (VOICE_DIR / "eric.txt").read_text(encoding="utf-8").strip()
+    client, events = speech_app
+    ref_wav = VOICE_DIR / "eric.wav"
+    ref_txt = VOICE_DIR / "eric.txt"
+    if not ref_wav.is_file() or not ref_txt.is_file():
+        pytest.skip(
+            f"reference voice sample not found under {VOICE_DIR} "
+            "(set REFERENCE_VOICES_DIR to a directory containing eric/eric.wav and eric.txt)"
+        )
+    ref_text = ref_txt.read_text(encoding="utf-8").strip()
 
-    with (VOICE_DIR / "eric.wav").open("rb") as ref_audio:
+    with ref_wav.open("rb") as ref_audio:
         response = client.post(
             SPEECH_PATH,
             data={"text": "Hello there, this is a short test.", "ref_text": ref_text},
             files={"ref_audio": ("eric.wav", ref_audio, "audio/wav")},
         )
 
-    _assert_plausible_speech(response)
+    _assert_plausible_speech(response, events)
 
 
 def test_multi_piece_request_splits_and_emits_pieces(speech_app) -> None:
@@ -128,12 +188,13 @@ def test_multi_piece_request_splits_and_emits_pieces(speech_app) -> None:
 
     response = client.post(SPEECH_PATH, data={"text": text, "split_chars": "40"})
 
-    assert response.status_code == 200
-    assert len(response.content) > 0
-
     accepted = [fields for name, fields in events.calls if name == "speech.accepted"]
     assert len(accepted) == 1
     assert accepted[0]["pieces"] >= 2
+
+    # Also proves every piece actually ran to completion, not just that the route
+    # accepted a multi-piece plan: exactly one speech.completed, matching the full body.
+    _assert_plausible_speech(response, events)
 
 
 def test_first_piece_without_room_gives_400_text_too_long(gpu_env, speech_app) -> None:
