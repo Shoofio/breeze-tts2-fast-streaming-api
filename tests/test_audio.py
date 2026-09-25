@@ -159,7 +159,11 @@ def _codec_config(*, encoder_overrides=None, decoder_overrides=None, **top_overr
             "num_quantizers": 16,
             "semantic_codebook_size": 4096,
             "num_semantic_quantizers": 1,
+            # Two distinct fields, both required (review #4): the real config has
+            # both, at this same path, and the decoder's total upsampling factor is
+            # prod(upsample_rates + upsampling_ratios).
             "upsample_rates": [8, 5, 4, 3],
+            "upsampling_ratios": [2, 2],
             "hidden_size": 512,
             **(decoder_overrides or {}),
         },
@@ -248,6 +252,16 @@ def test_codec_fingerprint_changes_with_encoder_identity_fields(tmp_path, overri
         {"semantic_codebook_size": 2048},
         {"num_semantic_quantizers": 2},
         {"upsample_rates": [4, 4, 4, 4]},
+        {"upsampling_ratios": [4, 1]},
+    ],
+    ids=[
+        "codebook_size",
+        "codebook_dim",
+        "num_quantizers",
+        "semantic_codebook_size",
+        "num_semantic_quantizers",
+        "upsample_rates",
+        "upsampling_ratios",
     ],
 )
 def test_codec_fingerprint_changes_with_decoder_identity_fields(tmp_path, overrides) -> None:
@@ -260,47 +274,27 @@ def test_codec_fingerprint_changes_with_decoder_identity_fields(tmp_path, overri
     assert codec_fingerprint(directory) != baseline
 
 
-def test_codec_fingerprint_accepts_upsampling_ratios_as_an_alias(tmp_path) -> None:
-    """Some qwen-tts codec versions name the decoder's upsample schedule
-    ``upsampling_ratios`` instead of ``upsample_rates``; either is accepted, but at
-    least one is required.
-    """
-    directory = tmp_path / "codec"
-    config = _codec_config()
-    del config["decoder_config"]["upsample_rates"]
-    config["decoder_config"]["upsampling_ratios"] = [2, 2]
-    _write_codec_dir(directory, config=config)
-
-    # Just needs to not raise.
-    codec_fingerprint(directory)
-
-
 @pytest.mark.parametrize(
     "drop_path",
     [
         ("input_sample_rate",),
         ("encoder_config", "codebook_size"),
         ("decoder_config", "num_semantic_quantizers"),
+        ("decoder_config", "upsample_rates"),
+        ("decoder_config", "upsampling_ratios"),
     ],
-    ids=["top-level", "encoder", "decoder"],
+    ids=["top-level", "encoder", "decoder", "decoder-upsample_rates", "decoder-upsampling_ratios"],
 )
 def test_codec_fingerprint_requires_every_identity_field(tmp_path, drop_path) -> None:
+    """``upsample_rates`` and ``upsampling_ratios`` are both required independently
+    (review #4): dropping either one alone (not just both together) must raise.
+    """
     directory = tmp_path / "codec"
     config = _codec_config()
     target = config
     for key in drop_path[:-1]:
         target = target[key]
     del target[drop_path[-1]]
-    _write_codec_dir(directory, config=config)
-
-    with pytest.raises(ValueError, match="required"):
-        codec_fingerprint(directory)
-
-
-def test_codec_fingerprint_requires_a_decoder_upsample_field(tmp_path) -> None:
-    directory = tmp_path / "codec"
-    config = _codec_config()
-    del config["decoder_config"]["upsample_rates"]
     _write_codec_dir(directory, config=config)
 
     with pytest.raises(ValueError, match="required"):
@@ -394,6 +388,84 @@ def test_codec_fingerprint_requires_safetensors_weights(tmp_path) -> None:
     (directory / "config.json").write_text(json.dumps(_codec_config()))
 
     with pytest.raises(FileNotFoundError):
+        codec_fingerprint(directory)
+
+
+def test_codec_fingerprint_prefers_the_single_file_over_a_stale_index(tmp_path) -> None:
+    """review #3: transformers 4.57's own resolution order
+    (``_get_resolved_checkpoint_files``, ``modeling_utils.py`` ~936-947) tries
+    ``model.safetensors`` *before* ``model.safetensors.index.json`` -- so a directory
+    that happens to have both (e.g. a stale index left over from a resharding) must
+    be fingerprinted from the single file, the one the real loader would actually use.
+    """
+    directory = tmp_path / "codec"
+    _write_codec_dir(directory, config=_codec_config())
+    single_file_fingerprint = codec_fingerprint(directory)
+
+    # A stale index pointing at a shard file with a *different* tensor shape --
+    # if _weight_files preferred the index, this would change the fingerprint.
+    _write_fake_safetensors(
+        directory / "stale-00001-of-00001.safetensors",
+        {"decoder.weight": {"dtype": "F32", "shape": [9999, 9999], "data_offsets": [0, 4]}},
+    )
+    (directory / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {"decoder.weight": "stale-00001-of-00001.safetensors"}}
+        )
+    )
+
+    assert codec_fingerprint(directory) == single_file_fingerprint
+
+
+def test_codec_fingerprint_rejects_a_pytorch_only_checkpoint(tmp_path) -> None:
+    """review #3: a codec shipped only as pytorch_model.bin is real and loadable by
+    transformers, but this fingerprint only parses the safetensors header format, so
+    it must fail clearly rather than report "no weights at all".
+    """
+    directory = tmp_path / "codec"
+    directory.mkdir()
+    (directory / "config.json").write_text(json.dumps(_codec_config()))
+    (directory / "pytorch_model.bin").write_bytes(b"not really a torch checkpoint")
+
+    with pytest.raises(ValueError, match="safetensors"):
+        codec_fingerprint(directory)
+
+
+@pytest.mark.parametrize(
+    "bad_header",
+    [{"decoder.weight": 5}, {"decoder.weight": {}}, {"decoder.weight": [1, 2, 3]}],
+    ids=["scalar", "empty_object", "list"],
+)
+def test_codec_fingerprint_rejects_a_malformed_tensor_entry(tmp_path, bad_header) -> None:
+    """review #9: a header that parses as JSON but has the wrong shape for a
+    safetensors header (not {name: {dtype, shape, ...}}) must raise ValueError, not
+    TypeError (indexing an int/list) or KeyError (a dict missing 'dtype'/'shape').
+    """
+    directory = tmp_path / "codec"
+    _write_codec_dir(directory, config=_codec_config(), tensor_header=bad_header)
+
+    with pytest.raises(ValueError, match="not a safetensors file"):
+        codec_fingerprint(directory)
+
+
+@pytest.mark.parametrize(
+    "bad_index",
+    [
+        {"weight_map": 5},
+        {"weight_map": ["model.safetensors"]},
+        {"weight_map": {"decoder.weight": 5}},
+        ["model.safetensors"],
+    ],
+    ids=["scalar_map", "list_map", "non_string_filename", "list_index"],
+)
+def test_codec_fingerprint_rejects_a_malformed_index(tmp_path, bad_index) -> None:
+    """review #9: same guarantee as the header case, for model.safetensors.index.json."""
+    directory = tmp_path / "codec"
+    directory.mkdir()
+    (directory / "config.json").write_text(json.dumps(_codec_config()))
+    (directory / "model.safetensors.index.json").write_text(json.dumps(bad_index))
+
+    with pytest.raises(ValueError):
         codec_fingerprint(directory)
 
 

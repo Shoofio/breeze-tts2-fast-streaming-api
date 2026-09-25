@@ -10,14 +10,21 @@ from typing import Any
 import numpy as np
 import torch
 
-# transformers.utils.SAFE_WEIGHTS_NAME / SAFE_WEIGHTS_INDEX_NAME: the single-file and
-# sharded safetensors conventions HuggingFace's own `from_pretrained` looks for, in
-# that order. `Qwen3TTSTokenizerV2Model.from_pretrained` (what `breeze_infer/runtime.py`
-# calls to load the bundled audio tokenizer) uses this same resolution, so this is the
-# one/few file(s) that actually determine what the loaded codec's weights are -- not
-# every `*.safetensors` file that happens to sit in the directory (review #1/#5).
+# transformers.utils.SAFE_WEIGHTS_NAME / SAFE_WEIGHTS_INDEX_NAME / WEIGHTS_NAME /
+# WEIGHTS_INDEX_NAME, and the exact resolution order `PreTrainedModel.from_pretrained`
+# checks them in (review #3, this round -- verified against transformers 4.57's
+# `modeling_utils.py`, `_get_resolved_checkpoint_files`, ~lines 936-958): the
+# single-file safetensors name first, then the sharded safetensors index, and only
+# then (never for this codebase, since nothing here passes `use_safetensors=False`)
+# a bare or sharded PyTorch `.bin`. `Qwen3TTSTokenizerV2Model.from_pretrained` (what
+# `breeze_infer/runtime.py` calls to load the bundled audio tokenizer) uses this same
+# resolution, so this is the one/few file(s) that actually determine what the loaded
+# codec's weights are -- not every `*.safetensors` file that happens to sit in the
+# directory (review #1/#5, prior round).
 _SAFETENSORS_SINGLE_FILE = "model.safetensors"
 _SAFETENSORS_INDEX_FILE = "model.safetensors.index.json"
+_PYTORCH_SINGLE_FILE = "pytorch_model.bin"
+_PYTORCH_INDEX_FILE = "pytorch_model.bin.index.json"
 
 _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024  # 100 MB; a real header is a few KB.
 
@@ -79,10 +86,12 @@ def pcm16(audio: np.ndarray) -> bytes:
 #     ``encoder_valid_num_quantizers`` slices it down to 16);
 #   - ``decoder_config``: ``codebook_size`` (2048), ``codebook_dim`` (512 -- not the
 #     same value as the encoder's), ``num_quantizers`` (16), ``semantic_codebook_size``
-#     (4096), ``num_semantic_quantizers`` (1), and its upsample schedule -- named
-#     ``upsample_rates`` in the real config, but ``upsampling_ratios`` is accepted too
-#     (both keys exist as aliases in different qwen-tts codec versions; whichever is
-#     present is used, and it's required that at least one is).
+#     (4096), ``num_semantic_quantizers`` (1), and **both** ``upsample_rates``
+#     ([8, 5, 4, 3]) and ``upsampling_ratios`` ([2, 2]) -- these are two distinct
+#     fields, not aliases of each other: the decoder's total upsampling factor is
+#     ``prod(upsample_rates + upsampling_ratios)``, so a change to either one changes
+#     what a code decodes to. Both are present, at this path, in the real bundled
+#     checkpoint's ``decoder_config`` and both are required.
 _TOP_LEVEL_IDENTITY_FIELDS = (
     "input_sample_rate",
     "output_sample_rate",
@@ -97,8 +106,9 @@ _DECODER_IDENTITY_FIELDS = (
     "num_quantizers",
     "semantic_codebook_size",
     "num_semantic_quantizers",
+    "upsample_rates",
+    "upsampling_ratios",
 )
-_DECODER_UPSAMPLE_FIELD_ALIASES = ("upsample_rates", "upsampling_ratios")
 
 
 def _require_field(config: dict[str, Any], key: str, *, where: str) -> Any:
@@ -108,16 +118,15 @@ def _require_field(config: dict[str, Any], key: str, *, where: str) -> Any:
     return value
 
 
-def _require_any_field(
-    config: dict[str, Any], keys: tuple[str, ...], *, where: str
-) -> tuple[str, Any]:
-    for key in keys:
-        value = config.get(key)
-        if value is not None:
-            return key, value
-    raise ValueError(
-        f"codec config missing required {where} field (any of {keys})"
-    )
+def _require_object_field(config: dict[str, Any], key: str, *, where: str) -> dict[str, Any]:
+    value = config.get(key)
+    if not isinstance(value, dict):
+        # ValueError, not TypeError (noqa: TRY004): every other identity-field
+        # failure in this module is a ValueError, and callers (a future voices.py
+        # loading a saved voice) need one exception type to catch for "bad config",
+        # whether the problem is a missing field or the wrong shape of config.
+        raise ValueError(f"{where} missing required '{key}' object")  # noqa: TRY004
+    return value
 
 
 def _codec_identity_fields(config: dict[str, Any]) -> dict[str, Any]:
@@ -127,20 +136,10 @@ def _codec_identity_fields(config: dict[str, Any]) -> dict[str, Any]:
     between the two in the real checkpoint -- can't collide and silently overwrite
     one with the other in a flattened dict.
     """
-    # ValueError, not TypeError, for both checks below (noqa: TRY004): every other
-    # identity-field failure in this module is a ValueError, and callers (a future
-    # voices.py loading a saved voice) need one exception type to catch for "bad
-    # config", whether the problem is a missing field or the wrong shape of config.
-    encoder_config = config.get("encoder_config")
-    if not isinstance(encoder_config, dict):
-        raise ValueError("codec config missing required 'encoder_config' object")  # noqa: TRY004
-    decoder_config = config.get("decoder_config")
-    if not isinstance(decoder_config, dict):
-        raise ValueError("codec config missing required 'decoder_config' object")  # noqa: TRY004
-
-    upsample_key, upsample_value = _require_any_field(
-        decoder_config, _DECODER_UPSAMPLE_FIELD_ALIASES, where="decoder_config"
-    )
+    if not isinstance(config, dict):
+        raise ValueError("codec config.json must be a JSON object")  # noqa: TRY004
+    encoder_config = _require_object_field(config, "encoder_config", where="codec config")
+    decoder_config = _require_object_field(config, "decoder_config", where="codec config")
 
     return {
         "top": {
@@ -152,11 +151,8 @@ def _codec_identity_fields(config: dict[str, Any]) -> dict[str, Any]:
             for field in _ENCODER_IDENTITY_FIELDS
         },
         "decoder": {
-            **{
-                field: _require_field(decoder_config, field, where="decoder_config")
-                for field in _DECODER_IDENTITY_FIELDS
-            },
-            upsample_key: upsample_value,
+            field: _require_field(decoder_config, field, where="decoder_config")
+            for field in _DECODER_IDENTITY_FIELDS
         },
     }
 
@@ -203,34 +199,77 @@ def _tensor_identity(header: dict[str, Any]) -> dict[str, list[Any]]:
     see: two checkpoints with identical tensor names/dtypes/shapes but different
     trained values hash the same. It detects an architecture, shape or dtype change,
     not a retrain of the same-shaped weights.
+
+    Each entry is validated (review #9): a header that parses as JSON but has the
+    wrong shape for a safetensors header (a tensor entry that isn't an object, or is
+    an object missing ``dtype``/``shape``) raises ``ValueError`` here rather than
+    crashing this function with a ``TypeError``/``KeyError`` when it's indexed.
     """
-    return {
-        name: [entry["dtype"], entry["shape"]]
-        for name, entry in header.items()
-        if name != "__metadata__"
-    }
+    identity: dict[str, list[Any]] = {}
+    for name, entry in header.items():
+        if name == "__metadata__":
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(  # noqa: TRY004 -- ValueError for consistency, see module note above
+                f"not a safetensors file: tensor entry '{name}' is not an object"
+            )
+        if "dtype" not in entry or "shape" not in entry:
+            raise ValueError(
+                f"not a safetensors file: tensor entry '{name}' is missing "
+                "'dtype' or 'shape'"
+            )
+        identity[name] = [entry["dtype"], entry["shape"]]
+    return identity
+
+
+def _weight_map_files(index_path: Path) -> list[Path]:
+    """The shard filenames a ``*.safetensors.index.json`` lists, validated (review
+    #9): a same-shaped-but-wrong index (``weight_map`` not an object, or one whose
+    values aren't all filenames) raises ``ValueError`` here instead of surfacing as
+    a ``TypeError`` from ``Path.__truediv__`` or an ``AttributeError`` from
+    ``dict.get`` on something that isn't a dict.
+    """
+    index = json.loads(index_path.read_text())
+    if not isinstance(index, dict):
+        raise ValueError(f"{index_path} must be a JSON object")  # noqa: TRY004
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError(f"{index_path} has no usable 'weight_map'")
+    filenames = set(weight_map.values())
+    if not all(isinstance(name, str) and name for name in filenames):
+        raise ValueError(f"{index_path}'s 'weight_map' values must all be filenames")
+    return [index_path.parent / name for name in sorted(filenames)]
 
 
 def _weight_files(directory: Path) -> list[Path]:
     """The weight file(s) ``Qwen3TTSTokenizerV2Model.from_pretrained`` actually loads
-    from ``audio_tokenizer/`` -- HuggingFace's own single-file/sharded-index
-    convention (``transformers.utils.SAFE_WEIGHTS_NAME`` /
-    ``SAFE_WEIGHTS_INDEX_NAME``), tried in that order, exactly as ``from_pretrained``
-    does. A stray extra ``*.safetensors`` file that the loader would never touch
-    (an old backup, an unrelated shard) is ignored rather than folded into the
-    fingerprint (review #1/#5).
-    """
-    index_path = directory / _SAFETENSORS_INDEX_FILE
-    if index_path.is_file():
-        index = json.loads(index_path.read_text())
-        weight_map = index.get("weight_map")
-        if not isinstance(weight_map, dict) or not weight_map:
-            raise ValueError(f"{index_path} has no usable 'weight_map'")
-        return [directory / name for name in sorted(set(weight_map.values()))]
+    from ``audio_tokenizer/`` -- HuggingFace's own resolution order (review #3, this
+    round; see the module-level comment by ``_SAFETENSORS_SINGLE_FILE``): the
+    single-file safetensors name first, *then* the sharded index, never the other
+    way around (a directory could in principle carry a stale index next to a real
+    single file, and the loader would still prefer the single file). A stray extra
+    ``*.safetensors`` file the loader would never touch (an old backup, an unrelated
+    shard) is ignored rather than folded into the fingerprint (review #1/#5, prior
+    round).
 
+    A directory with only a PyTorch ``.bin`` checkpoint (no safetensors at all) is a
+    real, loadable codec -- just not one this fingerprint can identify by tensor
+    header without adding a second, heavier parser -- so it's a clear, named
+    ``ValueError`` rather than the generic ``FileNotFoundError`` for "no weights at
+    all".
+    """
     single_path = directory / _SAFETENSORS_SINGLE_FILE
     if single_path.is_file():
         return [single_path]
+
+    index_path = directory / _SAFETENSORS_INDEX_FILE
+    if index_path.is_file():
+        return _weight_map_files(index_path)
+
+    if (directory / _PYTORCH_SINGLE_FILE).is_file() or (
+        directory / _PYTORCH_INDEX_FILE
+    ).is_file():
+        raise ValueError("the codec weights must be safetensors to fingerprint")
 
     raise FileNotFoundError(
         f"Neither {_SAFETENSORS_SINGLE_FILE} nor {_SAFETENSORS_INDEX_FILE} "

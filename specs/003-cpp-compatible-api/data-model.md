@@ -187,7 +187,7 @@ Path: `<voices_dir>/<id>.voice.json`, UTF-8 JSON. A consumer rejects any file wh
   "codebooks": 16,
   "codes": "<base64 of int16 little-endian, row-major [frames][codebooks]>",
   "codes_sha256": "<hex sha256 of the decoded bytes>",
-  "codec_fingerprint": "<hex sha256 of the codec config's required identity fields (sample rates, quantizer counts, codebook sizes/dims, upsample rates, from both the encoder and decoder blocks of audio_tokenizer/config.json) ‖ the loaded weight file's safetensors header ({tensor: [dtype, shape]} only, no tensor data) -- detects an architecture/shape/dtype change, not a retrain of same-shaped weights>",
+  "codec_fingerprint": "<hex sha256 of the codec config's required identity fields (sample rates, quantizer counts, codebook sizes/dims, and the decoder's upsample_rates AND upsampling_ratios -- two distinct required fields, not aliases -- from both the encoder and decoder blocks of audio_tokenizer/config.json) ‖ the safetensors header ({tensor: [dtype, shape]} only, no tensor data) of the ONE weight file the codec loader actually reads (model.safetensors, else the sharded index's file list, in that order -- transformers' own resolution order) -- detects an architecture/shape/dtype change, not a retrain of same-shaped weights>",
   "encode_ms": 812,
   "created_at": "2026-09-24T20:15:00Z"
 }

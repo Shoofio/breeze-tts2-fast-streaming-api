@@ -224,10 +224,6 @@ def test_min_suffix_room_is_the_default_instruction_suffix_plus_min_frames(
             "id": "min-suffix",
             "speaker": "S0",
             "ref_text": "x",
-            # The suffix carries no audio; the codes only have to be present.
-            "ref_audio_codes": torch.zeros(
-                1, env.model.config.num_codebooks, dtype=torch.long
-            ),
             "text": text,
             "instruction": DEFAULT_INSTRUCTION,
         }

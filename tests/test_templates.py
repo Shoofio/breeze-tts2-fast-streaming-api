@@ -156,6 +156,33 @@ def test_ref_edit_tata_rejects_out_of_range_codes(bad_value) -> None:
         _prepare(codes)
 
 
+def test_ref_edit_tata_accepts_plain_nested_lists() -> None:
+    codes = [[0] * 16 for _ in range(3)]
+
+    inputs = _prepare(codes)
+
+    assert tuple(inputs["input_values"].shape) == (1, 3, 16)
+
+
+@pytest.mark.parametrize(
+    "codes",
+    [
+        [[2**70] * 16] * 3,
+        [["a"] * 16] * 3,
+        "just a string",
+    ],
+    ids=["overflow_int", "strings", "bare_string"],
+)
+def test_ref_edit_tata_wraps_list_input_conversion_errors_as_value_error(codes) -> None:
+    """review #10: torch.as_tensor's own exception for an unconvertible list input
+    (a Python int too big for any torch dtype, a string element, or a bare string) is
+    not always a ValueError -- it must be caught and re-raised as one, not leak
+    whatever torch happens to raise.
+    """
+    with pytest.raises(ValueError):
+        _prepare(codes)
+
+
 # --- _codec_facts (review #8) ---------------------------------------------------
 
 
@@ -274,14 +301,32 @@ def test_prefix_inputs_also_require_reference_codes() -> None:
         prepare_prefix_inputs(FakeTokenizer(), _model_with_codec_facts(), request)
 
 
-def test_suffix_inputs_use_the_shared_validator() -> None:
-    """review #7: prepare_suffix_inputs now runs the same reference-source check as
-    prepare_inputs/prepare_prefix_inputs, so a request missing ref_audio_codes is
-    rejected before any text is prepared, with the same message shape.
+def test_suffix_inputs_do_not_require_reference_codes() -> None:
+    """review #8, this round: the suffix carries no audio (``split_reference_prefix``'s
+    ``guided``/``unguided`` pieces never touch ``ref_audio_codes``), so
+    ``prepare_suffix_inputs`` must not reject a request that has no codes at all --
+    the codes were already consumed by ``prepare_prefix_inputs`` for the same
+    request, earlier in the real call sequence.
     """
-    request = {"id": "s", "speaker": "S0", "text": "hi", "instruction": "calm"}
+    request = {
+        "id": "s",
+        "speaker": "S0",
+        "ref_text": "the transcript",
+        "text": "hi",
+        "instruction": "calm",
+    }
 
-    with pytest.raises(ValueError, match="ref_audio_codes"):
+    inputs = prepare_suffix_inputs(
+        FakeTokenizer(), _model_with_codec_facts(), request, guidance_scale=1.0
+    )
+
+    assert inputs["input_values"] is None
+
+
+def test_suffix_inputs_still_require_text_and_instruction() -> None:
+    request = {"id": "s", "speaker": "S0", "instruction": "calm"}
+
+    with pytest.raises(ValueError, match=r"\['text'\]"):
         prepare_suffix_inputs(
             FakeTokenizer(), _model_with_codec_facts(), request, guidance_scale=1.0
         )

@@ -190,6 +190,15 @@ def _normalize_codes_array(codes: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(codes, dtype=np.int64))
 
 
+def _require_integer_tensor_dtype(codes: torch.Tensor) -> None:
+    """The one shared dtype check (review #10) for every already-a-tensor path:
+    a torch tensor has no object/byte-order/stride quirks to normalize, only a
+    dtype that might be float, complex or bool instead of integer.
+    """
+    if codes.dtype is torch.bool or torch.is_floating_point(codes) or torch.is_complex(codes):
+        raise ValueError(f"audio_codes must have an integer dtype, got {codes.dtype}")
+
+
 def _resolve_segment_audio_codes(
     segment: Segment, *, codebooks: int, codebook_size: int
 ) -> torch.Tensor:
@@ -211,12 +220,17 @@ def _resolve_segment_audio_codes(
     if isinstance(codes, np.ndarray):
         codes = _normalize_codes_array(codes)
     elif isinstance(codes, torch.Tensor):
-        if codes.dtype is torch.bool or torch.is_floating_point(codes) or torch.is_complex(codes):
-            raise ValueError(f"audio_codes must have an integer dtype, got {codes.dtype}")
+        _require_integer_tensor_dtype(codes)
     else:
-        codes = torch.as_tensor(codes)
-        if codes.dtype is torch.bool or torch.is_floating_point(codes) or torch.is_complex(codes):
-            raise ValueError(f"audio_codes must have an integer dtype, got {codes.dtype}")
+        # A plain list/tuple (or anything else torch will try to interpret): torch's
+        # own exception for e.g. a value too big for its inferred dtype (2**70) or a
+        # string element is not always a ValueError (review #10), so it's wrapped
+        # into one with the offending input still named in the message.
+        try:
+            codes = torch.as_tensor(codes)
+        except (TypeError, ValueError, OverflowError, RuntimeError) as exc:
+            raise ValueError(f"audio_codes could not be read as a tensor: {exc}") from exc
+        _require_integer_tensor_dtype(codes)
 
     if codes.ndim != 2:
         raise ValueError(
@@ -270,11 +284,12 @@ def _check_reference_source(template: TemplateSpec, request: Request) -> None:
 def _validate_reference_request(
     template: TemplateSpec, request: Request, fields: tuple[str, ...]
 ) -> None:
-    """Shared by ``prepare_inputs``, ``prepare_prefix_inputs`` and
-    ``prepare_suffix_inputs`` (review #7/#8, this round and last): all three need the
-    same two checks -- the given ``fields`` are present, and (for a reference-audio
-    template) ``ref_audio_codes`` is too -- just against a different field tuple (the
-    full template vs. the reference-prefix-only vs. the text-continuation fields).
+    """Shared by ``prepare_inputs`` and ``prepare_prefix_inputs`` (review #8, prior
+    round): both need the same two checks -- the given ``fields`` are present, and
+    (for a reference-audio template) ``ref_audio_codes`` is too -- just against a
+    different field tuple (the full template vs. the reference-prefix-only fields).
+    ``prepare_suffix_inputs`` does *not* use this (review #8, this round): the
+    suffix carries no audio, so it must not require ``ref_audio_codes``.
     """
     missing = _missing_fields(request, fields)
     if missing:
@@ -546,9 +561,19 @@ def prepare_suffix_inputs(
     The result has the same keys as ``prepare_inputs`` for a single-CFG request
     (``input_ids`` plus ``cfg_negative_*`` when ``guidance_scale != 1``) but
     carries no audio, so the runtime's branch builder can consume it unchanged.
+
+    Unlike ``prepare_inputs``/``prepare_prefix_inputs``, this does *not* run
+    ``_check_reference_source`` (review #8, this round): the suffix is pure text --
+    ``split_reference_prefix``'s ``guided``/``unguided`` pieces never touch
+    ``ref_audio_codes`` -- so requiring it here would reject a perfectly valid
+    suffix-only call for a reference whose codes are already cached in the prefix
+    this suffix is meant to follow.
     """
-    template = get_template("ref_edit_tata")
-    _validate_reference_request(template, request, ("text", "instruction"))
+    missing = _missing_fields(request, ("text", "instruction"))
+    if missing:
+        raise ValueError(
+            f"Request {request.get('id')} missing template fields: {missing}"
+        )
     _, guided, unguided = split_reference_prefix(request)
     inputs = _prepare_segment_batches(tokenizer, model.config, model.device, [guided])
     if guidance_scale != 1.0:
