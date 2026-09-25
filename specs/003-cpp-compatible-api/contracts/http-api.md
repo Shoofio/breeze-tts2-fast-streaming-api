@@ -141,7 +141,7 @@ Generation stops within one chunk, and the GPU is released.
 | Status | Code | Message |
 |---|---|---|
 | 400 | `invalid_field` | `<field> must be <rule>` |
-| 400 | `invalid_field` | `<rule>` per field: numbers "an integer" / "a number"; control characters "free of control characters"; `cfg_scale` "finite and between 0 and 100"; `seed` "an integer between 0 and 4294967295"; `temperature` "0, or greater than 0 and at most 10"; `top_k` "0, or an integer between 1 and 10000"; `top_p` "0, or greater than 0 and at most 1"; `repetition_penalty` "0, or between 0.0001 and 10"; `max_new_tokens` "0, or an integer between 1 and 1,500"; `split_chars` "an integer between 0 and 10000"; `instruction`/`ref_text` "at most 2,000 characters"; `voice_id` "a voice name or v_ id" |
+| 400 | `invalid_field` | `<rule>` per field: numbers "an integer" / "a number"; control characters "free of control characters"; `cfg_scale` "finite and between 0 and 100"; `seed` "an integer between 0 and 4294967295"; `temperature` "0, or greater than 0 and at most 10"; `top_k` "0, or an integer between 1 and 10,000"; `top_p` "0, or greater than 0 and at most 1"; `repetition_penalty` "0, or between 0.0001 and 10"; `max_new_tokens` "0, or an integer between 1 and 1,500"; `split_chars` "an integer between 0 and 10,000"; `instruction`/`ref_text` "at most 2,000 characters"; `voice_id` "a voice name or v_ id" |
 | 400 | `invalid_field` | `content type must be multipart/form-data or application/x-www-form-urlencoded` |
 | 400 | `duplicate_field` | `<field> was given more than once` |
 | 400 | `text_required` | `text is required` |

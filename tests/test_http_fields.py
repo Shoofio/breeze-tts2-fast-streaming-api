@@ -433,10 +433,13 @@ def test_form_max_part_size_is_derived_from_max_text_chars() -> None:
 
 
 def test_a_full_length_four_byte_char_text_field_fits_urlencoded(tmp_path: Path) -> None:
-    # "🎉" is a 4-byte UTF-8 code point; percent-encoded it's exactly 12 ASCII bytes
-    # ("%XX" x 4), so MAX_TEXT_CHARS of them is exactly at half of FORM_MAX_PART_SIZE --
-    # comfortably under it, with headroom to spare (review 2 finding #4).
-    text = "\U0001f389" * MAX_TEXT_CHARS
+    # U+20000, a CJK Extension B ideograph, is a 4-byte UTF-8 code point; percent-encoded
+    # it's exactly 12 ASCII bytes ("%XX" x 4), so MAX_TEXT_CHARS of them is exactly at half
+    # of FORM_MAX_PART_SIZE -- comfortably under it, with headroom to spare (review 2
+    # finding #4). A CJK ideograph, not an emoji, specifically because it's a letter
+    # (Unicode category Lo): text_split.py's speakable rule (mirrored in this module) drops
+    # text with no letter or digit at all, which an emoji-only string would trip on.
+    text = "\U00020000" * MAX_TEXT_CHARS
     encoded_value = quote(text, safe="")
     assert len(encoded_value) < FORM_MAX_PART_SIZE
     body = f"text={encoded_value}".encode("ascii")
@@ -928,7 +931,7 @@ def test_bc_05_text_or_instruction_too_long_gets_400(tmp_path: Path) -> None:
     )
     assert instruction_response.status_code == 400
     assert instruction_response.json() == {
-        "error": "instruction must be at most 2000 characters",
+        "error": "instruction must be at most 2,000 characters",
         "code": "invalid_field",
     }
 
@@ -937,7 +940,7 @@ def test_bc_05_text_or_instruction_too_long_gets_400(tmp_path: Path) -> None:
     )
     assert ref_text_response.status_code == 400
     assert ref_text_response.json() == {
-        "error": "ref_text must be at most 2000 characters",
+        "error": "ref_text must be at most 2,000 characters",
         "code": "invalid_field",
     }
 
@@ -1348,3 +1351,226 @@ def test_blank_ref_text_counts_as_absent_needing_ref_text_required_with_ref_audi
         "error": "ref_text is required with ref_audio",
         "code": "ref_text_required",
     }
+
+
+# --- final-review follow-ups (Phase 5 checkpoint) ---------------------------------------
+
+
+def test_bc_01_decimal_with_huge_exponent_gets_400(tmp_path: Path) -> None:
+    """BC-01: a decimal literal with an enormous exponent is rejected with 400 -- the
+    grammar itself bounds an exponent to at most 4 digits, so a literal like this never
+    reaches decimal.Decimal's own construction, which would otherwise raise
+    InvalidOperation, unhandled, for an exponent outside its context's range (~999999). The
+    C++ server's strtod-family parsing has no such limit and would just saturate to
+    infinity instead of raising.
+    """
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "cfg_scale": "1e1000000000000000000"}
+    )
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "invalid_field"
+
+
+def test_decimal_range_check_survives_invalid_operation_from_a_bypassed_literal() -> None:
+    """The grammar's 4-digit exponent bound is what a real request always goes through, but
+    _check_decimal_range's own decimal.Decimal(literal) call is guarded independently too --
+    called directly here with a literal the grammar would never let through, to prove the
+    guard itself (not just the grammar) is what stands between a pathological literal and an
+    unhandled 500.
+    """
+    with pytest.raises(http_fields.ApiError) as exc_info:
+        http_fields._check_decimal_range(
+            "1e" + "9" * 20,
+            0.0,
+            "cfg_scale",
+            "0",
+            "100",
+            low_inclusive=True,
+            rule="finite and between 0 and 100",
+        )
+
+    assert exc_info.value.status == 400
+    assert exc_info.value.code == "invalid_field"
+    assert exc_info.value.message == "cfg_scale must be finite and between 0 and 100"
+
+
+def test_bc_01_leading_zeros_dont_count_against_the_digit_cap(tmp_path: Path) -> None:
+    """The integer literal digit cap (test_bc_01_integer_longer_than_20_digits_gets_400)
+    counts significant digits, not raw digits on the wire -- a value padded with leading
+    zeros must be judged by its actual magnitude, not its length."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "seed": "0" * 25 + "1"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["seed"] == 1
+
+
+def test_all_zero_integer_literal_still_means_the_default_however_padded(
+    tmp_path: Path,
+) -> None:
+    """An all-zero integer literal is exactly 0 -- FR-006's "0 means the model default" --
+    no matter how many leading zeros pad it, not rejected as too long."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "top_k": "0" * 25}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["top_k"] is None
+
+
+def test_top_k_range_message_matches_the_contract_exactly(tmp_path: Path) -> None:
+    response = _client(tmp_path).post("/speech", data={"text": "hi", "top_k": "-1"})
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "top_k must be 0, or an integer between 1 and 10,000",
+        "code": "invalid_field",
+    }
+
+
+def test_max_new_tokens_range_message_matches_the_contract_exactly(tmp_path: Path) -> None:
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "max_new_tokens": str(MAX_NEW_TOKENS_CEILING + 1)}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": f"max_new_tokens must be 0, or an integer between 1 and {MAX_NEW_TOKENS_CEILING:,}",
+        "code": "invalid_field",
+    }
+
+
+def test_split_chars_range_message_matches_the_contract_exactly(tmp_path: Path) -> None:
+    response = _client(tmp_path).post("/speech", data={"text": "hi", "split_chars": "-1"})
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "split_chars must be an integer between 0 and 10,000",
+        "code": "invalid_field",
+    }
+
+
+def test_bc_08_three_ref_audio_file_parts_get_400(tmp_path: Path) -> None:
+    """BC-08: three ref_audio file parts (not just two) still resolve to duplicate_field --
+    the multipart parser is given enough headroom to actually see every one of them itself,
+    rather than tripping its own generic file-count limit on the third one first."""
+    boundary = "xxxxBOUNDARYxxxx"
+
+    def part(n: int) -> str:
+        return (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="ref_audio"; filename="{n}.wav"\r\n'
+            "Content-Type: audio/wav\r\n\r\n"
+            f"file bytes {n}\r\n"
+        )
+
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="text"\r\n\r\n'
+        "hi\r\n" + part(1) + part(2) + part(3) + f"--{boundary}--\r\n"
+    ).encode("ascii")
+
+    response = _client(tmp_path).post(
+        "/speech",
+        content=body,
+        headers={"content-type": f"multipart/form-data; boundary={boundary}"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "ref_audio was given more than once",
+        "code": "duplicate_field",
+    }
+
+
+def test_text_length_is_checked_before_control_characters(tmp_path: Path) -> None:
+    """When text is both over-length and made entirely of control characters, the (cheap,
+    O(1)) length check runs first and wins -- BC-05's text_too_long, not BC-46's control-
+    character message -- so an over-length value is never scanned for control characters at
+    all."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "\x07" * (MAX_TEXT_CHARS + 1)}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "text is too long", "code": "text_too_long"}
+
+
+def test_instruction_length_is_checked_before_the_blank_check(tmp_path: Path) -> None:
+    """An instruction so long it exceeds the limit is rejected even when it's entirely
+    whitespace -- length is checked before deciding whether the value counts as blank (and
+    so gets the default instead)."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "instruction": " " * (MAX_INSTRUCTION_CHARS + 1)}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": f"instruction must be at most {MAX_INSTRUCTION_CHARS:,} characters",
+        "code": "invalid_field",
+    }
+
+
+def test_ref_text_length_is_checked_before_the_blank_check(tmp_path: Path) -> None:
+    """Same ordering as instruction: an over-length, all-whitespace ref_text is rejected as
+    too long, not treated as absent."""
+    response = _client(tmp_path).post(
+        "/speech",
+        data={
+            "text": "hi",
+            "voice_id": "alice",
+            "ref_text": " " * (MAX_REF_TEXT_CHARS + 1),
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": f"ref_text must be at most {MAX_REF_TEXT_CHARS:,} characters",
+        "code": "invalid_field",
+    }
+
+
+def test_voice_id_uppercase_v_prefix_is_rejected(tmp_path: Path) -> None:
+    """BC-26: names are unique ignoring case, so the v_ prefix is reserved case-
+    insensitively too -- V_ + 16 hex characters can't be treated as an ordinary
+    saved-name-shaped string just because its case doesn't literally match "v_"; a real
+    unnamed-voice id must still be lowercase, exactly as before."""
+    response = _client(tmp_path).post(
+        "/speech", data={"text": "hi", "voice_id": "V_" + "a1b2c3d4e5f60789"}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "voice_id must be a voice name or v_ id",
+        "code": "invalid_field",
+    }
+
+
+def test_punctuation_only_text_gets_text_required(tmp_path: Path) -> None:
+    """text_split.py's own rule drops a piece with no letter or digit (punctuation-only
+    text can't be spoken); caught here too, so it's 400 text_required at the field stage
+    rather than something split_text silently discards downstream."""
+    response = _client(tmp_path).post("/speech", data={"text": "..."})
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "text is required", "code": "text_required"}
+
+
+def test_emoji_only_text_gets_text_required(tmp_path: Path) -> None:
+    response = _client(tmp_path).post("/speech", data={"text": "\U0001f389\U0001f389"})
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "text is required", "code": "text_required"}
+
+
+def test_unspeakable_text_gets_text_required_before_reference_checks(tmp_path: Path) -> None:
+    """Stage 2 (field syntax) runs before stage 3 (reference consistency), per FR-007:
+    text="..." (unspeakable) together with a bare ref_text (which, on its own, would
+    otherwise be 400 reference_required) must still be 400 text_required -- the field-stage
+    problem with `text` is caught before `_build_reference` ever looks at `ref_text`."""
+    response = _client(tmp_path).post("/speech", data={"text": "...", "ref_text": "t"})
+
+    assert response.status_code == 400
+    assert response.json() == {"error": "text is required", "code": "text_required"}
