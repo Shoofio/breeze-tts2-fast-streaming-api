@@ -69,7 +69,7 @@ phases as follows:
 
 **Purpose**: capture the before-state and build the tools that every later gate uses.
 
-- [ ] T001 (after T003) Port the benchmark from `A:breeze_infer/bench_api.py` to `breeze_infer/bench_api.py`:
+- [X] T001 (after T003) Port the benchmark from `A:breeze_infer/bench_api.py` to `breeze_infer/bench_api.py`:
   - Add `--api old|new`. `old` drives the current API: port 7860, form fields `text`,
     `instruction`, `cfg_scale`, `seed`, `ref_audio`, `ref_text`. `new` drives
     contracts/http-api.md at 8080.
@@ -77,13 +77,13 @@ phases as follows:
   - Report the median time to first audio (TTFA, ms) and real-time factor (RTF) over `--runs`.
   - Output JSON events to stdout.
   - Add `tests/test_bench_api.py`, covering argument parsing and median maths.
-- [ ] T002 Record the performance baseline (quickstart Scenario 0.1, SC-007):
+- [X] T002 Record the performance baseline (quickstart Scenario 0.1, SC-007):
   1. Start the current API, `.venv/bin/python -m breeze_infer.api <model> --port 7860 --fast-all`.
   2. Run `python -m breeze_infer.bench_api --api old --url http://127.0.0.1:7860` (defaults:
      `--warmup 3 --runs 10`; see "SC-007 method" below).
   3. Write the GPU name, commit SHA, command lines and medians to
      `specs/003-cpp-compatible-api/research/baseline-2026-09-24.md` (use the actual date).
-- [ ] T003 Update `requirements.txt` (R4, plan "Dependency changes"):
+- [X] T003 Update `requirements.txt` (R4, plan "Dependency changes"):
   - Add `websockets>=15`.
   - Pin exactly: `fastapi==0.141.1`, `starlette==1.6.0`, `uvicorn==0.52.4`,
     `python-multipart==0.0.32`.
@@ -158,12 +158,12 @@ phases as follows:
 **Purpose**: the composition root, error envelope, limits, GPU gate and thread, segmenter,
 `/health`, launch scripts. No user story can start before this phase is done.
 
-- [ ] T012 [P] Create `breeze_infer/limits.py` with every constant in data-model.md "Limits".
+- [X] T012 [P] Create `breeze_infer/limits.py` with every constant in data-model.md "Limits".
   Plain module-level constants only (no mutable state).
-- [ ] T013 [P] Port `A:breeze_infer/events.py` to `breeze_infer/events.py` and `A:tests/test_events.py`
+- [X] T013 [P] Port `A:breeze_infer/events.py` to `breeze_infer/events.py` and `A:tests/test_events.py`
   to `tests/test_events.py`. The clock and output stream are injected; the emitter is built at the
   composition root and passed down.
-- [ ] T014 [P] Create `breeze_infer/errors.py` (R7), porting `A:breeze_infer/api.py` lines
+- [X] T014 [P] Create `breeze_infer/errors.py` (R7), porting `A:breeze_infer/api.py` lines
   ~539–599. It holds `ApiError(status, code, message)` and `install_error_handlers(app, events)`:
   - `StarletteHTTPException` maps to the envelope, passing `exc.headers` through (so `405` keeps
     `Allow`), with codes `not_found` (404) and `method_not_allowed` (405);
@@ -175,13 +175,13 @@ phases as follows:
 
   Port `A:tests/test_api_errors.py` to `tests/test_api_errors.py`, add `code` assertions, and name
   the tests `test_bc_18_*`.
-- [ ] T015 [P] Create `breeze_infer/body_limit.py` (R6): a pure-ASGI middleware. A
+- [X] T015 [P] Create `breeze_infer/body_limit.py` (R6): a pure-ASGI middleware. A
   `Content-Length` over `MAX_BODY_BYTES` is rejected immediately. Otherwise it wraps `receive`,
   counts bytes, and raises `ApiError(413, "payload_too_large", "request body is too large")`.
 
   `tests/test_body_limit.py` covers `Content-Length` over the limit, a chunked body over the limit,
   and a body under the limit passing (`test_bc_06_*`).
-- [ ] T016 [P] Create `breeze_infer/settings.py`: a frozen `Settings` plus `build_parser()` and
+- [X] T016 [P] Create `breeze_infer/settings.py`: a frozen `Settings` plus `build_parser()` and
   `settings_from_args(argv)` for every field in data-model.md "Settings":
   - `--port` defaults to 8080;
   - `--ws-port` takes a port or `disabled`, and defaults to `port + 1`;
@@ -284,12 +284,12 @@ phases as follows:
   CORS off (`test_bc_18_*`, `test_bc_24_*` partly). It also checks FR-001's excluded routes:
   `POST /v1/audio/convert`, `GET /`, `GET /app.js` and `GET /style.css` all return the `404`
   envelope.
-- [ ] T024 [P] Update the launch scripts:
+- [X] T024 [P] Update the launch scripts:
   - `scripts/start_breeze.sh`: `--port 8080`; pass extra arguments through, so `--cors` works.
   - `scripts/start_breeze.ps1`: `-Port 8080`, and new `-Cors` and `-WsPort` parameters.
   - `docker/run.sh`: publish `8080:8080` and `8081:8081` and pass `--port 8080`.
   - `docker/README.md` if it mentions 7860.
-- [ ] T025 [P] Set `breeze_infer/__init__.py` `__version__ = "2.0.0.dev1"`. Create
+- [X] T025 [P] Set `breeze_infer/__init__.py` `__version__ = "2.0.0.dev1"`. Create
   `breeze_infer/version_header.py`, a pure-ASGI middleware that adds
   `X-Breeze-Version: <__version__>` to every HTTP response start message (FR-037a). Wire it in
   `api.py` just inside the CORS middleware once T028 lands (until then, outermost).
