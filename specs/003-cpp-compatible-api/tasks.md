@@ -92,7 +92,7 @@ phases as follows:
     `.venv/bin/python -c "import websockets, httpx; print(websockets.__version__)"`.
   - Mirror the new dependency in the `scripts/start_breeze.ps1` bootstrap if it installs packages
     separately.
-- [ ] T004 [P] Create `tests/live/sillytavern/config.mjs`. It exports, each overridable by an env
+- [X] T004 [P] Create `tests/live/sillytavern/config.mjs`. It exports, each overridable by an env
   variable:
   - the SillyTavern URL (`http://127.0.0.1:8000/`);
   - Breeze `http_url` (`http://127.0.0.1:8080`) and `ws_url` (`ws://127.0.0.1:8081`);
@@ -100,7 +100,7 @@ phases as follows:
   - the chromium path (`~/.cache/ms-playwright/chromium-1234`);
   - the headless flag, and the launch args `--autoplay-policy=no-user-gesture-required`;
   - the reference voice samples dir (`$REFERENCE_VOICES_DIR`).
-- [ ] T005 Create `tests/live/sillytavern/lib.mjs`, adapted from
+- [X] T005 Create `tests/live/sillytavern/lib.mjs`, adapted from
   `<SillyTavern checkout>/specs/001-breeze-tts-provider/us*-browser-validation.mjs` and
   `make-validation-chat.mjs`. Helpers:
   - `openSillyTavern()`;
@@ -114,10 +114,10 @@ phases as follows:
   - `readToasts()`: from `#toast-container`;
   - `writeRecord(phase, results)`: writes JSON and markdown to
     `specs/003-cpp-compatible-api/research/live-<phase>.md`.
-- [ ] T006 [P] Create `tests/live/sillytavern/phases/health.mjs`: provider loads, the
+- [X] T006 [P] Create `tests/live/sillytavern/phases/health.mjs`: provider loads, the
   `breeze.health` event is present, no `breeze.check_failed` event, no toast, and no CORS console
   errors.
-- [ ] T007 [P] Create `tests/live/sillytavern/phases/voices.mjs`:
+- [X] T007 [P] Create `tests/live/sillytavern/phases/voices.mjs`:
   - upload `st_live_tmp` through `#breeze_upload_file`, `#breeze_upload_transcript`,
     `#breeze_upload_name` and `#breeze_upload_save` (accept the confirm dialog);
   - check that it appears in `#breeze_voice_list`;
@@ -126,25 +126,25 @@ phases as follows:
   - delete it via `.breeze_voice_delete[data-id="st_live_tmp"]`;
   - check the `voice.uploaded` and `voice.deleted` events, with no toasts;
   - check that `eric` and `vale` are still listed.
-- [ ] T008 [P] Create `tests/live/sillytavern/phases/speech.mjs`: in the SillyTavern page,
+- [X] T008 [P] Create `tests/live/sillytavern/phases/speech.mjs`: in the SillyTavern page,
   `page.evaluate(fetch(httpUrl + '/v1/audio/speech', {method:'POST', body: FormData{text}}))`.
   Assert:
   - `200`;
   - `X-Sample-Rate` is readable (expose-headers work);
   - the body is non-empty and has an even byte length;
   - a request with `cfg_scale=banana` returns `400` with a JSON `error` key readable from the page.
-- [ ] T009 [P] Create `tests/live/sillytavern/phases/full.mjs`:
+- [X] T009 [P] Create `tests/live/sillytavern/phases/full.mjs`:
   - narrate the last message with quoted text via `.mes_narrate`: expect `synth.request`, then
     `synth.event` `started`, then `synth.done`, with the time to first audio recorded;
   - narrate, then click `#tts_media_control` to stop: expect `synth.cancelled` and no toast;
   - voice preview for `eric`;
   - two back-to-back narrations: expect a `queued` event on the second;
   - repeat the narration with `cfg_scale` set to 1, 4 and 7.5.
-- [ ] T010 Create `tests/live/sillytavern/run.mjs <health|voices|speech|full>`:
+- [X] T010 Create `tests/live/sillytavern/run.mjs <health|voices|speech|full>`:
   - `full` runs health, then voices, then full; `speech` runs health, then speech.
   - Exit code 0 only if every step passes.
   - Add the command to the README development section (Constitution X).
-- [ ] T011 Run `node tests/live/sillytavern/run.mjs full` against the **C++ server**
+- [X] T011 Run `node tests/live/sillytavern/run.mjs full` against the **C++ server**
   (`<Breeze-TTS-2.cpp checkout>`, started with `--cors`), with `speech.mjs` skipped because the
   C++ server returns `200` for `cfg_scale=banana`, which that script treats as a failure. Record the result as the reference behavior in
   `research/live-phase0.md`, then stop the C++ server.
@@ -196,7 +196,7 @@ phases as follows:
 
   Create `tests/test_settings.py`, and move the flag tests out of `tests/test_runtime_flags.py`
   where they target the old parser.
-- [ ] T017 *(Opus)* Create `breeze_infer/gpu.py` `GpuGate` (R14): asyncio only, used only on the
+- [X] T017 *(Opus)* Create `breeze_infer/gpu.py` `GpuGate` (R14): asyncio only, used only on the
   event loop.
   - `try_acquire() -> bool` is false when the gate is held or any waiter is pending.
   - `async acquire()` returns a flag saying whether it had to wait, so the caller can send
@@ -205,7 +205,7 @@ phases as follows:
 
   `tests/test_gpu_gate.py` covers try/acquire, handoff order, a cancelled waiter being skipped, and
   HTTP `try_acquire` failing while a WebSocket waiter is queued.
-- [ ] T018 *(Opus)* Add `GpuThread` to `breeze_infer/gpu.py` (R14): a single-thread executor that
+- [X] T018 *(Opus)* Add `GpuThread` to `breeze_infer/gpu.py` (R14): a single-thread executor that
   calls `torch.cuda.set_device(device)` once when the thread starts. Methods:
   - `run(fn, *args)` (awaitable);
   - `step(gen)`, which returns the next item or a sentinel on `StopIteration`;
@@ -215,7 +215,7 @@ phases as follows:
   `tests/test_gpu_thread.py` checks that all calls run on one thread, that `close` queues behind an
   in-flight `step`, and that exceptions propagate. Pass a stub `set_device` callable so the test
   needs no GPU.
-- [ ] T019 *(Opus)* Port `A:breeze_infer/text_split.py` to `breeze_infer/text_split.py` with the
+- [X] T019 *(Opus)* Port `A:breeze_infer/text_split.py` to `breeze_infer/text_split.py` with the
   R11 fixes. It exposes `weigh(text)`, `segment(buffer, *, budget, first_budget=0, final)` and
   `split_text(text, *, budget, first_budget=0)`, and keeps `ANCHOR_CHARS` in `limits.py`.
   1. Drop the NUL-as-closer quirk.
@@ -229,7 +229,7 @@ phases as follows:
   7. `first_budget` applies to the first returned piece only.
   8. `budget == 0` means no length splitting.
   9. Strip pieces and drop empty ones; keep inner `\t` and `\r`.
-- [ ] T020 Port `A:tests/cpp_golden/{README.md,harness.cpp,gen_goldens.py,golden.json}` into
+- [X] T020 Port `A:tests/cpp_golden/{README.md,harness.cpp,gen_goldens.py,golden.json}` into
   `tests/cpp_golden/`. Change `gen_goldens.py` so it no longer rewrites the test file.
 
   Port `A:tests/test_text_split.py` to `tests/test_text_split.py`. It compares the normalized C++
@@ -251,7 +251,7 @@ phases as follows:
     or 2 × budget.
 
   Name the tests `test_bc_39_*` and `test_bc_46_*`.
-- [ ] T021 Port `A:tests/fakes.py` to `tests/fakes.py` and extend it with `FakeRuntime`:
+- [X] T021 Port `A:tests/fakes.py` to `tests/fakes.py` and extend it with `FakeRuntime`:
   - configurable chunks per piece, a per-chunk `threading.Event` gate, and fail-after-N;
   - it records the seeds, the sampling overrides and the reference passed to each piece;
   - it reports `sample_rate=24000`.

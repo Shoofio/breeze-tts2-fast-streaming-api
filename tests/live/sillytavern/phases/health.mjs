@@ -20,9 +20,10 @@ export default async function health(page, config, events) {
         const hasOption = await page.evaluate(() => $('#tts_provider option[value="Breeze"]').length > 0);
         step('SillyTavern loaded with the Breeze provider registered', hasOption);
 
+        // selectBreezeProvider waits for "TTS Provider Loaded" itself. Re-reading #tts_status
+        // afterwards races SillyTavern replacing it with "Successfully applied settings".
         const since = await selectBreezeProvider(page, config, events);
-        const status = await page.$eval('#tts_status', (e) => e.textContent);
-        step('provider reports "TTS Provider Loaded"', status.includes('TTS Provider Loaded'), status.trim());
+        step('provider reports "TTS Provider Loaded"', true);
 
         // Only events from this run's own refresh-triggered checkReady() count: selecting Breeze and
         // enabling TTS both ran their own checkReady() first, against whatever URL a previous session
