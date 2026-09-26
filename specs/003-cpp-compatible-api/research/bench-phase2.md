@@ -33,6 +33,12 @@ server log shows all 52 requests (4 cases × 13 including warm-ups) were one pie
 (`speech.accepted.pieces == 1`), and all 52 ended in `speech.completed` (no failed or aborted).
 So the comparison is like for like: the same output length, with no shorter opening piece.
 
+> **Correction (T054, 2026-09-25):** the inline lengths matching the baseline was chance. Before
+> `bebe8ce`, the reference encode could give slightly different codes in each server process
+> (`cudnn.benchmark` autotuning), so inline output lengths varied across restarts (5.20–6.96 s for
+> short_inline at `bea6767`). The design cases were unaffected. See research.md R18 and
+> `research/live-phase2.md`.
+
 **SC-007 passes.** No gating case regresses; TTFA improves by 17–29%, and RTF is unchanged within
 noise.
 
