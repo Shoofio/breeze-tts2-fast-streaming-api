@@ -9,8 +9,17 @@
     `speech` phase again, and the benchmark again across two server processes.
 - **Version numbering:** these runs reported `2.0.0.dev3` and `2.0.0.dev4`, which took the
   numbers the plan reserves for Phases 3 and 4. With the user's agreement they are renumbered
-  `2.0.0.dev2+1` and `2.0.0.dev2+2` (plan.md, live-gate step 1); the code now carries
-  `2.0.0.dev2+2`. The values below are what the server reported at the time.
+  `2.0.0.dev2+1` and `2.0.0.dev2+2` (plan.md, live-gate step 1); later Phase 2 fixes keep bumping
+  the local label (it is past `+2` by now), so treat the code's current label as whatever
+  `breeze_infer/__init__.py` says rather than assuming it still reads `+2`. The values below are
+  what the server reported at the time. Because `dev3` and `dev4` were reused, each of those two
+  version strings now names two different builds: the T054 runs recorded here, and later the
+  actual Phase 3 and Phase 4 live gates. Under PEP 440, `2.0.0.dev2+M` sorts *below*
+  `2.0.0.dev3`/`2.0.0.dev4` for any `M`, so these renumbered T054 builds compare as earlier
+  prereleases than the phases that follow them, even though they ran first and were later
+  legitimately superseded by the real dev3/dev4 builds. The user accepted both the reuse and the
+  sort ordering for a local development server, where nothing consumes `X-Breeze-Version` for
+  upgrade/downgrade comparisons.
 - **Result: the gate passes**, including the user's listening check (one speaker throughout). Voice
   design, the malformed corpus, the mid-stream abort, long text and the CFG values all behave as
   the contract says. SillyTavern's page can call the speech route and read the CORS-exposed

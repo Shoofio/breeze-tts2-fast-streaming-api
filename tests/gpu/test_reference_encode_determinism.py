@@ -39,11 +39,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # Reuse bench_api's default reference path as the source of truth for "the bench
 # reference wav", but stay overridable the same way tests/gpu/test_speech_http.py's
 # REFERENCE_VOICES_DIR is, for a machine without the reference-voices directory mounted at the
-# default path.
-REFERENCE_VOICES_DIR = Path(
-    os.environ.get("REFERENCE_VOICES_DIR", str(DEFAULT_REF_AUDIO.parent.parent))
+# default path. Only join an *override* onto "eric/eric.wav" -- deriving that layout
+# from DEFAULT_REF_AUDIO itself (via .parent.parent) would silently go stale if
+# DEFAULT_REF_AUDIO's own directory shape ever changes, since nothing would then keep
+# the two in sync.
+_REFERENCE_VOICES_DIR_OVERRIDE = os.environ.get("REFERENCE_VOICES_DIR")
+REFERENCE_WAV = (
+    Path(_REFERENCE_VOICES_DIR_OVERRIDE) / "eric" / "eric.wav"
+    if _REFERENCE_VOICES_DIR_OVERRIDE
+    else DEFAULT_REF_AUDIO
 )
-REFERENCE_WAV = REFERENCE_VOICES_DIR / "eric" / "eric.wav"
 
 # Three, not two: guards against a fix that happens to survive one lucky pair but not a
 # third process.
@@ -86,7 +91,10 @@ def test_same_reference_wav_encodes_identically_across_processes(
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     if not REFERENCE_WAV.is_file():
-        pytest.skip(f"bench reference wav not found at {REFERENCE_WAV}")
+        pytest.skip(
+            f"bench reference wav not found at {REFERENCE_WAV} "
+            "(override with REFERENCE_VOICES_DIR=<dir containing eric/eric.wav>)"
+        )
 
     # Each worker is its own fresh Python process with its own fresh cuDNN autotune
     # state -- exactly the "server restart" this bug is about. Not repeated calls in

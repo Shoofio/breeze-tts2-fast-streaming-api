@@ -541,7 +541,12 @@ software stack** (GPU model, driver, CUDA, cuDNN and torch versions all held fix
 stack, or cuDNN falling back to a different deterministic engine under GPU memory/workspace
 pressure than it did last time, is free to produce different codes for the identical input --
 `deterministic=True` only promises that *one* stack, run twice under the same conditions, picks
-the same algorithm every time; it says nothing about agreement across stacks. This has a direct
+the same algorithm every time; it says nothing about agreement across stacks. PyTorch's cuDNN
+plan cache is keyed on `deterministic` and `allow_tf32` but not on `benchmark`, so if anything
+ever set `cudnn.deterministic = True` globally while `benchmark` stayed `True`, a plan autotuned
+outside this scope could be looked up and reused inside it -- one more reason `deterministic`
+must only ever be scoped to the one call that needs it, as `_deterministic_cudnn_encode()` does,
+never set globally alongside `benchmark = True`. This has a direct
 implication for stored voice codes (T06x, not yet built): a voice saved by encoding the same
 reference wav on a different GPU/driver/CUDA/cuDNN stack can end up with different stored codes
 for what a person would call "the same voice" than encoding it fresh on this one. The
@@ -601,9 +606,10 @@ shape; it's just not the number that matters for the first request at a new leng
 **Evidence**: `tests/test_audio.py`'s
 `test_encode_prompt_waveform_scopes_cudnn_to_deterministic_no_benchmark` and
 `test_encode_prompt_waveform_restores_cudnn_flags_when_encode_raises` (a fake codec records all
-five cudnn flags -- not just the two this fix changes -- in effect during its own `encode`, on
-the CPU suite, confirming `enabled`/`allow_tf32`/`benchmark_limit` pass through untouched while
-`benchmark`/`deterministic` are pinned, and that all five are restored even when `encode` raises)
+six cudnn flags -- not just the two this fix changes -- in effect during its own `encode`, on
+the CPU suite, confirming `enabled`/`allow_tf32`/`benchmark_limit`/`fp32_precision` pass through
+untouched while `benchmark`/`deterministic` are pinned, and that all six are restored even when
+`encode` raises)
 and `tests/gpu/test_reference_encode_determinism.py`:
 
 - `test_same_reference_wav_encodes_identically_across_processes` runs

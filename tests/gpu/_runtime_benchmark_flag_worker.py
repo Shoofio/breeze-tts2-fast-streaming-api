@@ -65,6 +65,16 @@ def main() -> int:
         device=device,
         dtype=codec_dtype,
     )
+    # Asserted before construction so the test actually proves the constructor is what
+    # sets this -- without this check, a benchmark flag left over True from something
+    # earlier in the process would make the assertion below pass for the wrong reason.
+    if torch.backends.cudnn.benchmark is not False:
+        raise RuntimeError(
+            "torch.backends.cudnn.benchmark was already True before constructing "
+            "MultiRequestStreamRuntime -- this worker can't tell whether the "
+            "constructor sets it or it was just left on"
+        )
+
     with (
         mock.patch.object(
             MultiRequestStreamRuntime,

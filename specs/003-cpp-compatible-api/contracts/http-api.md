@@ -17,8 +17,9 @@ for C++ client compatibility. Breaking changes from the C++ server are tagged `B
 - Body larger than 26 MiB: `413 payload_too_large`, whether or not `Content-Length` is set (BC-06).
 
 **Version header**: every response, including errors, preflights and streamed speech, carries
-`X-Breeze-Version: 2.0.0` (the server version; `2.0.0.devN` during development). This is additive
-and lets consumers pin the contract version (FR-037a).
+`X-Breeze-Version: 2.0.0` (the server version; `2.0.0.devN` during development, plus a `+M` local
+label on a within-phase re-deploy, e.g. `2.0.0.dev2+2` -- see plan.md's live-gate step). This is
+additive and lets consumers pin the contract version (FR-037a).
 
 **Errors**
 - Every error has body `{"error": "<message>", "code": "<code>"}` and

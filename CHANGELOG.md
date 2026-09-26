@@ -66,10 +66,6 @@ exposes a C++-server-compatible HTTP and WebSocket API; see the README and
   can change after the first piece. The opening piece is at most 200 characters, or
   `split_chars` if that is smaller.
 
-Later phases append their own `BC-nn` entries to the **Breaking changes** section above (not to
-whatever section happens to be last in the file -- reordering the file doesn't make this
-unambiguous, since anything after a heading with no further heading reads as part of it).
-
 ### Fixed
 
 - An inline reference wav now encodes to the same codec codes regardless of which server process
