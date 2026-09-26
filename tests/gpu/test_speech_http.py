@@ -3,7 +3,7 @@
 Builds the *whole* app through `breeze_infer.api.create_app` -- the same wiring
 `breeze_infer.api.main` uses in production -- on the real, warmed runtime
 `tests/gpu/conftest.py`'s session-scoped `gpu_env` fixture loads. The components are
-marked ready with that runtime and a CPU copy of its tokenizer through
+marked ready with that runtime and two CPU copies of its tokenizer through
 `Components.mark_ready`, the step `load_in_background` ends with, and each test gets its own `GpuGate` /
 `GpuThread` / `RecordingEvents`, so a lease or event held by one test can never
 leak into the next.
@@ -25,7 +25,6 @@ actual verification that no such device/stream mismatch exists in practice.
 
 from __future__ import annotations
 
-import copy
 import os
 import time
 from collections.abc import Iterator
@@ -73,37 +72,38 @@ TERMINAL_EVENTS = ("speech.completed", "speech.aborted", "speech.failed")
 EVENT_POLL_TIMEOUT_SECONDS = 5.0
 
 
-_cpu_tokenizer_copy: Any = None
+_loaded_model: LoadedModel | None = None
 
 
-def _shared_cpu_tokenizer_copy(runtime: Any) -> Any:
-    """One `copy.deepcopy(runtime.tokenizer)` for the whole test session (review 32,
-    review-of-2d9070a #7 in the same pass), not one per `_components` call.
+def _shared_loaded_model(runtime: Any) -> LoadedModel:
+    """One `LoadedModel.from_runtime(runtime)` -- and so one pair of CPU tokenizer copies, the
+    pre-gate check's and the anchor sizing's -- for the whole test session (review 32,
+    review-of-2d9070a #7 in the same pass; a pair since review 34 finding 5), not one per
+    `_components` call.
 
-    `LoadedModel.from_runtime` makes a fresh copy every time -- deliberately, in production,
-    where it runs once before the server ever reports ready (its own docstring: "a deep copy
-    of a real one can take hundreds of ms"). Here, every GPU test in this session shares the
-    same session-scoped, already-warmed `gpu_env.runtime`, whose tokenizer never changes
-    underneath it, and `_components` is called once per test -- `test_speech_long_text.py`'s
-    own multi-run test even calls it once per run -- so repeating that deep copy each time
-    only adds test wall-clock for no safety benefit: `CpuTokenizer` docstring's "one thread at
-    a time" rule is about concurrent use, not object identity, and these tests never run two
-    GPU tests at once. Each test's own `CpuTokenizer` executor does use the copy, though, so
-    every teardown shuts it down with `wait=True` (review 33 on 10f0c29): a sizing still
-    running there must finish before the next test's executor can touch the same copy.
+    `from_runtime` makes fresh copies every time -- deliberately, in production, where it runs
+    once before the server ever reports ready (each deep copy takes about 700 ms). Here, every
+    GPU test in this session shares the same session-scoped, already-warmed
+    `gpu_env.runtime`, whose tokenizer never changes underneath it, and `_components` is
+    called once per test -- `test_speech_long_text.py`'s own multi-run test even calls it once
+    per run -- so repeating those deep copies each time only adds test wall-clock for no
+    safety benefit: `CpuTokenizer` docstring's "one thread at a time" rule is about concurrent
+    use, not object identity, and these tests never run two GPU tests at once. Each test's
+    workers do use the shared copies, though, so every teardown ends with
+    `shut_down_cpu_tokenizer` (review 33 on 10f0c29): a call still running there must finish
+    before the next test's workers touch the same copy.
     """
-    global _cpu_tokenizer_copy
-    if _cpu_tokenizer_copy is None:
-        _cpu_tokenizer_copy = copy.deepcopy(runtime.tokenizer)
-    return _cpu_tokenizer_copy
+    global _loaded_model
+    if _loaded_model is None:
+        _loaded_model = LoadedModel.from_runtime(runtime, {})
+    return _loaded_model
 
 
 def _components(gpu_env) -> tuple[Components, RecordingEvents]:
     # The model directory is never opened here (nothing loads through Settings): the
     # components are marked ready with `gpu_env.runtime` by the same step the server's own
-    # load ends with (`Components.mark_ready`), which also installs the speech route's CPU
-    # tokenizer copy -- the session-shared one above, not a fresh `LoadedModel.from_runtime`
-    # copy per call.
+    # load ends with (`Components.mark_ready`), which also installs the speech route's two CPU
+    # tokenizer copies -- the session-shared pair above, not fresh copies per call.
     events = RecordingEvents()
     device = resolve_device()
     components = Components(
@@ -115,14 +115,25 @@ def _components(gpu_env) -> tuple[Components, RecordingEvents]:
         ws_port=lambda: 0,
         cpu_tokenizer=CpuTokenizer(),
     )
-    components.mark_ready(
-        LoadedModel(
-            runtime=gpu_env.runtime,
-            report={},
-            cpu_tokenizer=_shared_cpu_tokenizer_copy(gpu_env.runtime),
-        )
-    )
+    components.mark_ready(_shared_loaded_model(gpu_env.runtime))
     return components, events
+
+
+# How long a teardown waits for a CPU tokenizer call still running. Sizing the longest text
+# takes well under a second, so a call still running after this is wedged.
+CPU_TOKENIZER_JOIN_SECONDS = 30.0
+
+
+def shut_down_cpu_tokenizer(components: Components) -> None:
+    """Stop `components`' CPU tokenizer workers and wait for any call still running, since the
+    next test's workers use the same tokenizer copies (`_shared_loaded_model`). The wait is
+    bounded (review 34 finding 6): a wedged call fails this teardown instead of hanging the
+    whole GPU session."""
+    components.cpu_tokenizer.shutdown()
+    assert components.cpu_tokenizer.join(CPU_TOKENIZER_JOIN_SECONDS), (
+        f"a CPU tokenizer call was still running {CPU_TOKENIZER_JOIN_SECONDS:.0f} s after "
+        "shutdown; the next test would share its tokenizer copies"
+    )
 
 
 @pytest.fixture()
@@ -138,8 +149,7 @@ def speech_app(gpu_env) -> Iterator[tuple[TestClient, RecordingEvents]]:
         try:
             components.gpu.shutdown()
         finally:
-            # Waits: the next test's executor uses the same tokenizer copy (see above).
-            components.cpu_tokenizer.shutdown(wait=True)
+            shut_down_cpu_tokenizer(components)
 
 
 def _pcm_stats(body: bytes) -> tuple[int, bool]:

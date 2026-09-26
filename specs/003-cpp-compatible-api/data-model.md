@@ -151,22 +151,29 @@ skipped, with `speech.anchor_skipped` (`piece_index` 0, `reason`), when:
   and before piece 1 starts, the decision is arithmetic on those lengths plus the anchor's frame
   count, with each room taken from the runtime (CFG rows and prefill bucket padding included).
 - `sizing_failed`: measuring the later pieces raised (a template or tokenizer error). The error
-  is also reported as `request.failed`; the stream goes on.
+  is also reported as `speech.anchor_sizing_failed`, not `request.failed`: the stream goes on,
+  and the request can still complete.
 - `sizing_timeout`: the measurement was still unfinished `ANCHOR_SIZING_TIMEOUT_SECONDS` (5 s)
-  after piece 0 finished. The GPU thread does not wait longer: a disconnect's close would queue
-  behind it, and a close past 30 s poisons the GPU gate.
+  after piece 0 finished. A backstop only, since the measurement has a CPU worker of its own.
+  The GPU thread does not wait longer: a disconnect's close would queue behind it, and a close
+  past 30 s poisons the GPU gate.
 - `shutdown`: server shutdown cancelled the measurement before it ran.
 
-A skipped anchor leaves the later pieces as voice design. A request that ends before the
-anchor decision (an error, a `400`, or a disconnect before or after the `200`) cancels its
-measurement if it is still queued, so it never delays another request's own room check.
+A skipped anchor leaves the later pieces as voice design. The measurement runs on a CPU worker
+of its own, with its own tokenizer copy, not the one every request's room check before the gate
+queues on, so a burst of requests can't delay it. It is cancelled, if still queued, as soon as
+nothing will read it: when the anchor is decided without it (`piece_truncated`, zero non-pad
+frames, `sizing_timeout`), and when the request ends before the anchor decision (an error, a
+`400`, or a disconnect before or after the `200`). A cancel by the request as it ends emits no
+`speech.anchor_skipped`: the stream is over anyway.
 
 ## Piece
 
 `(index, text, seed = (request_seed + index) & 0xFFFFFFFF)`.
 - Its model inputs are built on the GPU thread when the stream reaches it, not ahead of time, and
-  are not kept once it has been generated. Only its prompt length is measured ahead, before the
-  gate, for the anchor decision ("Reference").
+  are not kept once it has been generated. For a later piece with no reference, only its prompt
+  length is measured ahead, for the anchor decision ("Reference"): after the GPU lease is taken,
+  on the anchor-sizing worker, while piece 0 generates.
 - Its token cap is `min(max_new_tokens or 750, room)`.
 - A room of 0 fails: `400 text_too_long` for piece 0 before streaming, or an aborted stream for a
   later piece.
@@ -315,7 +322,10 @@ offending record's field names), so one bad field never breaks the request emitt
   - voices: `voices.loaded`, `voice.skipped`, `voice.created`, `voice.deleted`;
   - speech: `speech.accepted`, `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`
     (`piece_index`, `requested`, `cap`, `room`), `speech.anchor_skipped` (`piece_index`,
-    `reason`: `piece_truncated`, `no_room`, `sizing_failed`, `sizing_timeout` or `shutdown`), `speech.piece_done` (`piece_index`, `frames`), `speech.completed` (`rtf`),
+    `reason`: `piece_truncated`, `no_room`, `sizing_failed`, `sizing_timeout` or `shutdown`),
+    `speech.anchor_sizing_failed` (level `error`; `error`, `traceback`: measuring the later
+    pieces for the anchor raised, and the request goes on without the anchor),
+    `speech.piece_done` (`piece_index`, `frames`), `speech.completed` (`rtf`),
     `speech.failed`, `speech.aborted`, `speech.frame_prediction_mismatch`
     (`predicted_frames`, `actual_frames`);
   - WebSocket: `ws.connected`, `ws.rejected` (`reason`), `ws.closed` (`code`), `ws.piece`;

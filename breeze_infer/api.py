@@ -61,14 +61,14 @@ class Components:
     gpu: GpuThread
     readiness: Readiness
     ws_port: Callable[[], int]
-    # Empty until `mark_ready` installs the model load's tokenizer copy.
+    # Empty until `mark_ready` installs the model load's tokenizer copies.
     cpu_tokenizer: CpuTokenizer
 
     def mark_ready(self, loaded: LoadedModel) -> None:
-        """Serve `loaded`: its CPU tokenizer copy and its runtime, in one step, so the server
-        is never ready without the copy the speech route sizes requests with. The copy goes
-        in first: the first request the server admits may need it."""
-        self.cpu_tokenizer.install(loaded.cpu_tokenizer)
+        """Serve `loaded`: its two CPU tokenizer copies and its runtime, in one step, so the
+        server is never ready without the copies the speech route sizes requests with. The
+        copies go in first: the first request the server admits may need them."""
+        self.cpu_tokenizer.install(loaded.cpu_tokenizer, loaded.sizing_tokenizer)
         self.readiness.mark_ready(loaded.runtime)
 
 
@@ -573,8 +573,9 @@ async def _drain_gpu(components: Components, server: uvicorn.Server) -> bool:
     deadline = loop.time() + GPU_DRAIN_SECONDS
     if requests:
         await asyncio.wait(requests, timeout=GPU_DRAIN_SECONDS)
-    # No request is left to need it. Without waiting: a check already running on it takes
-    # milliseconds and ends on its own.
+    # No request is left to need either of its workers (the pre-gate checks and the anchor
+    # sizing). Without waiting: a call already running takes well under a second and ends on
+    # its own.
     components.cpu_tokenizer.shutdown()
     remaining = max(0.0, deadline - loop.time())
     return await asyncio.to_thread(components.gpu.shutdown, remaining)

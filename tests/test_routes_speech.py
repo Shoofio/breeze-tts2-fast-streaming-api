@@ -71,11 +71,11 @@ def _build_components(
     argv = [str(Path(__file__).parent)]
     if split_chars is not None:
         argv += ["--split-chars", str(split_chars)]
-    # What the model load installs: its own copy of the runtime's tokenizer. A plain
+    # What the model load installs: its two copies of the runtime's tokenizer. A plain
     # `FakeTokenizer` holds no state, so a fresh one is as good as a copy. Installed up front
     # because most tests here mark `readiness` ready directly, with a runtime alone.
     cpu_tokenizer = CpuTokenizer()
-    cpu_tokenizer.install(FakeTokenizer())
+    cpu_tokenizer.install(FakeTokenizer(), FakeTokenizer())
     return Components(
         settings=settings_from_args(argv),
         events=events if events is not None else Emitter(io.StringIO(), lambda: 0.0),
@@ -461,7 +461,7 @@ def test_the_cpu_room_check_uses_the_copy_made_at_load_never_the_gpu_threads() -
         tokenizer = _ThreadRecordingTokenizer()
         runtime.tokenizer = tokenizer
         cpu_copy = _ThreadRecordingTokenizer()
-        components.cpu_tokenizer.install(cpu_copy)
+        components.cpu_tokenizer.install(cpu_copy, FakeTokenizer())
         readiness.mark_ready(runtime)
         client = _client_for(components)
 
@@ -508,7 +508,7 @@ def test_concurrent_cpu_room_checks_are_serialized() -> None:
     components = _build_components(readiness)
     try:
         cpu_copy = _OverlapDetectingTokenizer()
-        components.cpu_tokenizer.install(cpu_copy)
+        components.cpu_tokenizer.install(cpu_copy, FakeTokenizer())
         readiness.mark_ready(_fake_runtime())
         client = _client_for(components)
         start = threading.Barrier(4)
@@ -562,9 +562,12 @@ def test_the_model_load_copies_the_tokenizer_on_the_gpu_thread(
     finally:
         gpu.shutdown()
 
-    [copied] = tokenizer.copies
-    assert loaded.cpu_tokenizer is copied
-    assert len(copied_on) == 1 and copied_on[0].startswith("breeze-gpu")
+    # Both copies -- the pre-gate check's and the anchor sizing's (review 34 finding 5) -- are
+    # made here, on the GPU thread while loading, never on the event loop.
+    pre_gate_copy, sizing_copy = tokenizer.copies
+    assert loaded.cpu_tokenizer is pre_gate_copy
+    assert loaded.sizing_tokenizer is sizing_copy
+    assert len(copied_on) == 2 and all(name.startswith("breeze-gpu") for name in copied_on)
 
 
 def test_the_cpu_copy_is_installed_before_the_server_reports_ready() -> None:
@@ -582,7 +585,9 @@ def test_the_cpu_copy_is_installed_before_the_server_reports_ready() -> None:
     readiness.mark_ready = mark_ready  # type: ignore[method-assign]
     server = SimpleNamespace(should_exit=False)
     try:
-        loaded = LoadedModel(runtime=runtime, report={}, cpu_tokenizer=cpu_copy)
+        loaded = LoadedModel(
+            runtime=runtime, report={}, cpu_tokenizer=cpu_copy, sizing_tokenizer=FakeTokenizer()
+        )
         assert asyncio.run(load_in_background(components, lambda: loaded, server))
     finally:
         components.gpu.shutdown()
@@ -599,10 +604,16 @@ def test_mark_ready_installs_the_copy_and_the_runtime_in_one_step() -> None:
         runtime = _fake_runtime()
         cpu_copy = FakeTokenizer()
 
-        components.mark_ready(LoadedModel(runtime=runtime, report={}, cpu_tokenizer=cpu_copy))
+        sizing_copy = FakeTokenizer()
+        components.mark_ready(
+            LoadedModel(
+                runtime=runtime, report={}, cpu_tokenizer=cpu_copy, sizing_tokenizer=sizing_copy
+            )
+        )
 
         assert readiness.runtime is runtime
         assert components.cpu_tokenizer._tokenizer is cpu_copy
+        assert components.cpu_tokenizer._sizing_tokenizer is sizing_copy
         client = _client_for(components)
         assert client.post(SPEECH_PATH, data={"text": "hello there"}).status_code == 200
     finally:
@@ -619,21 +630,60 @@ def test_components_and_loaded_model_both_require_a_cpu_tokenizer() -> None:
         Components(**fields)  # type: ignore[call-arg]
     with pytest.raises(TypeError, match="cpu_tokenizer"):
         LoadedModel(runtime=_fake_runtime(), report={})  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="sizing_tokenizer"):
+        LoadedModel(  # type: ignore[call-arg]
+            runtime=_fake_runtime(), report={}, cpu_tokenizer=FakeTokenizer()
+        )
 
 
-def test_installing_no_cpu_tokenizer_is_rejected() -> None:
+@pytest.mark.parametrize(
+    ("pre_gate", "sizing"),
+    [(None, FakeTokenizer()), (FakeTokenizer(), None)],
+    ids=["no_pre_gate_copy", "no_sizing_copy"],
+)
+def test_installing_no_cpu_tokenizer_is_rejected(pre_gate: Any, sizing: Any) -> None:
     with pytest.raises(ValueError, match="tokenizer"):
-        CpuTokenizer().install(None)
+        CpuTokenizer().install(pre_gate, sizing)
 
 
-def test_loaded_model_from_runtime_copies_the_runtimes_tokenizer() -> None:
+def test_installing_one_copy_for_both_workers_is_rejected() -> None:
+    """The two workers run at once, so one shared copy would be used by two threads."""
+    shared = FakeTokenizer()
+    with pytest.raises(ValueError, match="tokenizer"):
+        CpuTokenizer().install(shared, shared)
+
+
+class _UncopyableTokenizer(FakeTokenizer):
+    def __deepcopy__(self, memo: dict[int, Any]) -> _UncopyableTokenizer:
+        raise AssertionError("install must not copy: the model load already did")
+
+
+def test_install_uses_the_two_copies_it_is_given_without_copying_either() -> None:
+    """Review 34 follow-up: `install` runs on the event loop (`mark_ready`), where a ~700 ms
+    deep copy of a real tokenizer would stall every request, so it only takes the two copies
+    the model load made -- one per worker."""
+    pre_gate, sizing = _UncopyableTokenizer(), _UncopyableTokenizer()
+    cpu_tokenizer = CpuTokenizer()
+    cpu_tokenizer.install(pre_gate, sizing)
+    try:
+        used_by_run = asyncio.run(cpu_tokenizer.run(lambda tokenizer: tokenizer))
+        used_by_submit = cpu_tokenizer.submit(lambda tokenizer: tokenizer).result(5)
+    finally:
+        cpu_tokenizer.shutdown()
+
+    assert used_by_run is pre_gate
+    assert used_by_submit is sizing
+
+
+def test_loaded_model_from_runtime_makes_two_distinct_copies() -> None:
     tokenizer = _ThreadRecordingTokenizer()
     runtime = SimpleNamespace(tokenizer=tokenizer)
 
     loaded = LoadedModel.from_runtime(runtime, {"device": "cpu"})
 
-    [copied] = tokenizer.copies
-    assert loaded.cpu_tokenizer is copied
+    assert tokenizer.copies == [loaded.cpu_tokenizer, loaded.sizing_tokenizer]
+    assert loaded.cpu_tokenizer is not loaded.sizing_tokenizer
+    assert tokenizer not in (loaded.cpu_tokenizer, loaded.sizing_tokenizer)
     assert loaded.runtime is runtime
     assert loaded.report == {"device": "cpu"}
 

@@ -60,8 +60,10 @@ exposes a C++-server-compatible HTTP and WebSocket API; see the README and
 - **BC-47**: Text is split into pieces that must fit the 2,048-token context: a first piece that
   can't is `400 text is too long`, and a later piece that can't aborts the stream. Long text with
   no reference is anchored on its first piece so one speaker is heard throughout. The anchor is
-  skipped, and the server logs `speech.anchor_skipped`, when the first piece was cut off at its
-  frame limit or when the anchor would shorten any later piece; the later pieces then use voice
-  design. The opening piece is at most 200 characters, or `split_chars` if that is smaller.
+  skipped (`speech.anchor_skipped`) when the first piece was cut off at its frame limit, when
+  the anchor would shorten any later piece, when measuring the later pieces failed or timed out,
+  or when the server is shutting down; the later pieces then use voice design, so the speaker
+  can change after the first piece. The opening piece is at most 200 characters, or
+  `split_chars` if that is smaller.
 
 Later phases append their own `BC-nn` entries to this section as they land.

@@ -27,11 +27,12 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
 6. `gate.try_acquire()`, else `409 busy` -- or `GpuUnavailable` if the gate is poisoned,
    which propagates past this route to `errors.py`'s own handler (`503 gpu_unavailable`);
 6a. with no reference and more than one piece, every later piece's prompt length is queued
-   on the CPU tokenizer's executor right after the lease (`_start_anchor_sizing`), not before
+   on the CPU tokenizer's sizing worker right after the lease (`_start_anchor_sizing`), not before
    the busy check (review #2 on 2d9070a): it runs on the CPU while piece 0 itself prepares and
    generates on the `GpuThread` below, and `_anchor_for_later_pieces` only blocks on the result
-   once piece 0 has actually finished, by which point it has usually already. Every exit that
-   doesn't reach that point cancels it (review 33 on 10f0c29), and the anchor is skipped
+   once piece 0 has actually finished, by which point it has usually already. That worker is
+   its own, not the one the pre-gate checks queue on (review 34 finding 5). Every exit that
+   doesn't need the result abandons it (review 33 on 10f0c29), and the anchor is skipped
    rather than the stream aborted if it fails or is still unfinished after
    `ANCHOR_SIZING_TIMEOUT_SECONDS`;
 7. reference resolution and piece 0's preparation run on the `GpuThread` (`synthesis.py`),
@@ -74,16 +75,19 @@ itself since no `SpeechResponse` is ever built for it.
 # which refers to the local `components`, when the route is defined (routes_health.py does the
 # same, for the same reason).
 import asyncio
+import threading
+import time
 from collections.abc import AsyncGenerator, Callable, Iterator
 from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Annotated, Any, Protocol, TypeVar
 
 from fastapi import Depends, FastAPI, Request
 from starlette.responses import Response
 
 from breeze_infer import reference_audio
-from breeze_infer.errors import ApiError, report_unhandled
+from breeze_infer.errors import ApiError, error_fields, report_unhandled
 from breeze_infer.events import Emitter
 from breeze_infer.gpu import (
     DONE,
@@ -135,40 +139,72 @@ _SHUTDOWN_MESSAGE = "cannot schedule new futures after shutdown"
 
 
 class CpuTokenizer:
-    """The tokenizer the CPU-side sizing uses -- a copy of the runtime's, never the same
-    object -- and the one thread that uses it.
+    """The tokenizers the CPU-side sizing uses -- copies of the runtime's, never the same
+    object -- and the threads that use them.
 
     `_size_first_piece` tokenizes before the gate, and `_start_anchor_sizing` right after it,
     while the GPU thread may be using the runtime's tokenizer for another request's piece. A
     Hugging Face fast tokenizer is one Rust object behind a borrow checker, and using it from
-    two threads at once can fail with "Already borrowed", so the sizing gets its own instance.
-    The model load makes the copy (`LoadedModel.from_runtime`), and `api.Components.mark_ready`
-    installs it together with the runtime, so no request ever waits for a copy.
+    two threads at once can fail with "Already borrowed", so the sizing gets its own instances.
+    The model load makes both copies on the GPU thread (`LoadedModel.from_runtime`), and
+    `api.Components.mark_ready` installs them together with the runtime, so neither a request
+    nor the event loop ever waits for a copy.
 
-    Two requests can size at once, before the busy check, so the copy must not be shared
-    between them either: every use runs on this object's own single-worker executor, which
-    queues them, with no lock. Its own executor rather than asyncio's default one, because that
-    pool is shared with the reference decode, form parsing and `gpu.shutdown`: a burst of
-    requests blocked on one tokenizer would fill it. `api._drain_gpu` shuts it down at server
-    stop, after cancelling every request it already knows about -- but a request that arrived
-    just as the drain started might not be one of them (review #3 on 2d9070a); `run` and
-    `submit` answer that race with `GpuUnavailable` (the same `503 gpu_unavailable` a poisoned
-    gate answers with) rather than a `500` or a silent cancellation.
+    Two kinds of work use them, each on its own single-worker executor with its own copy:
+    - `run`: piece 0's room check (`_size_first_piece`), before the busy check. Any number of
+      requests can be there at once, including ones bound for `409`, so their checks queue on
+      this one worker, with no lock.
+    - `submit`: the lease holder's anchor sizing (`_start_anchor_sizing`). Only one lease
+      exists at a time, so this worker has only that request's sizing to run, or rarely also a
+      previous holder's that was already running when abandoned. On the pre-gate worker it
+      would queue behind every check in a burst of requests, time out, and the speaker would
+      change mid-stream (review 34 finding 5).
+    The workers run at the same time, so they can't share a copy. A lock around one shared copy
+    would serialise them again, and a Python lock is not fair: the pre-gate worker, releasing it
+    and taking it again for its next queued check, could keep the sizing waiting. So the
+    sizing worker gets a second copy.
+
+    Its own executors rather than asyncio's default one, because that pool is shared with the
+    reference decode, form parsing and `gpu.shutdown`: a burst of requests blocked on one
+    tokenizer would fill it. `api._drain_gpu` shuts them down at server stop, after cancelling
+    every request it already knows about -- but a request that arrived just as the drain
+    started might not be one of them (review #3 on 2d9070a); `run` and `submit` answer that race
+    with `GpuUnavailable` (the same `503 gpu_unavailable` a poisoned gate answers with) rather
+    than a `500` or a silent cancellation.
     """
 
     def __init__(self) -> None:
         self._tokenizer: Any = None
+        self._sizing_tokenizer: Any = None
+        # Every worker thread either executor starts, for `join`. Recorded by each thread
+        # itself as it starts (`initializer`), so this needs nothing private from the executor.
+        self._workers: list[threading.Thread] = []
         self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="breeze-cpu-tokenizer"
+            max_workers=1,
+            thread_name_prefix="breeze-cpu-tokenizer",
+            initializer=self._record_worker,
+        )
+        self._sizing_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="breeze-anchor-sizing",
+            initializer=self._record_worker,
         )
 
-    def install(self, tokenizer: Any) -> None:
-        if tokenizer is None:
-            raise ValueError("no CPU tokenizer to install: the model load makes the copy")
+    def install(self, tokenizer: Any, sizing_tokenizer: Any) -> None:
+        """Use `tokenizer` for the pre-gate checks and `sizing_tokenizer` for the anchor
+        sizing: two separate copies, both already made by the model load. Nothing is copied
+        here: this runs on the event loop (`api.Components.mark_ready`), where a real
+        tokenizer's ~700 ms deep copy would stall every request.
+        """
+        if tokenizer is None or sizing_tokenizer is None:
+            raise ValueError("no CPU tokenizer to install: the model load makes the copies")
+        if tokenizer is sizing_tokenizer:
+            raise ValueError("one CPU tokenizer for both workers: they run at the same time")
         self._tokenizer = tokenizer
+        self._sizing_tokenizer = sizing_tokenizer
 
     async def run(self, fn: Callable[..., _T], *args: Any) -> _T:
-        """`fn(tokenizer, *args)` on this object's thread, the only one that uses the copy.
+        """`fn(tokenizer, *args)` on the pre-gate worker, the only thread that uses its copy.
 
         A call still queued when `shutdown()` cancels it surfaces here as an ordinary
         `asyncio.CancelledError` -- indistinguishable, by type alone, from this coroutine's
@@ -194,7 +230,7 @@ class CpuTokenizer:
             raise GpuUnavailable("the CPU tokenizer is shutting down") from None
 
     def submit(self, fn: Callable[..., _T], *args: Any) -> Future[_T]:
-        """`fn(tokenizer, *args)`, queued on this object's executor, for a caller on another
+        """`fn(sizing tokenizer, *args)`, queued on the sizing worker, for a caller on another
         thread (the GPU thread) to block on with `.result()` -- `run`'s `await` needs the
         event loop, which the GPU thread doesn't have.
 
@@ -204,23 +240,68 @@ class CpuTokenizer:
         cancel count could tell that apart from anything else, since nothing here is awaited.
         """
         try:
-            return self._executor.submit(self._call, fn, args)
+            return self._sizing_executor.submit(self._call_sizing, fn, args)
         except RuntimeError as error:
             if _SHUTDOWN_MESSAGE not in str(error):
                 raise
             raise GpuUnavailable("the CPU tokenizer is shutting down") from error
 
     def _call(self, fn: Callable[..., _T], args: tuple[Any, ...]) -> _T:
-        if self._tokenizer is None:
-            raise RuntimeError("no CPU tokenizer: the model load installs one before ready")
-        return fn(self._tokenizer, *args)
+        return fn(_installed(self._tokenizer), *args)
 
-    def shutdown(self, *, wait: bool = False) -> None:
-        """Refuse new work, cancel queued calls, and let the thread end once any running call
-        has finished. `wait=True` also blocks until it has: a test teardown needs that, since
-        the GPU tests share one tokenizer copy across tests, each with its own executor.
+    def _call_sizing(self, fn: Callable[..., _T], args: tuple[Any, ...]) -> _T:
+        return fn(_installed(self._sizing_tokenizer), *args)
+
+    def _record_worker(self) -> None:
+        self._workers.append(threading.current_thread())
+
+    def shutdown(self) -> None:
+        """Refuse new work and cancel queued calls on both workers. A call already running
+        finishes on its own, and its thread ends after it."""
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._sizing_executor.shutdown(wait=False, cancel_futures=True)
+
+    def join(self, timeout: float) -> bool:
+        """After `shutdown()`, wait up to `timeout` seconds in all for both workers' threads to
+        end, and return whether they have.
+
+        For a test teardown: the GPU tests share one tokenizer copy across tests, each with its
+        own `CpuTokenizer`, so a call still running must finish before the next test's workers
+        use the copy. The wait is bounded so that a wedged call fails the teardown instead of
+        hanging the whole session (review 34 finding 6).
         """
-        self._executor.shutdown(wait=wait, cancel_futures=True)
+        deadline = time.monotonic() + timeout
+        for worker in self._workers:
+            worker.join(max(0.0, deadline - time.monotonic()))
+        return not any(worker.is_alive() for worker in self._workers)
+
+
+def _installed(tokenizer: Any) -> Any:
+    if tokenizer is None:
+        raise RuntimeError("no CPU tokenizer: the model load installs one before ready")
+    return tokenizer
+
+
+@dataclass(frozen=True)
+class _AnchorSizingJob:
+    """The lease holder's queued anchor sizing (`_start_anchor_sizing`), and whether the route
+    itself gave up on it.
+
+    `future.result()` raises the same `CancelledError` whoever cancelled it. Only a
+    `CpuTokenizer.shutdown()` is worth reporting (`speech.anchor_skipped`, `shutdown`); when the
+    route cancels it, the request no longer needs it or is ending anyway. So the route never
+    cancels `future` directly, only through `abandon()`, which records that first
+    (review 34 finding 3).
+    """
+
+    future: Future[AnchorSizing]
+    abandoned: threading.Event = field(default_factory=threading.Event)
+
+    def abandon(self) -> None:
+        """Cancel the sizing if it is still queued; one already running finishes on its own."""
+        # Set before cancelling, so a GPU thread woken by the cancel already sees it.
+        self.abandoned.set()
+        self.future.cancel()
 
 
 class SpeechComponents(Protocol):
@@ -305,9 +386,9 @@ async def _size_first_piece(
     codec whose frame count differs from the prediction.
 
     The later pieces' own lengths, needed for the anchor decision, are measured after the
-    lease instead (`_start_anchor_sizing`, review #2 on 2d9070a): a long no-reference request
-    would otherwise hold this one shared CPU executor for the whole text even when it is about
-    to get a `409`, queuing every other request's own piece-0 check behind it.
+    lease instead (`_start_anchor_sizing`, review #2 on 2d9070a), on a worker of their own
+    (review 34 finding 5): a request about to get a `409` must never size its whole text, and
+    the lease holder's sizing must never queue behind this pre-gate worker's checks.
     """
     stand_in = stand_in_reference(
         request.reference,
@@ -340,20 +421,20 @@ def _measure_first_piece(
 
 def _start_anchor_sizing(
     runtime: Any, cpu_tokenizer: CpuTokenizer, request: SpeechRequest, pieces: list[str]
-) -> Future[AnchorSizing] | None:
+) -> _AnchorSizingJob | None:
     """Queues what the anchor decision after piece 0 needs (`_anchor_for_later_pieces`) on the
-    CPU tokenizer's executor, right after the lease is taken (review #2 on 2d9070a) -- `None`
+    CPU tokenizer's sizing worker, right after the lease is taken (review #2 on 2d9070a) -- `None`
     with a reference or a single piece: only piece 0 can ever anchor (data-model.md
     "Reference"), and a single piece has no later ones to measure.
 
     Queuing rather than awaiting here is the point: this runs on the CPU while piece 0 itself
     prepares and generates on the `GpuThread` below, instead of serially before either. The
-    caller hands the returned `Future` to `_iter_pieces`, which blocks on it (`.result()`, on
+    caller hands the returned job to `_iter_pieces`, which blocks on it (`.result()`, on
     the GPU thread, once piece 0 has actually finished) only when it is actually needed.
     """
     if not isinstance(request.reference, NoReference) or len(pieces) < 2:
         return None
-    return cpu_tokenizer.submit(_size_later_pieces, runtime, request, pieces)
+    return _AnchorSizingJob(cpu_tokenizer.submit(_size_later_pieces, runtime, request, pieces))
 
 
 def _size_later_pieces(
@@ -401,7 +482,7 @@ def _iter_pieces(
     request_id: str,
     first_inputs: dict[str, Any],
     first_room: PieceRoom,
-    sizing_future: Future[AnchorSizing] | None,
+    sizing_job: _AnchorSizingJob | None,
     events: Emitter,
     *,
     chunk_first: int,
@@ -430,16 +511,17 @@ def _iter_pieces(
     (BC-47). With no reference, piece 0's frames are collected through the runtime's
     `token_observer` and, once piece 0 has finished, become every later piece's reference
     together with its text, unless `_anchor_for_later_pieces` decides against it, from the
-    later pieces' lengths `sizing_future` is still measuring, queued right after the lease
+    later pieces' lengths `sizing_job` is still measuring, queued right after the lease
     (`None`: no anchoring, as with a reference or a single piece); their inputs are still built
     here, one at a time. Only piece 0 can anchor (data-model.md "Reference"); without an anchor
     the later pieces stay voice design. A cancelled or failed piece 0 never reaches the
     anchoring step.
 
     However this generator ends -- exhausted, failed, or closed by a disconnect -- the sizing
-    is cancelled if still queued (review 33 on 10f0c29): an abandoned sizing of a long text
-    would otherwise hold the CPU tokenizer's one worker, and every later request's pre-gate
-    check would wait behind it. One already running or done is left alone.
+    is abandoned if still queued (review 33 on 10f0c29), so nothing is left on the sizing
+    worker for the next lease holder's own sizing to wait behind. The anchor decision abandons
+    it earlier whenever it doesn't need it (review 34 finding 1). One already running or done
+    is left alone.
     """
     try:
         for index, text in enumerate(pieces):
@@ -462,7 +544,7 @@ def _iter_pieces(
                 piece_index=index,
                 requested=request.max_new_tokens,
             )
-            frames: list[Any] | None = [] if sizing_future is not None and index == 0 else None
+            frames: list[Any] | None = [] if sizing_job is not None and index == 0 else None
             piece_bytes = 0
             for chunk in generate_piece(
                 runtime,
@@ -492,22 +574,22 @@ def _iter_pieces(
                     runtime,
                     frames,
                     text,
-                    sizing_future,
+                    sizing_job,
                     request,
                     events,
                     request_id=request_id,
                     frame_limit=max_new_tokens,
                 )
     finally:
-        if sizing_future is not None:
-            sizing_future.cancel()
+        if sizing_job is not None:
+            sizing_job.abandon()
 
 
 def _anchor_for_later_pieces(
     runtime: Any,
     frames: list[Any],
     text: str,
-    sizing_future: Future[AnchorSizing],
+    sizing_job: _AnchorSizingJob,
     request: SpeechRequest,
     events: Emitter,
     *,
@@ -526,40 +608,59 @@ def _anchor_for_later_pieces(
     Or the later pieces' lengths never arrived (review 33 on 10f0c29). The `200` is already out
     by then, so skipping the anchor is the only safe answer left, not aborting the stream:
     - `shutdown`: `CpuTokenizer.shutdown()` cancelled the sizing while it was still queued
-      (review #3 on 2d9070a). The route's own cancels run only once this generator is done
-      with it (`_iter_pieces`, `_serve_speech`);
-    - `sizing_timeout`: it was still unfinished after `ANCHOR_SIZING_TIMEOUT_SECONDS`, so the
-      CPU tokenizer's executor is backlogged. This GPU thread must not wait on it for long: a
-      disconnect's `gen.close()` would queue behind this wait and, past
-      `GPU_CLOSE_TIMEOUT_SECONDS`, poison the gate;
+      (review #3 on 2d9070a);
+    - `sizing_timeout`: it was still unfinished after `ANCHOR_SIZING_TIMEOUT_SECONDS`. The
+      sizing has a worker of its own, so this is only a backstop against a wedged or starved
+      CPU. This GPU thread must not wait on it for long: a disconnect's `gen.close()` would
+      queue behind this wait and, past `GPU_CLOSE_TIMEOUT_SECONDS`, poison the gate;
     - `sizing_failed`: it raised (a template or tokenizer error, or no CPU tokenizer). That is
-      still a server bug, so it is also reported as `request.failed`.
+      still a server bug, so it is also reported, as `speech.anchor_sizing_failed` with its
+      traceback -- not `request.failed`, since the request itself goes on to succeed (review
+      34 finding 4).
     Zero non-pad frames means there is nothing to anchor on; that needs no event.
 
+    The route can also cancel the sizing while this waits (`_serve_speech`'s cleanup, when the
+    request is cancelled or fails while this step is still in flight on the GPU thread). That
+    is the request ending, not a shutdown, and nothing more will stream, so it emits no event
+    at all (`_AnchorSizingJob.abandon`, review 34 finding 3).
+
+    Whenever the answer doesn't need the sizing -- piece 0 truncated, nothing to anchor on, or
+    the wait timed out -- it is abandoned right here (review 34 finding 1), not left queued
+    while every later piece streams.
+
     This runs on the GPU thread between piece 0 and piece 1, so it tokenizes nothing: every
-    later piece's length was already queued right after the lease (`sizing_future`,
+    later piece's length was already queued right after the lease (`sizing_job`,
     `_start_anchor_sizing`), running on the CPU while piece 0 itself generated here, and the
     anchor's frame count is all that was missing -- `.result()` only blocks for whatever, if
     anything, is left of that by now, and for at most `ANCHOR_SIZING_TIMEOUT_SECONDS`.
     """
     if len(frames) >= frame_limit:
+        sizing_job.abandon()
         _skip_anchor(events, request_id, "piece_truncated")
         return NoRef()
     codes = anchor_codes(frames, int(runtime.model.config.codebook_pad_token_id))
     if codes is None:
+        sizing_job.abandon()
         return NoRef()
     try:
-        sizing = sizing_future.result(timeout=ANCHOR_SIZING_TIMEOUT_SECONDS)
+        sizing = sizing_job.future.result(timeout=ANCHOR_SIZING_TIMEOUT_SECONDS)
     except FutureCancelledError:
-        _skip_anchor(events, request_id, "shutdown")
+        # Abandoned by the route means the request is ending: nothing more will stream, so
+        # there is nothing to report. Otherwise only a shutdown cancels it.
+        if not sizing_job.abandoned.is_set():
+            _skip_anchor(events, request_id, "shutdown")
         return NoRef()
     except TimeoutError:
-        # Cancelled in case it is still queued; one already running finishes on its own.
-        sizing_future.cancel()
+        sizing_job.abandon()
         _skip_anchor(events, request_id, "sizing_timeout")
         return NoRef()
     except Exception as error:  # noqa: BLE001 - reported; piece 0 is already out
-        report_unhandled(events, request_id, error)
+        events.emit(
+            "speech.anchor_sizing_failed",
+            level="error",
+            request_id=request_id,
+            **error_fields(error),
+        )
         _skip_anchor(events, request_id, "sizing_failed")
         return NoRef()
     if _anchor_costs_frames(runtime, sizing, int(codes.shape[0]), request.max_new_tokens):
@@ -729,12 +830,12 @@ async def _serve_speech(
 
     session: GpuSession[bytes] | None = None
     gpu_task: asyncio.Task[Any] | None = None
-    sizing_future: Future[AnchorSizing] | None = None
+    sizing_job: _AnchorSizingJob | None = None
     try:
         # Queued right after the lease (review #2 on 2d9070a), not before the busy check: a
         # request that gets 409 above must never run this at all. `None` with a reference or a
         # single piece (`_start_anchor_sizing`).
-        sizing_future = _start_anchor_sizing(runtime, components.cpu_tokenizer, request, pieces)
+        sizing_job = _start_anchor_sizing(runtime, components.cpu_tokenizer, request, pieces)
         gpu_task = asyncio.ensure_future(
             resolve_reference(
                 request.reference,
@@ -772,7 +873,7 @@ async def _serve_speech(
             request_id,
             first_inputs,
             first_room,
-            sizing_future,
+            sizing_job,
             components.events,
             chunk_first=components.settings.chunk_first,
             chunk_max=components.settings.chunk_max,
@@ -801,14 +902,16 @@ async def _serve_speech(
         # threaded) GPU executor (gpu.py), so releasing early would tell the next request
         # "free" while our own abandoned work is still really queued ahead of it there.
         #
-        # The anchor sizing is cancelled first (review 33 on 10f0c29), so a failed request
-        # leaves nothing queued ahead of the next request's pre-gate check. Only the anchor
+        # The anchor sizing is abandoned first (review 33 on 10f0c29), so a failed request
+        # leaves nothing queued ahead of the next lease holder's own sizing. Only the anchor
         # decision after piece 0 waits on it, and before the `200` the stream has not got that
-        # far unless piece 0 produced no audio at all -- a request failing anyway, whose wait
-        # would then just end early with a skipped anchor. If the generator started, closing
-        # it cancels the sizing too (`_iter_pieces`); this covers every exit before that.
-        if sizing_future is not None:
-            sizing_future.cancel()
+        # far unless piece 0 produced no audio at all. Then this can race that decision's wait
+        # on the GPU thread: `abandon()`, not a bare cancel, tells it the request is ending, so
+        # it ends early without reporting a shutdown (review 34 finding 3). If the generator
+        # started, closing it abandons the sizing too (`_iter_pieces`); this covers every exit
+        # before that.
+        if sizing_job is not None:
+            sizing_job.abandon()
         if gpu_task is not None and not gpu_task.done():
             # Released from a done-callback, not from code below that only runs if this
             # `except` block itself runs to completion (T046 review, finding 2 -- a lease

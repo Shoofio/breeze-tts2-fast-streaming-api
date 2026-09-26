@@ -50,7 +50,9 @@ from tests.test_routes_speech import (
     _fake_runtime,
     _wav_bytes,
 )
-from tests.test_speech_abort import LiveServer, wait_until
+from tests.test_routes_speech import _gate_is_free as _components_gate_is_free
+from tests.test_speech_abort import LiveServer, eventually, wait_until
+from tests.test_validation_order import _serve, _text_request
 
 PAD = 2050  # fake_model()'s codebook_pad_token_id, as the real checkpoint's
 INSTRUCTION = "Speak calmly."
@@ -206,9 +208,9 @@ def test_later_pieces_are_sized_after_the_lease_on_the_cpu_executor(
     envs: list[Env], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The anchor decision needs every later piece's length. Those are measured once, on the
-    CPU copy's own thread, and -- since review #2 on 2d9070a moved it -- only after the lease
-    is taken, not before the busy check: a long no-reference request must not hold the one
-    shared CPU executor for the whole text while it is still about to get a `409`."""
+    sizing worker's own thread (review 34 finding 5), and -- since review #2 on 2d9070a moved
+    it -- only after the lease is taken, not before the busy check: a request that is about to
+    get a `409` must never size its whole text."""
     runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(6), _frame(7)])
     env = _env(envs, runtime, split_chars=100)
     sized: list[tuple[str, bool, list[str]]] = []
@@ -229,7 +231,7 @@ def test_later_pieces_are_sized_after_the_lease_on_the_cpu_executor(
 
     assert response.status_code == 200
     [(thread, gate_free, later)] = sized
-    assert thread.startswith("breeze-cpu-tokenizer")
+    assert thread.startswith("breeze-anchor-sizing")
     assert not gate_free  # after the lease: this request's own lease still holds it
     assert later == pieces[1:]
 
@@ -687,16 +689,16 @@ def test_split_chars_below_the_opening_budget_does_not_make_piece_0_the_largest(
 
 # --- the anchor sizing future on every exit path (review 33 on 10f0c29) ----------------------
 #
-# `_start_anchor_sizing` queues the later pieces' sizing on the CPU tokenizer's one worker right
-# after the lease. A request that ends without consuming it must cancel it: abandoned sizing of
-# a 10k-character text would otherwise hold that worker, and every later request's pre-gate
-# room check (and the next lease holder's own `.result()`) would queue behind it. And the GPU
-# thread's `.result()` must never abort a stream that is already out, nor stall it for long.
+# `_start_anchor_sizing` queues the later pieces' sizing on the CPU tokenizer's sizing worker
+# right after the lease. A request that ends without consuming it must cancel it: abandoned
+# sizing of a 10k-character text would otherwise hold that worker, and the next lease holder's
+# own sizing would queue behind it. And the GPU thread's `.result()` must never abort a stream
+# that is already out, nor stall it for long.
 
 
 class _SizingHeldInQueue:
     """Keeps the request's anchor sizing *queued*, not running: right before
-    `_start_anchor_sizing` queues it, the CPU tokenizer's one worker is given a call that waits
+    `_start_anchor_sizing` queues it, the CPU tokenizer's sizing worker is given a call that waits
     until `release()`. Records every real `anchor_sizing` call, so a test can tell whether the
     sizing ever ran once the worker was free again."""
 
@@ -710,9 +712,10 @@ class _SizingHeldInQueue:
         def start(runtime: Any, cpu_tokenizer: Any, request: Any, pieces: list[str]) -> Any:
             if not self._released.is_set():
                 cpu_tokenizer.submit(lambda _tokenizer: self._released.wait(5))
-            future = real_start(runtime, cpu_tokenizer, request, pieces)
-            self.futures.append(future)
-            return future
+            job = real_start(runtime, cpu_tokenizer, request, pieces)
+            if job is not None:  # `None`: a single piece, nothing to size
+                self.futures.append(job.future)
+            return job
 
         def spy(*args: Any) -> Any:
             self.sized.append(args)
@@ -746,8 +749,8 @@ def test_a_request_that_fails_before_the_200_cancels_its_queued_sizing(
     envs: list[Env], monkeypatch: pytest.MonkeyPatch, prepare_first_piece: Any, status: int
 ) -> None:
     """Finding 1: the `400 text_too_long` after the lease, or a failing preparation, ends the
-    request with its sizing still queued. It is cancelled, so it never runs: the next
-    request's pre-gate check, queued on the same worker after it, finds nothing ahead."""
+    request with its sizing still queued. It is cancelled, so it never runs: nothing is left
+    on the sizing worker for the next lease holder's own sizing to wait behind."""
     runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(6), _frame(7)])
     env = _env(envs, runtime, split_chars=100)
     held = _SizingHeldInQueue(monkeypatch)
@@ -802,13 +805,102 @@ def test_a_disconnect_after_the_200_cancels_the_queued_sizing(
     assert held.sized == []
 
 
+@pytest.mark.parametrize(
+    ("frames", "max_new_tokens"),
+    [
+        # Piece 0 uses its whole 3-frame limit: `piece_truncated`.
+        ([_frame(n) for n in range(1, 11)], "3"),
+        # Piece 0 finishes, but every frame is pad: nothing to anchor on.
+        ([_frame(PAD)], None),
+    ],
+    ids=["piece_truncated", "all_pad"],
+)
+def test_an_anchor_decided_without_the_sizing_cancels_it_before_piece_1(
+    envs: list[Env],
+    monkeypatch: pytest.MonkeyPatch,
+    frames: list[torch.Tensor],
+    max_new_tokens: str | None,
+) -> None:
+    """Review 34 finding 1: both early answers leave the sizing unread. It is cancelled right
+    there, before piece 1 is prepared, not only once every later piece has streamed
+    (`_iter_pieces`' own `finally`): until then it would hold the sizing worker for nothing."""
+    runtime = _fake_runtime(chunks=1, frames=frames)
+    env = _env(envs, runtime, split_chars=100)
+    held = _SizingHeldInQueue(monkeypatch)
+    cancelled_at_piece: list[bool] = []
+
+    def spy(tokenizer, model, reference, text, instruction, cfg_scale):
+        if held.futures:
+            cancelled_at_piece.append(held.futures[0].cancelled())
+        return prepare_piece(tokenizer, model, reference, text, instruction, cfg_scale)
+
+    monkeypatch.setattr(routes_speech, "prepare_piece", spy)
+    fields = {} if max_new_tokens is None else {"max_new_tokens": max_new_tokens}
+    try:
+        response = env.speak(text=SENTENCES, **fields)
+    finally:
+        held.release()
+
+    assert response.status_code == 200
+    # Still queued while piece 0 is prepared; cancelled by the time any later piece is.
+    assert len(cancelled_at_piece) == len(_no_reference_pieces(SENTENCES, 100))
+    assert cancelled_at_piece[0] is False
+    assert all(cancelled_at_piece[1:])
+    assert held.sized == []
+
+
+def test_a_request_cancelled_while_the_gpu_thread_waits_on_its_sizing_reports_no_skip(
+    envs: list[Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review 34 finding 3: the route's own cancel (`_serve_speech`'s cleanup, here for a
+    request cancelled while priming) can reach the sizing while the GPU thread's in-flight step
+    is still waiting on it. That is the request ending, not a shutdown: the stream is over
+    anyway, so no `speech.anchor_skipped` is emitted at all -- in particular not `shutdown`.
+
+    Piece 0 yields no audio (`chunks=0`) but one non-pad frame, so priming runs straight into
+    the anchor decision, and the held worker keeps the sizing queued while it waits."""
+    runtime = _fake_runtime(chunks=0, frames=[_frame(5)])
+    env = _env(envs, runtime, split_chars=100)
+    held = _SizingHeldInQueue(monkeypatch)
+    deciding = threading.Event()
+    real_anchor_codes = routes_speech.anchor_codes
+
+    def spy(*args: Any) -> Any:
+        deciding.set()  # the last step before the GPU thread waits on the sizing
+        return real_anchor_codes(*args)
+
+    monkeypatch.setattr(routes_speech, "anchor_codes", spy)
+
+    async def scenario() -> None:
+        task = _serve(_text_request(SENTENCES), runtime, env.components)
+        assert await asyncio.to_thread(deciding.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await eventually(lambda: _components_gate_is_free(env.components))
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        held.release()
+
+    [future] = held.futures
+    assert future.cancelled()
+    assert _events(env.events, "speech.anchor_skipped") == []
+    assert held.sized == []
+
+
 def test_a_sizing_failure_skips_the_anchor_instead_of_aborting_the_stream(
     envs: list[Env], monkeypatch: pytest.MonkeyPatch, prepared: list[dict[str, Any]]
 ) -> None:
     """Finding 2: the sizing can fail for reasons of its own (a template or tokenizer error,
     or no CPU tokenizer installed). Piece 0 is already out by then, so the request degrades:
-    the anchor is skipped (`sizing_failed`), every later piece is generated as voice design,
-    and the error is still reported as a server failure (`request.failed`)."""
+    the anchor is skipped (`sizing_failed`), and every later piece is generated as voice design.
+
+    The error is still a server bug, reported at level error with its traceback, but as
+    `speech.anchor_sizing_failed`, not `request.failed` (review 34 finding 4): the request goes
+    on to a `200` and `speech.completed`, so a `request.failed` would count a request that
+    succeeded as a failed one."""
     runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(6), _frame(7)])
     env = _env(envs, runtime, split_chars=100)
 
@@ -826,9 +918,12 @@ def test_a_sizing_failure_skips_the_anchor_instead_of_aborting_the_stream(
     pieces = _no_reference_pieces(SENTENCES, 100)
     assert [p["text"] for p in prepared] == pieces
     assert all(isinstance(p["reference"], NoRef) for p in prepared)
-    [failed] = _events(env.events, "request.failed")
-    assert "the template broke" in str(failed["error"])
+    [failed] = _events(env.events, "speech.anchor_sizing_failed")
+    assert failed["level"] == "error"
     assert failed["request_id"] == response.headers["x-request-id"]
+    assert "the template broke" in str(failed["error"])
+    assert "broken_sizing" in str(failed["traceback"])  # where it was raised, not just what
+    assert _events(env.events, "request.failed") == []
     assert len(_events(env.events, "speech.completed")) == 1
 
 
@@ -910,7 +1005,7 @@ def test_cpu_tokenizer_run_after_shutdown_raises_gpu_unavailable() -> None:
     ("cannot schedule new futures after shutdown"), mapped to the same `GpuUnavailable` a
     poisoned gate answers with (`503 gpu_unavailable`) -- not left to surface as a `500`."""
     tokenizer = routes_speech.CpuTokenizer()
-    tokenizer.install(object())
+    tokenizer.install(object(), object())
     tokenizer.shutdown()
 
     with pytest.raises(GpuUnavailable):
@@ -921,7 +1016,7 @@ def test_cpu_tokenizer_submit_after_shutdown_raises_gpu_unavailable() -> None:
     """`submit` (the GPU thread's own entry point, `_start_anchor_sizing`) maps the same
     executor `RuntimeError` the same way, even though nothing here is `await`ed."""
     tokenizer = routes_speech.CpuTokenizer()
-    tokenizer.install(object())
+    tokenizer.install(object(), object())
     tokenizer.shutdown()
 
     with pytest.raises(GpuUnavailable):
@@ -935,7 +1030,7 @@ def test_cpu_tokenizer_run_queued_call_cancelled_by_shutdown_raises_gpu_unavaila
     directly below), it is mapped to the same `GpuUnavailable`, not left to surface as a bare
     `asyncio.CancelledError` indistinguishable from a client disconnect."""
     tokenizer = routes_speech.CpuTokenizer()
-    tokenizer.install(object())
+    tokenizer.install(object(), object())
     running = threading.Event()
     release = threading.Event()
 
@@ -962,22 +1057,83 @@ def test_cpu_tokenizer_run_queued_call_cancelled_by_shutdown_raises_gpu_unavaila
     asyncio.run(scenario())
 
 
-def test_cpu_tokenizer_shutdown_can_wait_for_a_running_call() -> None:
-    """Finding 7: `shutdown(wait=True)` returns only once a call already running has finished,
-    so a test's teardown can't leave it running into the next test, which uses the same
-    session-shared tokenizer copy from its own executor."""
+def test_cpu_tokenizer_join_waits_for_both_workers_within_its_timeout() -> None:
+    """Review 34 finding 6: a test teardown shuts the executors down, then `join`s them with a
+    bound, so a call still running can't reach into the next test (which reuses the same
+    session-shared tokenizer copy) and a wedged one fails the teardown instead of hanging it.
+    It waits for a running call on each worker, the pre-gate one and the sizing one."""
     tokenizer = routes_speech.CpuTokenizer()
-    tokenizer.install(object())
+    tokenizer.install(FakeTokenizer(), FakeTokenizer())
+    running = threading.Barrier(3)
+    finished: list[str] = []
+
+    def slow(name: str) -> Any:
+        def call(_tokenizer: Any) -> None:
+            running.wait(5)
+            time.sleep(0.1)
+            finished.append(name)
+
+        return call
+
+    pre_gate = threading.Thread(target=asyncio.run, args=(tokenizer.run(slow("pre_gate")),))
+    pre_gate.start()
+    tokenizer.submit(slow("sizing"))
+    running.wait(5)
+    tokenizer.shutdown()
+
+    assert tokenizer.join(5)
+    assert sorted(finished) == ["pre_gate", "sizing"]
+    pre_gate.join(5)
+
+
+def test_cpu_tokenizer_join_gives_up_on_a_wedged_call() -> None:
+    tokenizer = routes_speech.CpuTokenizer()
+    tokenizer.install(FakeTokenizer(), FakeTokenizer())
     running = threading.Event()
-    finished = threading.Event()
+    release = threading.Event()
 
-    def slow(_tokenizer: Any) -> None:
+    def wedged(_tokenizer: Any) -> None:
         running.set()
-        time.sleep(0.1)
-        finished.set()
+        release.wait(5)
 
-    tokenizer.submit(slow)
+    tokenizer.submit(wedged)
     assert running.wait(5)
-    tokenizer.shutdown(wait=True)
+    tokenizer.shutdown()
+    try:
+        assert tokenizer.join(0.05) is False
+    finally:
+        release.set()
+    assert tokenizer.join(5)
 
-    assert finished.is_set()
+
+# --- the lease holder's sizing has its own worker (review 34 finding 5) -----------------------
+
+
+def test_a_burst_of_pre_gate_checks_does_not_delay_the_lease_holders_sizing() -> None:
+    """Every request's pre-gate room check queues on one worker, including ones bound for
+    `409`. The lease holder's sizing has a worker of its own, so a burst of slow checks ahead
+    of it can't push it past `ANCHOR_SIZING_TIMEOUT_SECONDS` and change the speaker mid-stream."""
+    tokenizer = routes_speech.CpuTokenizer()
+    tokenizer.install(FakeTokenizer(), FakeTokenizer())
+    release = threading.Event()
+    started = threading.Event()
+
+    def slow_pre_gate_check(_tokenizer: Any) -> None:
+        started.set()
+        release.wait(5)
+
+    async def scenario() -> None:
+        burst = [asyncio.ensure_future(tokenizer.run(slow_pre_gate_check)) for _ in range(8)]
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            sizing = tokenizer.submit(lambda _tokenizer: "sized")
+            assert await asyncio.to_thread(sizing.result, 1.0) == "sized"
+            assert not any(check.done() for check in burst)  # sized while all still waited
+        finally:
+            release.set()
+            await asyncio.gather(*burst)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        tokenizer.shutdown()

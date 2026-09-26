@@ -49,6 +49,7 @@ from tests.gpu.test_speech_http import (
     SPEECH_PATH,
     _components,
     _wait_for_terminal_event,
+    shut_down_cpu_tokenizer,
 )
 
 pytestmark = pytest.mark.gpu
@@ -157,11 +158,11 @@ def _run_once(
             components.gpu.shutdown()
         finally:
             # Nested, not sequential (review 32, review-of-2d9070a #4/#7 in the same pass): a
-            # `gpu.shutdown()` failure must not leave the CPU tokenizer's own executor running
-            # past the test, which would leak its thread into the next one. It waits, too
-            # (review 33 on 10f0c29): the next run's executor uses the same tokenizer copy
-            # (`test_speech_http._shared_cpu_tokenizer_copy`).
-            components.cpu_tokenizer.shutdown(wait=True)
+            # `gpu.shutdown()` failure must not leave the CPU tokenizer's own workers running
+            # past the test, which would leak their threads into the next one. It waits, with
+            # a bound (review 33 on 10f0c29, review 34 finding 6): the next run's workers use
+            # the same tokenizer copies (`test_speech_http._shared_loaded_model`).
+            shut_down_cpu_tokenizer(components)
 
 
 def _save_wav(body: bytes) -> None:
@@ -286,27 +287,35 @@ def test_long_voice_design_completes_every_run(gpu_env) -> None:
     # determinism is a runtime-wide, production change, well outside a single test file). One
     # flipped token can move a piece's EOS by a frame or more.
     #
-    # Only piece 0 is compared frame by frame: it is voice design from the same seed, so kernel
+    # Piece 0 is compared frame by frame: it is voice design from the same seed, so kernel
     # noise moves it by a frame or two at most. Every later piece is anchored to piece 0's own
     # audio (T050/T052/T053), so any change in piece 0 changes every later piece's prompt and
-    # can move its length by far more than that (review 33 on 10f0c29). For those, the piece
-    # count must match exactly and the total length within 5%, which still catches a piece
-    # actually cut short, dropped or overrun without failing on that propagated noise.
+    # can move its length by far more than that (review 33 on 10f0c29). Each later piece is
+    # compared with run 0's on its own, within 25% (review 34 finding 2), which catches one
+    # piece cut short or overrun by more than a quarter. A total over all pieces could not:
+    # each later piece is only 15-18% of it, and errors in opposite directions cancel out.
+    # The piece count needs no check
+    # here: every run already asserted exactly `len(EXPECTED_PIECES)` `speech.piece_done`
+    # events (and `prepare_piece` calls) above.
     FIRST_PIECE_FRAME_TOLERANCE = 2
-    TOTAL_FRAMES_TOLERANCE = 0.05
+    LATER_PIECE_RELATIVE_TOLERANCE = 0.25
     baseline = per_run_piece_frames[0]
     all_runs = f"all runs' per-piece frames: {per_run_piece_frames}"
     for run_index, frames in enumerate(per_run_piece_frames):
-        assert len(frames) == len(baseline), (
-            f"run {run_index} has {len(frames)} pieces, run 0 has {len(baseline)}\n{all_runs}"
-        )
         assert abs(frames[0] - baseline[0]) <= FIRST_PIECE_FRAME_TOLERANCE, (
             f"run {run_index} piece 0 has {frames[0]} frames, run 0 has {baseline[0]} "
             f"(tolerance {FIRST_PIECE_FRAME_TOLERANCE})\n{all_runs}"
         )
-        assert abs(sum(frames) - sum(baseline)) <= TOTAL_FRAMES_TOLERANCE * sum(baseline), (
-            f"run {run_index} has {sum(frames)} frames in total, run 0 has {sum(baseline)} "
-            f"(tolerance {TOTAL_FRAMES_TOLERANCE:.0%})\n{all_runs}"
+        mismatches = [
+            (piece_index, frames[piece_index], baseline[piece_index])
+            for piece_index in range(1, len(baseline))
+            if abs(frames[piece_index] - baseline[piece_index])
+            > LATER_PIECE_RELATIVE_TOLERANCE * baseline[piece_index]
+        ]
+        assert not mismatches, (
+            f"run {run_index} later pieces differ from run 0 by more than "
+            f"{LATER_PIECE_RELATIVE_TOLERANCE:.0%} (piece_index, run_frames, run_0_frames): "
+            f"{mismatches}\n{all_runs}"
         )
 
 

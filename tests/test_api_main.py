@@ -321,7 +321,10 @@ posix_only = pytest.mark.skipif(
 
 def _loaded() -> LoadedModel:
     return LoadedModel(
-        runtime=FakeRuntime(), report={"device": "cpu"}, cpu_tokenizer=FakeTokenizer()
+        runtime=FakeRuntime(),
+        report={"device": "cpu"},
+        cpu_tokenizer=FakeTokenizer(),
+        sizing_tokenizer=FakeTokenizer(),
     )
 
 
@@ -443,7 +446,12 @@ def test_a_failed_load_is_reported_and_the_server_exits_non_zero() -> None:
         pytest.param(lambda: (_ for _ in ()).throw(SystemExit(3)), id="system-exit"),
         # A loader result that breaks marking ready / reporting it.
         pytest.param(
-            lambda: LoadedModel(runtime=object(), report={}, cpu_tokenizer=FakeTokenizer()),
+            lambda: LoadedModel(
+                runtime=object(),
+                report={},
+                cpu_tokenizer=FakeTokenizer(),
+                sizing_tokenizer=FakeTokenizer(),
+            ),
             id="bad-result",
         ),
     ],

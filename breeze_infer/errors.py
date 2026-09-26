@@ -12,6 +12,7 @@ specs/003-cpp-compatible-api/contracts/http-api.md.
 
 from __future__ import annotations
 
+import traceback
 import uuid
 from collections.abc import Mapping
 from typing import Any
@@ -162,6 +163,13 @@ def report_unhandled(events: Emitter, request_id: str, exc: BaseException) -> No
     if not isinstance(exc, Exception) or isinstance(exc, _NOT_REPORTED):
         return
     events.emit("request.failed", level="error", request_id=request_id, error=repr(exc))
+
+
+def error_fields(exc: BaseException) -> dict[str, str]:
+    """`error` (the same `repr` `request.failed` carries) and `traceback`, for an event that
+    reports a server bug a request survived, so no handler here will see it
+    (`routes_speech._anchor_for_later_pieces`: `speech.anchor_sizing_failed`)."""
+    return {"error": repr(exc), "traceback": "".join(traceback.format_exception(exc))}
 
 
 def _envelope(message: str, code: str) -> dict[str, str]:

@@ -31,25 +31,34 @@ MAX_SEQ_LEN = 2048
 class LoadedModel:
     """The ready runtime plus the facts worth reporting in `model.loaded`.
 
-    `cpu_tokenizer` is a copy of the runtime's tokenizer for the speech route's CPU room check
-    (`routes_speech.CpuTokenizer`), which must never share the GPU thread's. Required: the
-    speech route cannot size a request without it (`api.Components.mark_ready` installs it
-    together with the runtime). `from_runtime` makes the copy.
+    `cpu_tokenizer` and `sizing_tokenizer` are two copies of the runtime's tokenizer, for the
+    speech route's two CPU workers (`routes_speech.CpuTokenizer`): the room check before the
+    gate, and the lease holder's anchor sizing. Neither may share the GPU thread's tokenizer,
+    nor each other, since all three threads can tokenize at once. Required: the speech route
+    cannot size a request without them (`api.Components.mark_ready` installs them together
+    with the runtime). `from_runtime` makes the copies.
     """
 
     runtime: Any
     report: dict[str, Any]
     cpu_tokenizer: Any
+    sizing_tokenizer: Any
 
     @classmethod
     def from_runtime(cls, runtime: Any, report: dict[str, Any]) -> LoadedModel:
-        """`runtime` with its own tokenizer copied for the CPU room check.
+        """`runtime` with its own tokenizer copied twice, once for each CPU worker.
 
-        Call it before the server reports ready, while nothing else uses the tokenizer: a deep
-        copy of a real one can take hundreds of ms, which the first speech request would
-        otherwise spend on the GPU thread, stalling any stream already running.
+        Call it on the GPU thread before the server reports ready, while nothing else uses the
+        tokenizer: a deep copy of a real one takes about 700 ms, which would otherwise stall
+        the event loop (`CpuTokenizer.install`, from `mark_ready`) or, made lazily, the first
+        speech request.
         """
-        return cls(runtime=runtime, report=report, cpu_tokenizer=copy.deepcopy(runtime.tokenizer))
+        return cls(
+            runtime=runtime,
+            report=report,
+            cpu_tokenizer=copy.deepcopy(runtime.tokenizer),
+            sizing_tokenizer=copy.deepcopy(runtime.tokenizer),
+        )
 
 
 def configure_compile_cache(
