@@ -17,6 +17,9 @@ breaking change `BC-nn` or an additive change is marked.
 - `503 loading` while the model loads.
 - `503 too_many_connections` above 16 connections.
 - `503 shutting_down` once the server has started shutting down.
+- A request that isn't a valid WebSocket upgrade gets the same envelope: `426 upgrade_required`
+  (no `Upgrade` header) or `400 bad_handshake` (for example a bad `Sec-WebSocket-Key`), and an
+  unexpected handshake failure `500 internal_error`.
 - The handshake must complete within 10 s.
 
 **Frames**
@@ -62,7 +65,8 @@ On connect, before any client message, the server sends
 
 Messages are JSON objects with a string `type`, parsed with a real JSON parser, so `\uXXXX`
 escapes work (BC-32). Rules for every message:
-- Unknown fields are ignored, and a field whose value is JSON `null` counts as absent.
+- Unknown fields are ignored, and a field whose value is JSON `null` counts as absent. On `start`,
+  an empty string also counts as absent, as on HTTP (BC-02).
 - A message that is valid JSON but not an object gets `invalid_json`; a missing or non-string
   `type` gets `invalid_field`.
 - Wrong types or out-of-range values produce `error{code: invalid_field}`, and the message has no

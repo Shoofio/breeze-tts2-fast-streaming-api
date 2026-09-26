@@ -855,7 +855,10 @@ rules.
     the connection cap, and a `process_response` hook that adds `X-Breeze-Version` to every
     handshake response; both hooks synchronous (never awaiting); `open_timeout=10`,
     `max_size=1 MiB`, `ping_interval=20`, `ping_timeout=20`, `close_timeout=2`. `registry` is one
-    object shared by every `serve()` instance: the connection set, the cap and the shutdown flag.
+    object shared by every `serve()` instance: the connection set, the cap and the shutdown flag
+    (`ws_server.ConnectionRegistry`; `await registry.shutdown()` runs the whole shutdown and
+    returns once every handler is done). Limits are read from module globals at call time so
+    tests can monkeypatch them.
   - Per connection: send `ready`, then run a reader task (parse, `session.apply`, enqueue
     immediate events) and one worker coroutine:
     - `CancelMark` sends `cancelled`, `StartMark` sends `started`, and `EndMark` sends `done` if
@@ -888,7 +891,9 @@ rules.
 - [ ] T078 [US4] Wire the WebSocket into `breeze_infer/api.py`:
   - Unless `ws_port` is `disabled`, pre-bind the sockets on `settings.host:ws_port` (every
     address the host resolves to, like the HTTP sockets), with one `serve()` per socket, all
-    sharing one registry (one cap of 16, one shutdown flag).
+    sharing one registry (one cap of 16, one shutdown flag); `api.serve(..., *, ws_sockets=[...])`.
+    Test (`test_bc_30_*` in `tests/test_api_main.py`): the WebSocket sockets bind only the
+    configured host.
   - On `OSError`, emit `ws.bind_failed` and report 0 (`test_bc_24_ws_bind_failure_reports_zero`
     goes in `tests/test_health.py`).
   - `/health`'s `ws_port` provider returns the bound port.

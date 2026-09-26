@@ -348,9 +348,11 @@ busy depending on `work`), then `closed`.
   in flight. A queued `EndMark` alone still gets its `done` before `started`; buffered text alone is
   dropped silently by the reset.
 - `cancel` keeps the anchor and `piece_index` (seeds keep counting from `start`). It turns the
-  opening budget back on only when piece 0 is cancelled before it anchored.
-- The first piece that succeeds provides the anchor. If piece 0 fails, the opening budget turns
-  back on only when no piece is queued.
+  opening budget back on only when the opening piece is cancelled before it anchored.
+- The first piece that succeeds provides the anchor. If the opening piece fails, the opening budget
+  turns back on only when no piece is queued. "The opening piece" is whichever piece is spoken while
+  there is no anchor: piece 0 after `start`, or a later index once the opening budget has turned
+  back on, since indices keep counting.
 - A message rejected with an `error` has no other effect: a `flush` or `end` whose `text` would
   exceed the buffer limit (`text_too_long`) neither drains nor queues its `EndMark`.
 
