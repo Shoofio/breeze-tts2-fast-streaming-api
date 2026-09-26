@@ -82,14 +82,25 @@ class NameTaken(Exception):
 
 @dataclass(frozen=True)
 class SavedVoice:
+    """A saved voice. Its codes are kept in memory, loaded at scan or registration, so a
+    speech request resolves the voice without reading its file (T066): about 12 KB for a 30 s
+    reference (376 frames x 16 codebooks, int16)."""
+
     id: str
     ref_text: str
+    codes: np.ndarray
     frames: int
     encode_ms: int
 
     @classmethod
     def from_file(cls, voice: VoiceFile) -> SavedVoice:
-        return cls(id=voice.id, ref_text=voice.ref_text, frames=voice.frames, encode_ms=voice.encode_ms)
+        return cls(
+            id=voice.id,
+            ref_text=voice.ref_text,
+            codes=voice.codes,
+            frames=voice.frames,
+            encode_ms=voice.encode_ms,
+        )
 
 
 @dataclass(frozen=True)
@@ -101,6 +112,15 @@ class MemoryVoice:
     codes: np.ndarray
     frames: int
     encode_ms: int
+
+
+@dataclass(frozen=True)
+class ResolvedVoice:
+    """What a speech request needs from a voice, either tier (`VoiceRegistry.lookup`)."""
+
+    id: str
+    ref_text: str
+    codes: np.ndarray  # [frames, codebooks]
 
 
 @dataclass(frozen=True)
@@ -240,6 +260,15 @@ class VoiceRegistry:
             self._unnamed[id] = voice
             self._unnamed_order.append(id)
             return _entry(voice, saved=False), evicted
+
+    def lookup(self, voice_id: str) -> ResolvedVoice | None:
+        """The voice a speech request names, or `None` if there is none. Exact, as `DELETE`
+        is: case is ignored only at create (data-model.md "Registry rules")."""
+        with self._lock:
+            voice = self._saved.get(voice_id) or self._unnamed.get(voice_id)
+            if voice is None:
+                return None
+            return ResolvedVoice(id=voice.id, ref_text=voice.ref_text, codes=voice.codes)
 
     # -------------------------------------------------------------------- removing
 

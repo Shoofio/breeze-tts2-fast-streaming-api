@@ -3,8 +3,9 @@
 data-model.md "Reference": the "prefix" variant is a `ReferencePrefix` (cached KV) plus
 the stored `ref_text`, for a saved or unnamed voice with no override. This module owns
 only the cache half -- when to build, reuse and evict -- not the tensors or how they're
-built: `get_or_build` awaits a caller-supplied `build` on a miss. T066 wires `build` to
-``lambda: gpu.run(runtime.build_reference_prefix, prefix_inputs)``. The cache reads one
+built: `get_or_build` awaits a caller-supplied `build` on a miss. The speech route binds
+`build` to ``gpu.run(synthesis.build_voice_prefix, runtime, codes, ref_text)``, which calls
+`runtime.build_reference_prefix` on the GPU thread (T066). The cache reads one
 attribute of what `build` returns, `prefix_len`, and never imports torch, so it's testable
 on the CPU with a fake `build`, including one that raises `torch.cuda.OutOfMemoryError`.
 

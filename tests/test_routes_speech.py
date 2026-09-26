@@ -16,29 +16,42 @@ import asyncio
 import io
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import numpy as np
 import pytest
 import soundfile as sf
 import torch
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
 from breeze_infer import routes_speech
 from breeze_infer.api import Components, create_app, load_in_background
 from breeze_infer.events import Emitter
 from breeze_infer.gpu import GpuCloseTimeout, GpuGate, GpuSession, GpuThread
+from breeze_infer.limits import ANCHOR_CHARS
 from breeze_infer.model_loading import LoadedModel
 from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_speech import CpuTokenizer
+from breeze_infer.routes_voices import VoiceServices
 from breeze_infer.settings import settings_from_args
+from breeze_infer.synthesis import CodesRef, PrefixRef
+from breeze_infer.templates import prepare_prefix_inputs
+from breeze_infer.text_split import split_text
+from breeze_infer.voice_prefix import VoicePrefixCache
+from breeze_infer.voice_registry import VoiceRegistry
+from breeze_infer.voice_store import VoiceStore
 from tests.fakes import (
+    CODEC_CODEBOOK_SIZE,
+    CODEC_CODEBOOKS,
     FakeCodec,
     FakeRuntime,
     FakeStreamingConfig,
@@ -77,7 +90,7 @@ def _build_components(
     # because most tests here mark `readiness` ready directly, with a runtime alone.
     cpu_tokenizer = CpuTokenizer()
     cpu_tokenizer.install(FakeTokenizer(), FakeTokenizer())
-    return Components(
+    components = Components(
         settings=settings_from_args(argv),
         events=events if events is not None else Emitter(io.StringIO(), lambda: 0.0),
         gate=GpuGate(),
@@ -87,6 +100,10 @@ def _build_components(
         cpu_tokenizer=cpu_tokenizer,
         open_voices=open_no_voices,
     )
+    # Most tests here mark `readiness` ready directly, which installs no voices; a `voice_id`
+    # is still looked up (and not found) in an empty registry, as on a server with none.
+    components.voices.install(open_no_voices(None))
+    return components
 
 
 def _client_for(components: Components) -> TestClient:
@@ -819,3 +836,430 @@ def test_a_close_timeout_before_the_200_is_left_to_the_gate(
         assert [name for name, _ in events.calls if name == "gpu.close_failed"] == []
     finally:
         components.gpu.shutdown()
+
+
+# --- speech by voice_id (T060; the A: cases ported from A:tests/test_api_speech.py ~378-521) --
+#
+# A voice with no `ref_text` override is spoken through its cached KV prefix (data-model.md
+# "Reference", the prefix variant): built once on the GPU thread under the request's lease, then
+# reused. An override uses the codes path with the given transcript. The voice is resolved, and
+# the prefix cache's token read, before the gate (FR-007: an unknown voice is `404` before
+# `409 busy`).
+
+NARRATOR_TEXT = "stored transcript"
+UNNAMED_ID = "v_0123456789abcdef"
+# A deterministic reference: 8 frames of 16 codebooks, every value a valid code.
+VOICE_CODES = (np.arange(8 * CODEC_CODEBOOKS, dtype=np.int16) % CODEC_CODEBOOK_SIZE).reshape(
+    8, CODEC_CODEBOOKS
+)
+
+
+def _voice_services(voices_dir: Path, events: RecordingEvents) -> VoiceServices:
+    """What `api.open_voices` builds, on a real directory, with a 1-byte-per-token prefix
+    budget (the default 1 GiB) so the cache holds whatever the tests build."""
+    store = VoiceStore(
+        voices_dir,
+        codebooks=CODEC_CODEBOOKS,
+        codebook_size=CODEC_CODEBOOK_SIZE,
+        codec_fingerprint="f" * 64,
+        events=events,
+        clock=lambda: datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc),
+    )
+    store.scan()
+    return VoiceServices(
+        store=store,
+        registry=VoiceRegistry(clock=lambda: 0.0),
+        prefix_cache=VoicePrefixCache(bytes_per_token=1, on_event=events.emit),
+    )
+
+
+@pytest.fixture()
+def voice_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Callable[..., SimpleNamespace]]:
+    """Builds a ready server with a real voice directory. Every piece's `prepare_piece` call is
+    recorded (`prepared`: its reference and text) while the real one still runs."""
+    started: list[Components] = []
+    prepared: list[SimpleNamespace] = []
+    real_prepare_piece = routes_speech.prepare_piece
+
+    def recording_prepare_piece(
+        tokenizer: Any, model: Any, reference: Any, text: str, instruction: str, cfg_scale: float
+    ) -> dict[str, Any]:
+        prepared.append(SimpleNamespace(reference=reference, text=text))
+        return real_prepare_piece(tokenizer, model, reference, text, instruction, cfg_scale)
+
+    monkeypatch.setattr(routes_speech, "prepare_piece", recording_prepare_piece)
+
+    def start(
+        runtime: FakeRuntime | None = None,
+        *,
+        split_chars: int | None = None,
+        cpu_tokenizer: Any = None,
+    ) -> SimpleNamespace:
+        readiness = Readiness()
+        events = RecordingEvents()
+        components = _build_components(readiness, split_chars=split_chars, events=events)
+        started.append(components)
+        if cpu_tokenizer is not None:
+            components.cpu_tokenizer.install(cpu_tokenizer, FakeTokenizer())
+        services = _voice_services(tmp_path / "voices", events)
+        components.voices.install(services)
+        runtime = runtime if runtime is not None else _fake_runtime()
+        readiness.mark_ready(runtime)
+        return SimpleNamespace(
+            components=components,
+            client=_client_for(components),
+            runtime=runtime,
+            events=events,
+            services=services,
+            prepared=prepared,
+        )
+
+    yield start
+    for components in started:
+        components.gpu.shutdown()
+
+
+def _save_voice(server: SimpleNamespace, name: str = "Narrator", ref_text: str = NARRATOR_TEXT) -> str:
+    """Register a saved voice through `POST /v1/voices`, as a client would."""
+    response = server.client.post(
+        "/v1/voices",
+        data={"ref_text": ref_text, "name": name},
+        files={"ref_audio": ("ref.wav", _wav_bytes(), "audio/wav")},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["id"]
+
+
+def _add_unnamed_voice(server: SimpleNamespace, ref_text: str = NARRATOR_TEXT) -> str:
+    """Register an unnamed voice with known codes (`VOICE_CODES`) straight into the registry."""
+    server.services.registry.register_unnamed(
+        id=UNNAMED_ID, ref_text=ref_text, codes=VOICE_CODES, frames=8, encode_ms=1
+    )
+    return UNNAMED_ID
+
+
+def _speech(server: SimpleNamespace, **data: str) -> Any:
+    return server.client.post(SPEECH_PATH, data={"text": "hello there", **data})
+
+
+def _prefix_len(ref_text: str, codes: Any) -> int:
+    """The prefix length the real `build_reference_prefix` gives: its inputs' length."""
+    inputs = prepare_prefix_inputs(
+        FakeTokenizer(), model_with_codec_facts(), {"ref_text": ref_text, "ref_audio_codes": codes}
+    )
+    return int(inputs["attention_mask"].shape[1])
+
+
+def _named(server: SimpleNamespace, name: str) -> list[dict[str, Any]]:
+    return [fields for event, fields in server.events.calls if event == name]
+
+
+def test_voice_id_uses_the_prefix_path(voice_server: Callable[..., SimpleNamespace]) -> None:
+    server = voice_server()
+    voice_id = _add_unnamed_voice(server)
+
+    response = _speech(server, voice_id=voice_id)
+
+    assert response.status_code == 200
+    # One prefix, built from the stored transcript and codes, and the piece continues it.
+    [prefix_inputs] = server.runtime.prefix_builds
+    assert int(prefix_inputs["attention_mask"].shape[1]) == _prefix_len(NARRATOR_TEXT, VOICE_CODES)
+    [call] = server.runtime.calls
+    assert call["prefix"].prefix_len == _prefix_len(NARRATOR_TEXT, VOICE_CODES)
+    assert call["inputs"].get("input_values") is None  # the suffix carries no audio
+    [piece] = server.prepared
+    assert isinstance(piece.reference, PrefixRef)
+    assert piece.reference.ref_text == NARRATOR_TEXT
+    [accepted] = _named(server, "speech.accepted")
+    assert accepted["reference"] == "voice_prefix"
+    assert accepted["warm"] is False
+    assert _gate_is_free(server.components)
+
+
+def test_a_saved_voice_uses_the_prefix_path(voice_server: Callable[..., SimpleNamespace]) -> None:
+    server = voice_server()
+    _save_voice(server)
+
+    response = _speech(server, voice_id="Narrator")
+
+    assert response.status_code == 200
+    assert len(server.runtime.prefix_builds) == 1
+    assert server.runtime.calls[-1]["prefix"] is not None
+
+
+def test_voice_id_with_ref_text_uses_the_codes_path_with_the_override(
+    voice_server: Callable[..., SimpleNamespace],
+) -> None:
+    """A: `test_ref_text_with_voice_id_overrides_the_transcript_on_the_codes_tier`."""
+    server = voice_server()
+    voice_id = _add_unnamed_voice(server)
+
+    response = _speech(server, voice_id=voice_id, ref_text="a client transcript")
+
+    assert response.status_code == 200
+    assert server.runtime.prefix_builds == []  # no KV prefix for an overridden transcript
+    assert server.runtime.calls[-1]["prefix"] is None
+    [piece] = server.prepared
+    assert isinstance(piece.reference, CodesRef)
+    assert piece.reference.ref_text == "a client transcript"
+    assert np.array_equal(np.asarray(piece.reference.codes), VOICE_CODES)
+    # The override is for this request only: the stored transcript is unchanged.
+    [record] = server.client.get("/v1/voices").json()
+    assert record["ref_text"] == NARRATOR_TEXT
+    [accepted] = _named(server, "speech.accepted")
+    assert accepted["reference"] == "voice_codes"
+
+
+def test_an_unknown_voice_is_404(voice_server: Callable[..., SimpleNamespace]) -> None:
+    server = voice_server()
+    _save_voice(server)
+
+    # Only case is ignored at create: a lookup is exact (data-model.md "Registry rules").
+    for voice_id in ("nobody", "narrator", "v_ffffffffffffffff"):
+        response = _speech(server, voice_id=voice_id)
+        assert response.status_code == 404
+        assert response.json() == {"error": "unknown voice_id", "code": "unknown_voice"}
+    assert server.runtime.calls == []
+    assert _gate_is_free(server.components)
+
+
+@pytest.mark.parametrize("saved", [True, False], ids=["saved", "unnamed"])
+def test_a_deleted_voice_is_404(voice_server: Callable[..., SimpleNamespace], saved: bool) -> None:
+    server = voice_server()
+    voice_id = _save_voice(server) if saved else _add_unnamed_voice(server)
+    assert _speech(server, voice_id=voice_id).status_code == 200
+
+    assert server.client.delete(f"/v1/voices/{voice_id}").status_code == 200
+    response = _speech(server, voice_id=voice_id)
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "unknown voice_id", "code": "unknown_voice"}
+    assert len(server.services.prefix_cache) == 0  # the DELETE dropped its prefix
+
+
+def test_a_kv_prefix_is_reused_across_requests(voice_server: Callable[..., SimpleNamespace]) -> None:
+    """A: `test_voice_id_with_a_warm_prefix_uses_the_suffix_path`."""
+    server = voice_server()
+    voice_id = _add_unnamed_voice(server)
+
+    first = _speech(server, voice_id=voice_id)
+    second = _speech(server, voice_id=voice_id)
+
+    assert first.status_code == second.status_code == 200
+    assert len(server.runtime.prefix_builds) == 1
+    first_call, second_call = server.runtime.calls
+    assert second_call["prefix"] is first_call["prefix"]
+    assert [accepted["warm"] for accepted in _named(server, "speech.accepted")] == [False, True]
+    assert all(isinstance(piece.reference, PrefixRef) for piece in server.prepared)
+
+
+def test_every_piece_of_a_voice_request_reuses_the_one_prefix(
+    voice_server: Callable[..., SimpleNamespace],
+) -> None:
+    """A: `test_voice_pieces_all_reuse_the_kv_prefix`."""
+    server = voice_server(split_chars=15)
+    voice_id = _add_unnamed_voice(server)
+
+    response = _speech(server, voice_id=voice_id, text="Hi there. Go now yes. See you soon.")
+
+    assert response.status_code == 200
+    assert len(server.runtime.prefix_builds) == 1
+    assert len(server.runtime.calls) == 3
+    assert all(call["prefix"] is server.runtime.calls[0]["prefix"] for call in server.runtime.calls)
+    assert all(isinstance(piece.reference, PrefixRef) for piece in server.prepared)
+
+
+def test_a_voice_request_has_no_opening_piece(voice_server: Callable[..., SimpleNamespace]) -> None:
+    """A: `test_first_piece_uses_the_anchor_budget_only_without_a_reference`: a voice already
+    fixes the speaker, so the text is split with no short opening piece and nothing anchors."""
+    server = voice_server(split_chars=600)
+    voice_id = _add_unnamed_voice(server)
+    text = " ".join(f"Line {n} of the voice test text." for n in range(40))
+
+    assert _speech(server, text=text).status_code == 200
+    no_reference = [piece.text for piece in server.prepared]
+    server.prepared.clear()
+    assert _speech(server, text=text, voice_id=voice_id).status_code == 200
+    with_voice = [piece.text for piece in server.prepared]
+
+    assert no_reference == split_text(text, budget=600, first_budget=ANCHOR_CHARS)
+    assert with_voice == split_text(text, budget=600)
+    assert all(isinstance(piece.reference, PrefixRef) for piece in server.prepared)
+
+
+class _BlockingTokenizer(FakeTokenizer):
+    """Holds the first pre-gate room check open until `release` is set: the request has
+    resolved its voice by then, and hasn't taken the gate yet."""
+
+    def __init__(self) -> None:
+        self.reached = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, text: str, **kwargs: Any) -> Any:
+        self.reached.set()
+        assert self.release.wait(5.0)
+        return super().__call__(text, **kwargs)
+
+
+@pytest.mark.parametrize("re_register", [False, True], ids=["deleted", "deleted_and_re_registered"])
+def test_a_voice_deleted_between_resolution_and_the_gate_is_not_cached(
+    voice_server: Callable[..., SimpleNamespace], re_register: bool
+) -> None:
+    """A: `test_voice_deleted_between_lookup_and_prefix_build_is_404`, changed by the new
+    design (data-model.md "Voice", prefix-cache key): the request already holds the voice it
+    resolved, so it is still spoken, but its prefix is never cached -- even when the voice is
+    re-registered with the same audio and text, and so the same cache key, before the build."""
+    tokenizer = _BlockingTokenizer()
+    server = voice_server(cpu_tokenizer=tokenizer)
+    _save_voice(server)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(_speech, server, voice_id="Narrator")
+        assert tokenizer.reached.wait(5.0)
+        assert server.client.delete("/v1/voices/Narrator").status_code == 200
+        if re_register:
+            _save_voice(server)
+        tokenizer.release.set()
+        response = pending.result(10.0)
+
+    assert response.status_code == 200
+    assert len(server.runtime.prefix_builds) == 1
+    assert len(server.services.prefix_cache) == 0
+    request_id = response.headers["x-request-id"]
+    evicted = [f for f in _named(server, "voice.prefix_evicted") if f.get("request_id") == request_id]
+    assert evicted == [{"voice_id": "Narrator", "reason": "deleted", "request_id": request_id}]
+    later = _speech(server, voice_id="Narrator")
+    if re_register:
+        assert later.status_code == 200
+        assert len(server.runtime.prefix_builds) == 2  # built again: nothing stale was kept
+    else:
+        assert later.status_code == 404
+
+
+class _OutOfMemoryRuntime(FakeRuntime):
+    def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> Any:
+        self.prefix_builds.append(prefix_inputs)
+        raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB (fake)")
+
+
+def test_an_out_of_memory_prefix_build_falls_back_to_the_codes_path(
+    voice_server: Callable[..., SimpleNamespace],
+) -> None:
+    runtime = _OutOfMemoryRuntime()
+    runtime.tokenizer = FakeTokenizer()
+    runtime.model = model_with_codec_facts()
+    runtime.audio_tokenizer = FakeCodec()
+    server = voice_server(runtime)
+    voice_id = _add_unnamed_voice(server)
+
+    response = _speech(server, voice_id=voice_id)
+
+    assert response.status_code == 200
+    assert len(response.content) > 0
+    assert len(runtime.prefix_builds) == 1
+    assert runtime.calls[-1]["prefix"] is None
+    [piece] = server.prepared
+    assert isinstance(piece.reference, CodesRef)
+    assert piece.reference.ref_text == NARRATOR_TEXT
+    assert np.array_equal(np.asarray(piece.reference.codes), VOICE_CODES)
+    request_id = response.headers["x-request-id"]
+    [fallback] = _named(server, "speech.prefix_fallback")
+    assert fallback["level"] == "warning"
+    assert fallback["request_id"] == request_id
+    assert fallback["voice_id"] == voice_id
+    assert fallback["reason"] == "out_of_memory"
+    assert "CUDA out of memory" in fallback["error"]
+    assert _named(server, "request.failed") == []
+    [accepted] = _named(server, "speech.accepted")
+    assert accepted["reference"] == "voice_codes"
+    assert len(server.services.prefix_cache) == 0
+    assert _gate_is_free(server.components)
+
+
+class _SlowPrefixRuntime(FakeRuntime):
+    """`build_reference_prefix` blocks (on the GPU thread) until `release` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> Any:
+        self.started.set()
+        assert self.release.wait(5.0)
+        return super().build_reference_prefix(prefix_inputs)
+
+
+def _form_request(data: dict[str, str]) -> Request:
+    """A Starlette `Request` carrying `data` as a form body, for driving `_serve_speech`."""
+    built = httpx.Request("POST", "http://test" + SPEECH_PATH, data=data)
+    body = built.read()
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": SPEECH_PATH,
+        "query_string": b"",
+        "headers": [(b"content-type", built.headers["content-type"].encode("latin-1"))],
+    }
+    sent = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal sent
+        more = not sent
+        sent = True
+        return {"type": "http.request", "body": body if more else b"", "more_body": False}
+
+    return Request(scope, receive)
+
+
+async def _until(condition: Callable[[], bool]) -> None:
+    for _ in range(500):
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition never became true")
+
+
+def test_a_request_cancelled_during_the_prefix_build_hands_the_gate_to_the_build(
+    voice_server: Callable[..., SimpleNamespace],
+) -> None:
+    """A client disconnect while its prefix builds: the GPU work can't be abandoned, so the
+    build keeps the gate (`GpuLease.hand_over`) until it has finished, then frees it, and its
+    prefix is still cached for the next request."""
+    runtime = _SlowPrefixRuntime()
+    runtime.tokenizer = FakeTokenizer()
+    runtime.model = model_with_codec_facts()
+    runtime.audio_tokenizer = FakeCodec()
+    server = voice_server(runtime)
+    voice_id = _add_unnamed_voice(server)
+
+    async def main() -> None:
+        task = asyncio.ensure_future(
+            routes_speech._serve_speech(
+                _form_request({"text": "hello there", "voice_id": voice_id}),
+                runtime,
+                server.components,
+                request_id="cancelled-request",
+                received_at=0.0,
+                clock=lambda: 0.0,
+            )
+        )
+        await _until(runtime.started.is_set)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert not _gate_is_free(server.components)  # the build still holds it
+        runtime.release.set()
+        await _until(lambda: _gate_is_free(server.components))
+
+    asyncio.run(main())
+
+    assert len(server.services.prefix_cache) == 1
+    assert _named(server, "voice.prefix_build_failed") == []
+    assert runtime.calls == []  # nothing was generated for the cancelled request
+    # The next request finds it warm.
+    assert _speech(server, voice_id=voice_id).status_code == 200
+    assert len(runtime.prefix_builds) == 1

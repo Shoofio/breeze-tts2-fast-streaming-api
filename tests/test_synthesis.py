@@ -24,7 +24,10 @@ from breeze_infer.synthesis import (
     CodesRef,
     NoRef,
     PieceRoom,
+    PrefixRef,
+    UnbuiltPrefix,
     anchor_sizing,
+    build_voice_prefix,
     codec_samples_per_frame,
     generate_piece,
     piece_frame_limit,
@@ -36,11 +39,13 @@ from breeze_infer.synthesis import (
     resolve_reference,
     stand_in_reference,
 )
+from breeze_infer.templates import prepare_prefix_inputs
 from models.fast_streaming import NoRoomError, PromptLength, prompt_length
 from tests.fakes import (
     CODEC_SAMPLES_PER_FRAME,
     FakeCodec,
     FakeRuntime,
+    FakeStreamingConfig,
     FakeTokenizer,
     RecordingEvents,
     fake_model,
@@ -129,8 +134,10 @@ def test_resolve_reference_inline_ref_encodes_once_on_the_gpu() -> None:
     assert codec.last_sr == 24000
 
 
-def test_resolve_reference_voice_ref_is_a_documented_stub_until_t066() -> None:
-    with pytest.raises(NotImplementedError, match="T066"):
+def test_resolve_reference_leaves_a_voice_ref_to_the_route() -> None:
+    """A voice is resolved by the speech route (T066), which has the registry, the prefix cache
+    and the GPU lease a prefix build needs; here it is a caller bug, not a 500 in disguise."""
+    with pytest.raises(TypeError, match="routes_speech"):
         asyncio.run(
             resolve_reference(
                 VoiceRef(voice_id="v1", ref_text_override=None),
@@ -479,7 +486,7 @@ def test_codec_samples_per_frame_without_the_accessor_raises() -> None:
 def test_piece_room_takes_the_cap_from_the_runtimes_public_frame_cap() -> None:
     runtime = SimpleNamespace(
         frame_cap=lambda requested: 40,
-        max_new_tokens_room=lambda requested, inputs: 25,
+        max_new_tokens_room=lambda requested, inputs, prefix_len: 25,
     )
 
     assert piece_room(runtime, {}, None) == PieceRoom(cap=40, room=25)
@@ -551,14 +558,106 @@ def test_anchor_sizing_needs_no_gpu_model() -> None:
     assert len(sizing.later_lengths) == len(LATER_TEXTS)
 
 
-@pytest.mark.xfail(
-    reason="T066: a voice_id reference has no stand-in until the voice registry is wired; "
-    "a voice_id request must not 500 before the gate (review 26b #6)",
-    raises=TypeError,
-    strict=True,
+VOICE = SimpleNamespace(
+    id="alice",
+    ref_text="the stored transcript",
+    codes=(np.arange(9 * 16, dtype=np.int16) % 2048).reshape(9, 16),
 )
+
+
 def test_a_voice_reference_has_a_stand_in_for_the_pre_gate_room_check() -> None:
-    stand_in_reference(VoiceRef(voice_id="alice", ref_text_override=None), None, 16)
+    """With no override, the stand-in is the prefix the request will build: the voice's
+    stored transcript and codes (review 26b #6: no TypeError, so no 500 before the gate)."""
+    stand_in = stand_in_reference(
+        VoiceRef(voice_id="alice", ref_text_override=None), None, 16, voice=VOICE
+    )
+
+    assert isinstance(stand_in, UnbuiltPrefix)
+    assert stand_in.ref_text == VOICE.ref_text
+    assert np.array_equal(stand_in.codes, VOICE.codes)
+
+
+def test_a_voice_reference_with_an_override_stands_in_as_its_codes() -> None:
+    stand_in = stand_in_reference(
+        VoiceRef(voice_id="alice", ref_text_override="a client transcript"), None, 16, voice=VOICE
+    )
+
+    assert isinstance(stand_in, CodesRef)
+    assert stand_in.ref_text == "a client transcript"
+    assert np.array_equal(np.asarray(stand_in.codes), VOICE.codes)
+
+
+def test_a_voice_reference_needs_its_resolved_voice() -> None:
+    with pytest.raises(ValueError, match="resolved voice"):
+        stand_in_reference(VoiceRef(voice_id="alice", ref_text_override=None), None, 16)
+
+
+@pytest.mark.parametrize("fast_backbone_prefill", [False, True], ids=["exact", "bucketed"])
+@pytest.mark.parametrize("cfg_scale", [1.0, 2.5, 0.0])
+def test_a_voice_prefix_stand_in_predicts_the_prefix_paths_room(
+    cfg_scale: float, fast_backbone_prefill: bool
+) -> None:
+    """The prefix path prefills only the suffix after the cached prefix, so its room differs
+    from the codes path's once prefill buckets pad the suffix alone: the stand-in must give the
+    room the prefix path will really have, on every CFG branch shape. A small context makes the
+    room, not the cap, decide."""
+    runtime = FakeRuntime(
+        config=FakeStreamingConfig(max_seq_len=400, fast_backbone_prefill=fast_backbone_prefill)
+    )
+    runtime.model = model_with_codec_facts()
+    stand_in = stand_in_reference(
+        VoiceRef(voice_id="alice", ref_text_override=None), None, 16, voice=VOICE
+    )
+    prefix_inputs = prepare_prefix_inputs(
+        FakeTokenizer(),
+        runtime.model,
+        {"ref_text": VOICE.ref_text, "ref_audio_codes": VOICE.codes},
+    )
+    built = PrefixRef(
+        prefix=SimpleNamespace(prefix_len=int(prefix_inputs["attention_mask"].shape[1])),
+        ref_text=VOICE.ref_text,
+    )
+    real = prepare_piece(FakeTokenizer(), runtime.model, built, "Hello there.", "Speak.", cfg_scale)
+
+    predicted = predicted_room(
+        runtime, FakeTokenizer(), stand_in, "Hello there.", "Speak.", cfg_scale, None
+    )
+
+    expected = piece_room(runtime, real, None, prefix=built.prefix)
+    assert predicted == expected
+    assert 0 < expected.room < expected.cap
+
+
+def test_a_prefix_piece_is_the_text_suffix_alone() -> None:
+    """The prefix path's piece inputs carry no reference audio: the KV holds it, and its
+    length counts against the room (a small context, so the room decides, not the cap)."""
+    runtime = FakeRuntime(config=FakeStreamingConfig(max_seq_len=300))
+    runtime.model = model_with_codec_facts()
+    reference = PrefixRef(prefix=SimpleNamespace(prefix_len=40), ref_text="stored")
+
+    inputs = prepare_piece(FakeTokenizer(), runtime.model, reference, "Hello.", "Speak.", 2.5)
+
+    assert inputs.get("input_values") is None
+    assert inputs.get("cfg_negative_input_values") is None
+    assert piece_room(runtime, inputs, None, prefix=reference.prefix).room == (
+        piece_room(runtime, inputs, None).room - 40
+    )
+
+
+def test_build_voice_prefix_builds_from_the_voices_transcript_and_codes() -> None:
+    runtime = FakeRuntime()
+    runtime.tokenizer = FakeTokenizer()
+    runtime.model = model_with_codec_facts()
+
+    prefix = build_voice_prefix(runtime, VOICE.codes, VOICE.ref_text)
+
+    [prefix_inputs] = runtime.prefix_builds
+    expected = prepare_prefix_inputs(
+        FakeTokenizer(), runtime.model, {"ref_text": VOICE.ref_text, "ref_audio_codes": VOICE.codes}
+    )
+    assert torch.equal(prefix_inputs["input_ids"], expected["input_ids"])
+    assert torch.equal(prefix_inputs["input_values"], expected["input_values"])
+    assert prefix.prefix_len == int(expected["attention_mask"].shape[1])
 
 
 # --- piece_frame_limit: clamping (FR-036a, review 26b #9) ---------------------------------------

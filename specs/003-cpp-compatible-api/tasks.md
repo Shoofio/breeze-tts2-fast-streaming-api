@@ -688,7 +688,7 @@ rules.
   - deleting a skipped file's name releases it;
   - `GET` list shape and order;
   - the `200` response shape (`seconds` with 2 decimals, integer `encode_ms`).
-- [ ] T060 [P] [US1] Add speech-by-voice tests to `tests/test_routes_speech.py`:
+- [X] T060 [P] [US1] Add speech-by-voice tests to `tests/test_routes_speech.py`:
   - `voice_id` uses the prefix path;
   - `voice_id` plus `ref_text` uses the codes path with the override;
   - an unknown or deleted voice gets `404`;
@@ -730,7 +730,7 @@ rules.
   `settings.voices_dir`. The startup order is: model load, then the voice scan (on a worker
   thread, since checking files needs the loaded model's codec fingerprint and codebook size),
   then mark ready. Pass the clock and nonce source in from the composition root.
-- [ ] T066 [US1] Connect `VoiceRef` to `breeze_infer/synthesis.py` and `routes_speech.py`:
+- [X] T066 [US1] Connect `VoiceRef` to `breeze_infer/synthesis.py` and `routes_speech.py`:
   - replace the stub lookup with the real one;
   - with no override, use the prefix path;
   - with an override, use the codes path;
@@ -740,7 +740,8 @@ rules.
     registry (before waiting for the gate), and pass it to `get_or_build` as `resolved_token`,
     with the request's `request_id`; DELETE passes its `request_id` to `invalidate`;
   - the registry's saved and unnamed records must carry codes and ref_text (or a way to load
-    them) so a VoiceRef can be resolved; decide which during T066.
+    them) so a VoiceRef can be resolved; decide which during T066. Decided: the records hold
+    the codes and `ref_text` in memory, loaded at scan or registration (`VoiceRegistry.lookup`).
 - [ ] T067 [P] [US1] Port `A:tests/gpu/{test_voice_equivalence,test_voice_prefill_buckets,
   test_voice_tier1_equivalence}.py` to `tests/gpu/`, adapted to the new store (register through the
   route). Include a prefix longer than 548 tokens that now builds (R12, point 4).

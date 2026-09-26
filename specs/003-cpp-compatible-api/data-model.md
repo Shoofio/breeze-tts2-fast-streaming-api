@@ -138,6 +138,10 @@ The resolved reference for a request or session. It is never exposed on the wire
 | codes | `codes: int tensor [frames, codebooks]`, `ref_text` (inline, a voice with an overridden transcript, or an anchor) |
 | prefix | `ReferencePrefix` (cached KV) plus the stored `ref_text`, for a saved or unnamed voice with no override |
 
+A voice with an overridden transcript uses the codes path: its stored codes with the given
+`ref_text`. A prefix build that runs out of GPU memory is not cached, and that request falls back
+to the codes path with the stored `ref_text` (`speech.prefix_fallback`), never a `500` (T066).
+
 Transitions: `none` becomes `codes(anchor)` after piece 0 succeeds with at least one non-pad
 frame. It never happens on cancel, on failure, or when piece 0 produced zero frames. It is also
 skipped, with `speech.anchor_skipped` (`piece_index` 0, `reason`), when:
@@ -371,7 +375,11 @@ offending record's field names), so one bad field never breaks the request emitt
     at most `VOICE_PREFIX_CACHE_BYTES` (1 GiB) of estimated KV, where an entry costs
     `prefix_len` × 2 (key and value) × layers × KV heads × `head_dim` × dtype size (114,688 B per
     token for this checkpoint). It isn't warmed at startup: a voice's first request builds its prefix;
-  - speech: `speech.accepted`, `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`
+  - speech: `speech.accepted` (`pieces`, `reference`: `none`, `inline`, `voice_prefix` (with
+    `warm`: whether the prefix was already cached) or `voice_codes`), `speech.prefix_fallback`
+    (level `warning`; `voice_id`, `reason`: `out_of_memory`, `error`: a voice's prefix build ran
+    out of GPU memory, so the request used the codes path; T066),
+    `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`
     (`piece_index`, `requested`, `cap`, `room`), `speech.anchor_skipped` (`piece_index`,
     `reason`: `piece_truncated`, `no_room`, `sizing_failed`, `sizing_timeout` or `shutdown`),
     `speech.anchor_sizing_failed` (level `error`; `error`, `traceback`: measuring the later

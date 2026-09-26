@@ -1,9 +1,11 @@
 """Per-piece synthesis: reference resolution, prompt preparation and PCM streaming.
 
-specs/003-cpp-compatible-api/tasks.md T038 and T052 (data-model.md "Reference", "Piece").
-Only ``NoReference`` and ``InlineRef`` (`breeze_infer/http_fields.py` `ReferenceSpec`) are
-resolved here; ``VoiceRef`` is a documented stub until T066 wires the voice registry and its
-cached-KV prefix path. For long text, `anchor_codes` turns a no-reference request's piece 0
+specs/003-cpp-compatible-api/tasks.md T038, T052 and T066 (data-model.md "Reference", "Piece").
+``NoReference`` and ``InlineRef`` (`breeze_infer/http_fields.py` `ReferenceSpec`) are resolved
+here. A ``VoiceRef`` is resolved by the speech route, which holds the voice registry, the prefix
+cache and the GPU lease a prefix build needs (`routes_speech._voice_reference`); this module
+gives it the reference shapes (`PrefixRef`, or `CodesRef` for an override), the pre-gate
+stand-in and the GPU-thread build (`build_voice_prefix`). For long text, `anchor_codes` turns a no-reference request's piece 0
 into the reference for every later piece, and `piece_room`/`piece_frame_limit` size each
 piece against the room `FastBreezeStreamingRuntime.max_new_tokens_room` reports (clamping or
 refusing it). The piece loop itself is `routes_speech._iter_pieces`.
@@ -24,7 +26,12 @@ import torch
 
 from breeze_infer.audio import encode_prompt_waveform, pcm16
 from breeze_infer.http_fields import InlineRef, NoReference, ReferenceSpec, VoiceRef
-from breeze_infer.templates import get_template, prepare_inputs
+from breeze_infer.templates import (
+    get_template,
+    prepare_inputs,
+    prepare_prefix_inputs,
+    prepare_suffix_inputs,
+)
 from models.fast_streaming import NoRoomError, PromptLength, prompt_length
 
 if TYPE_CHECKING:
@@ -41,17 +48,37 @@ class NoRef:
 
 @dataclass(frozen=True)
 class CodesRef:
-    """A reference by codes: an inline upload (encoded once, here) or, from T066 on, a
-    saved voice with an overridden transcript."""
+    """A reference by codes: an inline upload (encoded once, here), a voice with an
+    overridden transcript, or a voice whose prefix build ran out of GPU memory."""
 
-    codes: Any  # int tensor [frames, codebooks]
+    codes: Any  # int tensor or array [frames, codebooks]
     ref_text: str
 
 
-# ``PrefixRef`` (cached backbone KV for a saved or unnamed voice with no override) is
-# deliberately not built yet: nothing before T066 resolves a ``VoiceRef`` at all, so a
-# reference variant only the voice path would produce has no caller in this phase.
-Reference = NoRef | CodesRef
+@dataclass(frozen=True)
+class PrefixRef:
+    """A saved or unnamed voice with no override: its reference prefix (the stored transcript
+    and codes) as cached backbone KV, so each piece prefills only its own text after it."""
+
+    prefix: Any  # `ReferencePrefix`, or anything with its `prefix_len`
+    ref_text: str
+
+
+Reference = NoRef | CodesRef | PrefixRef
+
+
+@dataclass(frozen=True)
+class UnbuiltPrefix:
+    """A `PrefixRef` before its KV exists: what the prefix will be built from. Only the
+    pre-gate room check uses it (`stand_in_reference`, `predicted_room`)."""
+
+    codes: Any  # [frames, codebooks]
+    ref_text: str
+
+
+def prefix_of(reference: Reference) -> Any | None:
+    """The cached prefix a piece continues, or ``None`` when its inputs hold the whole prompt."""
+    return reference.prefix if isinstance(reference, PrefixRef) else None
 
 
 async def resolve_reference(
@@ -91,12 +118,20 @@ async def resolve_reference(
         )
         return CodesRef(codes=codes, ref_text=spec.ref_text)
     if isinstance(spec, VoiceRef):
-        # T066 connects this to the voice registry: no override uses the cached-KV
-        # prefix path, an override re-encodes with the given text on the codes path.
-        raise NotImplementedError(
-            "voice_id references are not wired until T066 (voice registry lookup)"
+        raise TypeError(
+            "a VoiceRef is resolved by the speech route (routes_speech._voice_reference), "
+            "which holds the voice registry, the prefix cache and the GPU lease"
         )
     raise TypeError(f"unknown reference spec: {spec!r}")
+
+
+def build_voice_prefix(runtime: Any, codes: Any, ref_text: str) -> Any:
+    """A voice's `ReferencePrefix`: its transcript and codes run through the backbone once
+    (GPU-thread only). The speech route binds it as the prefix cache's ``build``."""
+    prefix_inputs = prepare_prefix_inputs(
+        runtime.tokenizer, runtime.model, {"ref_text": ref_text, "ref_audio_codes": codes}
+    )
+    return runtime.build_reference_prefix(prefix_inputs)
 
 
 def anchor_codes(frames: list[Any], pad_id: int) -> Any | None:
@@ -122,14 +157,26 @@ def anchor_codes(frames: list[Any], pad_id: int) -> Any | None:
     return kept.to(device="cpu", dtype=torch.int16)
 
 
-def stand_in_reference(spec: ReferenceSpec, predicted_frames: int | None, codebooks: int) -> Reference:
-    """A reference with the shape ``resolve_reference`` will give, before the codec has run.
+def stand_in_reference(
+    spec: ReferenceSpec,
+    predicted_frames: int | None,
+    codebooks: int,
+    *,
+    voice: Any | None = None,
+) -> Reference | UnbuiltPrefix:
+    """A reference with the shape the request will use, before the codec or the GPU has run.
 
     Used only to size piece 0's prompt for its room check before the GPU gate is taken
     (FR-007: a ``400`` comes before ``409 busy``). An ``InlineRef`` becomes zero codes of
     its *predicted* frame count (`reference_audio.predicted_frames`): a prompt's length
     depends on how many frames the reference has, never on their values. ``codebooks`` is
     the model's ``num_codebooks``, the width `templates.py` checks reference codes against.
+
+    A ``VoiceRef`` needs ``voice``, the voice the route resolved (`VoiceRegistry.lookup`),
+    whose codes are already known: with an override it is those codes and the given text;
+    without one it is the prefix the request will build (`UnbuiltPrefix`), since the prefix
+    path's room differs from the codes path's (only the text after the prefix is prefilled,
+    and bucket-padded).
     """
     if isinstance(spec, NoReference):
         return NoRef()
@@ -138,6 +185,12 @@ def stand_in_reference(spec: ReferenceSpec, predicted_frames: int | None, codebo
             raise ValueError("InlineRef requires its predicted frame count")
         codes = torch.zeros((predicted_frames, codebooks), dtype=torch.int16)
         return CodesRef(codes=codes, ref_text=spec.ref_text)
+    if isinstance(spec, VoiceRef):
+        if voice is None:
+            raise ValueError("VoiceRef requires its resolved voice")
+        if spec.ref_text_override is not None:
+            return CodesRef(codes=voice.codes, ref_text=spec.ref_text_override)
+        return UnbuiltPrefix(codes=voice.codes, ref_text=voice.ref_text)
     raise TypeError(f"no stand-in for reference spec: {spec!r}")
 
 
@@ -166,8 +219,13 @@ def prepare_piece(
     stay ``None``): T038 only exercises single-reference, single-CFG pieces, same as
     `iter_audio_chunks`'s ``no_cfg``/``single_cfg`` paths -- ``cfg_scale`` alone selects
     between them inside `prepare_inputs`.
+
+    A ``PrefixRef`` piece is only the text that follows the cached prefix
+    (`prepare_suffix_inputs`); the runtime continues the prefix with it (``prefix=``).
     """
     request: dict[str, Any] = {"text": text, "instruction": instruction}
+    if isinstance(reference, PrefixRef):
+        return prepare_suffix_inputs(tokenizer, model, request, guidance_scale=cfg_scale)
     if isinstance(reference, CodesRef):
         request["ref_text"] = reference.ref_text
         request["ref_audio_codes"] = reference.codes
@@ -204,24 +262,29 @@ class PieceRoom:
     room: int
 
 
-def piece_room(runtime: Any, inputs: dict[str, Any], requested: int | None) -> PieceRoom:
+def piece_room(
+    runtime: Any, inputs: dict[str, Any], requested: int | None, *, prefix: Any | None = None
+) -> PieceRoom:
     """``inputs``' room, from the runtime's own estimate (`max_new_tokens_room`, which shares
     ``_prefill_plan`` with the decode loop, so it stops exactly where the loop would).
+    ``prefix`` is the cached prefix ``inputs`` continue (`prefix_of`), whose length counts
+    against the context.
 
     The cap comes from the runtime's ``frame_cap``, the one place that resolves ``None`` to
     the model default and applies the ceiling; re-deriving it here would be a second copy of
     that rule to keep in step.
     """
+    prefix_len = 0 if prefix is None else int(prefix.prefix_len)
     return PieceRoom(
         cap=runtime.frame_cap(requested),
-        room=runtime.max_new_tokens_room(requested, inputs),
+        room=runtime.max_new_tokens_room(requested, inputs, prefix_len=prefix_len),
     )
 
 
 def predicted_room(
     runtime: Any,
     tokenizer: Any,
-    reference: Reference,
+    reference: Reference | UnbuiltPrefix,
     text: str,
     instruction: str,
     cfg_scale: float,
@@ -239,15 +302,22 @@ def predicted_room(
     every template branch through it to catch that.
     For piece 0, ``reference`` is `stand_in_reference`'s result, so the prompt has the length
     the real one will have, and the route still checks the real inputs on the GPU thread
-    afterwards, in case the codec's frame count differs from the prediction.
+    afterwards, in case the codec's frame count differs from the prediction. An
+    `UnbuiltPrefix` is measured as the prefix the GPU will build: its length is its inputs'
+    length, as `build_reference_prefix`'s is.
 
     ``tokenizer`` must be one no other thread is using at the same time: the route's own copy
     (`routes_speech.CpuTokenizer`), never ``runtime.tokenizer``, which the GPU thread uses.
     """
-    inputs = prepare_piece(
-        tokenizer, _cpu_model(runtime), reference, text, instruction, cfg_scale
-    )
-    return piece_room(runtime, inputs, requested)
+    cpu_model = _cpu_model(runtime)
+    if isinstance(reference, UnbuiltPrefix):
+        prefix_inputs = prepare_prefix_inputs(
+            tokenizer, cpu_model, {"ref_text": reference.ref_text, "ref_audio_codes": reference.codes}
+        )
+        prefix = SimpleNamespace(prefix_len=int(prefix_inputs["attention_mask"].shape[1]))
+        reference = PrefixRef(prefix=prefix, ref_text=reference.ref_text)
+    inputs = prepare_piece(tokenizer, cpu_model, reference, text, instruction, cfg_scale)
+    return piece_room(runtime, inputs, requested, prefix=prefix_of(reference))
 
 
 def _cpu_model(runtime: Any) -> Any:

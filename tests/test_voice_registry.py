@@ -326,3 +326,45 @@ def test_case_insensitive_names_groups_exact_names_by_their_folded_key():
     assert names.pop("carol") == "second"
     assert not names.taken("carol")
     assert names.pop("carol") is None
+
+
+# ------------------------------------------------------------------- lookup (T066)
+
+
+def test_lookup_resolves_saved_and_unnamed_voices_with_their_codes():
+    """A speech request resolves a voice from memory alone: every record carries its codes
+    and transcript (T066 option (a), loaded at scan or registration)."""
+    registry = _registry()
+    saved_codes = np.arange(4 * 16, dtype=np.int16).reshape(4, 16)
+    unnamed_codes = np.ones((3, 16), dtype=np.int16)
+    registry.load_from_scan(
+        [VoiceFile(**{**_saved_file("scanned").__dict__, "codes": saved_codes})], []
+    )
+    registry.register_saved(_saved_file("alice"))
+    registry.register_unnamed(
+        id="v_0000000000000001", ref_text="hi", codes=unnamed_codes, frames=3, encode_ms=1
+    )
+
+    scanned = registry.lookup("scanned")
+    assert scanned is not None
+    assert (scanned.id, scanned.ref_text) == ("scanned", "text for scanned")
+    assert np.array_equal(scanned.codes, saved_codes)
+    alice = registry.lookup("alice")
+    assert alice is not None and alice.codes.shape == (4, 16)
+    unnamed = registry.lookup("v_0000000000000001")
+    assert unnamed is not None
+    assert unnamed.ref_text == "hi"
+    assert np.array_equal(unnamed.codes, unnamed_codes)
+
+
+def test_lookup_is_exact_and_misses_removed_voices():
+    registry = _registry()
+    registry.register_saved(_saved_file("alice"))
+    _register_unnamed(registry, "v_0000000000000001")
+
+    assert registry.lookup("Alice") is None  # case is ignored only at create
+    assert registry.lookup("nobody") is None
+    registry.remove("alice")
+    registry.remove("v_0000000000000001")
+    assert registry.lookup("alice") is None
+    assert registry.lookup("v_0000000000000001") is None

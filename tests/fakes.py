@@ -432,10 +432,11 @@ class FakeRuntime:
       ``max_new_tokens`` or the context room (both fold into one ``limit`` here, as they
       do into the real loop's own two stop conditions). A natural (uncapped) ending keeps
       using ``is_final_on_last``/``flush_frames`` exactly as documented above.
-    - ``build_reference_prefix`` (the cached-KV "prefix" `Reference` variant) is
-      deliberately not faked here: none of the tasks that use `FakeRuntime` today
-      exercise a saved voice with no override, only the "codes" variant. Add it when a
-      task needs it.
+    - ``build_reference_prefix`` (the cached-KV "prefix" `Reference` variant, T066)
+      returns a ``SimpleNamespace(prefix_len, kv=None)`` whose ``prefix_len`` is the
+      prefix inputs' length, as the real one's is (``mask.shape[1]``), and records each
+      call's inputs in ``prefix_builds``. It runs no model: a test that needs it to
+      block or raise (an out-of-memory build) overrides it in a subclass.
 
     ``fail_after`` raises ``RuntimeError`` once that many chunks of a call have been
     yielded, standing in for a mid-stream CUDA error (checked, like the gate, before that
@@ -506,7 +507,14 @@ class FakeRuntime:
         self.collect_timing = collect_timing
         self.prefill_path = prefill_path
         self.calls: list[dict[str, Any]] = []
+        self.prefix_builds: list[dict[str, Any]] = []
         self.closed = 0
+
+    def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> Any:
+        """``FastBreezeStreamingRuntime.build_reference_prefix``'s result shape, with no KV
+        (class docstring)."""
+        self.prefix_builds.append(prefix_inputs)
+        return SimpleNamespace(prefix_len=int(prefix_inputs["attention_mask"].shape[1]), kv=None)
 
     def frame_cap(self, requested: int | None) -> int:
         """Ports ``FastBreezeStreamingRuntime.frame_cap`` exactly (it's two lines and

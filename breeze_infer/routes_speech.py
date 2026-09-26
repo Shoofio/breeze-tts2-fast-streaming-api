@@ -17,8 +17,12 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
    FR-007 puts every `400`/`404` before `409 busy`, and this is a `400` this phase can already
    produce; T046 review: it's still stage 2, "field syntax and ranges", a property of `text`
    alone -- so it belongs before stage 4's unknown-voice `404` too, not just before decode/busy);
-4. a `VoiceRef` is `404 unknown_voice` for now -- voices arrive in Phase 7 (T049 names this
-   the stub lookup);
+4. a `VoiceRef` is looked up in the voice registry (`VoiceRegistry.lookup`, exact id), else
+   `404 unknown_voice`. The prefix cache's token is read in that same event-loop step, with no
+   `await` between them (`VoicePrefixCache.token`): a `DELETE` that lands after it, however long
+   this request then takes to reach the gate, keeps this request's prefix out of the cache
+   (T066). The resolved voice (its codes and transcript, held in memory) is what the request
+   uses from here on, even if the voice is deleted meanwhile;
 5. an `InlineRef`'s bytes are decoded (`reference_audio.decode`) on a worker thread
    (`asyncio.to_thread`), never the event loop -- libsndfile's decode is blocking CPU work;
 5a. piece 0's room is checked on the CPU, on the CPU tokenizer's own thread (`_size_first_piece`:
@@ -39,7 +43,13 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
    each awaited through `asyncio.shield` (finding 7): a cancelled or failed request must not
    release the lease while that GPU-thread call is still actually running -- the executor is
    single-threaded, but releasing early would still tell the next request "free" while our
-   own abandoned work is still really queued ahead of it;
+   own abandoned work is still really queued ahead of it. A voice is resolved by
+   `_voice_reference` instead: with a `ref_text` override it is its codes and that text (the
+   codes path; nothing to run), otherwise its cached KV prefix (the prefix path), built under
+   this lease on a miss (`VoicePrefixCache.get_or_build`). A cancel during that build hands the
+   lease to the build, which releases it when the GPU work ends, so the route's own release is
+   then a no-op. A build that runs out of GPU memory falls back to the codes path for this
+   request (`speech.prefix_fallback`), never a `500`;
 8. piece 0's room is checked again on the `GpuThread`, on its real inputs, right after they are
    built (`FastBreezeStreamingRuntime.max_new_tokens_room`): the backstop for a codec whose
    frame count differs from 5a's prediction. Every later piece is prepared and sized on the
@@ -83,6 +93,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Protocol, TypeVar
 
+import torch
 from fastapi import Depends, FastAPI, Request
 from starlette.responses import Response
 
@@ -109,6 +120,7 @@ from breeze_infer.http_fields import (
 )
 from breeze_infer.limits import ANCHOR_CHARS, ANCHOR_SIZING_TIMEOUT_SECONDS
 from breeze_infer.routes_health import Readiness
+from breeze_infer.routes_voices import VoiceSlot
 from breeze_infer.settings import Settings
 from breeze_infer.streaming import SpeechResponse
 from breeze_infer.synthesis import (
@@ -116,20 +128,27 @@ from breeze_infer.synthesis import (
     CodesRef,
     NoRef,
     PieceRoom,
+    PrefixRef,
     Reference,
+    UnbuiltPrefix,
     anchor_codes,
     anchor_sizing,
+    build_voice_prefix,
     codec_samples_per_frame,
     generate_piece,
     piece_frame_limit,
     piece_room,
     piece_seed,
     predicted_room,
+    prefix_of,
     prepare_piece,
     resolve_reference,
     stand_in_reference,
 )
 from breeze_infer.text_split import split_text
+from breeze_infer.voice_file import prefix_key
+from breeze_infer.voice_prefix import VoicePrefixCache
+from breeze_infer.voice_registry import ResolvedVoice
 from models.fast_streaming import NoRoomError
 
 _T = TypeVar("_T")
@@ -316,16 +335,93 @@ class SpeechComponents(Protocol):
     gpu: GpuThread
     readiness: Readiness
     cpu_tokenizer: CpuTokenizer
+    voices: VoiceSlot
 
 
-def _reference_kind(reference: ReferenceSpec) -> str:
-    """`speech.accepted`'s `reference` field. A `VoiceRef` never reaches here: the route
-    rejects it with `404 unknown_voice` long before a request gets this far."""
+def _reference_fields(reference: ReferenceSpec) -> dict[str, Any]:
+    """`speech.accepted`'s `reference` field for a request with no voice. A voice's fields come
+    from `_voice_reference`, which knows which path it took."""
     if isinstance(reference, NoReference):
-        return "none"
+        return {"reference": "none"}
     if isinstance(reference, InlineRef):
-        return "inline"
+        return {"reference": "inline"}
     raise TypeError(f"unexpected reference spec: {reference!r}")
+
+
+@dataclass(frozen=True)
+class _VoiceLookup:
+    """A `VoiceRef` resolved before the gate (`_look_up_voice`): the voice, the prefix cache it
+    was resolved against, and that cache's token as read in the same event-loop step."""
+
+    spec: VoiceRef
+    voice: ResolvedVoice
+    prefix_cache: VoicePrefixCache
+    resolved_token: int
+
+
+def _look_up_voice(components: SpeechComponents, spec: VoiceRef) -> _VoiceLookup:
+    """The registry lookup and the token read together, with no `await` (module docstring,
+    step 4); `404 unknown_voice` if there is no such voice."""
+    services = components.voices.get()
+    voice = services.registry.lookup(spec.voice_id)
+    resolved_token = services.prefix_cache.token()
+    if voice is None:
+        raise ApiError(404, "unknown_voice", "unknown voice_id")
+    return _VoiceLookup(spec, voice, services.prefix_cache, resolved_token)
+
+
+async def _voice_reference(
+    lookup: _VoiceLookup,
+    runtime: Any,
+    components: SpeechComponents,
+    *,
+    lease: Any,
+    request_id: str,
+) -> tuple[Reference, dict[str, Any]]:
+    """The reference for a resolved voice, and its `speech.accepted` fields (`reference`:
+    `voice_prefix`, with `warm` for a cache hit, or `voice_codes`). Needs `lease` held.
+
+    With a `ref_text` override, the codes path: the stored codes with the given text, since
+    the cached KV was built from the stored text. Otherwise the prefix path: the voice's KV
+    prefix from the cache, built on a miss on the GPU thread under `lease`, with the token read
+    when the voice was resolved. Not shielded: if this request is cancelled during the build,
+    `get_or_build` hands `lease` to the build (module docstring, step 7).
+
+    A build that runs out of GPU memory is not cached (`VoicePrefixCache`); this request then
+    uses the codes path with the stored text instead, and `speech.prefix_fallback` records it.
+    Any other build error propagates (a `500`).
+    """
+    voice = lookup.voice
+    if lookup.spec.ref_text_override is not None:
+        return CodesRef(codes=voice.codes, ref_text=lookup.spec.ref_text_override), {
+            "reference": "voice_codes"
+        }
+
+    def build() -> Any:
+        return components.gpu.run(build_voice_prefix, runtime, voice.codes, voice.ref_text)
+
+    try:
+        prefix, warm = await lookup.prefix_cache.get_or_build(
+            prefix_key(voice.id, voice.ref_text, voice.codes),
+            build,
+            lease=lease,
+            resolved_token=lookup.resolved_token,
+            request_id=request_id,
+        )
+    except torch.OutOfMemoryError as error:
+        components.events.emit(
+            "speech.prefix_fallback",
+            level="warning",
+            request_id=request_id,
+            voice_id=voice.id,
+            reason="out_of_memory",
+            error=f"{type(error).__name__}: {error}",
+        )
+        return CodesRef(codes=voice.codes, ref_text=voice.ref_text), {"reference": "voice_codes"}
+    return PrefixRef(prefix=prefix, ref_text=voice.ref_text), {
+        "reference": "voice_prefix",
+        "warm": warm,
+    }
 
 
 def _check_frame_prediction(
@@ -374,13 +470,15 @@ async def _size_first_piece(
     request: SpeechRequest,
     pieces: list[str],
     decoded_audio: reference_audio.DecodedAudio | None,
+    voice: ResolvedVoice | None,
 ) -> None:
     """`400 text_too_long` if piece 0 has no room, decided before the GPU gate is taken.
 
     FR-007 puts every `400` before `409 busy`, so this can't wait for the codec: an inline
-    reference is sized by its *predicted* frame count (`stand_in_reference`), and the inputs
-    are built on the CPU (`predicted_room`). It runs on the CPU tokenizer's own thread, not the
-    event loop, because tokenizing is blocking CPU work, and with that thread's copy
+    reference is sized by its *predicted* frame count (`stand_in_reference`), a voice by its
+    resolved codes and transcript (as the prefix it will build, or with an override as codes),
+    and the inputs are built on the CPU (`predicted_room`). It runs on the CPU tokenizer's own
+    thread, not the event loop, because tokenizing is blocking CPU work, and with that thread's copy
     (`CpuTokenizer`), never the one the GPU thread uses. The real inputs are checked again
     on the GPU thread once the reference is encoded (`_prepare_first_piece`), which covers a
     codec whose frame count differs from the prediction.
@@ -394,6 +492,7 @@ async def _size_first_piece(
         request.reference,
         None if decoded_audio is None else decoded_audio.predicted_frames,
         int(runtime.model.config.num_codebooks),
+        voice=voice,
     )
     room = await cpu_tokenizer.run(_measure_first_piece, runtime, request, pieces, stand_in)
     if room.room <= 0:
@@ -405,7 +504,7 @@ def _measure_first_piece(
     runtime: Any,
     request: SpeechRequest,
     pieces: list[str],
-    stand_in: Reference,
+    stand_in: Reference | UnbuiltPrefix,
 ) -> PieceRoom:
     """`_size_first_piece`'s blocking part, run by `CpuTokenizer.run` with its copy."""
     return predicted_room(
@@ -462,7 +561,9 @@ def _prepare_first_piece(
     inputs = prepare_piece(
         runtime.tokenizer, runtime.model, reference, text, request.instruction, request.cfg_scale
     )
-    return inputs, piece_room(runtime, inputs, request.max_new_tokens)
+    return inputs, piece_room(
+        runtime, inputs, request.max_new_tokens, prefix=prefix_of(reference)
+    )
 
 
 
@@ -536,7 +637,9 @@ def _iter_pieces(
                     request.instruction,
                     request.cfg_scale,
                 )
-                room = piece_room(runtime, inputs, request.max_new_tokens)
+                room = piece_room(
+                    runtime, inputs, request.max_new_tokens, prefix=prefix_of(reference)
+                )
             max_new_tokens = piece_frame_limit(
                 room,
                 events,
@@ -554,6 +657,7 @@ def _iter_pieces(
                 chunk_first=chunk_first,
                 chunk_max=chunk_max,
                 samples_per_frame=samples_per_frame,
+                prefix=prefix_of(reference),
                 temperature=request.temperature,
                 top_k=request.top_k,
                 top_p=request.top_p,
@@ -809,8 +913,9 @@ async def _serve_speech(
     if not pieces:
         raise ApiError(400, "text_required", "text is required")
 
+    voice_lookup = None
     if isinstance(request.reference, VoiceRef):
-        raise ApiError(404, "unknown_voice", "unknown voice_id")
+        voice_lookup = _look_up_voice(components, request.reference)
 
     decoded_audio = None
     if isinstance(request.reference, InlineRef):
@@ -820,7 +925,14 @@ async def _serve_speech(
             reference_audio.decode, request.reference.audio_bytes
         )
 
-    await _size_first_piece(runtime, components.cpu_tokenizer, request, pieces, decoded_audio)
+    await _size_first_piece(
+        runtime,
+        components.cpu_tokenizer,
+        request,
+        pieces,
+        decoded_audio,
+        None if voice_lookup is None else voice_lookup.voice,
+    )
 
     # None means busy (409); a poisoned gate raises GpuUnavailable instead (gpu.py), which
     # propagates straight past this route to errors.py's own handler (503 gpu_unavailable).
@@ -836,16 +948,22 @@ async def _serve_speech(
         # request that gets 409 above must never run this at all. `None` with a reference or a
         # single piece (`_start_anchor_sizing`).
         sizing_job = _start_anchor_sizing(runtime, components.cpu_tokenizer, request, pieces)
-        gpu_task = asyncio.ensure_future(
-            resolve_reference(
-                request.reference,
-                decoded_audio=decoded_audio,
-                audio_tokenizer=runtime.audio_tokenizer,
-                gpu=components.gpu,
+        if voice_lookup is not None:
+            reference, accepted_fields = await _voice_reference(
+                voice_lookup, runtime, components, lease=lease, request_id=request_id
             )
-        )
-        reference = await asyncio.shield(gpu_task)
-        gpu_task = None
+        else:
+            gpu_task = asyncio.ensure_future(
+                resolve_reference(
+                    request.reference,
+                    decoded_audio=decoded_audio,
+                    audio_tokenizer=runtime.audio_tokenizer,
+                    gpu=components.gpu,
+                )
+            )
+            reference = await asyncio.shield(gpu_task)
+            gpu_task = None
+            accepted_fields = _reference_fields(request.reference)
         _check_frame_prediction(
             decoded_audio, reference, components.events, request_id=request_id
         )
@@ -862,7 +980,7 @@ async def _serve_speech(
             "speech.accepted",
             request_id=request_id,
             pieces=len(pieces),
-            reference=_reference_kind(request.reference),
+            **accepted_fields,
         )
 
         gen = _iter_pieces(
