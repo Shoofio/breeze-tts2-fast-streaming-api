@@ -651,14 +651,14 @@ rules.
 
 ### Tests (write first)
 
-- [ ] T055 [P] [US1] Create `tests/test_voice_file.py` (pure): v1 round trip. Rejections:
+- [X] T055 [P] [US1] Create `tests/test_voice_file.py` (pure): v1 round trip. Rejections:
   - an unknown `format` or `version`;
   - a stem that differs from `id`;
   - a bad name, or a `v_` name;
   - a codes length or sha256 mismatch;
   - a code outside `[0, codebook_size)`;
   - a fingerprint mismatch.
-- [ ] T056 [P] [US1] Create `tests/test_voice_store.py` (real `tmp_path`, with `sleep` injected):
+- [X] T056 [P] [US1] Create `tests/test_voice_store.py` (real `tmp_path`, with `sleep` injected):
   - atomic create that never overwrites;
   - case-duplicate creation refused;
   - delete renames to `.del-*` and retries 5× on `PermissionError`;
@@ -666,7 +666,7 @@ rules.
   - `test_bc_29_breeze_files_are_ignored_and_counted`;
   - `test_bc_25_invalid_files_are_skipped_with_an_event`;
   - a skipped file with a valid name reserves that name.
-- [ ] T057 [P] [US1] Create `tests/test_voice_registry.py` (pure):
+- [X] T057 [P] [US1] Create `tests/test_voice_registry.py` (pure):
   - `test_bc_26_names_are_unique_ignoring_case_and_v_prefix_is_reserved`;
   - `test_bc_48_cap_counts_only_unnamed_voices`;
   - oldest unnamed voice evicted first;
@@ -697,16 +697,16 @@ rules.
 
 ### Implementation
 
-- [ ] T061 [P] [US1] Create `breeze_infer/voice_file.py`, the v1 codec and validation from
+- [X] T061 [P] [US1] Create `breeze_infer/voice_file.py`, the v1 codec and validation from
   data-model.md "Voice file v1". Codes are base64 of int16 little-endian, row-major.
-- [ ] T062 [US1] Create `breeze_infer/voice_store.py`: `scan() -> (voices, skipped, breeze_count)`,
+- [X] T062 [US1] Create `breeze_infer/voice_store.py`: `scan() -> (voices, skipped, breeze_count)`,
   `create(record)` and `remove(id)`.
   - Port from `A:breeze_infer/voices.py`: `_rename_with_retry` (~545–554), the fsync helpers
     (~563–586), the leftover sweep (~503–510) and the write-lock pattern (~190–194).
   - `sleep`, the clock (for `created_at`) and the nonce source (for `.del-<nonce>` and
     `.tmp-<nonce>` names) are injected; tests pass fixed ones.
   - Emit `voices.loaded{loaded, skipped, breeze_ignored}` and `voice.skipped{file, reason}`.
-- [ ] T063 [US1] Create `breeze_infer/voice_registry.py`:
+- [X] T063 [US1] Create `breeze_infer/voice_registry.py`:
   - in-memory voices, a case-insensitive name index (including reserved skipped names), the
     unnamed cap and eviction, and ordering;
   - `unnamed_id(wav_bytes, text) = "v_" + blake2b(len ‖ wav ‖ text, digest_size=8).hexdigest()`;
