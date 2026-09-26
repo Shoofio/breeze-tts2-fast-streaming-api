@@ -12,8 +12,13 @@ the piece before them is finished, so each client message gets exactly one reply
 order, after the audio it follows (BC-34, BC-35, BC-36). C++ latched a cancel flag instead,
 which could go unacknowledged, fire twice, or swallow the next piece.
 
-Stopping the piece in flight works through epochs: `cancel` (and a `start` that interrupts)
-bumps the epoch, and the worker checks `is_stale(piece)` between audio chunks.
+Stopping the piece in flight works through epochs: every `cancel` and every accepted `start`
+begins a new epoch, and the worker checks `is_stale(piece)` between audio chunks.
+
+A superseded `done` needs no epoch check: a `cancel` (or interrupting `start`) removes its own
+session's EndMarks from the deque, and only those, so an EndMark still in the deque always owes
+its `done`, including one a previous session left queued when a `start` interrupted nothing.
+The worker sends it as soon as `next_item` returns it, with no `apply` in between.
 
 Text is cut by the shared segmenter (`text_split.segment`, R11), so a text gives the same pieces
 over HTTP and WebSocket.
@@ -33,12 +38,18 @@ from breeze_infer.http_fields import (
 )
 from breeze_infer.limits import ANCHOR_CHARS, MAX_TEXT_CHARS
 from breeze_infer.text_split import segment
-from breeze_infer.ws_messages import Cancel, End, Flush, Instruction, Start, Text
+from breeze_infer.ws_messages import (
+    Cancel,
+    End,
+    Flush,
+    Instruction,
+    Message,
+    Start,
+    Text,
+)
 
 if TYPE_CHECKING:
     from breeze_infer.voice_registry import ResolvedVoice
-
-Message = Start | Text | Flush | End | Instruction | Cancel
 
 _SEED_MASK = 0xFFFFFFFF
 
@@ -79,7 +90,7 @@ class Piece:
 
 @dataclass(frozen=True)
 class EndMark:
-    """Send `done`, if `epoch` is still current when the worker reaches it."""
+    """Send `done`. A cancel that supersedes it removes it from the deque instead."""
 
     epoch: int
 
@@ -110,14 +121,11 @@ def _instruction_or_default(instruction: str | None) -> str:
     return instruction
 
 
-_REQUEST_TYPES: dict[type, str] = {
-    Start: "start",
-    Text: "text",
-    Flush: "flush",
-    End: "end",
-    Instruction: "instruction",
-    Cancel: "cancel",
-}
+def _request_type(message: Message) -> str:
+    """The client's `type` for an error's `request_type`. Each ws_messages class is named for
+    its wire type (`Start` for `"start"`, ...), so the name gives it without a second table
+    to keep in step with the parser."""
+    return type(message).__name__.lower()
 
 
 class Session:
@@ -156,7 +164,7 @@ class Session:
         """Apply one parsed client message. Returns the events to send at once (`error`,
         `instruction_set`); `started`, `cancelled` and `done` go through the work deque
         instead, so they keep their place after the audio queued before them."""
-        request_type = _REQUEST_TYPES[type(message)]
+        request_type = _request_type(message)
         if isinstance(message, Start):
             return self._start(message)
         if self.config is None:
@@ -198,6 +206,9 @@ class Session:
         # reset below without a `cancelled`.
         if self.config is not None and self._piece_pending():
             self._cancel()
+        # A new session, a new epoch: a later `cancel` then removes only this session's items,
+        # never an EndMark the previous one left queued.
+        self._epoch += 1
         self.config = config
         self._buffer = ""
         self.anchor = None
@@ -206,13 +217,18 @@ class Session:
         return []
 
     def _cancel(self) -> None:
-        """Drop everything not yet spoken, stop the piece in flight, reply once.
+        """Drop this session's work not yet spoken, stop the piece in flight, reply once.
 
-        The anchor and the piece index survive: seeds keep counting from `start`, and a voice
-        the session already anchored stays anchored. Dropping the queued EndMarks is what makes
-        a later `cancel` replace a pending `done`."""
+        Only items of the current epoch go: dropping this session's EndMarks is what makes a
+        later `cancel` replace a pending `done`, but an EndMark a previous session left queued
+        (older epoch) keeps its `done`. The anchor and the piece index survive: seeds keep
+        counting from `start`, and a voice the session already anchored stays anchored."""
+        self.work = deque(
+            item
+            for item in self.work
+            if not (isinstance(item, Piece | EndMark) and item.epoch == self._epoch)
+        )
         self._epoch += 1
-        self.work = deque(item for item in self.work if not isinstance(item, Piece | EndMark))
         self._buffer = ""
         self.work.append(CancelMark())
 
@@ -284,8 +300,14 @@ class Session:
         return item
 
     def is_stale(self, item: Piece | EndMark) -> bool:
-        """True once a `cancel` or an interrupting `start` has superseded the item's epoch: a
-        stale piece stops at its next chunk, and a stale EndMark sends no `done`."""
+        """For a piece: true once a `cancel` or a `start` has begun a new epoch, so the piece
+        stops at its next chunk (or is skipped).
+
+        An EndMark is never stale: a cancel that supersedes one removes it from the deque, so
+        any EndMark `next_item` returns owes its `done`. (Accepted because ws_server's worker
+        asks about both.)"""
+        if isinstance(item, EndMark):
+            return False
         return item.epoch != self._epoch
 
     def mark_piece_done(self, anchor: object | None) -> None:

@@ -24,10 +24,12 @@ from breeze_infer.http_fields import (
     TOP_K_RANGE,
     TOP_P_RANGE,
     decimal_literal_in_range,
+    is_valid_voice_id,
     is_zero_literal,
     significant_int_digits,
 )
-from breeze_infer.text_rules import has_control_characters
+from breeze_infer.limits import MAX_INSTRUCTION_CHARS, MAX_REF_TEXT_CHARS
+from breeze_infer.text_rules import has_control_characters, is_utf8_encodable
 
 
 @dataclass(frozen=True)
@@ -83,8 +85,9 @@ Message = Start | Text | Flush | End | Instruction | Cancel
 @dataclass(frozen=True)
 class WsError:
     """contracts/ws-api.md's `error` event, minus the wire `type` (`ws_server.py` adds
-    that). `request_type` is the client's `type` when it was a readable string, else
-    `None` -- `unknown_type` is the only case that carries one.
+    that). `request_type` is the client's `type` when it was a readable string -- true
+    of every field-level error inside a recognized message, not just `unknown_type` --
+    and `None` only for `invalid_json` and a missing/non-string `type` itself.
     """
 
     code: str
@@ -138,15 +141,21 @@ def _string_field(data: dict[str, object], name: str, *, request_type: str) -> s
 
 
 def _text_field(data: dict[str, object], name: str, *, request_type: str) -> str | None:
-    """`_string_field`, plus BC-46: a disallowed control character
-    (`text_rules.has_control_characters`) is `invalid_field`. Used for `text`, `start`'s
+    """`_string_field`, plus BC-46 (a disallowed control character is `invalid_field`)
+    and a lone-surrogate check: a `\\uD800`-style escape decodes to a real Python `str`
+    that can never be encoded back to UTF-8 (`text_rules.is_utf8_encodable`, the same
+    rule `voice_file` applies to a saved `ref_text`). Used for `text`, `start`'s
     `instruction`/`ref_text`, and the standalone `instruction` message.
     """
     value = _string_field(data, name, request_type=request_type)
-    if value is not None and has_control_characters(value):
+    if value is None:
+        return None
+    if has_control_characters(value):
         raise _Invalid(
             WsError("invalid_field", f"{name} must be free of control characters", request_type)
         )
+    if not is_utf8_encodable(value):
+        raise _Invalid(WsError("invalid_field", f"{name} must be valid UTF-8 text", request_type))
     return value
 
 
@@ -166,8 +175,8 @@ def _decimal_field(
     literal like `1e-400` that underflows to `0.0` isn't mistaken for a true `0`.
     """
     value = data.get(name)
-    if value is None:
-        return None
+    if value is None or value == "":
+        return None  # BC-02: an empty string counts as absent, same as every other field
     if not isinstance(value, (_JsonInt, _JsonFloat)):
         raise _Invalid(WsError("invalid_field", f"{name} must be a number", request_type))
     literal = str(value)
@@ -194,8 +203,8 @@ def _int_field(
     grammar rejects a decimal-shaped string on HTTP.
     """
     value = data.get(name)
-    if value is None:
-        return None
+    if value is None or value == "":
+        return None  # BC-02: an empty string counts as absent, same as every other field
     if not isinstance(value, _JsonInt):
         raise _Invalid(WsError("invalid_field", f"{name} must be an integer", request_type))
     sign, significant_digits = significant_int_digits(str(value))
@@ -209,11 +218,51 @@ def _int_field(
     return parsed
 
 
+def _capped(value: str | None, max_chars: int, *, name: str, request_type: str) -> None:
+    """`instruction`'s length cap: a blank (whitespace-only) value skips it entirely,
+    matching http_fields' own order (control, then blank -- meaning "use the default" --
+    then length) -- a value that's blank purely because it's very long spaces is still
+    blank, never "too long".
+    """
+    if value is not None and value.strip() and len(value) > max_chars:
+        raise _Invalid(
+            WsError(
+                "invalid_field", f"{name} must be at most {max_chars:,} characters", request_type
+            )
+        )
+
+
+def _validated_ref_text(data: dict[str, object], *, request_type: str) -> str | None:
+    """Mirrors `http_fields._validated_text_field` for `ref_text`: after `_text_field`'s
+    control-character/UTF-8 checks, a whitespace-only value counts as absent (so it can
+    neither override a stored transcript nor trigger BC-13), and a real value is capped
+    at `MAX_REF_TEXT_CHARS`.
+    """
+    value = _text_field(data, "ref_text", request_type=request_type)
+    if value is None or not value.strip():
+        return None
+    if len(value) > MAX_REF_TEXT_CHARS:
+        raise _Invalid(
+            WsError(
+                "invalid_field",
+                f"ref_text must be at most {MAX_REF_TEXT_CHARS:,} characters",
+                request_type,
+            )
+        )
+    return value
+
+
 def _parse_start(data: dict[str, object]) -> Start | WsError:
     try:
         voice_id = _blank_means_absent(_string_field(data, "voice_id", request_type="start"))
-        instruction = _blank_means_absent(_text_field(data, "instruction", request_type="start"))
-        ref_text = _blank_means_absent(_text_field(data, "ref_text", request_type="start"))
+        if voice_id is not None and not is_valid_voice_id(voice_id):
+            raise _Invalid(
+                WsError("invalid_field", "voice_id must be a voice name or v_ id", "start")
+            )
+        instruction = _text_field(data, "instruction", request_type="start")
+        _capped(instruction, MAX_INSTRUCTION_CHARS, name="instruction", request_type="start")
+        instruction = _blank_means_absent(instruction)
+        ref_text = _validated_ref_text(data, request_type="start")
         cfg_scale = _decimal_field(
             data, "cfg_scale", *CFG_SCALE_RANGE,
             low_inclusive=True, zero_means_default=False, request_type="start",
@@ -297,10 +346,11 @@ def _parse_end(data: dict[str, object]) -> End | WsError:
 def _parse_instruction(data: dict[str, object]) -> Instruction | WsError:
     try:
         instruction = _text_field(data, "instruction", request_type="instruction")
+        if instruction is None:
+            return WsError("invalid_field", "instruction is required", "instruction")
+        _capped(instruction, MAX_INSTRUCTION_CHARS, name="instruction", request_type="instruction")
     except _Invalid as exc:
         return exc.error
-    if instruction is None:
-        return WsError("invalid_field", "instruction is required", "instruction")
     return Instruction(instruction=instruction)
 
 
@@ -313,14 +363,33 @@ _PARSERS = {
 }
 
 
+def _reject_non_finite_constant(token: str) -> float:
+    """`json.loads`'s `parse_constant` hook: Python otherwise accepts the bare tokens
+    `NaN`/`Infinity`/`-Infinity` anywhere a number goes, a non-standard extension to
+    RFC 8259 that a "real JSON parser" (contracts/ws-api.md) shouldn't accept either.
+    """
+    raise ValueError(f"{token} is not valid JSON")
+
+
 def parse(raw: str) -> Message | WsError:
     """contracts/ws-api.md "Client -> server": one WebSocket text frame -> a typed
     message or a `WsError`. See the module docstring for the `parse_int`/`parse_float`
     hooks this relies on to keep each number's exact literal text.
     """
     try:
-        data = json.loads(raw, parse_int=_JsonInt, parse_float=_JsonFloat)
-    except json.JSONDecodeError:
+        data = json.loads(
+            raw,
+            parse_int=_JsonInt,
+            parse_float=_JsonFloat,
+            parse_constant=_reject_non_finite_constant,
+        )
+    except (ValueError, RecursionError):
+        # ValueError covers both json.JSONDecodeError (a subclass) and our own
+        # parse_constant rejection above. RecursionError is json.loads's own recursive
+        # descent parser hitting Python's stack limit on deeply nested input (an array
+        # or object nested hundreds of thousands deep) -- uncaught, it would escape this
+        # function and crash whatever's reading the socket; contracts/ws-api.md promises
+        # the connection stays open after any malformed message, this one included.
         return WsError("invalid_json", "invalid JSON", None)
 
     if not isinstance(data, dict):

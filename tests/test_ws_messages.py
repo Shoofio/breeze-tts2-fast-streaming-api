@@ -39,7 +39,11 @@ from __future__ import annotations
 
 import pytest
 
-from breeze_infer.limits import MAX_NEW_TOKENS_CEILING
+from breeze_infer.limits import (
+    MAX_INSTRUCTION_CHARS,
+    MAX_NEW_TOKENS_CEILING,
+    MAX_REF_TEXT_CHARS,
+)
 from breeze_infer.ws_messages import (
     Cancel,
     End,
@@ -650,6 +654,200 @@ def test_unknown_fields_are_ignored() -> None:
     assert parse(raw) == Text(text="hi")
 
 
+# --- review 46: deeply nested JSON must not crash the reader ---------------------------
+
+
+def test_deeply_nested_json_gives_invalid_json_not_a_crash() -> None:
+    """A `RecursionError` from `json.loads` (its recursive descent parser has no depth
+    limit of its own) must be caught here, not left to escape `parse` and crash the
+    WebSocket reader task -- the same "stay open after any of these errors" guarantee
+    contracts/ws-api.md gives every other malformed message.
+    """
+    raw = "[" * 200_000 + "]" * 200_000
+
+    _assert_error(raw, "invalid_json", request_type=None)
+
+
+# --- review 46: NaN/Infinity tokens are not valid JSON ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"type":"start","cfg_scale":NaN}',
+        '{"type":"start","temperature":Infinity}',
+        '{"type":"start","temperature":-Infinity}',
+        "NaN",
+        "Infinity",
+    ],
+)
+def test_non_finite_json_constants_give_invalid_json(raw: str) -> None:
+    """`json.loads` otherwise accepts the bare tokens `NaN`/`Infinity`/`-Infinity` as a
+    non-standard extension to RFC 8259 -- not real JSON, and not something
+    contracts/ws-api.md's "real JSON parser" should accept either.
+    """
+    _assert_error(raw, "invalid_json", request_type=None)
+
+
+# --- review 46: a lone surrogate from a \\uXXXX escape can't be UTF-8 encoded -----------
+
+
+def test_lone_surrogate_rejected_in_text() -> None:
+    """A `\\uD800`-style escape decodes to a real Python `str` holding a lone surrogate
+    codepoint -- valid JSON, valid as a Python `str`, but impossible to encode back to
+    UTF-8 later (`text_rules.is_utf8_encodable`, the same rule `voice_file` already
+    applies to a saved `ref_text`). Rejected here instead of failing downstream.
+    """
+    raw = '{"type":"text","text":"a\\ud800b"}'
+
+    _assert_error(raw, "invalid_field", request_type="text")
+
+
+def test_lone_surrogate_rejected_in_start_instruction() -> None:
+    raw = _start(instruction='"a\\ud800b"')
+
+    _assert_error(raw, "invalid_field", request_type="start")
+
+
+def test_lone_surrogate_rejected_in_start_ref_text() -> None:
+    raw = _start(voice_id='"alice"', ref_text='"a\\ud800b"')
+
+    _assert_error(raw, "invalid_field", request_type="start")
+
+
+def test_lone_surrogate_rejected_in_instruction_message() -> None:
+    raw = _msg("instruction", instruction='"a\\ud800b"')
+
+    _assert_error(raw, "invalid_field", request_type="instruction")
+
+
+# --- review 46: ref_text mirrors http_fields._validated_text_field ---------------------
+
+
+def test_ref_text_whitespace_only_counts_as_absent_and_is_not_a_bc_13_error() -> None:
+    """Extends test_bc_02_start_empty_ref_text_counts_as_absent_and_is_not_a_bc_13_error:
+    http_fields._validated_text_field treats *whitespace-only*, not just empty, as
+    absent -- `ref_text` must match, so it neither overrides a voice's stored transcript
+    nor triggers BC-13 (`reference_required`) when the only content is spaces.
+    """
+    result = parse(_start(ref_text='"   \\t  "'))
+
+    assert isinstance(result, Start)
+    assert result.ref_text is None
+    assert result.voice_id is None
+
+
+def test_ref_text_over_max_chars_gets_invalid_field() -> None:
+    too_long = "a" * (MAX_REF_TEXT_CHARS + 1)
+
+    _assert_error(
+        _start(voice_id='"alice"', ref_text=f'"{too_long}"'),
+        "invalid_field",
+        request_type="start",
+    )
+
+
+def test_ref_text_over_max_chars_without_voice_id_is_still_invalid_field_not_bc_13() -> None:
+    """The length cap is checked before the BC-13 co-presence check (matching
+    http_fields' field-then-reference-consistency order): an over-length `ref_text` with
+    no `voice_id` is `invalid_field`, not `reference_required`.
+    """
+    too_long = "a" * (MAX_REF_TEXT_CHARS + 1)
+
+    _assert_error(_start(ref_text=f'"{too_long}"'), "invalid_field", request_type="start")
+
+
+def test_ref_text_at_max_chars_is_accepted() -> None:
+    at_limit = "a" * MAX_REF_TEXT_CHARS
+
+    result = parse(_start(voice_id='"alice"', ref_text=f'"{at_limit}"'))
+
+    assert isinstance(result, Start)
+    assert result.ref_text == at_limit
+
+
+# --- review 46: instruction is capped, on start and on the instruction message ----------
+
+
+def test_start_instruction_over_max_chars_gets_invalid_field() -> None:
+    too_long = "a" * (MAX_INSTRUCTION_CHARS + 1)
+
+    _assert_error(
+        _start(instruction=f'"{too_long}"'), "invalid_field", request_type="start"
+    )
+
+
+def test_instruction_message_over_max_chars_gets_invalid_field() -> None:
+    too_long = "a" * (MAX_INSTRUCTION_CHARS + 1)
+
+    _assert_error(
+        _msg("instruction", instruction=f'"{too_long}"'),
+        "invalid_field",
+        request_type="instruction",
+    )
+
+
+def test_start_instruction_at_max_chars_is_accepted() -> None:
+    at_limit = "a" * MAX_INSTRUCTION_CHARS
+
+    result = parse(_start(instruction=f'"{at_limit}"'))
+
+    assert isinstance(result, Start)
+    assert result.instruction == at_limit
+
+
+def test_start_whitespace_only_instruction_skips_the_length_cap() -> None:
+    """Mirrors http_fields' own order for `instruction` (control, then blank -- which
+    means "use the default" -- then length): a whitespace-only value never reaches the
+    length check at all, however long, so it is not rejected as "too long".
+    """
+    result = parse(_start(instruction='"' + " " * (MAX_INSTRUCTION_CHARS + 1) + '"'))
+
+    assert isinstance(result, Start)
+    # Blank means "use the default" either way (ws_session's job) -- this only asserts
+    # the length cap didn't fire.
+
+
+# --- review 46: BC-02 extends to start's numeric fields too -----------------------------
+
+
+_NUMERIC_START_FIELDS = [
+    "seed",
+    "cfg_scale",
+    "temperature",
+    "top_k",
+    "top_p",
+    "repetition_penalty",
+    "max_new_tokens",
+    "split_chars",
+]
+
+
+@pytest.mark.parametrize("field", _NUMERIC_START_FIELDS)
+def test_bc_02_start_empty_string_in_numeric_field_counts_as_absent(field: str) -> None:
+    """contracts/ws-api.md: "On `start`, an empty string also counts as absent, as on
+    HTTP (BC-02)" -- extended in this review to the numeric fields too, matching HTTP's
+    own `_first`, which treats every field's empty value as absent, not just the string
+    ones. A non-empty string still gets `invalid_field` (test_start_field_wrong_type_gets_
+    invalid_field already covers that, e.g. `"cfg_scale": "1.0"`).
+    """
+    result = parse(_start(voice_id='"alice"', **{field: '""'}))
+
+    assert isinstance(result, Start)
+    assert getattr(result, field) is None
+
+
+# --- review 46: voice_id is syntax-checked like HTTP ------------------------------------
+
+
+def test_start_voice_id_with_invalid_syntax_gets_invalid_field() -> None:
+    """`http_fields.is_valid_voice_id`'s shape check (a saved voice's name, or an
+    unnamed voice's `v_` + 16 lowercase hex id) applies here too -- a path-traversal-
+    shaped string is neither, so it's rejected before ever reaching a registry lookup.
+    """
+    _assert_error(_start(voice_id='"../etc"'), "invalid_field", request_type="start")
+
+
 # --- Design notes -----------------------------------------------------------------------
 #
 # This file's first draft flagged five things as ambiguous; the coordinator resolved all
@@ -682,3 +880,14 @@ def test_unknown_fields_are_ignored() -> None:
 #    than working from the parsed Python `float`/`int` alone -- is spelled out there in
 #    full, since it's the one place this file commits to *how* T075 must implement this,
 #    not just *what* the observable behavior should be).
+#
+# Review 46 (commit 64e0f78) found eight more gaps, all fixed test-first above (see each
+# "review 46:" section): a `RecursionError` from very deeply nested JSON escaping `parse`
+# uncaught; a bare `NaN`/`Infinity`/`-Infinity` token (a non-standard `json.loads`
+# extension) not rejected; a lone surrogate from a `\uXXXX` escape accepted even though it
+# can't round-trip to UTF-8; `ref_text` missing http_fields' whitespace-means-absent and
+# `MAX_REF_TEXT_CHARS` cap; `instruction` missing `MAX_INSTRUCTION_CHARS` entirely, on
+# both `start` and the `instruction` message; `start`'s BC-02 empty-string-is-absent
+# reaching only the string fields, not the numeric ones; `voice_id` never syntax-checked;
+# and `WsError`'s docstring wrongly claiming only `unknown_type` carries a
+# `request_type`, when every field-level error inside a recognized message does.

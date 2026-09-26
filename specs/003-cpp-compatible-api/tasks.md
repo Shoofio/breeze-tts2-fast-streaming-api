@@ -861,8 +861,8 @@ rules.
     tests can monkeypatch them.
   - Per connection: send `ready`, then run a reader task (parse, `session.apply`, enqueue
     immediate events) and one worker coroutine:
-    - `CancelMark` sends `cancelled`, `StartMark` sends `started`, and `EndMark` sends `done` if
-      its epoch is current;
+    - `CancelMark` sends `cancelled`, `StartMark` sends `started`, and `EndMark` sends `done`
+      (a superseding `cancel` has already removed it from the deque);
     - a `Piece` does `gate.acquire` (sending `queued` when it waits), sends `speaking`, and steps
       the generator on the `GpuThread`, checking the cancel event between chunks;
     - the piece anchors on success; on failure it sends `generation_failed`; `finally` closes the

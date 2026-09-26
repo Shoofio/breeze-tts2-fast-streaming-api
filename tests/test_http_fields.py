@@ -2226,6 +2226,6 @@ def test_voice_id_names_are_checked_by_voice_file_is_valid_name(monkeypatch) -> 
     from breeze_infer import voice_file
 
     monkeypatch.setattr(voice_file, "is_valid_name", lambda name: name == "only-this")
-    assert http_fields._is_valid_voice_id("only-this") is True
-    assert http_fields._is_valid_voice_id("alice") is False
-    assert http_fields._is_valid_voice_id("v_0123456789abcdef") is True
+    assert http_fields.is_valid_voice_id("only-this") is True
+    assert http_fields.is_valid_voice_id("alice") is False
+    assert http_fields.is_valid_voice_id("v_0123456789abcdef") is True

@@ -17,7 +17,8 @@ Interface these tests pin (T076 implements to it):
   `done` come from the worker, through the work deque, so they keep message order.
 - `session.next_item()` returns, in order, `Piece(epoch, index, text)`, `EndMark(epoch)`, a
   `CancelMark` instance, `StartMark(config)`, or `None` when the deque is empty.
-- `session.is_stale(item)` takes a `Piece` or an `EndMark`: true once its epoch is not current.
+- `session.is_stale(item)`: for a `Piece`, true once its epoch is not current. It also takes an
+  `EndMark` and always says False: a cancel that supersedes one removes it from the deque.
 - `session.mark_piece_done(anchor)`: the worker calls it exactly once for every `Piece` that
   `next_item` returned, when it stops working on it (finished, failed, cancelled, or skipped as
   stale). `anchor` is the reference built from a piece that succeeded, or `None` when it failed
@@ -375,6 +376,25 @@ def test_start_after_only_an_end_mark_sends_done_then_started() -> None:
     assert worker.kinds() == ["speaking", "done", "started"]
 
 
+def test_cancel_in_a_new_session_keeps_the_previous_sessions_done() -> None:
+    """Review 46 #3: a start that interrupts nothing leaves the old session's EndMark queued,
+    and a cancel in the new session supersedes only the new session's work."""
+    session, worker = started_session()
+    session.apply(msg("end"))  # EndMark queued, no pieces
+    session.apply(msg("start", voice_id="alice"))  # nothing pending: no cancel
+    session.apply(msg("cancel"))
+    worker.run()
+    assert worker.kinds() == ["done", "started", "cancelled"]
+
+    # Same with pieces queued in the new session: they go, the old done stays.
+    session.apply(msg("end"))
+    session.apply(msg("start"))
+    session.apply(msg("text", text="One. Two. Tail"))
+    session.apply(msg("cancel"))
+    worker.run()
+    assert worker.kinds()[3:] == ["done", "started", "cancelled"]
+
+
 def test_start_drops_buffered_text_silently() -> None:
     session, worker = started_session()
     session.apply(msg("text", text="Unfinished sentence"))
@@ -664,6 +684,16 @@ def test_text_too_long_on_flush_or_end_has_no_other_effect(kind: str) -> None:
 WORDS = ["alpha", "bravo", "charlie", "delta", "echo", "fox", "golf", "hotel"]
 SEPARATORS = [" ", " ", " ", ", ", ". ", "! ", "? ", "; ", "\n"]
 SEEDS = range(1_000)
+# Frames `parse` rejects: the server replies with the error and never calls the session.
+INVALID_FRAMES = [
+    "not json",
+    '{"type":"bogus"}',
+    '{"type":"text","text":5}',
+    '{"type":"start","seed":-1}',
+    '{"type":"start","split_chars":-1}',
+    '{"type":"end","text":"a\\u0000b"}',
+]
+OVERSIZED = "zulu " * (MAX_TEXT_CHARS // 5) + "z"  # over the limit whatever is buffered
 
 
 def letters(text: str) -> str:
@@ -692,7 +722,9 @@ def run_sequence(seed: int) -> tuple[list[tuple[str, str]], list[dict], set[int]
 
     Returns the boundary-relevant messages as `(kind, letters of its text)`, the events, and the
     indices of the `start`s that found a `Piece` queued or in flight, so must send `cancelled`
-    first. `instruction` and rejected `start`s go straight to the session: they emit no markers.
+    first. `instruction`, rejected `start`s, oversized text and frames `parse` rejects are not
+    recorded: they emit no markers, and a rejected message must have no other effect, which the
+    checker would see as unexplained markers or unsent letters ("zulu") being spoken.
     """
     rng = random.Random(seed)
     session = new_session(rng.choice([0, 12, 40, 600]))
@@ -717,8 +749,11 @@ def run_sequence(seed: int) -> tuple[list[tuple[str, str]], list[dict], set[int]
                 worker.step()
             continue
         kind = rng.choices(
-            ["text", "flush", "end", "cancel", "start", "instruction", "bad_start"],
-            weights=[40, 8, 14, 14, 8, 10, 3],
+            [
+                "text", "flush", "end", "cancel", "start", "instruction", "bad_start",
+                "oversized", "invalid",
+            ],
+            weights=[40, 8, 14, 14, 8, 10, 3, 3, 3],
         )[0]
         if kind == "text":
             send("text", text=random_text(rng))
@@ -732,9 +767,17 @@ def run_sequence(seed: int) -> tuple[list[tuple[str, str]], list[dict], set[int]
             instruction = rng.choice(["", "Whisper.", "Shout."])
             out = session.apply(msg("instruction", instruction=instruction))
             assert out == [{"type": "instruction_set"}], seed
-        else:
+        elif kind == "bad_start":
             out = session.apply(msg("start", voice_id="nobody"))
             assert out == [error("unknown_voice", "unknown voice_id", "start")], seed
+        elif kind == "oversized":
+            request_type = rng.choice(["text", "flush", "end"])
+            out = session.apply(msg(request_type, text=OVERSIZED))
+            assert [(e["code"], e["request_type"]) for e in out] == [
+                ("text_too_long", request_type)
+            ], seed
+        else:
+            assert isinstance(ws_messages.parse(rng.choice(INVALID_FRAMES)), ws_messages.WsError)
     worker.run()
     return messages, worker.events, interrupts
 
@@ -769,20 +812,27 @@ def check_sequence(
             take("done", i)
     assert p == len(markers), (seed, "unexplained markers", markers[p:])
 
-    # Each end gets its done unless a later cancel (or interrupting start) superseded it, and a
-    # done is emitted before the first such message was applied.
+    # Each end gets its done unless a cancel (or interrupting start) in its own session
+    # superseded it: only the first cancel/start after the end can, since a start that
+    # interrupts nothing ends the session and leaves the end's done owed (review 46 #3). A done
+    # is emitted before its superseder was applied.
     def supersedes(j: int | None) -> bool:
         return j is not None and (messages[j][0] == "cancel" or j in interrupting)
+
+    def next_boundary(i: int) -> int | None:
+        return next(
+            (j for j in range(i + 1, len(messages)) if messages[j][0] in ("cancel", "start")), None
+        )
 
     for i, (kind, _) in enumerate(messages):
         if kind != "end":
             continue
-        j = next((j for j in range(i + 1, len(messages)) if supersedes(j)), None)
+        j = next_boundary(i)
         if i in done_for:
-            if j is not None:
+            if supersedes(j):
                 assert done_for[i]["_at"] <= j, (seed, "done after its superseder", i, j)
         else:
-            assert j is not None, (seed, "end without done", i)
+            assert supersedes(j), (seed, "end without done", i)
 
     # Segments: each cancel/start begins one. Its marker(s) in the event stream begin the same
     # segment there, since everything shares one ordered deque.
@@ -802,12 +852,19 @@ def check_sequence(
     spoken: dict[int, str] = {}
     aborted_in: set[int] = set()
     current = 0
-    last_index = -1  # piece indices (and so seeds) count up from each start, through cancels
+    # Piece indices (and so seeds) count from 0 at each start and keep counting through
+    # cancels: each speaking is the next index, unless a cancel since the last one dropped
+    # pieces, in which case it is later.
+    last_index = -1
+    cancelled_since = False
     for event in events:
         if id(event) in owner:
             i = owner[id(event)]
             if event["type"] == "started":
                 last_index = -1
+                cancelled_since = False
+            elif event["type"] == "cancelled" and messages[i][0] == "cancel":
+                cancelled_since = True
             if event["type"] == "done":
                 # Everything sent up to the `end` was spoken, and nothing sent after it.
                 assert current == segment_of[i], (seed, "done in the wrong segment", i)
@@ -815,8 +872,12 @@ def check_sequence(
             else:
                 current = segment_of[i]
         elif event["type"] == "speaking":
-            assert event["_index"] > last_index, (seed, "piece index went backwards")
+            if cancelled_since:
+                assert event["_index"] > last_index, (seed, "piece index went backwards")
+            else:
+                assert event["_index"] == last_index + 1, (seed, "piece index skipped")
             last_index = event["_index"]
+            cancelled_since = False
             spoken[current] = spoken.get(current, "") + letters(event["text"])
             if event["_aborted"]:
                 aborted_in.add(current)

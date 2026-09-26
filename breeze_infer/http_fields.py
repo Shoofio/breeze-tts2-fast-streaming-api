@@ -980,7 +980,7 @@ ReferenceSpec = NoReference | VoiceRef | InlineRef
 _VOICE_UNNAMED_ID_PATTERN = re.compile(r"v_[0-9a-f]{16}", re.ASCII)
 
 
-def _is_valid_voice_id(value: str) -> bool:
+def is_valid_voice_id(value: str) -> bool:
     """Branches on the `v_` prefix rather than just checking the saved-name shape alone:
     that shape's character class would also accept a `v_`-prefixed string that isn't a
     real 16-hex id (e.g. `v_not-a-real-id`) as if it were a plausible saved name -- which it
@@ -1017,7 +1017,7 @@ def _build_reference(fields: Fields) -> ReferenceSpec:
     turns an empty blob into `400 invalid_audio` (data-model.md "DecodedAudio").
     """
     voice_id = _first(fields, "voice_id")
-    if voice_id is not None and not _is_valid_voice_id(voice_id):
+    if voice_id is not None and not is_valid_voice_id(voice_id):
         # A field-syntax check (FR-007 order), so it runs before the reference-consistency
         # checks below, same as ref_text's own length/control-character check does.
         raise ApiError(400, "invalid_field", "voice_id must be a voice name or v_ id")
