@@ -71,8 +71,12 @@ replace and delete check through the SillyTavern UI with a throwaway voice (neve
   - The id round trip through `encodeURIComponent` matched; no `*_failed` events and no console
     errors. `eric` and `vale` were untouched.
 - **`ws_port: 0`** in `/health` is expected until Phase 8 builds the WebSocket server. Until then
-  the extension can only synthesize in HTTP (buffer) mode; its `test/live/2-http.live.mjs`
-  expects 8081 and will fail until Phase 8.
+  SillyTavern **cannot synthesize at all**: the extension has no HTTP fallback (its "buffer" mode
+  also uses the WebSocket and only collects the audio before playback), so narration and voice
+  preview fail with "Cannot connect to Breeze WebSocket at ws://127.0.0.1:8081". Only `/health`
+  and the voice routes are usable from SillyTavern before Phase 8, and the extension's
+  `test/live/2-http.live.mjs` (which expects `ws_port` 8081) fails until then. Correction from
+  `sillytavern-agent`.
 
 ### Findings
 
