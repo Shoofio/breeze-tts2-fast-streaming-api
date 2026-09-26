@@ -569,39 +569,50 @@ shape during warm-up.
 That warm number is not the whole story (review finding 9, this round): every request can bring
 a differently-sized inline reference, and cuDNN's algorithm choice is keyed on input shape, so
 the *first* encode at each new reference length is a fresh "cold" case regardless of how many
-other lengths that process has already warmed up. Measured with the bench reference wav
-(`$REFERENCE_VOICES_DIR/eric/eric.wav`, 44.1 kHz mono, 10.245 s -- sliced from the
-start to 1, 3, 5, 7 and 9.5 s; not 12/20 s, since the wav itself is only 10.245 s long), one fresh
-process per (length, scope) pair so the timed call is always the first and only encode call that
-process ever makes:
+other lengths that process has already warmed up. A first attempt at measuring this ran one
+(length, scope) pair per fresh process, so the timed call was also the first CUDA call that
+process ever made -- it measured CUDA context creation, cuDNN handle setup and kernel loading,
+not the per-length cost, which is why even the fastest row came out at several seconds. Redone
+correctly: 3 fresh processes per scope setting; each process loads the codec, sets
+`cudnn.benchmark = True` (matching `--fast-all`), does one *unrecorded* warm-up encode of a 2 s
+slice to pay the CUDA/cuDNN start-up cost up front, then a **cold pass** -- the bench reference
+wav (`$REFERENCE_VOICES_DIR/eric/eric.wav`, 44.1 kHz mono, 10.245 s) sliced to 1, 3, 5,
+7 and 9.5 s, encoded once each in that order and recorded (first call at that exact shape, but
+not first call in the process) -- then a **warm pass** over the same five lengths again, recorded.
+Values below are the median over the 3 processes for each cell:
 
-**Caveat -- to be re-measured**: every number below is the *first call in a fresh process*, so
-it bundles CUDA context creation, cuDNN handle setup and kernel loading in with the per-length
-cost; that's why even the fastest row is several seconds. It does not yet isolate what a new
-reference length costs on a server that has already encoded something (warm process, cold
-shape) -- the actual question this finding is about. Treat this table as provisional.
+| reference length | with scope, cold | with scope, warm | without scope, cold | without scope, warm |
+| --- | --- | --- | --- | --- |
+| 1.0 s | 85.5 ms | 23.7 ms | 233.9 ms | 24.3 ms |
+| 3.0 s | 35.3 ms | 25.9 ms | 207.7 ms | 24.7 ms |
+| 5.0 s | 36.1 ms | 21.6 ms | 208.4 ms | 26.0 ms |
+| 7.0 s | 73.5 ms | 34.9 ms | 528.2 ms | 29.5 ms |
+| 9.5 s | 40.8 ms | 28.3 ms | 131.0 ms | 29.6 ms |
 
-| reference length | with the scope | without the scope |
-| --- | --- | --- |
-| 1.0 s | 3055 ms | 4915 ms |
-| 3.0 s | 3064 ms | 3477 ms |
-| 5.0 s | 3228 ms | 4184 ms |
-| 7.0 s | 6696 ms | 41732 ms |
-| 9.5 s | 5533 ms | 3794 ms |
+**Conclusion**: once CUDA/cuDNN start-up is paid once (by the warm-up call) and excluded, the
+real per-length cold cost is modest -- tens to a few hundred ms, not the multi-second-to-tens-
+of-seconds figures the first attempt reported; those were an artifact of conflating process
+start-up with per-shape cost, not a property of the fix. With the scope, cold costs range
+~35-86 ms; without it, ~131-528 ms -- **higher without the scope at every length measured**,
+because cuDNN's `benchmark=True` runs a real timed search over candidate algorithms the first
+time it sees a new shape, while forcing `benchmark=False` (a heuristic pick, no search) is
+consistently cheaper. Both settle to ~20-35 ms on the warm pass either way, matching the
+original steady-state figure above. So the fix's cold-path cost is real but small, and it is
+never a net cost versus not having the fix -- at every length measured here it was a modest,
+consistent saving instead.
 
-The cold cost is material -- multiple seconds, not the ~10 ms this would need to clear to call it
-noise -- and it does not move smoothly with length or consistently favor one side: 7 s without the
-scope spiked to 41.7 s (cuDNN apparently benchmarking a slow candidate algorithm for that
-particular shape), while at 9.5 s without the scope was actually *faster* than with it (3.8 s vs.
-5.5 s). Autotuning search cost is shape-dependent in a way that isn't predictable from length
-alone, and at least at this one length, it happened to land below the scoped heuristic pick's own
-cost rather than above it. What's consistent across all five lengths is that both figures are
-firmly in "seconds," not "noise": whichever side of the comparison is faster at a given length,
-the first encode of a new reference length costs multiple seconds either way, fix or no fix, and
-that is the material fact worth recording -- not a clean "the fix is always faster" story, which
-the 9.5 s row rules out. The warm figure above still describes steady state correctly, once cuDNN
-has already searched (or, with the fix, already made its one heuristic pick) for that exact
-shape; it's just not the number that matters for the first request at a new length.
+The first-call-in-process cost measured by the first (flawed) attempt still exists either way --
+it just isn't the encode scope's cost, it's CUDA/cuDNN's own start-up cost, paid once per
+process regardless of `encode_prompt_waveform`. It lands on whatever is the first CUDA work that
+process does. The server's own warm-up (`FastBreezeStreamingRuntime.warmup_from_profile`,
+`models/fast_streaming.py`) does not encode a reference: its codec stage calls
+`codec.decode_request_chunk(...)` on synthetic zero codes -- decode only -- and nothing in
+warm-up calls `encode_prompt_waveform` or the codec's `.encode(...)`. So the first inline
+reference request after start-up is the first time the *encode* path runs in that process at
+all. By then, though, warm-up's own decode/backbone/depth-decoder graphs have already created
+the CUDA context and loaded the relevant kernels, so that first request pays this table's
+"cold" column, not a from-scratch CUDA cold start -- consistent with the story above, not a new
+cost.
 
 **Evidence**: `tests/test_audio.py`'s
 `test_encode_prompt_waveform_scopes_cudnn_to_deterministic_no_benchmark` and
