@@ -748,7 +748,7 @@ rules.
 - [X] T068 [US1] Coordinate with `sillytavern-agent` via SendMessage: confirm whether the
   extension's DELETE-then-POST replace flow and the new delete wording have landed. Record the
   answer in `research/live-phase3.md`.
-- [ ] T069 [US1] **Live gate (voices)**:
+- [X] T069 [US1] **Live gate (voices)**:
   1. Set the version to `2.0.0.dev3`, and add BC-25–BC-29 and BC-48 to the CHANGELOG.
   2. Start the server and register `eric` and `vale` with curl (quickstart Scenario 3.1), using the
      samples and transcripts in `$REFERENCE_VOICES_DIR/{eric,vale}`.
