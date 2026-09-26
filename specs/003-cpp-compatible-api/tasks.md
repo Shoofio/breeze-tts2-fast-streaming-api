@@ -779,7 +779,7 @@ rules.
 
 ### Tests (write first)
 
-- [ ] T071 [P] [US4] Create `tests/test_ws_messages.py` (pure):
+- [X] T071 [P] [US4] Create `tests/test_ws_messages.py` (pure):
   - `test_bc_32_unicode_escapes_are_decoded` (`"你好"`);
   - `invalid_json`;
   - `unknown_type` with the message `unknown type`;
@@ -789,7 +789,7 @@ rules.
   - `test_bc_38_split_chars_zero_means_no_splitting_negative_is_invalid`;
   - `test_bc_46_control_characters_rejected`;
   - `test_bc_13_start_ref_text_without_voice_id_is_an_error`.
-- [ ] T072 [P] [US4] Create `tests/test_ws_session.py` (pure session plus a scripted fake worker):
+- [X] T072 [P] [US4] Create `tests/test_ws_session.py` (pure session plus a scripted fake worker):
   - `test_bc_34_end_with_nothing_left_still_sends_one_done`;
   - `test_bc_35_every_cancel_gets_exactly_one_cancelled_even_when_idle`;
   - `test_bc_35_cancel_between_pieces_never_drops_later_pieces`;
@@ -841,11 +841,11 @@ rules.
 
 ### Implementation
 
-- [ ] T075 [US4] Create `breeze_infer/ws_messages.py`: parse text frames with `json.loads` into
+- [X] T075 [US4] Create `breeze_infer/ws_messages.py`: parse text frames with `json.loads` into
   typed messages (`Start`, `Text`, `Flush`, `End`, `Instruction`, `Cancel`) or a
   `WsError(code, message, request_type)`. Reuse the range and grammar helpers from `http_fields.py`
   (extract them into shared functions there if needed). Emit no I/O.
-- [ ] T076 [US4] *(Opus)* Create `breeze_infer/ws_session.py`: the pure state machine from
+- [X] T076 [US4] *(Opus)* Create `breeze_infer/ws_session.py`: the pure state machine from
   data-model.md "WebSocket Session" and R15. `apply(message) -> list[immediate events]`, plus the
   work-deque operations the worker consumes (`next_item`, `mark_piece_done(anchor)`,
   `is_stale(piece)`). No I/O, no GPU, no locks.

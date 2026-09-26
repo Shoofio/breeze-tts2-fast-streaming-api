@@ -95,6 +95,20 @@ DEFAULT_INSTRUCTION = "Speak clearly and naturally."
 DEFAULT_CFG_SCALE = 1.0
 DEFAULT_SEED = 42
 
+# Each sampling/reference field's [low, high] bound (data-model.md SpeechRequest), shared
+# with ws_messages.parse (T075) so HTTP and WebSocket can't drift apart. Decimal bounds
+# are literal text, not `float`, for the same exactness reason decimal_literal_in_range
+# takes `low`/`high` as strings. `low_inclusive` and FR-006's zero-sentinel stay at each
+# call site -- they differ per field.
+CFG_SCALE_RANGE = ("0", "100")
+TEMPERATURE_RANGE = ("0", "10")
+TOP_P_RANGE = ("0", "1")
+REPETITION_PENALTY_RANGE = ("0.0001", "10")
+SEED_RANGE = (0, 4_294_967_295)
+SPLIT_CHARS_RANGE = (0, 10_000)
+TOP_K_RANGE = (1, 10_000)
+MAX_NEW_TOKENS_RANGE = (1, MAX_NEW_TOKENS_CEILING)
+
 # The limits passed to the multipart parser, and to _urlencoded_pairs_sync by hand
 # (research.md R6). Letting Starlette's own parser accept a few file parts, not just one, is
 # what lets `read_fields`'s own BC-08 pass (`_check_no_duplicate_names`, run over
@@ -599,7 +613,7 @@ def _first(fields: Fields, name: str) -> str | None:
 # literal's own sign and digits, but a re-anchored exponent (`_decimal_from_unrepresentable_
 # literal`, T048 post-final review finding #1) -- not the already-parsed `float`, whose
 # underflow-to-zero loses the sign a range check needs. For the optional sampling fields,
-# `_is_zero_literal` means a zero-mantissa literal like `0e99999` never reaches `Decimal`
+# `is_zero_literal` means a zero-mantissa literal like `0e99999` never reaches `Decimal`
 # construction at all -- but that's *not* true of every numeric field: `cfg_scale` has no
 # such pre-check (0 is an ordinary in-range value for it, not a "use the default" sentinel),
 # so `cfg_scale=0e1000000000000000000` genuinely does reach, and overflow, `Decimal`'s
@@ -614,7 +628,19 @@ _DECIMAL_LITERAL = re.compile(r"[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", re.ASCII
 # 4294967295); 20 is a generous margin that's still nowhere near the CPython limit, so a
 # literal this long is rejected as out-of-range before `int()` is ever called on it, rather
 # than relying on a limit that exists for a different reason and could itself change.
-_MAX_INT_LITERAL_DIGITS = 20
+MAX_INT_LITERAL_DIGITS = 20
+
+
+def significant_int_digits(value: str) -> tuple[str, str]:
+    """`value`'s sign and significant digits, leading zeros stripped, so a padded
+    literal (`"0" * 25 + "1"`) is judged by its actual magnitude. `value` must already be
+    known to match `_INT_LITERAL` (or JSON's own integer grammar, a subset of it) --
+    this only strips characters, it never validates them. Shared by `_parse_int` below
+    and by `ws_messages.py`'s integer fields.
+    """
+    sign = "-" if value.startswith("-") else ""
+    significant_digits = value.lstrip("+-").lstrip("0") or "0"
+    return sign, significant_digits
 
 
 def _parse_int(value: str, field: str, rule: str) -> int:
@@ -628,12 +654,6 @@ def _parse_int(value: str, field: str, rule: str) -> int:
     not malformed, so it gets that field's `"<field> must be <rule>"` message, not the
     generic "must be an integer" one.
 
-    The digit count is taken after stripping leading zeros (`"0" * 25 + "1"` is the single
-    significant digit `"1"`; `"0" * 25` alone -- all zeros -- collapses to the one digit
-    `"0"`, via the `or "0"` fallback for when stripping leaves nothing at all): a literal
-    padded with zeros must be judged by its actual magnitude, not by how long it happens to
-    be on the wire.
-
     Regression (final review): `int()` is called on `sign + significant_digits`, the
     stripped result, never on the original `value`. Calling it on `value` instead -- even
     after the digit count above had already confirmed the *significant* digit count was
@@ -644,9 +664,8 @@ def _parse_int(value: str, field: str, rule: str) -> int:
     """
     if _INT_LITERAL.fullmatch(value) is None:
         raise ApiError(400, "invalid_field", f"{field} must be an integer")
-    sign = "-" if value.startswith("-") else ""
-    significant_digits = value.lstrip("+-").lstrip("0") or "0"
-    if len(significant_digits) > _MAX_INT_LITERAL_DIGITS:
+    sign, significant_digits = significant_int_digits(value)
+    if len(significant_digits) > MAX_INT_LITERAL_DIGITS:
         raise ApiError(400, "invalid_field", f"{field} must be {rule}")
     return int(sign + significant_digits)
 
@@ -666,7 +685,7 @@ def _parse_decimal(value: str, field: str) -> float:
     return float(value)
 
 
-def _is_zero_literal(value: str) -> bool:
+def is_zero_literal(value: str) -> bool:
     """Whether a decimal literal already known to match `_DECIMAL_LITERAL` is zero,
     decided from its digits rather than its parsed `float` value.
 
@@ -735,7 +754,7 @@ def _decimal_from_unrepresentable_literal(literal: str) -> Decimal:
     `_CLAMPED_EXPONENT`: `Decimal`'s tuple constructor -- unlike its string constructor --
     isn't bounds-checked against the context at all, so it never raises here, however far
     outside decimal's representable range the clamped exponent still is. A zero mantissa is
-    exactly zero, whatever its exponent (`_is_zero_literal`'s rule, kept here too since
+    exactly zero, whatever its exponent (`is_zero_literal`'s rule, kept here too since
     `cfg_scale` never calls it separately, unlike the optional sampling fields); a nonzero
     mantissa keeps its sign and a merely very large (not unrepresentable) exponent, so
     `_check_decimal_range`'s ordinary bound comparison judges it exactly as it would any
@@ -743,7 +762,7 @@ def _decimal_from_unrepresentable_literal(literal: str) -> Decimal:
     underflow-to-zero can't carry a negative sign a range check needs (T048 post-final
     review finding #1).
     """
-    if _is_zero_literal(literal):
+    if is_zero_literal(literal):
         return Decimal(0)
     mantissa, _, exponent_digits = literal.partition("e")
     if not exponent_digits:
@@ -751,7 +770,7 @@ def _decimal_from_unrepresentable_literal(literal: str) -> Decimal:
     sign_bit = 1 if mantissa.startswith("-") else 0
     int_part, _, frac_part = mantissa.lstrip("+-").partition(".")
     # Leading zeros don't affect the value once the exponent accounts for the decimal
-    # point's position, so stripping them here is safe -- `_is_zero_literal` above already
+    # point's position, so stripping them here is safe -- `is_zero_literal` above already
     # ruled out every digit being zero, so at least one significant digit survives.
     digits = (int_part + frac_part).lstrip("0")
     exponent = -len(frac_part) + _parse_exponent(exponent_digits)
@@ -764,16 +783,9 @@ def _check_int_range(value: int, field: str, low: int, high: int, rule: str) -> 
         raise ApiError(400, "invalid_field", f"{field} must be {rule}")
 
 
-def _check_decimal_range(
-    literal: str,
-    value: float,
-    field: str,
-    low: str,
-    high: str,
-    *,
-    low_inclusive: bool,
-    rule: str,
-) -> None:
+def decimal_literal_in_range(
+    literal: str, value: float, low: str, high: str, *, low_inclusive: bool
+) -> bool:
     """The bound comparison checks `literal`, via `decimal.Decimal`, not just the parsed
     `float`. `float`'s limited (~15-17 significant digit) precision can round a genuinely
     out-of-range literal into range -- `float("10.0000000000000001") == 10.0` exactly, so a
@@ -805,7 +817,7 @@ def _check_decimal_range(
     finding #6) -- e.g. `cfg_scale=0e1000000000000000000` -- not a safety net alongside some
     other cap: the grammar's exponent cap was removed (see the DECISION above
     `_INT_LITERAL`), so this is now how such a literal is actually handled, for every numeric
-    field this function guards. `cfg_scale` in particular never runs `_is_zero_literal` first
+    field this function guards. `cfg_scale` in particular never runs `is_zero_literal` first
     the way the optional sampling fields do (0 is an ordinary in-range value for it, not a
     "use the default" sentinel), so a zero-mantissa literal with an unrepresentable exponent
     reaches here, not just a nonzero one (T048 post-final review finding #1).
@@ -821,7 +833,7 @@ def _check_decimal_range(
     Reconstructing from the literal's own digits keeps the sign and the nonzero-ness a zero
     *float* can't carry, so the ordinary bound comparison below decides it exactly as it
     would any other value: a mantissa of all zeros is exactly zero, whatever its exponent
-    (`_is_zero_literal`'s own rule, since `cfg_scale` never calls it separately) -- in range
+    (`is_zero_literal`'s own rule, since `cfg_scale` never calls it separately) -- in range
     for `cfg_scale`'s `[0, 100]`, out of range for a sampling field that reaches this at all,
     like `temperature`'s `(0, 10]`; a nonzero mantissa keeps its sign, so a tiny negative
     value is out of range for `cfg_scale` too, not mistaken for `-0.0`; a huge positive
@@ -843,7 +855,26 @@ def _check_decimal_range(
         value >= float_low if low_inclusive else value > float_low
     ) and value <= float_high
 
-    if not (decimal_in_range and float_in_range):
+    return decimal_in_range and float_in_range
+
+
+def _check_decimal_range(
+    literal: str,
+    value: float,
+    field: str,
+    low: str,
+    high: str,
+    *,
+    low_inclusive: bool,
+    rule: str,
+) -> None:
+    """The HTTP wrapper over `decimal_literal_in_range` above (see its docstring for the
+    exactness reasoning this whole check exists for): raises this field's own `400
+    invalid_field` wording when the literal is out of range. `ws_messages.py` calls
+    `decimal_literal_in_range` directly instead -- a WebSocket `error` event has no
+    per-field prose to fill in here, only a `code`.
+    """
+    if not decimal_literal_in_range(literal, value, low, high, low_inclusive=low_inclusive):
         raise ApiError(400, "invalid_field", f"{field} must be {rule}")
 
 
@@ -867,14 +898,14 @@ def _optional_decimal(
 ) -> float | None:
     """FR-006: `0` (or an absent field) means the model default (`None`); otherwise the
     value must fall in the given range. The sentinel is decided from the literal text
-    (`_is_zero_literal`), not the parsed `float`, per the review finding `_is_zero_literal`
+    (`is_zero_literal`), not the parsed `float`, per the review finding `is_zero_literal`
     documents -- so a nonzero literal that underflows still reaches, and fails,
     `_check_decimal_range` instead of being mistaken for the default."""
     raw = _first(fields, name)
     if raw is None:
         return None
     value = _parse_decimal(raw, name)
-    if _is_zero_literal(raw):
+    if is_zero_literal(raw):
         return None
     _check_decimal_range(raw, value, name, low, high, low_inclusive=low_inclusive, rule=rule)
     return value
@@ -1089,8 +1120,7 @@ def parse_speech(fields: Fields, settings: Settings) -> SpeechRequest:
             cfg_scale_raw,
             cfg_scale,
             "cfg_scale",
-            "0",
-            "100",
+            *CFG_SCALE_RANGE,
             low_inclusive=True,
             rule="finite and between 0 and 100",
         )
@@ -1101,25 +1131,27 @@ def parse_speech(fields: Fields, settings: Settings) -> SpeechRequest:
     else:
         seed_rule = "an integer between 0 and 4294967295"
         seed = _parse_int(seed_raw, "seed", seed_rule)
-        _check_int_range(seed, "seed", 0, 4_294_967_295, seed_rule)
+        _check_int_range(seed, "seed", *SEED_RANGE, seed_rule)
 
     temperature = _optional_decimal(
-        fields, "temperature", "0", "10", low_inclusive=False,
+        fields, "temperature", *TEMPERATURE_RANGE, low_inclusive=False,
         rule="0, or greater than 0 and at most 10",
     )
-    top_k = _optional_int(fields, "top_k", 1, 10_000, "0, or an integer between 1 and 10,000")
+    top_k = _optional_int(
+        fields, "top_k", *TOP_K_RANGE, "0, or an integer between 1 and 10,000"
+    )
     top_p = _optional_decimal(
-        fields, "top_p", "0", "1", low_inclusive=False, rule="0, or greater than 0 and at most 1"
+        fields, "top_p", *TOP_P_RANGE, low_inclusive=False,
+        rule="0, or greater than 0 and at most 1",
     )
     repetition_penalty = _optional_decimal(
-        fields, "repetition_penalty", "0.0001", "10", low_inclusive=True,
+        fields, "repetition_penalty", *REPETITION_PENALTY_RANGE, low_inclusive=True,
         rule="0, or between 0.0001 and 10",
     )
     max_new_tokens = _optional_int(
         fields,
         "max_new_tokens",
-        1,
-        MAX_NEW_TOKENS_CEILING,
+        *MAX_NEW_TOKENS_RANGE,
         f"0, or an integer between 1 and {MAX_NEW_TOKENS_CEILING:,}",
     )
 
@@ -1129,7 +1161,7 @@ def parse_speech(fields: Fields, settings: Settings) -> SpeechRequest:
     else:
         split_chars_rule = "an integer between 0 and 10,000"
         split_chars = _parse_int(split_chars_raw, "split_chars", split_chars_rule)
-        _check_int_range(split_chars, "split_chars", 0, 10_000, split_chars_rule)
+        _check_int_range(split_chars, "split_chars", *SPLIT_CHARS_RANGE, split_chars_rule)
 
     return SpeechRequest(
         text=text,
