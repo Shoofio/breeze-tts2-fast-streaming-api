@@ -33,7 +33,7 @@ import torch
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from breeze_infer import routes_speech
+from breeze_infer import routes_speech, voice_file
 from breeze_infer.api import Components, create_app, load_in_background
 from breeze_infer.events import Emitter
 from breeze_infer.gpu import GpuCloseTimeout, GpuGate, GpuSession, GpuThread
@@ -627,7 +627,8 @@ def test_mark_ready_installs_the_copy_and_the_runtime_in_one_step() -> None:
         components.mark_ready(
             LoadedModel(
                 runtime=runtime, report={}, cpu_tokenizer=cpu_copy, sizing_tokenizer=sizing_copy
-            )
+            ),
+            open_no_voices(None),
         )
 
         assert readiness.runtime is runtime
@@ -868,7 +869,7 @@ def _voice_services(voices_dir: Path, events: RecordingEvents) -> VoiceServices:
     store.scan()
     return VoiceServices(
         store=store,
-        registry=VoiceRegistry(clock=lambda: 0.0),
+        registry=VoiceRegistry(),
         prefix_cache=VoicePrefixCache(bytes_per_token=1, on_event=events.emit),
     )
 
@@ -933,9 +934,16 @@ def _save_voice(server: SimpleNamespace, name: str = "Narrator", ref_text: str =
 
 
 def _add_unnamed_voice(server: SimpleNamespace, ref_text: str = NARRATOR_TEXT) -> str:
-    """Register an unnamed voice with known codes (`VOICE_CODES`) straight into the registry."""
+    """Register an unnamed voice with known codes (`VOICE_CODES`) straight into the registry,
+    with its prefix length measured as a registration measures it. No room check: a test can
+    register a voice `POST /v1/voices` would refuse, as a voice on disk from a larger context."""
     server.services.registry.register_unnamed(
-        id=UNNAMED_ID, ref_text=ref_text, codes=VOICE_CODES, frames=8, encode_ms=1
+        id=UNNAMED_ID,
+        ref_text=ref_text,
+        codes=VOICE_CODES,
+        frames=8,
+        encode_ms=1,
+        prefix_len=_prefix_len(ref_text, VOICE_CODES),
     )
     return UNNAMED_ID
 
@@ -1090,17 +1098,40 @@ def test_a_voice_request_has_no_opening_piece(voice_server: Callable[..., Simple
 
 
 class _BlockingTokenizer(FakeTokenizer):
-    """Holds the first pre-gate room check open until `release` is set: the request has
-    resolved its voice by then, and hasn't taken the gate yet."""
+    """Once `armed` is set, holds the next pre-gate room check open until `release` is set: the
+    request has resolved its voice by then, and hasn't taken the gate yet. Unarmed, it
+    tokenizes at once (a `POST /v1/voices` measures its prefix on this worker too)."""
 
     def __init__(self) -> None:
+        self.armed = threading.Event()
         self.reached = threading.Event()
         self.release = threading.Event()
 
     def __call__(self, text: str, **kwargs: Any) -> Any:
-        self.reached.set()
-        assert self.release.wait(5.0)
+        if self.armed.is_set():
+            self.reached.set()
+            assert self.release.wait(5.0)
         return super().__call__(text, **kwargs)
+
+
+def _register_again(server: SimpleNamespace, voice: Any) -> None:
+    """Register `voice` (a `lookup` result) as a saved voice again, as `POST /v1/voices` commits
+    one, but without the route: a `POST` would queue behind the blocked room check on the CPU
+    tokenizer's one worker."""
+    stored = server.services.store.create(
+        voice_file.VoiceFile(
+            id=voice.id,
+            ref_text=voice.ref_text,
+            frames=int(voice.codes.shape[0]),
+            codebooks=int(voice.codes.shape[1]),
+            codes=voice.codes,
+            codes_sha256=voice_file.codes_sha256(voice.codes),
+            codec_fingerprint=server.services.store.codec_fingerprint,
+            encode_ms=1,
+            created_at="",
+        )
+    )
+    server.services.registry.register_saved(stored, prefix_len=voice.prefix_len)
 
 
 @pytest.mark.parametrize("re_register", [False, True], ids=["deleted", "deleted_and_re_registered"])
@@ -1114,13 +1145,15 @@ def test_a_voice_deleted_between_resolution_and_the_gate_is_not_cached(
     tokenizer = _BlockingTokenizer()
     server = voice_server(cpu_tokenizer=tokenizer)
     _save_voice(server)
+    voice = server.services.registry.lookup("Narrator")
+    tokenizer.armed.set()
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(_speech, server, voice_id="Narrator")
         assert tokenizer.reached.wait(5.0)
         assert server.client.delete("/v1/voices/Narrator").status_code == 200
         if re_register:
-            _save_voice(server)
+            _register_again(server, voice)
         tokenizer.release.set()
         response = pending.result(10.0)
 
@@ -1263,3 +1296,160 @@ def test_a_request_cancelled_during_the_prefix_build_hands_the_gate_to_the_build
     # The next request finds it warm.
     assert _speech(server, voice_id=voice_id).status_code == 200
     assert len(runtime.prefix_builds) == 1
+
+
+# --- review 42 on 8760821: prefix sizing, the out-of-memory fallback, per-voice facts ------
+
+
+def _voice_runtime(runtime: FakeRuntime) -> FakeRuntime:
+    runtime.tokenizer = FakeTokenizer()
+    runtime.model = model_with_codec_facts()
+    runtime.audio_tokenizer = FakeCodec()
+    return runtime
+
+
+class _RoomyRuntime(FakeRuntime):
+    """Reports the full frame cap as every piece's room, however long its prompt: the room
+    check alone never refuses, so only the prefix guard can."""
+
+    def max_new_tokens_room(self, requested: Any, inputs: Any, *, prefix_len: int = 0) -> int:
+        return self.frame_cap(requested)
+
+
+def test_42_1_a_stored_prefix_the_runtime_would_not_build_is_refused_before_the_gate(
+    voice_server: Callable[..., SimpleNamespace],
+) -> None:
+    """A voice already on disk (registered under a larger context, say) whose prefix leaves
+    under MIN_SUFFIX_ROOM slots: the short text has room, but `build_reference_prefix` would
+    refuse it, a 500 after the gate. It's the pre-gate `400 text_too_long` instead."""
+    from models.fast_streaming import MIN_SUFFIX_ROOM
+
+    length = _prefix_len(NARRATOR_TEXT, VOICE_CODES)
+    runtime = _voice_runtime(
+        _RoomyRuntime(config=FakeStreamingConfig(max_seq_len=length + MIN_SUFFIX_ROOM))
+    )
+    server = voice_server(runtime)
+    voice_id = _add_unnamed_voice(server)
+
+    response = _speech(server, voice_id=voice_id)
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "text_too_long"
+    assert runtime.prefix_builds == []
+    assert _gate_is_free(server.components)
+
+
+class _CodesPathTightRuntime(FakeRuntime):
+    """No room on the codes path (a whole prompt carrying the reference audio, no prefix); the
+    ordinary room everywhere else, the prefix path included."""
+
+    def max_new_tokens_room(self, requested: Any, inputs: Any, *, prefix_len: int = 0) -> int:
+        if prefix_len == 0 and inputs.get("input_values") is not None:
+            return 0
+        return super().max_new_tokens_room(requested, inputs, prefix_len=prefix_len)
+
+
+def test_42_3_a_voice_whose_codes_path_has_no_room_is_refused_before_the_gate(
+    voice_server: Callable[..., SimpleNamespace],
+) -> None:
+    """The out-of-memory fallback speaks through the codes path: a request only the prefix
+    path fits would turn into a `400` after the gate (or a later-piece abort) whenever the
+    fallback runs. Both paths are measured before the gate."""
+    runtime = _voice_runtime(_CodesPathTightRuntime())
+    server = voice_server(runtime)
+    voice_id = _add_unnamed_voice(server)
+
+    response = _speech(server, voice_id=voice_id)
+
+    assert response.status_code == 400
+    assert response.json()["code"] == "text_too_long"
+    assert runtime.prefix_builds == []
+    assert runtime.calls == []
+
+
+class _OutOfMemoryHoldingRuntime(FakeRuntime):
+    """`build_reference_prefix` allocates a large object and runs out of memory while it
+    holds it, as a real build holds its GPU tensors in the frames of the failing call."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.held: Any = None
+
+    def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> Any:
+        import weakref
+
+        self.prefix_builds.append(prefix_inputs)
+        workspace = torch.zeros(1 << 20)  # a stand-in for the build's GPU tensors
+        self.held = weakref.ref(workspace)
+        raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB (fake)")
+
+
+def test_42_2_the_failed_builds_memory_is_freed_before_the_fallback_starts(
+    voice_server: Callable[..., SimpleNamespace], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the cyclic collector (disabled here): the fallback's codes path needs more
+    memory than the build that failed, so nothing of that build may still be alive, through
+    the exception's traceback or a task that kept the exception, when it starts."""
+    import gc
+
+    runtime = _voice_runtime(_OutOfMemoryHoldingRuntime())
+    server = voice_server(runtime)
+    voice_id = _add_unnamed_voice(server)
+    alive_at_fallback: list[bool] = []
+    recording_prepare_piece = routes_speech.prepare_piece
+
+    def checking_prepare_piece(*args: Any) -> Any:
+        if runtime.held is not None and not alive_at_fallback:
+            alive_at_fallback.append(runtime.held() is not None)
+        return recording_prepare_piece(*args)
+
+    monkeypatch.setattr(routes_speech, "prepare_piece", checking_prepare_piece)
+    gc.disable()
+    try:
+        response = _speech(server, voice_id=voice_id)
+    finally:
+        gc.enable()
+
+    assert response.status_code == 200
+    assert alive_at_fallback == [False]
+    [fallback] = _named(server, "speech.prefix_fallback")
+    assert "CUDA out of memory" in fallback["error"]
+
+
+def test_42_7_a_warm_voice_request_neither_reassembles_the_prefix_nor_rehashes_its_key(
+    voice_server: Callable[..., SimpleNamespace], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prefix length and cache key are the voice's own, computed once when it was
+    registered: a request reads them off the registry record."""
+    from breeze_infer import synthesis, templates, voice_registry
+
+    server = voice_server()
+    voice_id = _save_voice(server)
+    assert _speech(server, voice_id=voice_id).status_code == 200  # builds the prefix
+    assemblies: list[int] = []
+    hashes: list[int] = []
+    real_prefix_inputs = templates.prepare_prefix_inputs
+    real_prefix_key = voice_registry.prefix_key
+
+    def counting_prefix_inputs(*args: Any) -> Any:
+        assemblies.append(1)
+        return real_prefix_inputs(*args)
+
+    def counting_prefix_key(*args: Any) -> Any:
+        hashes.append(1)
+        return real_prefix_key(*args)
+
+    monkeypatch.setattr(synthesis, "prepare_prefix_inputs", counting_prefix_inputs)
+    # The route no longer imports it at all; set anyway, so the check holds either way.
+    monkeypatch.setattr(routes_speech, "prefix_key", counting_prefix_key, raising=False)
+    monkeypatch.setattr(voice_registry, "prefix_key", counting_prefix_key)
+
+    response = _speech(server, voice_id=voice_id)
+
+    assert response.status_code == 200
+    [_cold, warm] = _named(server, "speech.accepted")
+    assert warm["warm"] is True
+    assert assemblies == []
+    assert hashes == []
+    voice = server.services.registry.lookup(voice_id)
+    assert voice.prefix_len == server.runtime.prefix_builds[0]["attention_mask"].shape[1]

@@ -78,6 +78,14 @@ MIN_SUFFIX_FRAMES = 12
 MIN_SUFFIX_ROOM = 10 + MIN_SUFFIX_FRAMES
 
 
+def max_reference_prefix_len(max_seq_len: int) -> int:
+    """The longest reference prefix ``build_reference_prefix`` accepts in a
+    ``max_seq_len``-token context: one that leaves ``MIN_SUFFIX_ROOM`` slots.
+    The one statement of that rule, which the voice routes also check before a
+    voice is registered and before a request takes the GPU."""
+    return max_seq_len - 1 - MIN_SUFFIX_ROOM
+
+
 @dataclass(frozen=True)
 class FastStreamingConfig:
     # Hard ceiling on frames per request; also sizes the token-history buffer.
@@ -1132,7 +1140,7 @@ class FastBreezeStreamingRuntime:
         # no room for a default-instruction suffix and about 1 s of audio
         # (MIN_SUFFIX_ROOM). Each request's real room depends on its own
         # suffix and cap, which max_new_tokens_room checks per request.
-        if prefix_len > self.config.max_seq_len - 1 - MIN_SUFFIX_ROOM:
+        if prefix_len > max_reference_prefix_len(self.config.max_seq_len):
             raise ValueError(
                 f"reference prefix of {prefix_len} tokens leaves no room to generate "
                 f"{MIN_SUFFIX_FRAMES} frames after the shortest default-instruction "

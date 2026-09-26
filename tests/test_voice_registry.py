@@ -32,14 +32,28 @@ def _saved_file(id: str, *, frames: int = 4, encode_ms: int = 100) -> VoiceFile:
     )
 
 
+# The registry stores whatever prefix length its caller measured; its value is arbitrary here.
+PREFIX_LEN = 10
+
+
 def _registry(cap: int = 64) -> VoiceRegistry:
-    return VoiceRegistry(cap=cap, clock=lambda: 0.0)
+    return VoiceRegistry(cap=cap)
 
 
 def _register_unnamed(registry: VoiceRegistry, id: str, *, frames: int = 4, encode_ms: int = 1):
     return registry.register_unnamed(
-        id=id, ref_text="hi", codes=np.zeros((frames, 16), dtype=np.int16), frames=frames, encode_ms=encode_ms
+        id=id,
+        ref_text="hi",
+        codes=np.zeros((frames, 16), dtype=np.int16),
+        frames=frames,
+        encode_ms=encode_ms,
+        prefix_len=PREFIX_LEN,
     )
+
+
+def _scanned(*voices: VoiceFile) -> list[tuple[VoiceFile, int]]:
+    """Scanned voices as `load_from_scan` takes them: each with its measured prefix length."""
+    return [(voice, PREFIX_LEN) for voice in voices]
 
 
 # --------------------------------------------------------------------------- BC-26
@@ -47,7 +61,7 @@ def _register_unnamed(registry: VoiceRegistry, id: str, *, frames: int = 4, enco
 
 def test_bc_26_names_are_unique_ignoring_case_and_v_prefix_is_reserved():
     registry = _registry()
-    registry.register_saved(_saved_file("alice"))
+    registry.register_saved(_saved_file("alice"), prefix_len=PREFIX_LEN)
 
     assert registry.name_taken("alice") is True
     assert registry.name_taken("Alice") is True
@@ -55,21 +69,21 @@ def test_bc_26_names_are_unique_ignoring_case_and_v_prefix_is_reserved():
     assert registry.name_taken("bob") is False
 
     with pytest.raises(NameTaken):
-        registry.register_saved(_saved_file("ALICE"))
+        registry.register_saved(_saved_file("ALICE"), prefix_len=PREFIX_LEN)
 
     # The whole v_ namespace is reserved, whether or not any such id has ever been
     # minted -- it's not tied to a specific registration.
     assert registry.name_taken("v_0000000000000000") is True
     assert registry.name_taken("V_ANYTHING") is True
     with pytest.raises(NameTaken):
-        registry.register_saved(_saved_file("v_deadbeefdeadbeef"))
+        registry.register_saved(_saved_file("v_deadbeefdeadbeef"), prefix_len=PREFIX_LEN)
 
     # A name a skipped file reserves collides too, even though nothing was ever saved
     # under it (data-model.md: "including names reserved by skipped files").
     registry.load_from_scan(voices=[], skipped=[SkippedVoiceFile(file="carol.voice.json", reason="broken", name="carol")])
     assert registry.name_taken("Carol") is True
     with pytest.raises(NameTaken):
-        registry.register_saved(_saved_file("carol"))
+        registry.register_saved(_saved_file("carol"), prefix_len=PREFIX_LEN)
 
 
 # --------------------------------------------------------------------------- BC-48
@@ -78,7 +92,7 @@ def test_bc_26_names_are_unique_ignoring_case_and_v_prefix_is_reserved():
 def test_bc_48_cap_counts_only_unnamed_voices():
     registry = _registry(cap=3)
     for i in range(10):
-        registry.register_saved(_saved_file(f"saved-{i}"))
+        registry.register_saved(_saved_file(f"saved-{i}"), prefix_len=PREFIX_LEN)
     assert registry.saved_count() == 10
 
     for i in range(3):
@@ -124,9 +138,9 @@ def test_an_identical_unnamed_registration_returns_the_existing_entry():
 def test_bc_25_list_order_is_saved_sorted_then_unnamed_by_registration():
     registry = _registry()
     # Saved, registered out of alphabetical order.
-    registry.register_saved(_saved_file("zeta"))
-    registry.register_saved(_saved_file("alpha"))
-    registry.register_saved(_saved_file("mid"))
+    registry.register_saved(_saved_file("zeta"), prefix_len=PREFIX_LEN)
+    registry.register_saved(_saved_file("alpha"), prefix_len=PREFIX_LEN)
+    registry.register_saved(_saved_file("mid"), prefix_len=PREFIX_LEN)
     # Unnamed, registered in a specific order that isn't alphabetical either.
     _register_unnamed(registry, "v_bbbbbbbbbbbbbbbb")
     _register_unnamed(registry, "v_aaaaaaaaaaaaaaaa")
@@ -140,7 +154,7 @@ def test_bc_25_list_order_is_saved_sorted_then_unnamed_by_registration():
 
 def test_list_record_shape_matches_the_contract():
     registry = _registry()
-    registry.register_saved(_saved_file("alice", frames=375, encode_ms=812))
+    registry.register_saved(_saved_file("alice", frames=375, encode_ms=812), prefix_len=PREFIX_LEN)
 
     [record] = registry.list_records(sample_rate=SAMPLE_RATE, samples_per_frame=SAMPLES_PER_FRAME)
 
@@ -178,7 +192,7 @@ def test_unnamed_id_disambiguates_where_wav_ends():
 
 def test_remove_drops_a_saved_voice_and_frees_its_name():
     registry = _registry()
-    registry.register_saved(_saved_file("alice"))
+    registry.register_saved(_saved_file("alice"), prefix_len=PREFIX_LEN)
     removed = registry.remove("alice")
     assert removed is not None
     assert removed.kind == "saved"
@@ -201,10 +215,10 @@ def test_remove_of_unknown_id_returns_none():
 
 def test_load_from_scan_clears_unnamed_voices_but_not_saved():
     registry = _registry()
-    registry.register_saved(_saved_file("alice"))
+    registry.register_saved(_saved_file("alice"), prefix_len=PREFIX_LEN)
     _register_unnamed(registry, "v_0000000000000000")
 
-    registry.load_from_scan(voices=[_saved_file("alice")], skipped=[])
+    registry.load_from_scan(voices=_scanned(_saved_file("alice")), skipped=[])
 
     assert registry.unnamed_count() == 0
     assert registry.saved_count() == 1
@@ -274,7 +288,7 @@ def test_store_and_registry_agree_on_which_id_delete_matches(tmp_path, skipped: 
     )
     scan = store.scan()
     registry = _registry()
-    registry.load_from_scan(scan.voices, scan.skipped)
+    registry.load_from_scan(_scanned(*scan.voices), scan.skipped)
 
     assert store.remove("carol") is False
     assert registry.remove("carol") is None
@@ -338,11 +352,16 @@ def test_lookup_resolves_saved_and_unnamed_voices_with_their_codes():
     saved_codes = np.arange(4 * 16, dtype=np.int16).reshape(4, 16)
     unnamed_codes = np.ones((3, 16), dtype=np.int16)
     registry.load_from_scan(
-        [VoiceFile(**{**_saved_file("scanned").__dict__, "codes": saved_codes})], []
+        _scanned(VoiceFile(**{**_saved_file("scanned").__dict__, "codes": saved_codes})), []
     )
-    registry.register_saved(_saved_file("alice"))
+    registry.register_saved(_saved_file("alice"), prefix_len=PREFIX_LEN)
     registry.register_unnamed(
-        id="v_0000000000000001", ref_text="hi", codes=unnamed_codes, frames=3, encode_ms=1
+        id="v_0000000000000001",
+        ref_text="hi",
+        codes=unnamed_codes,
+        frames=3,
+        encode_ms=1,
+        prefix_len=PREFIX_LEN,
     )
 
     scanned = registry.lookup("scanned")
@@ -359,7 +378,7 @@ def test_lookup_resolves_saved_and_unnamed_voices_with_their_codes():
 
 def test_lookup_is_exact_and_misses_removed_voices():
     registry = _registry()
-    registry.register_saved(_saved_file("alice"))
+    registry.register_saved(_saved_file("alice"), prefix_len=PREFIX_LEN)
     _register_unnamed(registry, "v_0000000000000001")
 
     assert registry.lookup("Alice") is None  # case is ignored only at create
@@ -368,3 +387,34 @@ def test_lookup_is_exact_and_misses_removed_voices():
     registry.remove("v_0000000000000001")
     assert registry.lookup("alice") is None
     assert registry.lookup("v_0000000000000001") is None
+
+
+# ------------------------------------------------------------------- review 42 #7/#8
+
+
+def test_each_record_carries_its_prefix_length_and_key_computed_once():
+    """A speech request reads a voice's prefix length and cache key off its record: they are
+    computed when the voice is registered or scanned, not per request."""
+    from breeze_infer.voice_file import prefix_key
+
+    registry = _registry()
+    scanned = _saved_file("scanned")
+    registry.load_from_scan([(scanned, 11)], [])
+    registry.register_saved(_saved_file("alice"), prefix_len=12)
+    registry.register_unnamed(
+        id="v_0000000000000001",
+        ref_text="hi",
+        codes=np.ones((3, 16), dtype=np.int16),
+        frames=3,
+        encode_ms=1,
+        prefix_len=13,
+    )
+
+    for voice_id, text, codes, length in [
+        ("scanned", scanned.ref_text, scanned.codes, 11),
+        ("alice", "text for alice", _saved_file("alice").codes, 12),
+        ("v_0000000000000001", "hi", np.ones((3, 16), dtype=np.int16), 13),
+    ]:
+        voice = registry.lookup(voice_id)
+        assert voice.prefix_len == length
+        assert voice.prefix_key == prefix_key(voice_id, text, codes)

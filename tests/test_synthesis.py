@@ -563,6 +563,12 @@ VOICE = SimpleNamespace(
     ref_text="the stored transcript",
     codes=(np.arange(9 * 16, dtype=np.int16) % 2048).reshape(9, 16),
 )
+# As the registry holds it: the length its prefix builds to, measured when it was registered.
+VOICE.prefix_len = int(
+    prepare_prefix_inputs(
+        FakeTokenizer(), model_with_codec_facts(), {"ref_text": VOICE.ref_text, "ref_audio_codes": VOICE.codes}
+    )["attention_mask"].shape[1]
+)
 
 
 def test_a_voice_reference_has_a_stand_in_for_the_pre_gate_room_check() -> None:
@@ -697,3 +703,61 @@ def test_a_piece_within_its_cap_is_not_clamped_and_no_room_raises() -> None:
             PieceRoom(cap=50, room=0), events, request_id="r", piece_index=1, requested=50
         )
     assert events.calls == []
+
+
+# --- review 42 on 8760821 -----------------------------------------------------------------
+
+
+def test_42_1_the_registration_measure_and_the_build_share_one_assembly() -> None:
+    """The prefix length a voice is registered with is the one its build produces: both come
+    from the same helper."""
+    from breeze_infer.synthesis import measure_voice_prefix
+
+    runtime = FakeRuntime()
+    runtime.tokenizer = FakeTokenizer()
+    runtime.model = model_with_codec_facts()
+
+    measured = measure_voice_prefix(runtime, FakeTokenizer(), VOICE.codes, VOICE.ref_text)
+    built = build_voice_prefix(runtime, VOICE.codes, VOICE.ref_text)
+
+    assert measured == built.prefix_len
+
+
+class _OutOfMemoryPrefixRuntime(FakeRuntime):
+    def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> Any:
+        raise torch.OutOfMemoryError("CUDA out of memory (fake)")
+
+
+@pytest.mark.parametrize("cuda_initialized", [True, False])
+def test_42_2_an_out_of_memory_build_frees_the_cache_and_raises_a_marker(
+    monkeypatch: pytest.MonkeyPatch, cuda_initialized: bool
+) -> None:
+    from breeze_infer.synthesis import PrefixBuildOutOfMemory
+
+    emptied: list[bool] = []
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: cuda_initialized)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(True))
+    runtime = _OutOfMemoryPrefixRuntime()
+    runtime.tokenizer = FakeTokenizer()
+    runtime.model = model_with_codec_facts()
+
+    with pytest.raises(PrefixBuildOutOfMemory, match="CUDA out of memory") as caught:
+        build_voice_prefix(runtime, VOICE.codes, VOICE.ref_text)
+
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert emptied == ([True] if cuda_initialized else [])
+
+
+def test_42_6_one_rule_decides_a_voices_reference_shape() -> None:
+    from breeze_infer.synthesis import voice_reference
+
+    voice = SimpleNamespace(ref_text="stored", codes=VOICE.codes, prefix_len=42)
+
+    override = voice_reference(voice, "a client transcript")
+    stored = voice_reference(voice, None)
+
+    assert isinstance(override, CodesRef) and override.ref_text == "a client transcript"
+    assert isinstance(stored, UnbuiltPrefix)
+    assert (stored.ref_text, stored.prefix_len) == ("stored", 42)
+    fallback = stored.codes_path()
+    assert isinstance(fallback, CodesRef) and fallback.ref_text == "stored"

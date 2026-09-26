@@ -150,7 +150,7 @@ Generation stops within one chunk, and the GPU is released.
 | 400 | `invalid_field` | `content type must be multipart/form-data or application/x-www-form-urlencoded` |
 | 400 | `duplicate_field` | `<field> was given more than once` |
 | 400 | `text_required` | `text is required` |
-| 400 | `text_too_long` | `text is too long` (over the limit, or the first piece doesn't fit the context, BC-47) |
+| 400 | `text_too_long` | `text is too long` (over the limit, or the first piece doesn't fit the context, BC-47; for a `voice_id` without `ref_text`, the first piece must fit both with the voice's cached prefix and with its codes, the fallback when the prefix can't be built, and a stored prefix the model can't build at all is refused here too) |
 | 400 | `reference_conflict` | `voice_id and ref_audio cannot be used together` |
 | 400 | `ref_text_required` | `ref_text is required with ref_audio` |
 | 400 | `reference_required` | `ref_text needs ref_audio or voice_id` |
@@ -184,9 +184,14 @@ Generation stops within one chunk, and the GPU is released.
    → `409 voice_exists` (BC-27, BC-26);
 4. unnamed voice: compute the id; if it already exists → `200` with the existing entry, without
    checking busy;
-5. decode and limits (`400`);
+5. decode and limits (`400`), then the reference prefix the voice would build, sized from the
+   transcript and the predicted frame count: one the model can't build (it leaves fewer than
+   `MIN_SUFFIX_ROOM` slots of the context) → `400 voice_too_long`. An unnamed voice registered
+   meanwhile by an identical request → `200` with that entry;
 6. busy (`409`);
-7. encode;
+7. encode (codes a voice can't hold, such as 0 frames or more than a 30 s reference gives →
+   `500 internal_error`; a frame count other than predicted is sized again, → `400 voice_too_long`
+   if it no longer fits);
 8. named voice: write the file (a name clash found at commit → `409 voice_exists`; write failure →
    `500 voice_write_failed`).
 
@@ -210,8 +215,10 @@ oldest unnamed voice is evicted first; saved voices don't count toward the cap (
 | 400 | `voice_fields_required` | `ref_audio and ref_text are required` |
 | 400 | `invalid_name` | `name can only use letters, digits, dash and underscore` (also used for the `v_` prefix) |
 | 400 | `invalid_audio`, `audio_too_long`, `audio_too_short` | as speech |
+| 400 | `voice_too_long` | `the reference is too long for the model's context` |
 | 409 | `voice_exists` | `voice already exists` |
 | 409 | `busy` | `busy` |
+| 500 | `internal_error` | `internal error` (the encode produced codes no voice can hold; nothing is written or registered) |
 | 500 | `voice_write_failed` | `could not write the voice file` |
 
 The storage `500`s (`voice_write_failed` here, `voice_delete_failed` on `DELETE`) keep their own
@@ -252,7 +259,8 @@ Files that failed validation at startup are not listed.
 
 `invalid_field`, `duplicate_field`, `text_required`, `text_too_long`, `reference_conflict`,
 `ref_text_required`, `reference_required`, `invalid_audio`, `audio_too_long`, `audio_too_short`,
-`voice_fields_required`, `invalid_name`, `unknown_voice`, `voice_exists`, `busy`, `loading`,
+`voice_fields_required`, `invalid_name`, `voice_too_long`, `unknown_voice`, `voice_exists`, `busy`,
+`loading`,
 `gpu_unavailable`,
 `not_found`, `method_not_allowed`, `payload_too_large`, `origin_not_allowed`,
 `voice_write_failed`, `voice_delete_failed`, `internal_error`.

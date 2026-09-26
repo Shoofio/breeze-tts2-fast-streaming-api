@@ -204,7 +204,6 @@ def encode(
     if codes.ndim != 2:
         raise ValueError(f"codes must be 2D [frames, codebooks], got shape {codes.shape}")
     frames, codebooks = codes.shape
-    payload = _codes_bytes(codes)
     record = {
         "format": FORMAT,
         "version": VERSION,
@@ -212,13 +211,58 @@ def encode(
         "ref_text": ref_text,
         "frames": int(frames),
         "codebooks": int(codebooks),
-        "codes": base64.b64encode(payload).decode("ascii"),
-        "codes_sha256": hashlib.sha256(payload).hexdigest(),
+        "codes": base64.b64encode(_codes_bytes(codes)).decode("ascii"),
+        "codes_sha256": codes_sha256(codes),
         "codec_fingerprint": codec_fingerprint,
         "encode_ms": int(encode_ms),
         "created_at": created_at,
     }
     return (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def check_counts(frames: int, codebooks: int, encode_ms: int, *, model_codebooks: int) -> None:
+    """The frame count, codebook count and `encode_ms` a voice may have, whether read from a
+    file (`decode`) or just encoded (`checked_codes`, before `POST /v1/voices` keeps it).
+    Raises `VoiceFileError` naming the first one out of bounds."""
+    # At most what a 30 s reference can encode to: POST /v1/voices could never have
+    # produced more, and a longer prefix would outgrow what the rest of the server sizes
+    # a reference for.
+    if not 1 <= frames <= MAX_REF_FRAMES:
+        raise VoiceFileError(f"frames must be between 1 and {MAX_REF_FRAMES}, got {frames}")
+    # Checked against the model's own count, not merely for being positive: codes with
+    # frames and codebooks swapped have the same byte length and sha256, and only this
+    # tells them apart.
+    if codebooks != model_codebooks:
+        raise VoiceFileError(f"codebooks is {codebooks}, the model has {model_codebooks}")
+    if not 0 <= encode_ms <= MAX_ENCODE_MS:
+        raise VoiceFileError(f"encode_ms must be between 0 and {MAX_ENCODE_MS}, got {encode_ms}")
+
+
+def check_code_range(codes: np.ndarray, codebook_size: int) -> None:
+    """Every code within `[0, codebook_size)`; `VoiceFileError` otherwise."""
+    low, high = int(codes.min()), int(codes.max())
+    if low < 0 or high >= codebook_size:
+        raise VoiceFileError(f"code out of range [0, {codebook_size}): [{low}, {high}]")
+
+
+def checked_codes(
+    codes: np.ndarray, encode_ms: int, *, codebooks: int, codebook_size: int
+) -> np.ndarray:
+    """A fresh encode's codes, checked by the rules `decode` applies to a file (shape, counts,
+    `encode_ms`, code range), as the contiguous int16 array `decode` itself returns.
+
+    `POST /v1/voices` runs this before it writes or registers anything: a voice the next
+    startup scan would skip must never answer `200` (its file would keep the name reserved
+    while the voice vanished). The dtype is converted only after the range check, so an
+    out-of-range code can't wrap into range.
+    """
+    codes = np.asarray(codes)
+    if codes.ndim != 2 or not np.issubdtype(codes.dtype, np.integer):
+        raise VoiceFileError(f"codes must be integers [frames, codebooks], got {codes.dtype} {codes.shape}")
+    frames, found_codebooks = codes.shape
+    check_counts(int(frames), int(found_codebooks), int(encode_ms), model_codebooks=codebooks)
+    check_code_range(codes, codebook_size)
+    return np.ascontiguousarray(codes, dtype=np.int16)
 
 
 def _require_int(payload: dict, field: str) -> int:
@@ -308,13 +352,7 @@ def decode(
         raise VoiceFileError("ref_text is blank")
     if len(ref_text) > MAX_REF_TEXT_CHARS:
         raise VoiceFileError(f"ref_text is longer than {MAX_REF_TEXT_CHARS} characters")
-    # At most what a 30 s reference can encode to: POST /v1/voices could never have
-    # produced more, and a longer prefix would outgrow what the rest of the server sizes
-    # a reference for.
-    if not 1 <= frames <= MAX_REF_FRAMES:
-        raise VoiceFileError(f"frames must be between 1 and {MAX_REF_FRAMES}, got {frames}")
-    if not 0 <= encode_ms <= MAX_ENCODE_MS:
-        raise VoiceFileError(f"encode_ms must be between 0 and {MAX_ENCODE_MS}, got {encode_ms}")
+    check_counts(frames, file_codebooks, encode_ms, model_codebooks=codebooks)
     # A real parse (so 2026-02-30 fails), and a round trip back through the same format
     # (so strptime's leniency -- "2026-9-24" -- can't slip through): exactly the shape
     # the store writes.
@@ -326,11 +364,6 @@ def decode(
         raise VoiceFileError(f"created_at is not {CREATED_AT_FORMAT}: {created_at!r}") from exc
     if parsed.strftime(CREATED_AT_FORMAT) != created_at:
         raise VoiceFileError(f"created_at is not {CREATED_AT_FORMAT}: {created_at!r}")
-    # Checked against the model's own count, not merely for being positive: codes with
-    # frames and codebooks swapped have the same byte length and sha256, and only this
-    # tells them apart.
-    if file_codebooks != codebooks:
-        raise VoiceFileError(f"codebooks is {file_codebooks}, the model has {codebooks}")
 
     # -- stem vs id, then the name itself
     if voice_id != expected_id:
@@ -356,11 +389,7 @@ def decode(
 
     # -- code range. frames >= 1 and codebooks matching the model make this reshape safe.
     codes = np.frombuffer(codes_bytes, dtype="<i2").reshape(frames, codebooks)
-    if int(codes.min()) < 0 or int(codes.max()) >= codebook_size:
-        raise VoiceFileError(
-            f"code out of range [0, {codebook_size}): "
-            f"[{int(codes.min())}, {int(codes.max())}]"
-        )
+    check_code_range(codes, codebook_size)
 
     # -- codec fingerprint
     if file_fingerprint != codec_fingerprint:

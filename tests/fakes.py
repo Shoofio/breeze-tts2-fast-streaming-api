@@ -112,6 +112,13 @@ def model_with_codec_facts():
     """
     model = fake_model()
     model.config.codec_config.codebook_size = 2048
+    # The backbone's attention shape, which `api.prefix_bytes_per_token` sizes the voice prefix
+    # cache from when a (fake) model loads: the bundled checkpoint's.
+    model.config.num_hidden_layers = 28
+    model.config.num_attention_heads = 16
+    model.config.num_key_value_heads = 8
+    model.config.hidden_size = 2048
+    model.config.head_dim = 128
     return model
 
 
@@ -449,6 +456,8 @@ class FakeRuntime:
     """
 
     sample_rate = 24000
+    # The real runtime's KV dtype, which `api.prefix_bytes_per_token` reads.
+    dtype = torch.bfloat16
 
     def __init__(
         self,
@@ -512,9 +521,15 @@ class FakeRuntime:
 
     def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> Any:
         """``FastBreezeStreamingRuntime.build_reference_prefix``'s result shape, with no KV
-        (class docstring)."""
+        (class docstring), and its guard: a prefix leaving under ``MIN_SUFFIX_ROOM`` slots of
+        the context is refused with ``ValueError``, as the real one refuses it."""
+        from models.fast_streaming import max_reference_prefix_len
+
         self.prefix_builds.append(prefix_inputs)
-        return SimpleNamespace(prefix_len=int(prefix_inputs["attention_mask"].shape[1]), kv=None)
+        prefix_len = int(prefix_inputs["attention_mask"].shape[1])
+        if prefix_len > max_reference_prefix_len(self.config.max_seq_len):
+            raise ValueError(f"reference prefix of {prefix_len} tokens leaves no room (fake)")
+        return SimpleNamespace(prefix_len=prefix_len, kv=None)
 
     def frame_cap(self, requested: int | None) -> int:
         """Ports ``FastBreezeStreamingRuntime.frame_cap`` exactly (it's two lines and
@@ -779,10 +794,13 @@ class FakeRuntime:
             self.closed += 1
 
 
-def open_no_voices(_runtime: Any) -> VoiceServices:
+def open_no_voices(_loaded: Any, prefix_cache: VoicePrefixCache | None = None) -> VoiceServices:
     """A stand-in for `api.Components.open_voices` in tests that don't use the voice routes:
     empty voice services that never touch the disk (nothing scans `voices_dir`, and nothing
-    in those tests writes a voice)."""
+    in those tests writes a voice). Called directly (to mark components ready by hand), it
+    makes its own small prefix cache."""
+    if prefix_cache is None:
+        prefix_cache = VoicePrefixCache(bytes_per_token=1, on_event=lambda *_a, **_k: None)
     return VoiceServices(
         store=VoiceStore(
             Path("unused-test-voices"),
@@ -792,6 +810,6 @@ def open_no_voices(_runtime: Any) -> VoiceServices:
             events=RecordingEvents(),
             clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
         ),
-        registry=VoiceRegistry(clock=lambda: 0.0),
-        prefix_cache=VoicePrefixCache(bytes_per_token=1, on_event=lambda *_a, **_k: None),
+        registry=VoiceRegistry(),
+        prefix_cache=prefix_cache,
     )

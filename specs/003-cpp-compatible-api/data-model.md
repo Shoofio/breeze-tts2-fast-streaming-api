@@ -139,8 +139,14 @@ The resolved reference for a request or session. It is never exposed on the wire
 | prefix | `ReferencePrefix` (cached KV) plus the stored `ref_text`, for a saved or unnamed voice with no override |
 
 A voice with an overridden transcript uses the codes path: its stored codes with the given
-`ref_text`. A prefix build that runs out of GPU memory is not cached, and that request falls back
-to the codes path with the stored `ref_text` (`speech.prefix_fallback`), never a `500` (T066).
+`ref_text`. A prefix build that runs out of GPU memory is not cached, frees what it held on the
+GPU thread before anything else runs there, and that request falls back to the codes path with
+the stored `ref_text` (`speech.prefix_fallback`), never a `500` (T066). So the fallback can't
+change the outcome, the room check before the gate measures a voice without an override on both
+paths (the prefix path by its stored `prefix_len`, the codes path by its whole prompt) and needs
+piece 0 to fit both; a stored prefix longer than the model builds (`prefix_len > max_seq_len - 1 -
+MIN_SUFFIX_ROOM`) is `400 text_too_long` there too. Later pieces are sized when they run, on the
+path the request took (BC-47).
 
 Transitions: `none` becomes `codes(anchor)` after piece 0 succeeds with at least one non-pad
 frame. It never happens on cancel, on failure, or when piece 0 produced zero frames. It is also
@@ -193,12 +199,14 @@ frames, `sizing_timeout`), and when the request ends before the anchor decision 
 |---|---|---|
 | `id` | str | Saved: the name, `[A-Za-z0-9_-]{1,64}` and not `v_*`. Unnamed: `v_` + 16 lowercase hex characters |
 | `ref_text` | str | ≤ 2,000 |
-| `codes` | int16 `[frames, codebooks]` | Every value within `[0, codebook_size)` |
+| `codes` | int16 `[frames, codebooks]` | Every value within `[0, codebook_size)`. A new voice's codes pass the same checks a voice file does at startup (frames, codebooks, range, `encode_ms`), then are kept as int16 |
 | `codes_sha256` | hex | Checksum of `codes` in the voice file |
 | `frames` | int | ≥ 1 |
 | `seconds` | float | `frames × samples_per_frame / sample_rate` |
 | `encode_ms` | float | Measured at creation |
 | `saved` | bool | True when named |
+| `prefix_len` | int | The length its reference prefix builds to, measured once (at registration or the startup scan) with the same prefix-input assembly the build uses; never stored in the file |
+| `prefix_key` | `(id, content_hash)` | Its prefix-cache key (below), computed once with `prefix_len` |
 
 **Prefix-cache key**: `(id, content_hash)` from `voice_file.prefix_key`, where `content_hash` is
 a sha256 over the length-prefixed `ref_text`, the codes' shape and the codes' bytes. The KV
@@ -221,10 +229,14 @@ delete is never cached, even if the voice is re-registered with the same audio a
 **Lifecycle**:
 
 ```text
-POST (named)   → [validate] → [409 if name taken, ignoring case] → [decode] → [gate] → [encode]
-               → [write file under lock, re-checking the name] → registered (saved)
-POST (unnamed) → [validate] → [hash → existing? return it] → [decode] → [gate] → [encode]
-               → registered (unnamed; may evict the oldest unnamed voice)
+POST (named)   → [validate] → [409 if name taken, ignoring case] → [decode] → [prefix fits?
+                 else 400 voice_too_long] → [gate] → [encode] → [codes valid? else 500]
+               → [write file under lock, re-checking the name; a registry refusal after the
+                 write removes the file again → 409] → registered (saved)
+POST (unnamed) → [validate] → [hash → existing? return it] → [decode] → [prefix fits? else
+                 400 voice_too_long] → [existing now? return it] → [gate] → [encode] → [codes
+                 valid? else 500] → registered (unnamed; may evict the oldest unnamed voice),
+                 unless an identical request registered it first: its entry is returned
 DELETE         → saved: rename to .del-* and fsync the directory, then unlink (best-effort: a
                  failure leaves the .del-* file for the next startup's sweep) → unregistered;
                  prefix cache entry dropped
@@ -234,12 +246,21 @@ DELETE         → saved: rename to .del-* and fsync the directory, then unlink 
 restart        → saved voices reloaded from files; unnamed voices gone
 ```
 
-**Startup order**: model load (on the GPU thread), then the voice scan (on a worker thread: checking
-a file needs the loaded model's codebook facts and codec fingerprint), then mark ready. Every route
-answers `503 loading` until the scan has finished, and `voices.loaded`/`voice.skipped` come before
-`model.loaded`. A voices directory that can't be created, listed or fingerprinted (the codec's
-`audio_tokenizer` files) fails startup: `model.load_failed` with `stage: voices`, exit non-zero,
-never ready (decided by the user on 2026-09-26). A bad single file is still only skipped (BC-25).
+**Startup order**: model load (on the GPU thread) and sizing the prefix cache from the model's
+config, then the voice scan (on a worker thread: checking a file needs the loaded model's codebook
+facts and codec fingerprint, and each loaded voice's `prefix_len` is measured with the load's CPU
+tokenizer copy), then mark ready. Every route answers `503 loading` until the scan has finished,
+and `voices.loaded`/`voice.skipped` come before `model.loaded`. A model config the prefix cache
+can't be sized from fails startup with `stage: model`. A voices directory that can't be created,
+listed or fingerprinted (the codec's `audio_tokenizer` files) fails startup: `model.load_failed`
+with `stage: voices`, exit non-zero, never ready (decided by the user on 2026-09-26). A bad single
+file is still only skipped (BC-25). A voice whose prefix no longer fits the context (a file from a
+larger `max_seq_len`) still loads, and a request for it is `400 text_too_long` before the gate.
+
+**Changes**: every store and registry change (create, register, delete) runs on one worker thread
+of the voice services' own, never the event loop or asyncio's shared pool, one at a time. What
+goes with a change on the event loop (dropping a cached prefix, the `voice.*` events) is scheduled
+by that thread right after the change, so a request cancelled mid-change still gets them.
 
 ## Voice file v1
 
@@ -351,15 +372,22 @@ offending record's field names), so one bad field never breaks the request emitt
     traceback; `level` is `error` when either is present, else `warning`. A cancellation is
     never a crash or a stop failure), `ws.bind_failed`,
     `model.loaded`,
-    `model.load_failed` (the process then exits non-zero; `stage`: `model` (the load itself),
+    `model.load_failed` (the process then exits non-zero; `stage`: `model` (the load itself, or a
+    model config the voice prefix cache can't be sized from),
     `voices` (the startup voice scan) or `ready` (marking the server ready or reporting it)),
     `gpu.close_failed`,
     `gpu.close_timeout` (a `gen.close()` ran past 30 s: the GPU gate is poisoned and `/health`
     answers `503 gpu_unavailable` until restart);
   - voices: `voices.loaded`, `voice.skipped`,
-    `voice.created` (`request_id`, `voice_id`, `saved`, `frames`, `encode_ms`; none for an unnamed
-    `POST` answered with an existing entry), `voice.deleted` (`request_id`, `voice_id`, `kind`:
-    `saved`, `unnamed` or `reserved`),
+    `voice.created` (`request_id`, `voice_id`, `saved`, `frames`, `encode_ms`; only when this
+    request created the entry: none for an unnamed `POST` answered with an existing entry, even
+    one that encoded before finding it), `voice.deleted` (`request_id`, `voice_id`, `kind`:
+    `saved`, `unnamed` or `reserved`), `voice.store_mismatch` (level `warning`; `request_id`,
+    `voice_id`, `file_removed`, `kind`: a `DELETE` where the store and the registry disagreed
+    about whether the voice has a file, e.g. a file removed for an id the registry didn't hold
+    (`kind` null, no `voice.deleted`); the delete still answers `200`),
+    `voice.frame_prediction_mismatch` (level `warning`; `request_id`, `predicted_frames`,
+    `actual_frames`: a `POST /v1/voices` encode, as `speech.frame_prediction_mismatch`),
     `voice.cleanup_failed` (`file`, `op`: `sweep`, `stat`, `unlink_tmp` or `unlink`, `error`: a
     leftover the store couldn't remove or examine; it is left for the next startup's sweep),
     `voice.prefix_built` (`voice_id`, `tokens`: the prefix length, `bytes`: its estimated KV

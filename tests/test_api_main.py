@@ -44,7 +44,12 @@ from breeze_infer.model_loading import LoadedModel
 from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.settings import settings_from_args
-from tests.fakes import FakeRuntime, FakeTokenizer, open_no_voices
+from tests.fakes import (
+    FakeRuntime,
+    FakeTokenizer,
+    model_with_codec_facts,
+    open_no_voices,
+)
 
 MODEL_DIR = str(Path(__file__).parent)  # any existing directory; nothing loads it
 
@@ -321,8 +326,10 @@ posix_only = pytest.mark.skipif(
 
 
 def _loaded() -> LoadedModel:
+    runtime = FakeRuntime()
+    runtime.model = model_with_codec_facts()  # the voice prefix cache is sized from its config
     return LoadedModel(
-        runtime=FakeRuntime(),
+        runtime=runtime,
         report={"device": "cpu"},
         cpu_tokenizer=FakeTokenizer(),
         sizing_tokenizer=FakeTokenizer(),

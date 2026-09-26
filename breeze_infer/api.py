@@ -51,6 +51,7 @@ from breeze_infer.routes_voices import VoiceServices, VoiceSlot, install_voices
 from breeze_infer.runtime import get_dist_info
 from breeze_infer.settings import Settings, settings_from_args
 from breeze_infer.streaming import ClientAbortLogFilter
+from breeze_infer.synthesis import measure_voice_prefix
 from breeze_infer.version_header import VersionHeaderMiddleware
 from breeze_infer.voice_prefix import VoicePrefixCache, kv_bytes_per_token
 from breeze_infer.voice_registry import VoiceRegistry
@@ -69,34 +70,36 @@ class Components:
     ws_port: Callable[[], int]
     # Empty until `mark_ready` installs the model load's tokenizer copies.
     cpu_tokenizer: CpuTokenizer
-    # Opens the voice directory for the loaded runtime (`open_voices`, bound to the settings by
-    # `main()`); `load_in_background` runs it on a worker thread once the model has loaded.
-    # Required, like `cpu_tokenizer`, so no wiring can forget the voices.
-    open_voices: Callable[[Any], VoiceServices]
+    # Opens the voice directory for the loaded model, with the prefix cache the model stage
+    # sized (`open_voices`, bound to the settings by `main()`); `load_in_background` runs it on a
+    # worker thread once the model has loaded. Required, like `cpu_tokenizer`, so no wiring can
+    # forget the voices.
+    open_voices: Callable[[LoadedModel, VoicePrefixCache], VoiceServices]
     # Empty until `mark_ready` installs what `open_voices` built.
     voices: VoiceSlot = field(default_factory=VoiceSlot)
 
-    def mark_ready(self, loaded: LoadedModel, voices: VoiceServices | None = None) -> None:
-        """Serve `loaded`: its two CPU tokenizer copies, the scanned voices (if any) and its
-        runtime, in one step, so the server is never ready without the copies the speech route
-        sizes requests with, nor the voices the voice routes serve. Those go in first: the first
-        request the server admits may need them."""
+    def mark_ready(self, loaded: LoadedModel, voices: VoiceServices) -> None:
+        """Serve `loaded`: its two CPU tokenizer copies, the scanned voices and its runtime, in
+        one step, so the server is never ready without the copies the speech route sizes
+        requests with, nor the voices the voice routes serve. Those go in first: the first
+        request the server admits may need them. `voices` is required: a server with none still
+        has an (empty) store, registry and prefix cache."""
         self.cpu_tokenizer.install(loaded.cpu_tokenizer, loaded.sizing_tokenizer)
-        if voices is not None:
-            self.voices.install(voices)
+        self.voices.install(voices)
         self.readiness.mark_ready(loaded.runtime)
 
 
-def create_app(components: Components) -> ASGIApp:
+def create_app(components: Components, *, clock: Callable[[], float] = time.perf_counter) -> ASGIApp:
     """Build the FastAPI app and wrap it in the pure-ASGI middleware, outermost first:
-    version header, CORS, body limit, app.
+    version header, CORS, body limit, app. `clock` times speech (`ttfa_ms`, `rtf`) and each
+    voice encode (`encode_ms`); tests pass their own.
     """
     # No /docs, /redoc or /openapi.json: FR-001 allows exactly the contract's routes.
     app = FastAPI(title="Breeze TTS", docs_url=None, redoc_url=None, openapi_url=None)
     install_error_handlers(app, components.events)
     install_health(app, components.readiness, components.ws_port)
-    install_speech(app, components, clock=time.perf_counter)
-    install_voices(app, components)
+    install_speech(app, components, clock=clock)
+    install_voices(app, components, clock=clock)
 
     policy = CorsPolicy(origins=components.settings.cors)
     inner: ASGIApp = CorsMiddleware(BodyLimitMiddleware(app), policy, app.router)
@@ -270,21 +273,29 @@ def _ignore_sigint() -> None:
 async def load_in_background(
     components: Components, load: Callable[[], LoadedModel], server: uvicorn.Server
 ) -> bool:
-    """Load the model on the GPU thread, then scan the voice directory on a worker thread
-    (checking a voice file needs the loaded model's codebook facts and codec fingerprint), then
-    mark the server ready. Every route answers `503 loading` until then.
+    """Load the model on the GPU thread and size the voice prefix cache from its config, then
+    scan the voice directory on a worker thread (checking a voice file needs the loaded model's
+    codebook facts and codec fingerprint, and measuring a voice needs its tokenizer), then mark
+    the server ready. Every route answers `503 loading` until then.
 
     Any failure, including one scanning the voices, marking it ready or reporting it, is fatal:
     the server is told to exit (and `serve` returns non-zero) rather than answering
-    `503 loading` forever. `model.load_failed`'s `stage` says which step failed: `model`,
-    `voices`, or `ready` (marking it ready or reporting it). A voices failure is the directory itself (it can't be created or listed, or the
-    codec can't be fingerprinted); a bad voice file is only skipped, never fatal (BC-25).
+    `503 loading` forever. `model.load_failed`'s `stage` says which step failed: `model` (the
+    load, or a model config the prefix cache can't be sized from), `voices`, or `ready`
+    (marking it ready or reporting it). A voices failure is the directory itself (it can't be
+    created or listed, or the codec can't be fingerprinted); a bad voice file is only skipped,
+    never fatal (BC-25).
     """
     stage = "model"
     try:
         loaded = await components.gpu.run(load)
+        prefix_cache = VoicePrefixCache(
+            budget_bytes=VOICE_PREFIX_CACHE_BYTES,
+            bytes_per_token=prefix_bytes_per_token(loaded.runtime),
+            on_event=components.events.emit,
+        )
         stage = "voices"
-        voices = await asyncio.to_thread(components.open_voices, loaded.runtime)
+        voices = await asyncio.to_thread(components.open_voices, loaded, prefix_cache)
         stage = "ready"
         components.mark_ready(loaded, voices)
         components.events.emit(
@@ -320,20 +331,22 @@ def prefix_bytes_per_token(runtime: Any) -> int:
 
 
 def open_voices(
-    runtime: Any,
+    loaded: LoadedModel,
+    prefix_cache: VoicePrefixCache,
     *,
     voices_dir: Path,
     events: Emitter,
     codec_fingerprint: str,
     now: Callable[[], datetime],
     nonce: Callable[[], str],
-    encode_clock: Callable[[], float],
 ) -> VoiceServices:
-    """Build the voice store for `runtime`'s codec, scan `voices_dir` into the registry, and
-    build the (empty) voice prefix cache. Blocking file I/O: `load_in_background` runs it on a
-    worker thread. `now` stamps a saved voice's `created_at`, `nonce` names the store's
-    temporary files, and `encode_clock` times each encode (`encode_ms`).
+    """Build the voice store for the loaded model's codec, scan `voices_dir`, and register every
+    voice it loads with its measured prefix length (`synthesis.measure_voice_prefix`). Blocking
+    file I/O and tokenizing: `load_in_background` runs it on a worker thread. The measuring uses
+    the model load's pre-gate tokenizer copy, which nothing else uses until `mark_ready` installs
+    it. `now` stamps a saved voice's `created_at` and `nonce` names the store's temporary files.
     """
+    runtime = loaded.runtime
     model_config = runtime.model.config
     store = VoiceStore(
         voices_dir,
@@ -345,28 +358,29 @@ def open_voices(
         nonce=nonce,
     )
     scan = store.scan()
-    registry = VoiceRegistry(clock=encode_clock)
-    registry.load_from_scan(scan.voices, scan.skipped)
-    prefix_cache = VoicePrefixCache(
-        budget_bytes=VOICE_PREFIX_CACHE_BYTES,
-        bytes_per_token=prefix_bytes_per_token(runtime),
-        on_event=events.emit,
-    )
+    measured = [
+        (voice, measure_voice_prefix(runtime, loaded.cpu_tokenizer, voice.codes, voice.ref_text))
+        for voice in scan.voices
+    ]
+    registry = VoiceRegistry()
+    registry.load_from_scan(measured, scan.skipped)
     return VoiceServices(store=store, registry=registry, prefix_cache=prefix_cache)
 
 
-def _open_checkpoint_voices(runtime: Any, *, settings: Settings, events: Emitter) -> VoiceServices:
-    """`open_voices` for the served checkpoint, with the real clocks and nonces. The codec is
+def _open_checkpoint_voices(
+    loaded: LoadedModel, prefix_cache: VoicePrefixCache, *, settings: Settings, events: Emitter
+) -> VoiceServices:
+    """`open_voices` for the served checkpoint, with the real clock and nonces. The codec is
     fingerprinted from the same `audio_tokenizer` directory `runtime.load_runtime` loads it
     from."""
     return open_voices(
-        runtime,
+        loaded,
+        prefix_cache,
         voices_dir=settings.voices_dir,
         events=events,
         codec_fingerprint=audio.codec_fingerprint(settings.model_path / "audio_tokenizer"),
         now=lambda: datetime.now(timezone.utc),
         nonce=lambda: os.urandom(8).hex(),
-        encode_clock=time.perf_counter,
     )
 
 
@@ -652,8 +666,9 @@ def _record_drain_failure(outcome: ServeOutcome, drain: asyncio.Task[bool]) -> N
 
 
 async def _drain_gpu(components: Components, server: uvicorn.Server) -> bool:
-    """Close every open generation on the GPU thread, then stop the CPU tokenizer's executor
-    and the GPU thread, within `GPU_DRAIN_SECONDS`. Returns whether the GPU thread stopped."""
+    """Close every open generation on the GPU thread, then stop the CPU tokenizer's executors,
+    the voice thread and the GPU thread, within `GPU_DRAIN_SECONDS`. Returns whether the GPU
+    thread stopped."""
     # Requests uvicorn left running: it doesn't cancel them on a forced exit, and cancels
     # without waiting when the graceful timeout expires. Each one's GpuSession queues its
     # gen.close() as it unwinds, and the GPU thread must still be there to run it.
@@ -664,10 +679,11 @@ async def _drain_gpu(components: Components, server: uvicorn.Server) -> bool:
     deadline = loop.time() + GPU_DRAIN_SECONDS
     if requests:
         await asyncio.wait(requests, timeout=GPU_DRAIN_SECONDS)
-    # No request is left to need either of its workers (the pre-gate checks and the anchor
-    # sizing). Without waiting: a call already running takes well under a second and ends on
-    # its own.
+    # No request is left to need the CPU tokenizer's workers (the pre-gate checks and the
+    # anchor sizing) or the voice thread. Without waiting: a call already running takes well
+    # under a second and ends on its own (a voice change's file write included).
     components.cpu_tokenizer.shutdown()
+    components.voices.shutdown()
     remaining = max(0.0, deadline - loop.time())
     return await asyncio.to_thread(components.gpu.shutdown, remaining)
 

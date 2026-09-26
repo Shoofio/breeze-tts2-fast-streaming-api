@@ -116,7 +116,7 @@ def _components(gpu_env) -> tuple[Components, RecordingEvents]:
         cpu_tokenizer=CpuTokenizer(),
         open_voices=open_no_voices,
     )
-    components.mark_ready(_shared_loaded_model(gpu_env.runtime))
+    components.mark_ready(_shared_loaded_model(gpu_env.runtime), open_no_voices(None))
     return components, events
 
 

@@ -21,14 +21,14 @@ from __future__ import annotations
 
 import hashlib
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 from breeze_infer.limits import UNNAMED_VOICE_CAP
-from breeze_infer.voice_file import CaseInsensitiveNames, VoiceFile
+from breeze_infer.voice_file import CaseInsensitiveNames, VoiceFile, prefix_key
 from breeze_infer.voice_store import SkippedVoiceFile
 
 
@@ -84,34 +84,45 @@ class NameTaken(Exception):
 class SavedVoice:
     """A saved voice. Its codes are kept in memory, loaded at scan or registration, so a
     speech request resolves the voice without reading its file (T066): about 12 KB for a 30 s
-    reference (376 frames x 16 codebooks, int16)."""
+    reference (376 frames x 16 codebooks, int16).
+
+    `prefix_len` (the length its KV prefix builds to, `synthesis.measure_voice_prefix`) and
+    `prefix_key` (its prefix cache key, `voice_file.prefix_key`) are computed once, when the
+    voice is registered or scanned, so no speech request re-measures or re-hashes them."""
 
     id: str
     ref_text: str
     codes: np.ndarray
     frames: int
     encode_ms: int
+    prefix_len: int
+    prefix_key: tuple[str, str]
 
     @classmethod
-    def from_file(cls, voice: VoiceFile) -> SavedVoice:
+    def from_file(cls, voice: VoiceFile, prefix_len: int) -> SavedVoice:
         return cls(
             id=voice.id,
             ref_text=voice.ref_text,
             codes=voice.codes,
             frames=voice.frames,
             encode_ms=voice.encode_ms,
+            prefix_len=prefix_len,
+            prefix_key=prefix_key(voice.id, voice.ref_text, voice.codes),
         )
 
 
 @dataclass(frozen=True)
 class MemoryVoice:
-    """An unnamed voice: codes live only in memory, for this process's life."""
+    """An unnamed voice: codes live only in memory, for this process's life. `prefix_len` and
+    `prefix_key` as for `SavedVoice`."""
 
     id: str
     ref_text: str
     codes: np.ndarray
     frames: int
     encode_ms: int
+    prefix_len: int
+    prefix_key: tuple[str, str]
 
 
 @dataclass(frozen=True)
@@ -121,6 +132,8 @@ class ResolvedVoice:
     id: str
     ref_text: str
     codes: np.ndarray  # [frames, codebooks]
+    prefix_len: int
+    prefix_key: tuple[str, str]
 
 
 @dataclass(frozen=True)
@@ -154,13 +167,11 @@ class VoiceRegistry:
     names), the unnamed cap and eviction, and `GET /v1/voices`'s listing order.
 
     One lock, held only over the plain dict/list bookkeeping below -- never across I/O
-    (a file write/rename) or the GPU (an encode). `clock` is exposed for a caller timing
-    an encode step (`encode_ms`) around the GPU work that must happen outside this
-    lock; the registry itself never calls it.
+    (a file write/rename), the GPU (an encode) or hashing (a record's `prefix_key` is computed
+    before the lock is taken).
     """
 
-    def __init__(self, *, cap: int = UNNAMED_VOICE_CAP, clock: Callable[[], float]) -> None:
-        self.clock = clock
+    def __init__(self, *, cap: int = UNNAMED_VOICE_CAP) -> None:
         self._cap = int(cap)
         self._lock = threading.Lock()
         self._saved: dict[str, SavedVoice] = {}  # id (as saved) -> SavedVoice
@@ -193,20 +204,22 @@ class VoiceRegistry:
     # ------------------------------------------------------------------- startup
 
     def load_from_scan(
-        self, voices: Iterable[VoiceFile], skipped: Iterable[SkippedVoiceFile]
+        self, voices: Iterable[tuple[VoiceFile, int]], skipped: Iterable[SkippedVoiceFile]
     ) -> None:
         """Rebuild the saved-voice and reserved-name state from one
-        `VoiceStore.scan()` result. Startup only: unnamed voices never survive a
-        restart (data-model.md "Lifecycle"), so this also clears them.
+        `VoiceStore.scan()` result: each loaded voice with its measured prefix length, and
+        the skipped files. Startup only: unnamed voices never survive a restart
+        (data-model.md "Lifecycle"), so this also clears them.
         """
+        saved = [SavedVoice.from_file(voice, prefix_len) for voice, prefix_len in voices]
         with self._lock:
             self._saved.clear()
             self._name_index.clear()
             self._reserved.clear()
             self._unnamed.clear()
             self._unnamed_order.clear()
-            for voice in voices:
-                self._saved[voice.id] = SavedVoice.from_file(voice)
+            for voice in saved:
+                self._saved[voice.id] = voice
                 self._name_index[CaseInsensitiveNames.key(voice.id)] = voice.id
             for item in skipped:
                 if item.name is not None:
@@ -214,15 +227,15 @@ class VoiceRegistry:
 
     # --------------------------------------------------------------- registering
 
-    def register_saved(self, voice: VoiceFile) -> VoiceEntry:
-        """Add a voice the store has already committed to disk. Raises `NameTaken` if
-        `voice.id` is no longer free -- the caller's own commit-time re-check (T065)
-        should have ruled this out already; this is the in-memory side of the same
-        guarantee, not a second source of truth."""
+    def register_saved(self, voice: VoiceFile, *, prefix_len: int) -> VoiceEntry:
+        """Add a voice the store has already committed to disk, with its measured prefix
+        length. Raises `NameTaken` if `voice.id` is no longer free -- the caller's own
+        commit-time re-check (T065) should have ruled this out already; this is the
+        in-memory side of the same guarantee, not a second source of truth."""
+        saved = SavedVoice.from_file(voice, prefix_len)
         with self._lock:
             if self._name_taken_locked(voice.id):
                 raise NameTaken(voice.id)
-            saved = SavedVoice.from_file(voice)
             self._saved[voice.id] = saved
             self._name_index[CaseInsensitiveNames.key(voice.id)] = voice.id
             return _entry(saved, saved=True)
@@ -236,7 +249,14 @@ class VoiceRegistry:
             return _entry(voice, saved=False) if voice is not None else None
 
     def register_unnamed(
-        self, *, id: str, ref_text: str, codes: np.ndarray, frames: int, encode_ms: int
+        self,
+        *,
+        id: str,
+        ref_text: str,
+        codes: np.ndarray,
+        frames: int,
+        encode_ms: int,
+        prefix_len: int,
     ) -> tuple[VoiceEntry, str | None]:
         """Insert a new unnamed voice, evicting the oldest unnamed one first if the cap
         (BC-48: saved voices never count) is already reached. An id already present is
@@ -246,6 +266,7 @@ class VoiceRegistry:
         Returns `(entry, evicted_id)`, so a caller can drop `evicted_id` from the
         prefix cache too.
         """
+        key = prefix_key(id, ref_text, codes)
         with self._lock:
             existing = self._unnamed.get(id)
             if existing is not None:
@@ -256,7 +277,15 @@ class VoiceRegistry:
                 evicted = self._unnamed_order.pop(0)
                 del self._unnamed[evicted]
 
-            voice = MemoryVoice(id=id, ref_text=ref_text, codes=codes, frames=frames, encode_ms=encode_ms)
+            voice = MemoryVoice(
+                id=id,
+                ref_text=ref_text,
+                codes=codes,
+                frames=frames,
+                encode_ms=encode_ms,
+                prefix_len=prefix_len,
+                prefix_key=key,
+            )
             self._unnamed[id] = voice
             self._unnamed_order.append(id)
             return _entry(voice, saved=False), evicted
@@ -268,7 +297,13 @@ class VoiceRegistry:
             voice = self._saved.get(voice_id) or self._unnamed.get(voice_id)
             if voice is None:
                 return None
-            return ResolvedVoice(id=voice.id, ref_text=voice.ref_text, codes=voice.codes)
+            return ResolvedVoice(
+                id=voice.id,
+                ref_text=voice.ref_text,
+                codes=voice.codes,
+                prefix_len=voice.prefix_len,
+                prefix_key=voice.prefix_key,
+            )
 
     # -------------------------------------------------------------------- removing
 

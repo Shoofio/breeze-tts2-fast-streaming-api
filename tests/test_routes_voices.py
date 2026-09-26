@@ -27,27 +27,35 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import numpy as np
 import pytest
 import soundfile as sf
 import torch
 from fastapi.testclient import TestClient
 
-from breeze_infer import api
+from breeze_infer import api, reference_audio, routes_voices, voice_file
 from breeze_infer.api import Components, create_app, load_in_background
 from breeze_infer.events import Emitter
 from breeze_infer.gpu import GpuGate, GpuThread
 from breeze_infer.limits import UNNAMED_VOICE_CAP
 from breeze_infer.model_loading import LoadedModel
+from breeze_infer.reference_audio import MAX_REF_FRAMES
 from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.settings import settings_from_args
-from breeze_infer.voice_registry import unnamed_id
+from breeze_infer.templates import prepare_prefix_inputs
+from breeze_infer.voice_prefix import VoicePrefixCache
+from breeze_infer.voice_registry import NameTaken, VoiceRegistry, unnamed_id
+from models.fast_streaming import MIN_SUFFIX_ROOM
 from tests.fakes import (
+    CODEC_CODEBOOK_SIZE,
+    CODEC_CODEBOOKS,
     CODEC_SAMPLE_RATE,
     CODEC_SAMPLES_PER_FRAME,
     FakeCodec,
     FakeRuntime,
+    FakeStreamingConfig,
     FakeTokenizer,
     RecordingEvents,
     codec_frame_count,
@@ -64,22 +72,25 @@ ENCODE_SECONDS = 0.8123
 
 
 class _EncodeClock:
-    """Advances `ENCODE_SECONDS` per reading, so every encode (two readings) lasts exactly
-    that long."""
+    """Advances `seconds` (`ENCODE_SECONDS` unless given) per reading, so every encode (two
+    readings) lasts exactly that long."""
 
-    def __init__(self) -> None:
+    def __init__(self, seconds: float = ENCODE_SECONDS) -> None:
+        self._seconds = seconds
         self._now = 0.0
 
     def __call__(self) -> float:
-        self._now += ENCODE_SECONDS
+        self._now += self._seconds
         return self._now
 
 
-def _runtime() -> FakeRuntime:
+def _runtime(max_seq_len: int | None = None) -> FakeRuntime:
     """A `FakeRuntime` with what the voice routes and `api.open_voices` read off the real
     `FastBreezeStreamingRuntime`: the audio tokenizer, the model config (codebooks, codebook
-    size, and the backbone's attention shape for the prefix cache's KV estimate) and `dtype`."""
-    runtime = FakeRuntime()
+    size, and the backbone's attention shape for the prefix cache's KV estimate), `dtype`,
+    and the context length (`config.max_seq_len`, 1,024 unless given)."""
+    config = FakeStreamingConfig() if max_seq_len is None else FakeStreamingConfig(max_seq_len=max_seq_len)
+    runtime = FakeRuntime(config=config)
     runtime.tokenizer = FakeTokenizer()
     runtime.model = model_with_codec_facts()
     config = runtime.model.config
@@ -91,6 +102,15 @@ def _runtime() -> FakeRuntime:
     runtime.dtype = torch.bfloat16
     runtime.audio_tokenizer = FakeCodec()
     return runtime
+
+
+def _loaded(runtime: FakeRuntime | None = None) -> LoadedModel:
+    return LoadedModel(
+        runtime=runtime if runtime is not None else _runtime(),
+        report={},
+        cpu_tokenizer=FakeTokenizer(),
+        sizing_tokenizer=FakeTokenizer(),
+    )
 
 
 def _wav(seconds: float = 0.5, sample_rate: int = 16000, pitch: float = 220.0) -> bytes:
@@ -105,7 +125,13 @@ def _wav(seconds: float = 0.5, sample_rate: int = 16000, pitch: float = 220.0) -
 class _Server:
     """One started app: its components, client, fake runtime and recorded events."""
 
-    def __init__(self, voices_dir: Path, *, runtime: FakeRuntime | None = None) -> None:
+    def __init__(
+        self,
+        voices_dir: Path,
+        *,
+        runtime: FakeRuntime | None = None,
+        encode_seconds: float = ENCODE_SECONDS,
+    ) -> None:
         self.voices_dir = voices_dir
         self.events = RecordingEvents()
         self.runtime = runtime if runtime is not None else _runtime()
@@ -125,7 +151,6 @@ class _Server:
                 codec_fingerprint=FINGERPRINT,
                 now=lambda: datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc),
                 nonce=lambda: f"n{next(nonces)}",
-                encode_clock=_EncodeClock(),
             ),
         )
         loaded = LoadedModel(
@@ -136,7 +161,19 @@ class _Server:
         )
         server = SimpleNamespace(should_exit=False)
         assert asyncio.run(load_in_background(self.components, lambda: loaded, server))
-        self.client = TestClient(create_app(self.components), raise_server_exceptions=False)
+        self.app = create_app(self.components, clock=_EncodeClock(encode_seconds))
+        self.client = TestClient(self.app, raise_server_exceptions=False)
+
+    def run_async(self, scenario: Any) -> Any:
+        """Run `scenario(client)` with an async client on this app, in one event loop, so a
+        test can hold several requests in flight at once or cancel one."""
+
+        async def main() -> Any:
+            transport = httpx.ASGITransport(app=self.app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+                return await scenario(client)
+
+        return asyncio.run(main())
 
     @property
     def services(self) -> Any:
@@ -505,12 +542,10 @@ def test_a_write_failure_gets_500_voice_write_failed_and_closes_the_connection(
     assert "No space left on device" in failed["error"]
 
 
-def test_the_store_is_called_off_the_event_loop_under_the_write_lock(start: Any) -> None:
-    """VoiceStore holds its lock across a rename and an fsync: never on the event loop. Each
-    store change runs under `write_lock`, with the registry update that goes with it."""
+def test_the_store_is_never_called_on_the_event_loop(start: Any) -> None:
+    """VoiceStore holds its lock across a rename and an fsync: never on the event loop."""
     server = start()
     on_loop: list[bool] = []
-    locked: list[bool] = []
     store = server.services.store
 
     def spy(method: Any) -> Any:
@@ -520,7 +555,6 @@ def test_the_store_is_called_off_the_event_loop_under_the_write_lock(start: Any)
                 on_loop.append(True)
             except RuntimeError:
                 on_loop.append(False)
-            locked.append(server.services.write_lock.locked())
             return method(*args)
 
         return call
@@ -531,7 +565,6 @@ def test_the_store_is_called_off_the_event_loop_under_the_write_lock(start: Any)
     assert server.post(audio=_wav(), name="alice").status_code == 200
     assert server.delete("alice").status_code == 200
     assert on_loop == [False, False]
-    assert locked == [True, True]
 
 
 def test_evicting_an_unnamed_voice_drops_its_cached_prefix(start: Any) -> None:
@@ -827,19 +860,19 @@ def test_the_scan_runs_after_the_load_on_a_worker_thread_and_before_ready(tmp_pa
             runtime=runtime, report={}, cpu_tokenizer=FakeTokenizer(), sizing_tokenizer=FakeTokenizer()
         )
 
-    def open_voices(loaded_runtime: Any) -> Any:
-        assert loaded_runtime is runtime
+    def open_voices(loaded: Any, prefix_cache: Any) -> Any:
+        assert loaded.runtime is runtime
         order.append(f"scan on {threading.current_thread().name}")
         scan_started.set()
         assert finish_scan.wait(10)
         return api.open_voices(
-            loaded_runtime,
+            loaded,
+            prefix_cache,
             voices_dir=tmp_path,
             events=events,
             codec_fingerprint=FINGERPRINT,
             now=lambda: datetime(2026, 9, 26, tzinfo=timezone.utc),
             nonce=lambda: "n",
-            encode_clock=_EncodeClock(),
         )
 
     components = Components(
@@ -883,7 +916,7 @@ def test_a_failed_scan_stops_the_server_and_it_never_reports_ready(tmp_path: Pat
     readiness = Readiness()
     runtime = _runtime()
 
-    def open_voices(_runtime: Any) -> Any:
+    def open_voices(*_args: Any) -> Any:
         raise PermissionError(13, "Permission denied", str(tmp_path))
 
     components = Components(
@@ -924,7 +957,7 @@ def test_a_failed_model_load_reports_the_model_stage_and_never_scans(tmp_path: P
         readiness=Readiness(),
         ws_port=lambda: 0,
         cpu_tokenizer=CpuTokenizer(),
-        open_voices=lambda _runtime: scanned.append(True),
+        open_voices=lambda *_args: scanned.append(True),
     )
 
     def load() -> LoadedModel:
@@ -955,13 +988,13 @@ def test_open_voices_loads_saved_voices_and_reserves_skipped_names(tmp_path: Pat
     events = RecordingEvents()
 
     services = api.open_voices(
-        _runtime(),
+        _loaded(),
+        VoicePrefixCache(bytes_per_token=1, on_event=events.emit),
         voices_dir=tmp_path,
         events=events,
         codec_fingerprint=FINGERPRINT,
         now=lambda: datetime(2026, 9, 26, tzinfo=timezone.utc),
         nonce=lambda: "n",
-        encode_clock=_EncodeClock(),
     )
 
     assert [record["id"] for record in services.registry.list_records(
@@ -981,13 +1014,13 @@ def test_a_voice_file_from_another_codec_is_skipped(tmp_path: Path) -> None:
     events = RecordingEvents()
 
     services = api.open_voices(
-        _runtime(),
+        _loaded(),
+        VoicePrefixCache(bytes_per_token=1, on_event=events.emit),
         voices_dir=tmp_path,
         events=events,
         codec_fingerprint="0" * 64,
         now=lambda: datetime(2026, 9, 26, tzinfo=timezone.utc),
         nonce=lambda: "n",
-        encode_clock=_EncodeClock(),
     )
 
     assert services.registry.saved_count() == 0
@@ -1006,3 +1039,523 @@ def test_components_require_open_voices() -> None:
             ws_port=lambda: 0,
             cpu_tokenizer=CpuTokenizer(),
         )
+
+
+# ------------------------------------------------------------------------ review 41 on 0ba6165
+
+
+async def _until(condition: Any, *, seconds: float = 10.0) -> None:
+    """Poll `condition()` on the event loop, which keeps running (unlike a blocking wait)."""
+    for _ in range(int(seconds / 0.01)):
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition never became true")
+
+
+def _post_async(client: httpx.AsyncClient, wav: bytes, **data: str) -> Any:
+    return client.post(VOICES, data=data, files={"ref_audio": ("ref.wav", wav, "audio/wav")})
+
+
+def _prefix_len(ref_text: str, frames: int) -> int:
+    """The prefix length the runtime's `build_reference_prefix` gives a voice: its inputs'
+    length, assembled on the CPU from the fake model's config."""
+    inputs = prepare_prefix_inputs(
+        FakeTokenizer(),
+        model_with_codec_facts(),
+        {"ref_text": ref_text, "ref_audio_codes": torch.zeros((frames, CODEC_CODEBOOKS), dtype=torch.int16)},
+    )
+    return int(inputs["attention_mask"].shape[1])
+
+
+@pytest.mark.parametrize(
+    ("frames", "codebooks", "value"),
+    [
+        (0, CODEC_CODEBOOKS, 0),
+        (MAX_REF_FRAMES + 1, CODEC_CODEBOOKS, 0),
+        (5, CODEC_CODEBOOKS - 1, 0),
+        (5, CODEC_CODEBOOKS, CODEC_CODEBOOK_SIZE),
+        (5, CODEC_CODEBOOKS, -1),
+    ],
+    ids=["no_frames", "too_many_frames", "wrong_codebooks", "code_too_large", "negative_code"],
+)
+@pytest.mark.parametrize("name", ["alice", None], ids=["named", "unnamed"])
+def test_41_1_an_encode_that_breaks_the_voice_file_rules_is_a_500_and_nothing_is_kept(
+    start: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    frames: int,
+    codebooks: int,
+    value: int,
+    name: str | None,
+) -> None:
+    """The rules `voice_file.decode` applies at scan, applied before commit: otherwise the
+    voice answers 200, then vanishes at the next restart while its file keeps the name."""
+    server = start()
+    codes = torch.full((frames, codebooks), value, dtype=torch.int64)
+    monkeypatch.setattr(routes_voices, "encode_prompt_waveform", lambda *_args: codes)
+
+    response = server.post(audio=_wav(), name=name)
+
+    # The catch-all's 500, like speech's "no audio" 500: uvicorn closes the connection after an
+    # unhandled error, which the test client can't show.
+    _assert_error(response, 500, "internal_error")
+    [failed] = server.events_named("request.failed")
+    assert failed["request_id"] == response.headers["x-request-id"]
+    assert server.listing() == []
+    assert list(server.voices_dir.glob("*.voice.json")) == []
+    assert server.events_named("voice.created") == []
+    assert server.gate_is_free()
+
+
+def test_41_1_an_encode_over_the_encode_ms_bound_is_a_500(start: Any) -> None:
+    server = start(encode_seconds=(voice_file.MAX_ENCODE_MS + 1) / 1000)
+
+    _assert_error(server.post(audio=_wav(), name="alice"), 500, "internal_error")
+    assert server.listing() == []
+    assert list(server.voices_dir.glob("*.voice.json")) == []
+
+
+def test_41_1_a_frame_count_other_than_predicted_emits_a_mismatch_event(
+    start: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = start()
+    wav = _wav()
+    predicted = _expected_frames(wav)
+    codes = torch.zeros((predicted + 1, CODEC_CODEBOOKS), dtype=torch.int64)
+    monkeypatch.setattr(routes_voices, "encode_prompt_waveform", lambda *_args: codes)
+
+    response = server.post(audio=wav, name="alice")
+
+    assert response.status_code == 200
+    assert response.json()["frames"] == predicted + 1
+    assert server.events_named("voice.frame_prediction_mismatch") == [
+        {
+            "level": "warning",
+            "request_id": response.headers["x-request-id"],
+            "predicted_frames": predicted,
+            "actual_frames": predicted + 1,
+        }
+    ]
+
+
+def test_41_1_a_frame_count_as_predicted_emits_no_mismatch_event(start: Any) -> None:
+    server = start()
+
+    assert server.post(audio=_wav(), name="alice").status_code == 200
+
+    assert server.events_named("voice.frame_prediction_mismatch") == []
+
+
+def test_41_2_an_identical_unnamed_post_that_missed_the_dedupe_is_answered_from_the_registry(
+    start: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B misses the dedupe and starts decoding; A, identical, registers meanwhile. B dedupes
+    again before the gate, so it neither encodes nor reports a second `voice.created`."""
+    server = start()
+    wav = _wav()
+    real_decode = reference_audio.decode
+    decodes: list[int] = []
+    b_decoding = threading.Event()
+    release_b = threading.Event()
+
+    def decode(blob: bytes) -> Any:
+        decodes.append(1)
+        if len(decodes) == 1:  # B's
+            b_decoding.set()
+            assert release_b.wait(10)
+        return real_decode(blob)
+
+    monkeypatch.setattr(reference_audio, "decode", decode)
+
+    async def scenario(client: httpx.AsyncClient) -> tuple[Any, Any]:
+        b = asyncio.create_task(_post_async(client, wav, ref_text="same"))
+        await _until(b_decoding.is_set)
+        a = await _post_async(client, wav, ref_text="same")
+        release_b.set()
+        return a, await b
+
+    a, b = server.run_async(scenario)
+
+    assert a.status_code == 200 and b.status_code == 200
+    assert b.json() == a.json()
+    assert server.runtime.audio_tokenizer.encode_calls == 1
+    assert len(server.events_named("voice.created")) == 1
+
+
+def test_41_2_a_second_encode_of_the_same_unnamed_voice_reports_no_second_creation(
+    start: Any,
+) -> None:
+    """The window the gate's done-callback leaves: A's encode has finished and freed the
+    gate, but A is not registered yet. An identical B passes both dedupes, encodes, and finds
+    A's entry only when it registers: it answers with A's entry and creates nothing."""
+    server = start()
+    wav = _wav()
+    registry = server.services.registry
+    real_register = registry.register_unnamed
+    a_registering = threading.Event()
+    release_a = threading.Event()
+    registrations: list[str] = []
+
+    def register_unnamed(**kwargs: Any) -> Any:
+        registrations.append(kwargs["id"])
+        if len(registrations) == 1:
+            a_registering.set()
+            assert release_a.wait(10)
+        return real_register(**kwargs)
+
+    registry.register_unnamed = register_unnamed  # type: ignore[method-assign]
+
+    async def scenario(client: httpx.AsyncClient) -> tuple[Any, Any]:
+        a = asyncio.create_task(_post_async(client, wav, ref_text="same"))
+        await _until(a_registering.is_set)
+        b = asyncio.create_task(_post_async(client, wav, ref_text="same"))
+        await _until(lambda: server.runtime.audio_tokenizer.encode_calls == 2)
+        release_a.set()
+        return await a, await b
+
+    a, b = server.run_async(scenario)
+
+    assert a.status_code == 200 and b.status_code == 200
+    assert b.json() == a.json()
+    assert [record["id"] for record in server.listing()] == [a.json()["id"]]
+    [created] = server.events_named("voice.created")
+    assert created["request_id"] == a.headers["x-request-id"]
+
+
+def test_41_3_a_name_the_registry_refuses_after_the_file_is_written_is_rolled_back(
+    start: Any,
+) -> None:
+    server = start()
+    registry = server.services.registry
+    real_register = registry.register_saved
+
+    def refuse(voice: Any, **kwargs: Any) -> Any:
+        raise NameTaken(voice.id)
+
+    registry.register_saved = refuse  # type: ignore[method-assign]
+
+    _assert_error(server.post(audio=_wav(), name="alice"), 409, "voice_exists")
+
+    assert list(server.voices_dir.glob("*.voice.json")) == []
+    assert server.listing() == []
+    assert server.events_named("voice.created") == []
+    assert server.gate_is_free()
+    registry.register_saved = real_register  # type: ignore[method-assign]
+    assert server.post(audio=_wav(), name="alice").status_code == 200  # the store let go too
+
+
+def test_41_3_a_file_removed_for_an_id_the_registry_did_not_hold_is_a_200_and_reported(
+    start: Any,
+) -> None:
+    server = start()
+    assert server.post(audio=_wav(), name="alice").status_code == 200
+    server.services.registry.remove = lambda _voice_id: None  # type: ignore[method-assign]
+
+    response = server.delete("alice")
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted": "alice", "file_kept": False}
+    assert not (server.voices_dir / "alice.voice.json").exists()
+    assert server.events_named("voice.store_mismatch") == [
+        {
+            "level": "warning",
+            "request_id": response.headers["x-request-id"],
+            "voice_id": "alice",
+            "file_removed": True,
+            "kind": None,
+        }
+    ]
+    assert server.events_named("voice.deleted") == []
+
+
+def test_41_4_a_delete_cancelled_while_the_store_works_still_drops_the_prefix_and_reports(
+    start: Any,
+) -> None:
+    server = start()
+    assert server.post(audio=_wav(), name="alice").status_code == 200
+    store = server.services.store
+    real_remove = store.remove
+    removing = threading.Event()
+    release = threading.Event()
+    invalidated: list[str] = []
+    cache = server.services.prefix_cache
+    real_invalidate = cache.invalidate
+
+    def remove(voice_id: str) -> bool:
+        removing.set()
+        assert release.wait(10)
+        return real_remove(voice_id)
+
+    def invalidate(voice_id: str, *, request_id: str | None = None) -> bool:
+        invalidated.append(voice_id)
+        return real_invalidate(voice_id, request_id=request_id)
+
+    store.remove = remove  # type: ignore[method-assign]
+    cache.invalidate = invalidate  # type: ignore[method-assign]
+
+    async def scenario(client: httpx.AsyncClient) -> None:
+        delete = asyncio.create_task(client.delete(f"{VOICES}/alice"))
+        await _until(removing.is_set)
+        delete.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await delete
+        release.set()
+        await _until(lambda: bool(server.events_named("voice.deleted")))
+
+    server.run_async(scenario)
+
+    assert invalidated == ["alice"]
+    [deleted] = server.events_named("voice.deleted")
+    assert deleted["voice_id"] == "alice"
+    assert server.listing() == []
+
+
+def test_41_4_a_post_cancelled_while_the_store_works_still_reports_the_creation(
+    start: Any,
+) -> None:
+    server = start()
+    store = server.services.store
+    real_create = store.create
+    creating = threading.Event()
+    release = threading.Event()
+
+    def create(voice: Any) -> Any:
+        creating.set()
+        assert release.wait(10)
+        return real_create(voice)
+
+    store.create = create  # type: ignore[method-assign]
+
+    async def scenario(client: httpx.AsyncClient) -> None:
+        post = asyncio.create_task(_post_async(client, _wav(), ref_text="t", name="alice"))
+        await _until(creating.is_set)
+        post.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await post
+        release.set()
+        await _until(lambda: bool(server.events_named("voice.created")))
+
+    server.run_async(scenario)
+
+    [created] = server.events_named("voice.created")
+    assert created["voice_id"] == "alice"
+    assert [record["id"] for record in server.listing()] == ["alice"]
+
+
+def test_41_5_mark_ready_requires_the_voices(tmp_path: Path) -> None:
+    components = Components(
+        settings=settings_from_args([MODEL_DIR]),
+        events=Emitter(io.StringIO(), lambda: 0.0),
+        gate=GpuGate(),
+        gpu=GpuThread("cpu", lambda _device: None),
+        readiness=Readiness(),
+        ws_port=lambda: 0,
+        cpu_tokenizer=CpuTokenizer(),
+        open_voices=open_no_voices,
+    )
+    loaded = LoadedModel(
+        runtime=_runtime(), report={}, cpu_tokenizer=FakeTokenizer(), sizing_tokenizer=FakeTokenizer()
+    )
+    try:
+        with pytest.raises(TypeError, match="voices"):
+            components.mark_ready(loaded)  # type: ignore[call-arg]
+        assert components.readiness.runtime is None
+    finally:
+        components.gpu.shutdown()
+
+
+def test_41_6_store_and_registry_changes_run_on_the_one_voice_thread(start: Any) -> None:
+    """Not asyncio's default pool, which the speech route's decode and form parsing share:
+    one thread of the voice services' own, which also serialises every change."""
+    server = start()
+    services = server.services
+    threads: list[tuple[str, str]] = []
+
+    def spy(owner: Any, name: str) -> None:
+        method = getattr(owner, name)
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            threads.append((name, threading.current_thread().name))
+            return method(*args, **kwargs)
+
+        setattr(owner, name, call)
+
+    for name in ("create", "remove"):
+        spy(services.store, name)
+    for name in ("register_saved", "register_unnamed", "remove"):
+        spy(services.registry, name)
+
+    assert server.post(audio=_wav(), name="alice").status_code == 200
+    unnamed = server.post(audio=_wav(), ref_text="unnamed").json()["id"]
+    assert server.delete("alice").status_code == 200
+    assert server.delete(unnamed).status_code == 200
+
+    assert [name for name, _thread in threads] == [
+        "create", "register_saved", "register_unnamed", "remove", "remove", "remove", "remove",
+    ]
+    assert len({thread for _name, thread in threads}) == 1
+    assert threads[0][1].startswith("breeze-voices")
+    assert not hasattr(services, "write_lock")
+
+
+def test_41_7_the_server_stop_shuts_the_voice_thread_down(start: Any) -> None:
+    server = start()
+    services = server.services
+
+    drained = asyncio.run(
+        api._drain_gpu(server.components, SimpleNamespace(server_state=SimpleNamespace(tasks=set())))
+    )
+
+    assert drained
+    with pytest.raises(RuntimeError, match="shutdown"):
+        services.executor.submit(lambda: None)
+
+
+def test_41_8_voice_file_encode_uses_the_one_checksum_helper(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(voice_file, "codes_sha256", lambda _codes: "from-the-helper")
+
+    raw = voice_file.encode(
+        id="alice",
+        ref_text="t",
+        codes=np.zeros((2, CODEC_CODEBOOKS), dtype=np.int16),
+        codec_fingerprint=FINGERPRINT,
+        encode_ms=1,
+        created_at="2026-09-26T12:00:00Z",
+    )
+
+    assert json.loads(raw)["codes_sha256"] == "from-the-helper"
+
+
+def test_41_9_the_registry_has_no_clock_the_encode_clock_is_the_routes() -> None:
+    registry = VoiceRegistry()
+
+    assert not hasattr(registry, "clock")
+
+
+def test_41_10_a_model_config_problem_fails_startup_in_the_model_stage(tmp_path: Path) -> None:
+    sink = io.StringIO()
+    runtime = _runtime()
+    del runtime.model.config.num_hidden_layers  # the prefix cache can't be sized
+    opened: list[bool] = []
+
+    def open_voices(*args: Any) -> Any:
+        opened.append(True)
+        raise AssertionError("the voices stage must not start")
+
+    components = Components(
+        settings=settings_from_args([MODEL_DIR]),
+        events=Emitter(sink, lambda: 0.0),
+        gate=GpuGate(),
+        gpu=GpuThread("cpu", lambda _device: None),
+        readiness=Readiness(),
+        ws_port=lambda: 0,
+        cpu_tokenizer=CpuTokenizer(),
+        open_voices=open_voices,
+    )
+    loaded = LoadedModel(
+        runtime=runtime, report={}, cpu_tokenizer=FakeTokenizer(), sizing_tokenizer=FakeTokenizer()
+    )
+    try:
+        assert not asyncio.run(
+            load_in_background(components, lambda: loaded, SimpleNamespace(should_exit=False))
+        )
+    finally:
+        components.gpu.shutdown()
+
+    assert opened == []
+    [failed] = [json.loads(line) for line in sink.getvalue().splitlines()]
+    assert failed["event"] == "model.load_failed"
+    assert failed["stage"] == "model"
+
+
+# --------------------------------------------- additions A and B: overlong prefixes, int16 codes
+
+
+@pytest.mark.parametrize("name", ["alice", None], ids=["named", "unnamed"])
+def test_a_a_voice_whose_prefix_leaves_no_room_is_refused_before_busy_and_the_encode(
+    start: Any, name: str | None
+) -> None:
+    wav = _wav()
+    length = _prefix_len("hello there", _expected_frames(wav))
+    # One slot short: the longest prefix the runtime builds is max_seq_len - 1 - MIN_SUFFIX_ROOM.
+    server = start(runtime=_runtime(max_seq_len=length + MIN_SUFFIX_ROOM))
+    lease = server.components.gate.try_acquire()
+    assert lease is not None
+    try:
+        body = _assert_error(server.post(audio=wav, name=name), 400, "voice_too_long")
+    finally:
+        lease.release()
+
+    assert "context" in body["error"]
+    assert server.runtime.audio_tokenizer.encode_calls == 0
+    assert server.listing() == []
+    assert list(server.voices_dir.glob("*.voice.json")) == []
+
+
+def test_a_a_voice_whose_prefix_just_fits_is_registered(start: Any) -> None:
+    wav = _wav()
+    length = _prefix_len("hello there", _expected_frames(wav))
+    server = start(runtime=_runtime(max_seq_len=length + 1 + MIN_SUFFIX_ROOM))
+
+    assert server.post(audio=wav, name="alice").status_code == 200
+
+
+def test_a_an_encode_longer_than_predicted_is_measured_again_and_refused(
+    start: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prediction fits, the codec's real frame count doesn't: refused after the encode,
+    with the gate already free, and nothing kept."""
+    wav = _wav()
+    predicted = _expected_frames(wav)
+    server = start(runtime=_runtime(max_seq_len=_prefix_len("hello there", predicted) + 1 + MIN_SUFFIX_ROOM))
+    codes = torch.zeros((predicted + 1, CODEC_CODEBOOKS), dtype=torch.int64)
+    monkeypatch.setattr(routes_voices, "encode_prompt_waveform", lambda *_args: codes)
+
+    _assert_error(server.post(audio=wav, name="alice"), 400, "voice_too_long")
+
+    assert server.listing() == []
+    assert list(server.voices_dir.glob("*.voice.json")) == []
+    assert server.events_named("voice.created") == []
+    assert server.gate_is_free()
+
+
+@pytest.mark.parametrize("name", ["alice", None], ids=["named", "unnamed"])
+def test_b_registered_codes_are_int16_as_a_scan_reads_them(start: Any, name: str | None) -> None:
+    server = start()
+    wav = _wav()
+
+    voice_id = server.post(audio=wav, name=name).json()["id"]
+
+    voice = server.services.registry.lookup(voice_id)
+    assert voice.codes.dtype == np.int16
+    assert voice.codes.shape == (_expected_frames(wav), CODEC_CODEBOOKS)
+
+
+@pytest.mark.parametrize("name", ["alice", None], ids=["named", "unnamed"])
+def test_b_codes_from_an_encoder_of_another_dtype_are_kept_as_int16(
+    start: Any, monkeypatch: pytest.MonkeyPatch, name: str | None
+) -> None:
+    """`encode_prompt_waveform` returns int16 today; the voice's codes are normalised at
+    registration anyway, after the range check, so the registry never holds another dtype."""
+    server = start()
+    wav = _wav()
+    codes = torch.full((_expected_frames(wav), CODEC_CODEBOOKS), 7, dtype=torch.int64)
+    monkeypatch.setattr(routes_voices, "encode_prompt_waveform", lambda *_args: codes)
+
+    voice_id = server.post(audio=wav, name=name).json()["id"]
+
+    voice = server.services.registry.lookup(voice_id)
+    assert voice.codes.dtype == np.int16
+    assert voice.codes.flags["C_CONTIGUOUS"]
+
+
+def test_42_7_a_scanned_voice_carries_its_measured_prefix_length(start: Any, tmp_path: Path) -> None:
+    voices_dir = tmp_path / "voices"
+    wav = _wav()
+    start(voices_dir).post(audio=wav, name="alice", ref_text="kept")
+
+    restarted = start(voices_dir)
+
+    voice = restarted.services.registry.lookup("alice")
+    assert voice.prefix_len == _prefix_len("kept", _expected_frames(wav))
+    assert voice.prefix_key == voice_file.prefix_key("alice", "kept", voice.codes)

@@ -231,6 +231,16 @@ class VoiceStore:
         self._skipped: CaseInsensitiveNames[Path] = CaseInsensitiveNames()
 
     @property
+    def codebooks(self) -> int:
+        """The model's codebook count: what every voice's codes must have."""
+        return self._codebooks
+
+    @property
+    def codebook_size(self) -> int:
+        """The model's per-codebook size: every code must be below it."""
+        return self._codebook_size
+
+    @property
     def codec_fingerprint(self) -> str:
         """The loaded codec's fingerprint: what every file this store loads must carry, and
         so what a new voice's record must carry too."""

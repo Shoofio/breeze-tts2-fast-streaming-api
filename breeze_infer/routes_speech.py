@@ -21,13 +21,16 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
    `404 unknown_voice`. The prefix cache's token is read in that same event-loop step, with no
    `await` between them (`VoicePrefixCache.token`): a `DELETE` that lands after it, however long
    this request then takes to reach the gate, keeps this request's prefix out of the cache
-   (T066). The resolved voice (its codes and transcript, held in memory) is what the request
-   uses from here on, even if the voice is deleted meanwhile;
+   (T066). The resolved voice (its codes, transcript, prefix length and prefix cache key, held in
+   memory since it was registered) is what the request uses from here on, even if the voice is
+   deleted meanwhile;
 5. an `InlineRef`'s bytes are decoded (`reference_audio.decode`) on a worker thread
    (`asyncio.to_thread`), never the event loop -- libsndfile's decode is blocking CPU work;
 5a. piece 0's room is checked on the CPU, on the CPU tokenizer's own thread (`_size_first_piece`:
    its tokenized text plus the reference's *predicted* frames), so "no room" is a `400
-   text_too_long` even while the GPU is busy -- the "first piece has no room" half of BC-47;
+   text_too_long` even while the GPU is busy -- the "first piece has no room" half of BC-47. A
+   voice on the prefix path must fit on its codes path too (the out-of-memory fallback), and a
+   stored prefix the runtime would refuse to build has no room at all;
 6. `gate.try_acquire()`, else `409 busy` -- or `GpuUnavailable` if the gate is poisoned,
    which propagates past this route to `errors.py`'s own handler (`503 gpu_unavailable`);
 6a. with no reference and more than one piece, every later piece's prompt length is queued
@@ -93,7 +96,6 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Protocol, TypeVar
 
-import torch
 from fastapi import Depends, FastAPI, Request
 from starlette.responses import Response
 
@@ -128,6 +130,7 @@ from breeze_infer.synthesis import (
     CodesRef,
     NoRef,
     PieceRoom,
+    PrefixBuildOutOfMemory,
     PrefixRef,
     Reference,
     UnbuiltPrefix,
@@ -144,9 +147,9 @@ from breeze_infer.synthesis import (
     prepare_piece,
     resolve_reference,
     stand_in_reference,
+    voice_reference,
 )
 from breeze_infer.text_split import split_text
-from breeze_infer.voice_file import prefix_key
 from breeze_infer.voice_prefix import VoicePrefixCache
 from breeze_infer.voice_registry import ResolvedVoice
 from models.fast_streaming import NoRoomError
@@ -381,44 +384,45 @@ async def _voice_reference(
     """The reference for a resolved voice, and its `speech.accepted` fields (`reference`:
     `voice_prefix`, with `warm` for a cache hit, or `voice_codes`). Needs `lease` held.
 
-    With a `ref_text` override, the codes path: the stored codes with the given text, since
-    the cached KV was built from the stored text. Otherwise the prefix path: the voice's KV
-    prefix from the cache, built on a miss on the GPU thread under `lease`, with the token read
-    when the voice was resolved. Not shielded: if this request is cancelled during the build,
-    `get_or_build` hands `lease` to the build (module docstring, step 7).
+    `synthesis.voice_reference` decides the path, as it did for the pre-gate stand-in: with a
+    `ref_text` override, the codes path (the stored codes with the given text). Otherwise the
+    prefix path: the voice's KV prefix from the cache, under the key the registry computed when
+    the voice was registered, built on a miss on the GPU thread under `lease`, with the token
+    read when the voice was resolved. Not shielded: if this request is cancelled during the
+    build, `get_or_build` hands `lease` to the build (module docstring, step 7).
 
-    A build that runs out of GPU memory is not cached (`VoicePrefixCache`); this request then
-    uses the codes path with the stored text instead, and `speech.prefix_fallback` records it.
-    Any other build error propagates (a `500`).
+    A build that runs out of GPU memory is not cached (`VoicePrefixCache`), and has already
+    freed what it held (`PrefixBuildOutOfMemory`); this request then uses the codes path with
+    the stored text instead, which the pre-gate check also sized, and `speech.prefix_fallback`
+    records it. Any other build error propagates (a `500`).
     """
     voice = lookup.voice
-    if lookup.spec.ref_text_override is not None:
-        return CodesRef(codes=voice.codes, ref_text=lookup.spec.ref_text_override), {
-            "reference": "voice_codes"
-        }
+    shape = voice_reference(voice, lookup.spec.ref_text_override)
+    if isinstance(shape, CodesRef):
+        return shape, {"reference": "voice_codes"}
 
     def build() -> Any:
-        return components.gpu.run(build_voice_prefix, runtime, voice.codes, voice.ref_text)
+        return components.gpu.run(build_voice_prefix, runtime, shape.codes, shape.ref_text)
 
     try:
         prefix, warm = await lookup.prefix_cache.get_or_build(
-            prefix_key(voice.id, voice.ref_text, voice.codes),
+            voice.prefix_key,
             build,
             lease=lease,
             resolved_token=lookup.resolved_token,
             request_id=request_id,
         )
-    except torch.OutOfMemoryError as error:
+    except PrefixBuildOutOfMemory as error:
         components.events.emit(
             "speech.prefix_fallback",
             level="warning",
             request_id=request_id,
             voice_id=voice.id,
             reason="out_of_memory",
-            error=f"{type(error).__name__}: {error}",
+            error=str(error),
         )
-        return CodesRef(codes=voice.codes, ref_text=voice.ref_text), {"reference": "voice_codes"}
-    return PrefixRef(prefix=prefix, ref_text=voice.ref_text), {
+        return shape.codes_path(), {"reference": "voice_codes"}
+    return PrefixRef(prefix=prefix, ref_text=shape.ref_text), {
         "reference": "voice_prefix",
         "warm": warm,
     }
@@ -506,16 +510,27 @@ def _measure_first_piece(
     pieces: list[str],
     stand_in: Reference | UnbuiltPrefix,
 ) -> PieceRoom:
-    """`_size_first_piece`'s blocking part, run by `CpuTokenizer.run` with its copy."""
-    return predicted_room(
-        runtime,
-        tokenizer,
-        stand_in,
-        pieces[0],
-        request.instruction,
-        request.cfg_scale,
-        request.max_new_tokens,
-    )
+    """`_size_first_piece`'s blocking part, run by `CpuTokenizer.run` with its copy.
+
+    A voice on the prefix path is measured on its codes path too, and gets the smaller room:
+    the prefix build's out-of-memory fallback speaks through the codes path
+    (`_voice_reference`), and must never turn a request accepted here into a `400` after the
+    gate. Only piece 0 is measured; a later piece is sized when it runs, on whichever path the
+    request took (BC-47)."""
+    paths = [stand_in, stand_in.codes_path()] if isinstance(stand_in, UnbuiltPrefix) else [stand_in]
+    rooms = [
+        predicted_room(
+            runtime,
+            tokenizer,
+            path,
+            pieces[0],
+            request.instruction,
+            request.cfg_scale,
+            request.max_new_tokens,
+        )
+        for path in paths
+    ]
+    return min(rooms, key=lambda room: room.room)
 
 
 def _start_anchor_sizing(
