@@ -625,7 +625,7 @@ and `test_bc_46` tests.
   - check the first piece's room on the CPU before `try_acquire` (predicted reference frames plus
     tokenized text via `_prefill_plan`);
   - prepare later pieces on the `GpuThread` inside the body.
-- [ ] T054 [US3] **Live gate (speech)**:
+- [X] T054 [US3] **Live gate (speech)**:
   1. Set the version to `2.0.0.dev2` (re-deploys: `2.0.0.dev2+1` after the review fixes, `+2` after the reference-encode fix; plan.md's live-gate step), and add BC-01–BC-17, BC-46 and BC-47 to the CHANGELOG
      (standing rule 8).
   2. Start the server with `--cors http://127.0.0.1:8000`.
