@@ -286,6 +286,10 @@ class MultiRequestStreamRuntime:
             and self.config.device is not None
             and self.config.device.type == "cuda"
         ):
+            # This is process-wide, so cuDNN can autotune a different conv algorithm per
+            # process for anything that runs under it (specs/003-cpp-compatible-api/research.md
+            # R18). Any reference encode must go through breeze_infer.audio.encode_prompt_waveform,
+            # which scopes back to benchmark=False, deterministic=True for that call.
             torch.backends.cudnn.benchmark = True
         self._compile_snakes()
         self._req_tombstones: OrderedDict[str, TombstoneEntry] = OrderedDict()

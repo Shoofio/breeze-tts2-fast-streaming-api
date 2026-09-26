@@ -7,6 +7,10 @@
   - `2.0.0.dev3` at `f6e4b68`: Scenario 2, the SillyTavern `speech` phase and the first benchmark.
   - `2.0.0.dev4` at `bebe8ce`: the deterministic reference encode (research.md R18), the SillyTavern
     `speech` phase again, and the benchmark again across two server processes.
+- **Version numbering:** these runs reported `2.0.0.dev3` and `2.0.0.dev4`, which took the
+  numbers the plan reserves for Phases 3 and 4. With the user's agreement they are renumbered
+  `2.0.0.dev2+1` and `2.0.0.dev2+2` (plan.md, live-gate step 1); the code now carries
+  `2.0.0.dev2+2`. The values below are what the server reported at the time.
 - **Result: the gate passes**, including the user's listening check (one speaker throughout). Voice
   design, the malformed corpus, the mid-stream abort, long text and the CFG values all behave as
   the contract says. SillyTavern's page can call the speech route and read the CORS-exposed

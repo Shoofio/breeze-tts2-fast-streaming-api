@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,29 @@ _PYTORCH_INDEX_FILE = "pytorch_model.bin.index.json"
 _MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024  # 100 MB; a real header is a few KB.
 
 
+@contextlib.contextmanager
+def _deterministic_cudnn_encode() -> Iterator[None]:
+    """Force ``benchmark=False, deterministic=True`` for exactly the encode call
+    below, restoring both on the way out -- including when the encode raises.
+
+    Not ``torch.backends.cudnn.flags()``: that context manager resets every flag
+    you don't pass to *its own* default (``allow_tf32=True``, ``benchmark_limit=10``,
+    ``fp32_precision="none"``), not to the caller's actual value, so a caller running
+    with e.g. ``allow_tf32=False`` would get TF32 turned back on for the duration of
+    the encode (review finding 1). Saving and restoring exactly the two flags this
+    fix cares about leaves everything else alone.
+    """
+    saved_benchmark = torch.backends.cudnn.benchmark
+    saved_deterministic = torch.backends.cudnn.deterministic
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.benchmark = saved_benchmark
+        torch.backends.cudnn.deterministic = saved_deterministic
+
+
 def encode_prompt_waveform(
     audio_tokenizer: Any, wav: np.ndarray, sample_rate: int
 ) -> torch.Tensor:
@@ -40,9 +65,7 @@ def encode_prompt_waveform(
     # a different conv algorithm; they round differently and flip about 1% of the fine codes,
     # changing the audio for the same reference after a restart (research.md R18). Only the
     # encode is pinned; decode keeps its tuned algorithms.
-    with torch.backends.cudnn.flags(
-        enabled=torch.backends.cudnn.enabled, benchmark=False, deterministic=True
-    ):
+    with _deterministic_cudnn_encode():
         encoded = audio_tokenizer.encode(wav, sr=int(sample_rate))
     codes = torch.as_tensor(encoded["audio_codes"][0], dtype=torch.int16)
     if codes.ndim != 2:

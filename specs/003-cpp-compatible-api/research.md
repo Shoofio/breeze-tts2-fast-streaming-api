@@ -496,46 +496,142 @@ different branch.
 
 ## R18. Cross-process determinism of inline reference codes
 
-**Decision**: `breeze_infer/audio.py`'s `encode_prompt_waveform` scopes the codec's `encode` call
-in `torch.backends.cudnn.flags(enabled=torch.backends.cudnn.enabled, benchmark=False,
-deterministic=True)`. `enabled` is read from whatever the caller already has, never forced;
-`benchmark` and `deterministic` are the only two flags this scope changes, and only for the
-duration of the encode call -- the codec's decode path outside this scope keeps cuDNN's
-autotuned algorithms. `infer.py` and `breeze_infer/synthesis.py`'s `resolve_reference` are the
-only two places that encode reference audio in the live serving path, and both already call
-`encode_prompt_waveform` rather than the codec directly, so no other call site needed changing.
-(`models/breeze.py`'s `_get_audio_token_from_batch` also calls a codec's `.encode(...)` directly,
-but it has no caller anywhere in this repo -- dead training-script code ported from the base
-model, not part of the inference server -- so it was left alone.)
+**Decision**: `breeze_infer/audio.py`'s `encode_prompt_waveform` wraps the codec's `encode` call
+in `_deterministic_cudnn_encode()`, a small save-and-restore context manager -- not
+`torch.backends.cudnn.flags()` (review finding 1, this round): that context manager resets
+every argument you don't pass to *its own* default (`allow_tf32=True`, `benchmark_limit=10`,
+`fp32_precision="none"`), not to the caller's actual value, so a caller running with e.g.
+`allow_tf32=False` would silently get TF32 turned back on for the duration of the encode.
+`_deterministic_cudnn_encode()` instead saves exactly `torch.backends.cudnn.benchmark` and
+`torch.backends.cudnn.deterministic`, sets `benchmark=False, deterministic=True`, and restores
+both saved values in a `finally` -- even when the encode raises -- once the `with` block exits;
+every other cudnn flag (`enabled`, `allow_tf32`, `benchmark_limit`, ...) is never touched, so
+whatever the caller had stays exactly as it was, inside the scope and out. The codec's decode
+path outside this scope keeps cuDNN's autotuned algorithms. `infer.py` and
+`breeze_infer/synthesis.py`'s `resolve_reference` are the only two places that encode reference
+audio in the live serving path, and both already call `encode_prompt_waveform` rather than the
+codec directly, so no other call site needed changing. (`models/breeze.py`'s
+`_get_audio_token_from_batch` also calls a codec's `.encode(...)` directly, but it has no caller
+anywhere in this repo -- dead training-script code ported from the base model, not part of the
+inference server -- so it was left alone.)
 
 This is a deviation the user approved on 2026-09-25, not a BC item: `--fast-all` sets
 `torch.backends.cudnn.benchmark = True` for the whole process
-(`models/stream_runtime/stream/runtime.py`'s `MultiRequestStreamRuntime.__init__`), so cuDNN
-autotunes whichever conv algorithm looks fastest *in that process* on first use and reuses it.
-Autotuning races candidate kernels against a wall clock, so two separate server processes can
-settle on different algorithms for the identical convolution, and those algorithms round
-differently -- about 1% of the fine-codebook codes (codebooks 6-15) then differ for the same
-input. The observable symptom: the same inline reference wav, the same text and the same seed
-produced audio 5.20 s long in one process and 6.96 s long after a restart, at `bea6767`. Pinning
-the encoded codes (bypassing a fresh `encode` call) gave byte-identical output at both `bea6767`
-and `HEAD`, isolating the divergence to the encode step rather than generation or decode. A probe
-that forced `benchmark=False` around only the encode call, in two otherwise-identical fresh
-processes, produced identical codes both times; without it, the same two processes produced
-22-23 differing entries out of 2,064 (129 frames x 16 codebooks) -- consistent with the ~1%
-figure above.
+(`models/stream_runtime/stream/runtime.py`'s `MultiRequestStreamRuntime.__init__`, which now has
+a short comment pointing back here), so cuDNN autotunes whichever conv algorithm looks fastest
+*in that process* on first use and reuses it. Autotuning races candidate kernels against a wall
+clock, so two separate server processes can settle on different algorithms for the identical
+convolution, and those algorithms round differently -- about 1% of the fine-codebook codes
+(codebooks 6-15) then differ for the same input. The observable symptom: the same inline
+reference wav, the same text and the same seed produced audio 5.20 s long in one process and
+6.96 s long after a restart, at `bea6767`. Pinning the encoded codes (bypassing a fresh `encode`
+call) gave byte-identical output at both `bea6767` and `HEAD`, isolating the divergence to the
+encode step rather than generation or decode. A probe that forced `benchmark=False` around only
+the encode call, in two otherwise-identical fresh processes, produced identical codes both times;
+without it, the same two processes produced 22-23 differing entries out of 2,064 (129 frames x 16
+codebooks) -- consistent with the ~1% figure above.
 
 **Rationale**: Scoping the fix to the encode call, rather than turning `cudnn.benchmark` off for
 the whole process, keeps the decode path's autotuned performance (the reason `--fast-all` sets
 `benchmark = True` in the first place) while making the one thing that must be reproducible --
-what a saved or inline reference encodes to -- independent of which process encoded it.
-Measured cost (bench reference wav, median of 20 calls after 5 warm-up calls, one process, fast
-codec's `cudnn.benchmark=True` already enabled): ~25.6 ms/call with the scoped flags versus
-~24.9 ms/call without them -- the two are within each other's run-to-run noise, so the fix has no
-measurable cost once cuDNN has already picked an algorithm during warm-up.
+what a saved or inline reference encodes to -- independent of which process encoded it. The
+guarantee this buys is narrower than "always identical," and is stated that way on purpose
+(review finding 4, this round): codes are identical across processes **on the same GPU and
+software stack** (GPU model, driver, CUDA, cuDNN and torch versions all held fixed). A different
+stack, or cuDNN falling back to a different deterministic engine under GPU memory/workspace
+pressure than it did last time, is free to produce different codes for the identical input --
+`deterministic=True` only promises that *one* stack, run twice under the same conditions, picks
+the same algorithm every time; it says nothing about agreement across stacks. This has a direct
+implication for stored voice codes (T06x, not yet built): a voice saved by encoding the same
+reference wav on a different GPU/driver/CUDA/cuDNN stack can end up with different stored codes
+for what a person would call "the same voice" than encoding it fresh on this one. The
+`codec_fingerprint` that travels with saved codes (`breeze_infer/audio.py`) doesn't cover this --
+it hashes the codec's own identity (its config's identity fields and its weight files' tensor
+`{dtype, shape}`, not the trained values), which tells a loader whether *this checkpoint's codec*
+can decode a saved voice's codes at all, not whether those codes match what today's stack would
+have produced. That's fine for what saved voices actually need: `codec_fingerprint`'s own
+docstring notes there is no re-encode path for a saved voice (the original recording isn't kept),
+so the stored codes are authoritative for that voice once saved, by design -- but it's one reason
+a stored voice is pinned to whatever codes it was saved with rather than silently re-derived, and
+worth knowing if a saved-voice migration or backup ever moves those codes to different hardware.
+
+Measured cost, **warm** (bench reference wav, median of 20 calls after 5 warm-up calls at that
+same length, one process, fast codec's `cudnn.benchmark=True` already enabled): ~25.6 ms/call
+with the scoped flags versus ~24.9 ms/call without them -- within each other's run-to-run noise,
+so the fix has no measurable cost once cuDNN has already picked an algorithm for that exact input
+shape during warm-up.
+
+That warm number is not the whole story (review finding 9, this round): every request can bring
+a differently-sized inline reference, and cuDNN's algorithm choice is keyed on input shape, so
+the *first* encode at each new reference length is a fresh "cold" case regardless of how many
+other lengths that process has already warmed up. Measured with the bench reference wav
+(`$REFERENCE_VOICES_DIR/eric/eric.wav`, 44.1 kHz mono, 10.245 s -- sliced from the
+start to 1, 3, 5, 7 and 9.5 s; not 12/20 s, since the wav itself is only 10.245 s long), one fresh
+process per (length, scope) pair so the timed call is always the first and only encode call that
+process ever makes:
+
+**Caveat -- to be re-measured**: every number below is the *first call in a fresh process*, so
+it bundles CUDA context creation, cuDNN handle setup and kernel loading in with the per-length
+cost; that's why even the fastest row is several seconds. It does not yet isolate what a new
+reference length costs on a server that has already encoded something (warm process, cold
+shape) -- the actual question this finding is about. Treat this table as provisional.
+
+| reference length | with the scope | without the scope |
+| --- | --- | --- |
+| 1.0 s | 3055 ms | 4915 ms |
+| 3.0 s | 3064 ms | 3477 ms |
+| 5.0 s | 3228 ms | 4184 ms |
+| 7.0 s | 6696 ms | 41732 ms |
+| 9.5 s | 5533 ms | 3794 ms |
+
+The cold cost is material -- multiple seconds, not the ~10 ms this would need to clear to call it
+noise -- and it does not move smoothly with length or consistently favor one side: 7 s without the
+scope spiked to 41.7 s (cuDNN apparently benchmarking a slow candidate algorithm for that
+particular shape), while at 9.5 s without the scope was actually *faster* than with it (3.8 s vs.
+5.5 s). Autotuning search cost is shape-dependent in a way that isn't predictable from length
+alone, and at least at this one length, it happened to land below the scoped heuristic pick's own
+cost rather than above it. What's consistent across all five lengths is that both figures are
+firmly in "seconds," not "noise": whichever side of the comparison is faster at a given length,
+the first encode of a new reference length costs multiple seconds either way, fix or no fix, and
+that is the material fact worth recording -- not a clean "the fix is always faster" story, which
+the 9.5 s row rules out. The warm figure above still describes steady state correctly, once cuDNN
+has already searched (or, with the fix, already made its one heuristic pick) for that exact
+shape; it's just not the number that matters for the first request at a new length.
 
 **Evidence**: `tests/test_audio.py`'s
-`test_encode_prompt_waveform_scopes_cudnn_to_deterministic_no_benchmark` (a fake codec records
-the flags in effect during its own `encode`, on the CPU suite) and
-`tests/gpu/test_reference_encode_determinism.py` (encodes the bench reference wav in two fresh
-Python processes, with the same `MultiRequestStreamRuntime`-based fast codec runtime production
-uses, and asserts identical codes).
+`test_encode_prompt_waveform_scopes_cudnn_to_deterministic_no_benchmark` and
+`test_encode_prompt_waveform_restores_cudnn_flags_when_encode_raises` (a fake codec records all
+five cudnn flags -- not just the two this fix changes -- in effect during its own `encode`, on
+the CPU suite, confirming `enabled`/`allow_tf32`/`benchmark_limit` pass through untouched while
+`benchmark`/`deterministic` are pinned, and that all five are restored even when `encode` raises)
+and `tests/gpu/test_reference_encode_determinism.py`:
+
+- `test_same_reference_wav_encodes_identically_across_processes` runs
+  `_encode_determinism_worker.py` in three fresh processes. Each worker loads only the codec --
+  not a full `MultiRequestStreamRuntime`, which costs ~85 s per worker (a lazy `torch.compile` of
+  every `SnakeBeta` module plus a CUDA graph warmup, both unrelated to what this test checks) just
+  to reach the one line that sets `cudnn.benchmark = True` -- and sets that flag directly instead.
+  It then records the cudnn flags in effect during the codec's own `encode` call and the test
+  asserts `benchmark=False, deterministic=True` there in all three workers, in addition to
+  asserting the three workers' codes are identical to each other. Asserting the flags directly
+  (not just comparing codes) matters because the bug this guards against is probabilistic:
+  without the fix, cuDNN's autotuner often lands on the same algorithm across processes anyway, so
+  a bare "codes are equal" check can pass by luck with the regression still present.
+- `test_multi_request_stream_runtime_sets_cudnn_benchmark_for_fast_codec` is a second, cheap GPU
+  test/assert that builds a real `MultiRequestStreamRuntime` -- not a reimplementation of its
+  `__init__`, a source-level check would not be acceptable here -- with its two slowest,
+  unrelated init steps patched to no-ops (`_validate_and_get_samples_per_code`'s decoder forward
+  pass, which is what actually triggers the lazy `SnakeBeta` compile, and
+  `_maybe_warmup_fast_codec`'s CUDA graph capture), and asserts `cudnn.benchmark` really is `True`
+  afterward. This is the direct proof that the condition the worker above reproduces by hand is
+  real, without paying the ~85 s full-construction cost: measured directly (not inferred),
+  `MultiRequestStreamRuntime(...)` with both patches applied takes ~7 s, versus ~85 s unpatched.
+  That's the saving this patching buys; it is not the whole per-worker wall time. On this
+  machine, a fresh process spends ~80 s just importing `qwen_tts`/`transformers`/
+  `models.stream_runtime` (`transformers` eagerly scans its own `models/` package tree at import
+  time, and this repo's checkpoints and dependencies sit on a slow, WSL-mounted drive) plus ~7 s
+  loading the codec -- both fixed costs of any fresh-process worker, old test or new, unrelated to
+  what this patch skips. That import/load cost is why the reworked GPU test file's total wall
+  time (four fresh processes: three encode workers plus this one) is still several minutes on
+  this machine, not "a few seconds" -- but the ~85 s to ~7 s improvement inside the construction
+  itself is real and is what this test isolates.

@@ -66,11 +66,16 @@ exposes a C++-server-compatible HTTP and WebSocket API; see the README and
   can change after the first piece. The opening piece is at most 200 characters, or
   `split_chars` if that is smaller.
 
-Later phases append their own `BC-nn` entries to this section as they land.
+Later phases append their own `BC-nn` entries to the **Breaking changes** section above (not to
+whatever section happens to be last in the file -- reordering the file doesn't make this
+unambiguous, since anything after a heading with no further heading reads as part of it).
 
 ### Fixed
 
 - An inline reference wav now encodes to the same codec codes regardless of which server process
-  handled the request, so the same reference, text and seed give the same audio across a
-  restart. (Previously, `--fast-all`'s process-wide `cudnn.benchmark = True` let cuDNN settle on
-  a different, differently-rounding conv algorithm per process for the reference encode step.)
+  handled the request, on the same GPU and software stack (GPU, driver, CUDA, cuDNN, torch), so
+  the same reference, text and seed give the same audio across a restart there. (Previously,
+  `--fast-all`'s process-wide `cudnn.benchmark = True` let cuDNN settle on a different,
+  differently-rounding conv algorithm per process for the reference encode step.) A different
+  stack, or cuDNN falling back to another deterministic engine under workspace pressure, may
+  still give different codes; see research.md R18.

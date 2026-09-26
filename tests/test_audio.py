@@ -61,25 +61,51 @@ def test_encode_prompt_waveform_scopes_cudnn_to_deterministic_no_benchmark() -> 
     force `benchmark=False, deterministic=True` for just the codec's `encode` call so
     the same wav always encodes to the same codes, regardless of what the rest of the
     process has autotuned.
+
+    `torch.backends.cudnn.flags()` is the obvious way to scope this, but it resets
+    every argument you don't pass to its own default -- `allow_tf32=True`,
+    `benchmark_limit=10` -- not to the caller's value (review finding 1). A caller
+    running with `allow_tf32=False` would silently get TF32 back for the encode. So
+    `enabled`, `allow_tf32` and `benchmark_limit` are set here to non-default values
+    before the call and must come through the encode, and out the other side,
+    completely untouched.
     """
-    seen_flags: dict[str, bool] = {}
+    seen_flags: dict[str, object] = {}
 
     class _FlagRecordingCodec(FakeCodec):
         def encode(self, wav, sr, return_dict=True):
+            seen_flags["enabled"] = torch.backends.cudnn.enabled
             seen_flags["benchmark"] = torch.backends.cudnn.benchmark
             seen_flags["deterministic"] = torch.backends.cudnn.deterministic
+            seen_flags["allow_tf32"] = torch.backends.cudnn.allow_tf32
+            seen_flags["benchmark_limit"] = torch.backends.cudnn.benchmark_limit
             return super().encode(wav, sr, return_dict=return_dict)
 
-    with torch.backends.cudnn.flags(enabled=True, benchmark=True, deterministic=False):
+    with torch.backends.cudnn.flags(
+        enabled=True,
+        benchmark=True,
+        deterministic=False,
+        allow_tf32=False,
+        benchmark_limit=3,
+    ):
         encode_prompt_waveform(
             _FlagRecordingCodec(), np.zeros(1920, dtype=np.float32), 24000
         )
 
-        assert seen_flags == {"benchmark": False, "deterministic": True}
+        assert seen_flags == {
+            "enabled": True,
+            "benchmark": False,
+            "deterministic": True,
+            "allow_tf32": False,
+            "benchmark_limit": 3,
+        }
         # Restored to the caller's own flags once the encode call returns, not left
-        # at the scoped values.
+        # at the scoped values -- all five, not just the two this fix changes.
+        assert torch.backends.cudnn.enabled is True
         assert torch.backends.cudnn.benchmark is True
         assert torch.backends.cudnn.deterministic is False
+        assert torch.backends.cudnn.allow_tf32 is False
+        assert torch.backends.cudnn.benchmark_limit == 3
 
 
 def test_encode_prompt_waveform_restores_cudnn_flags_when_encode_raises() -> None:
@@ -87,14 +113,25 @@ def test_encode_prompt_waveform_restores_cudnn_flags_when_encode_raises() -> Non
         def encode(self, wav, sr, return_dict=True):
             raise RuntimeError("boom")
 
-    with torch.backends.cudnn.flags(enabled=True, benchmark=True, deterministic=False):
+    with torch.backends.cudnn.flags(
+        enabled=True,
+        benchmark=True,
+        deterministic=False,
+        allow_tf32=False,
+        benchmark_limit=3,
+    ):
         with pytest.raises(RuntimeError, match="boom"):
             encode_prompt_waveform(
                 _RaisingCodec(), np.zeros(1920, dtype=np.float32), 24000
             )
 
+        # Restoration on the error path must cover all five flags too, not just the
+        # two the try/finally around the encode call actually changes.
+        assert torch.backends.cudnn.enabled is True
         assert torch.backends.cudnn.benchmark is True
         assert torch.backends.cudnn.deterministic is False
+        assert torch.backends.cudnn.allow_tf32 is False
+        assert torch.backends.cudnn.benchmark_limit == 3
 
 
 # --- pcm16 --------------------------------------------------------------------------

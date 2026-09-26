@@ -193,7 +193,9 @@ becomes the composition root only.
 
 1. **Bump the version first.** Before the live run, set the development version
    (`2.0.0.devN`, where N is the phase number) and append the phase's BC entries to the
-   `CHANGELOG.md` "Unreleased" section.
+   `CHANGELOG.md` "Unreleased" section. A re-deploy within the same phase adds a local label
+   (`2.0.0.devN+1`, `+2`, ...), so `X-Breeze-Version` still names the phase and each deploy
+   is unique.
 2. **Start the server** (`scripts/start_breeze.sh --cors http://127.0.0.1:8000`), after stopping
    the C++ server.
 3. **Run the SillyTavern live test**: `node tests/live/sillytavern/run.mjs <phase>` against
