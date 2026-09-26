@@ -230,6 +230,13 @@ DELETE         → saved: rename to .del-* and fsync the directory, then unlink 
 restart        → saved voices reloaded from files; unnamed voices gone
 ```
 
+**Startup order**: model load (on the GPU thread), then the voice scan (on a worker thread: checking
+a file needs the loaded model's codebook facts and codec fingerprint), then mark ready. Every route
+answers `503 loading` until the scan has finished, and `voices.loaded`/`voice.skipped` come before
+`model.loaded`. A voices directory that can't be created, listed or fingerprinted (the codec's
+`audio_tokenizer` files) fails startup: `model.load_failed` with `stage: voices`, exit non-zero,
+never ready (decided by the user on 2026-09-26). A bad single file is still only skipped (BC-25).
+
 ## Voice file v1
 
 Path: `<voices_dir>/<id>.voice.json`, UTF-8 JSON. A consumer rejects any file whose `format` or
@@ -340,10 +347,15 @@ offending record's field names), so one bad field never breaks the request emitt
     traceback; `level` is `error` when either is present, else `warning`. A cancellation is
     never a crash or a stop failure), `ws.bind_failed`,
     `model.loaded`,
-    `model.load_failed` (the process then exits non-zero), `gpu.close_failed`,
+    `model.load_failed` (the process then exits non-zero; `stage`: `model` (the load itself),
+    `voices` (the startup voice scan) or `ready` (marking the server ready or reporting it)),
+    `gpu.close_failed`,
     `gpu.close_timeout` (a `gen.close()` ran past 30 s: the GPU gate is poisoned and `/health`
     answers `503 gpu_unavailable` until restart);
-  - voices: `voices.loaded`, `voice.skipped`, `voice.created`, `voice.deleted`,
+  - voices: `voices.loaded`, `voice.skipped`,
+    `voice.created` (`request_id`, `voice_id`, `saved`, `frames`, `encode_ms`; none for an unnamed
+    `POST` answered with an existing entry), `voice.deleted` (`request_id`, `voice_id`, `kind`:
+    `saved`, `unnamed` or `reserved`),
     `voice.cleanup_failed` (`file`, `op`: `sweep`, `stat`, `unlink_tmp` or `unlink`, `error`: a
     leftover the store couldn't remove or examine; it is left for the next startup's sweep),
     `voice.prefix_built` (`voice_id`, `tokens`: the prefix length, `bytes`: its estimated KV

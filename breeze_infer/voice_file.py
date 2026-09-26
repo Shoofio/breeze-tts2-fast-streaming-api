@@ -155,6 +155,12 @@ def _codes_bytes(codes: np.ndarray) -> bytes:
     return np.ascontiguousarray(codes, dtype="<i2").tobytes()
 
 
+def codes_sha256(codes: np.ndarray) -> str:
+    """The `codes_sha256` a voice file records for `codes`: the hex sha256 of their
+    row-major int16 little-endian bytes."""
+    return hashlib.sha256(_codes_bytes(codes)).hexdigest()
+
+
 def prefix_key(voice_id: str, ref_text: str, codes: np.ndarray) -> tuple[str, str]:
     """The voice prefix cache's key: `(voice_id, content_hash)` (data-model.md "Voice").
 

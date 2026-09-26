@@ -44,7 +44,7 @@ from breeze_infer.model_loading import LoadedModel
 from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.settings import settings_from_args
-from tests.fakes import FakeRuntime, FakeTokenizer
+from tests.fakes import FakeRuntime, FakeTokenizer, open_no_voices
 
 MODEL_DIR = str(Path(__file__).parent)  # any existing directory; nothing loads it
 
@@ -62,6 +62,7 @@ def _components(sink: io.StringIO) -> Components:
         readiness=readiness,
         ws_port=lambda: 0,
         cpu_tokenizer=CpuTokenizer(),
+        open_voices=open_no_voices,
     )
 
 

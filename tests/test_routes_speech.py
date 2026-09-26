@@ -45,6 +45,7 @@ from tests.fakes import (
     FakeTokenizer,
     RecordingEvents,
     model_with_codec_facts,
+    open_no_voices,
 )
 
 SPEECH_PATH = "/v1/audio/speech"
@@ -84,6 +85,7 @@ def _build_components(
         readiness=readiness,
         ws_port=lambda: 0,
         cpu_tokenizer=cpu_tokenizer,
+        open_voices=open_no_voices,
     )
 
 

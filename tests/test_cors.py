@@ -40,7 +40,7 @@ from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.settings import settings_from_args
 from breeze_infer.version_header import VersionHeaderMiddleware
-from tests.fakes import FakeRuntime
+from tests.fakes import FakeRuntime, open_no_voices
 
 MODEL_DIR = str(Path(__file__).parent)  # any existing directory; nothing loads it
 GOOD_ORIGIN = "https://good.example"
@@ -74,6 +74,7 @@ def make_client() -> Iterator[Callable[[Sequence[str]], TestClient]]:
             readiness=readiness,
             ws_port=lambda: 8081,
             cpu_tokenizer=CpuTokenizer(),
+            open_voices=open_no_voices,
         )
         made.append(components)
         # raise_server_exceptions=False: a 500 is a legitimate response to assert on here (its

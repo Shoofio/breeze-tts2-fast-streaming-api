@@ -22,11 +22,18 @@ import hashlib
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+
+from breeze_infer.routes_voices import VoiceServices
+from breeze_infer.voice_prefix import VoicePrefixCache
+from breeze_infer.voice_registry import VoiceRegistry
+from breeze_infer.voice_store import VoiceStore
 
 # ``models.fast_streaming`` pulls in the cudagraph submodules and costs real wall-clock
 # time to import (finding #8, T021 review 2) even though most of this module's own
@@ -762,3 +769,21 @@ class FakeRuntime:
                     token_observer(frame)
         finally:
             self.closed += 1
+
+
+def open_no_voices(_runtime: Any) -> VoiceServices:
+    """A stand-in for `api.Components.open_voices` in tests that don't use the voice routes:
+    empty voice services that never touch the disk (nothing scans `voices_dir`, and nothing
+    in those tests writes a voice)."""
+    return VoiceServices(
+        store=VoiceStore(
+            Path("unused-test-voices"),
+            codebooks=CODEC_CODEBOOKS,
+            codebook_size=CODEC_CODEBOOK_SIZE,
+            codec_fingerprint="0" * 64,
+            events=RecordingEvents(),
+            clock=lambda: datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+        registry=VoiceRegistry(clock=lambda: 0.0),
+        prefix_cache=VoicePrefixCache(bytes_per_token=1, on_event=lambda *_a, **_k: None),
+    )

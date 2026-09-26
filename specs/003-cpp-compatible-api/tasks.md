@@ -676,7 +676,7 @@ rules.
   re-keyed by `(voice_id, content_hash)` (`voice_file.prefix_key`: `ref_text` and codes). Add the
   delete-and-re-register case: the stale KV is never returned, including when the delete lands
   during the build.
-- [ ] T059 [P] [US1] Create `tests/test_routes_voices.py` (TestClient, `FakeRuntime`, `tmp_path`):
+- [X] T059 [P] [US1] Create `tests/test_routes_voices.py` (TestClient, `FakeRuntime`, `tmp_path`):
   - the POST check order from contracts/http-api.md;
   - `test_bc_27_existing_name_gets_409_voice_exists`, also for different case;
   - an unnamed dedupe returns `200` without the gate, even while busy;
@@ -720,7 +720,7 @@ rules.
   bounded by `VOICE_PREFIX_CACHE_BYTES`, built on the `GpuThread` while the gate is held. A
   build's out-of-memory error propagates with nothing cached; the codes-path fallback is T066's.
   Delete invalidates the entry.
-- [ ] T065 [US1] Create `breeze_infer/routes_voices.py`:
+- [X] T065 [US1] Create `breeze_infer/routes_voices.py`:
   - `POST /v1/voices`, in the contract order, with a commit-time name re-check under the store
     lock;
   - `GET /v1/voices`;
@@ -738,7 +738,9 @@ rules.
     request (emit an event) instead of a 500;
   - read `VoicePrefixCache.token()` in the same event-loop step that resolves the voice from the
     registry (before waiting for the gate), and pass it to `get_or_build` as `resolved_token`,
-    with the request's `request_id`; DELETE passes its `request_id` to `invalidate`.
+    with the request's `request_id`; DELETE passes its `request_id` to `invalidate`;
+  - the registry's saved and unnamed records must carry codes and ref_text (or a way to load
+    them) so a VoiceRef can be resolved; decide which during T066.
 - [ ] T067 [P] [US1] Port `A:tests/gpu/{test_voice_equivalence,test_voice_prefill_buckets,
   test_voice_tier1_equivalence}.py` to `tests/gpu/`, adapted to the new store (register through the
   route). Include a prefix longer than 548 tokens that now builds (R12, point 4).

@@ -20,8 +20,10 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -29,7 +31,7 @@ import uvicorn
 from fastapi import FastAPI
 from starlette.types import ASGIApp
 
-from breeze_infer import __version__
+from breeze_infer import __version__, audio
 from breeze_infer.body_limit import BodyLimitMiddleware
 from breeze_infer.cors import CorsMiddleware, CorsPolicy
 from breeze_infer.errors import install_error_handlers
@@ -40,15 +42,19 @@ from breeze_infer.gpu import (
     GpuThread,
     report_close_failed,
 )
-from breeze_infer.limits import TCP_USER_TIMEOUT_MS
+from breeze_infer.limits import TCP_USER_TIMEOUT_MS, VOICE_PREFIX_CACHE_BYTES
 from breeze_infer.model_loading import LoadedModel, load_model
 from breeze_infer.request_id import RequestIdMiddleware
 from breeze_infer.routes_health import Readiness, install_health
 from breeze_infer.routes_speech import CpuTokenizer, install_speech
+from breeze_infer.routes_voices import VoiceServices, VoiceSlot, install_voices
 from breeze_infer.runtime import get_dist_info
 from breeze_infer.settings import Settings, settings_from_args
 from breeze_infer.streaming import ClientAbortLogFilter
 from breeze_infer.version_header import VersionHeaderMiddleware
+from breeze_infer.voice_prefix import VoicePrefixCache, kv_bytes_per_token
+from breeze_infer.voice_registry import VoiceRegistry
+from breeze_infer.voice_store import VoiceStore
 
 
 @dataclass(frozen=True)
@@ -63,12 +69,21 @@ class Components:
     ws_port: Callable[[], int]
     # Empty until `mark_ready` installs the model load's tokenizer copies.
     cpu_tokenizer: CpuTokenizer
+    # Opens the voice directory for the loaded runtime (`open_voices`, bound to the settings by
+    # `main()`); `load_in_background` runs it on a worker thread once the model has loaded.
+    # Required, like `cpu_tokenizer`, so no wiring can forget the voices.
+    open_voices: Callable[[Any], VoiceServices]
+    # Empty until `mark_ready` installs what `open_voices` built.
+    voices: VoiceSlot = field(default_factory=VoiceSlot)
 
-    def mark_ready(self, loaded: LoadedModel) -> None:
-        """Serve `loaded`: its two CPU tokenizer copies and its runtime, in one step, so the
-        server is never ready without the copies the speech route sizes requests with. The
-        copies go in first: the first request the server admits may need them."""
+    def mark_ready(self, loaded: LoadedModel, voices: VoiceServices | None = None) -> None:
+        """Serve `loaded`: its two CPU tokenizer copies, the scanned voices (if any) and its
+        runtime, in one step, so the server is never ready without the copies the speech route
+        sizes requests with, nor the voices the voice routes serve. Those go in first: the first
+        request the server admits may need them."""
         self.cpu_tokenizer.install(loaded.cpu_tokenizer, loaded.sizing_tokenizer)
+        if voices is not None:
+            self.voices.install(voices)
         self.readiness.mark_ready(loaded.runtime)
 
 
@@ -81,6 +96,7 @@ def create_app(components: Components) -> ASGIApp:
     install_error_handlers(app, components.events)
     install_health(app, components.readiness, components.ws_port)
     install_speech(app, components, clock=time.perf_counter)
+    install_voices(app, components)
 
     policy = CorsPolicy(origins=components.settings.cors)
     inner: ASGIApp = CorsMiddleware(BodyLimitMiddleware(app), policy, app.router)
@@ -254,14 +270,23 @@ def _ignore_sigint() -> None:
 async def load_in_background(
     components: Components, load: Callable[[], LoadedModel], server: uvicorn.Server
 ) -> bool:
-    """Load the model on the GPU thread, then mark the server ready.
+    """Load the model on the GPU thread, then scan the voice directory on a worker thread
+    (checking a voice file needs the loaded model's codebook facts and codec fingerprint), then
+    mark the server ready. Every route answers `503 loading` until then.
 
-    Any failure, including one marking it ready or reporting it, is fatal: the server is told
-    to exit (and `serve` returns non-zero) rather than answering `503 loading` forever.
+    Any failure, including one scanning the voices, marking it ready or reporting it, is fatal:
+    the server is told to exit (and `serve` returns non-zero) rather than answering
+    `503 loading` forever. `model.load_failed`'s `stage` says which step failed: `model`,
+    `voices`, or `ready` (marking it ready or reporting it). A voices failure is the directory itself (it can't be created or listed, or the
+    codec can't be fingerprinted); a bad voice file is only skipped, never fatal (BC-25).
     """
+    stage = "model"
     try:
         loaded = await components.gpu.run(load)
-        components.mark_ready(loaded)
+        stage = "voices"
+        voices = await asyncio.to_thread(components.open_voices, loaded.runtime)
+        stage = "ready"
+        components.mark_ready(loaded, voices)
         components.events.emit(
             "model.loaded", sample_rate=int(loaded.runtime.sample_rate), **loaded.report
         )
@@ -271,12 +296,78 @@ async def load_in_background(
         components.events.emit(
             "model.load_failed",
             level="error",
+            stage=stage,
             error=repr(exc),
             traceback="".join(traceback.format_exception(exc)),
         )
         server.should_exit = True
         return False
     return True
+
+
+def prefix_bytes_per_token(runtime: Any) -> int:
+    """The voice prefix cache's estimated KV bytes per prefix token, from the loaded backbone's
+    config: layers, KV heads, `head_dim` (or `hidden_size / num_attention_heads` when the
+    config has none) and the runtime's KV dtype (114,688 B for the bundled checkpoint)."""
+    config = runtime.model.config
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    return kv_bytes_per_token(
+        num_layers=int(config.num_hidden_layers),
+        num_kv_heads=int(config.num_key_value_heads),
+        head_dim=int(head_dim),
+        dtype_bytes=runtime.dtype.itemsize,
+    )
+
+
+def open_voices(
+    runtime: Any,
+    *,
+    voices_dir: Path,
+    events: Emitter,
+    codec_fingerprint: str,
+    now: Callable[[], datetime],
+    nonce: Callable[[], str],
+    encode_clock: Callable[[], float],
+) -> VoiceServices:
+    """Build the voice store for `runtime`'s codec, scan `voices_dir` into the registry, and
+    build the (empty) voice prefix cache. Blocking file I/O: `load_in_background` runs it on a
+    worker thread. `now` stamps a saved voice's `created_at`, `nonce` names the store's
+    temporary files, and `encode_clock` times each encode (`encode_ms`).
+    """
+    model_config = runtime.model.config
+    store = VoiceStore(
+        voices_dir,
+        codebooks=int(model_config.num_codebooks),
+        codebook_size=int(model_config.codec_config.codebook_size),
+        codec_fingerprint=codec_fingerprint,
+        events=events,
+        clock=now,
+        nonce=nonce,
+    )
+    scan = store.scan()
+    registry = VoiceRegistry(clock=encode_clock)
+    registry.load_from_scan(scan.voices, scan.skipped)
+    prefix_cache = VoicePrefixCache(
+        budget_bytes=VOICE_PREFIX_CACHE_BYTES,
+        bytes_per_token=prefix_bytes_per_token(runtime),
+        on_event=events.emit,
+    )
+    return VoiceServices(store=store, registry=registry, prefix_cache=prefix_cache)
+
+
+def _open_checkpoint_voices(runtime: Any, *, settings: Settings, events: Emitter) -> VoiceServices:
+    """`open_voices` for the served checkpoint, with the real clocks and nonces. The codec is
+    fingerprinted from the same `audio_tokenizer` directory `runtime.load_runtime` loads it
+    from."""
+    return open_voices(
+        runtime,
+        voices_dir=settings.voices_dir,
+        events=events,
+        codec_fingerprint=audio.codec_fingerprint(settings.model_path / "audio_tokenizer"),
+        now=lambda: datetime.now(timezone.utc),
+        nonce=lambda: os.urandom(8).hex(),
+        encode_clock=time.perf_counter,
+    )
 
 
 @dataclass
@@ -648,6 +739,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         readiness=readiness,
         ws_port=lambda: 0,  # the WebSocket server arrives in Phase 8 (T077)
         cpu_tokenizer=CpuTokenizer(),
+        open_voices=partial(_open_checkpoint_voices, settings=settings, events=events),
     )
     app = create_app(components)
     load = partial(load_model, settings, device, environ)

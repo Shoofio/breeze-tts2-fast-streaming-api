@@ -174,8 +174,12 @@ Generation stops within one chunk, and the GPU is released.
 ### Order of checks
 
 1. body size;
-2. fields (missing `ref_audio` or `ref_text` → `400 voice_fields_required`; bad name →
-   `400 invalid_name`);
+2. fields, in this order:
+   1. `ref_text` syntax: over 2,000 characters or holding control characters →
+      `400 invalid_field` (the same rule as speech's `ref_text`; a blank value is absent);
+   2. missing `ref_audio` or `ref_text` → `400 voice_fields_required` (an attached but empty
+      `ref_audio` part counts as present, and fails the decode with `invalid_audio`);
+   3. bad name → `400 invalid_name`;
 3. named voice: a name already taken, ignoring case (including a name held by a skipped file)
    → `409 voice_exists` (BC-27, BC-26);
 4. unnamed voice: compute the id; if it already exists → `200` with the existing entry, without
@@ -202,12 +206,17 @@ oldest unnamed voice is evicted first; saved voices don't count toward the cap (
 
 | Status | Code | Message |
 |---|---|---|
+| 400 | `invalid_field` | `ref_text` over 2,000 characters or with control characters (the shared speech rule) |
 | 400 | `voice_fields_required` | `ref_audio and ref_text are required` |
 | 400 | `invalid_name` | `name can only use letters, digits, dash and underscore` (also used for the `v_` prefix) |
 | 400 | `invalid_audio`, `audio_too_long`, `audio_too_short` | as speech |
 | 409 | `voice_exists` | `voice already exists` |
 | 409 | `busy` | `busy` |
 | 500 | `voice_write_failed` | `could not write the voice file` |
+
+The storage `500`s (`voice_write_failed` here, `voice_delete_failed` on `DELETE`) keep their own
+codes, and like every `500` they close the connection (`Connection: close`) and emit
+`request.failed` with the request id.
 
 ## `GET /v1/voices`
 
@@ -228,7 +237,7 @@ Files that failed validation at startup are not listed.
 | Status | Code | Message |
 |---|---|---|
 | 404 | `unknown_voice` | `unknown voice_id` |
-| 500 | `voice_delete_failed` | `could not delete the voice file`. The voice stays registered |
+| 500 | `voice_delete_failed` | `could not delete the voice file`. The voice stays registered. Closes the connection and emits `request.failed`, like every `500` |
 
 ## Other routes
 

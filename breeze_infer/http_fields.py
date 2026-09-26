@@ -1144,3 +1144,34 @@ def parse_speech(fields: Fields, settings: Settings) -> SpeechRequest:
         max_new_tokens=max_new_tokens,
         split_chars=split_chars,
     )
+
+
+@dataclass(frozen=True)
+class VoiceCreateRequest:
+    """`POST /v1/voices`'s fields, already validated (contracts/http-api.md "Fields").
+    `name` is `None` for an unnamed voice."""
+
+    audio_bytes: bytes
+    ref_text: str
+    name: str | None
+
+
+def parse_voice_create(fields: Fields) -> VoiceCreateRequest:
+    """Step 2 of `POST /v1/voices`'s order of checks.
+
+    `ref_text` goes through the same rule as speech's (`_validated_text_field`: control
+    characters and over-length are `400 invalid_field`; blank means absent). Then a missing
+    `ref_audio` or `ref_text` is `400 voice_fields_required`, and only then is the name
+    checked (`400 invalid_name`, also for the reserved `v_` prefix, BC-26), the order the
+    contract lists them in. An attached but empty `ref_audio` part counts as present, as for
+    speech: the decode step turns it into `400 invalid_audio`.
+    """
+    ref_text = _validated_text_field(fields, "ref_text", MAX_REF_TEXT_CHARS)
+    if fields.ref_audio is None or ref_text is None:
+        raise ApiError(400, "voice_fields_required", "ref_audio and ref_text are required")
+    name = _first(fields, "name")
+    if name is not None and not voice_file.is_valid_name(name):
+        raise ApiError(
+            400, "invalid_name", "name can only use letters, digits, dash and underscore"
+        )
+    return VoiceCreateRequest(audio_bytes=fields.ref_audio, ref_text=ref_text, name=name)

@@ -230,6 +230,12 @@ class VoiceStore:
         self._known: CaseInsensitiveNames[Path] = CaseInsensitiveNames()
         self._skipped: CaseInsensitiveNames[Path] = CaseInsensitiveNames()
 
+    @property
+    def codec_fingerprint(self) -> str:
+        """The loaded codec's fingerprint: what every file this store loads must carry, and
+        so what a new voice's record must carry too."""
+        return self._codec_fingerprint
+
     def path_for(self, voice_id: str) -> Path:
         return self.voices_dir / f"{voice_id}{SUFFIX}"
 

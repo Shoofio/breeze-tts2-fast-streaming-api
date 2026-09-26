@@ -22,7 +22,7 @@ from breeze_infer.gpu import GpuGate, GpuThread
 from breeze_infer.routes_health import Readiness, install_health
 from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.settings import settings_from_args
-from tests.fakes import FakeRuntime
+from tests.fakes import FakeRuntime, open_no_voices
 
 LOADING = {"status": "loading", "error": "model is loading", "code": "loading"}
 WS_PORT = 8081
@@ -38,6 +38,7 @@ def _components(readiness: Readiness) -> Components:
         readiness=readiness,
         ws_port=lambda: WS_PORT,
         cpu_tokenizer=CpuTokenizer(),
+        open_voices=open_no_voices,
     )
 
 

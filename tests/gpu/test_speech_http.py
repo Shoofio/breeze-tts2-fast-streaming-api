@@ -45,7 +45,7 @@ from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.runtime import resolve_device
 from breeze_infer.settings import DEFAULT_CHUNK_MAX, settings_from_args
 from breeze_infer.streaming import BYTES_PER_SAMPLE
-from tests.fakes import RecordingEvents
+from tests.fakes import RecordingEvents, open_no_voices
 
 pytestmark = pytest.mark.gpu
 
@@ -114,6 +114,7 @@ def _components(gpu_env) -> tuple[Components, RecordingEvents]:
         readiness=Readiness(),
         ws_port=lambda: 0,
         cpu_tokenizer=CpuTokenizer(),
+        open_voices=open_no_voices,
     )
     components.mark_ready(_shared_loaded_model(gpu_env.runtime))
     return components, events
