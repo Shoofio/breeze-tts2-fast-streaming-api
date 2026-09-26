@@ -108,11 +108,13 @@ uvicorn. Configuration:
 `close_timeout` aborts a stalled peer, and that `process_request` can return a JSON `403`/`503`.
 
 **Amendment after the plan check (T070, 2026-09-26)**: `close_timeout` does *not* evict a peer
-that stopped reading while we were sending: `ws.close()` writes the close frame and awaits
-`drain()` before its deadline starts, so it blocks forever, and so do the keepalive ping and
-`Server.close()` (`research/ws-prototype.md`). The rationale bullet above holds only for an idle
-peer. Decision (user): keep `websockets` and bound every server-initiated close ourselves:
-`asyncio.timeout(2)` around `ws.close()`, then `SO_LINGER(1, 0)` and `ws.transport.abort()`, with
+that stopped reading while we were sending: `ws.close()` sets its deadline but awaits `drain()`
+before enforcing it, so it blocks forever, and so do the keepalive ping and `Server.close()`
+(`research/ws-prototype.md`). The rationale bullet above holds only for an idle peer. Decision
+(user): keep `websockets` and bound every server-initiated close ourselves:
+`asyncio.timeout(WS_CLOSE_TIMEOUT_SECONDS)` around `ws.close()`, then `SO_LINGER(1, 0)` and
+`ws.transport.abort()`, on every close path (outbox overflow, a send blocked for
+`WS_SEND_TIMEOUT_SECONDS`, shutdown, every handler exit), with our own connection set and
 `TCP_USER_TIMEOUT` (30 s) on the WebSocket listening socket as a Linux-only backstop. Other
 libraries were not adopted: uvicorn never aborts, `wsproto` means hand-rolled I/O, and the rest
 are untested and would need the same bounded close.

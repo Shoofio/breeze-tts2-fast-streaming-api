@@ -811,19 +811,27 @@ rules.
   - every handshake response, accepted or refused, carries `X-Breeze-Version` (FR-037a);
   - `test_bc_31_disallowed_origin_gets_403_json`, and no-Origin connections allowed;
   - `test_bc_30_binds_configured_host_only`;
-  - `503 loading` and `503 too_many_connections` above 16;
+  - `503 loading`, `503 shutting_down`, and `503 too_many_connections` above 16 (17 concurrent
+    handshakes give exactly one);
+  - the library's own `400`/`426` refusals come back as the JSON envelope;
   - handshake timeout;
   - `test_bc_43_close_codes`: an echoed client close gives 1000, an unmasked frame 1002, bad UTF-8
     1007, a message over 1 MiB 1009;
   - `test_bc_44_speaking_text_is_exact`: tabs and CR preserved;
   - `test_bc_45_binary_frame_gets_error`;
   - `test_bc_41_generation_failure_is_an_error_event_and_session_continues`;
-  - `test_bc_42_slow_client_closed_1008_and_gpu_freed`;
+  - `test_bc_42_slow_client_closed_1008_and_gpu_freed`, split in two: a client that resumes
+    reading within `WS_CLOSE_TIMEOUT_SECONDS` receives 1008; one that never reads is dropped, its
+    slot is freed and the gate released; `ws.closed` shows `aborted`;
+  - a client that stalls with less than `WS_OUTBOX_BYTES` pending is evicted after
+    `WS_SEND_TIMEOUT_SECONDS` (monkeypatched small);
+  - shutdown with a stalled raw-socket peer finishes within `WS_CLOSE_TIMEOUT_SECONDS` plus a
+    margin (the T070 check 4 hang);
   - `queued` sent only when actually waiting;
   - piece seeds continue from `start`.
 - [ ] T074 [P] [US4] Create `tests/test_ws_isolation.py` (SC-006): WebSocket client A stops
   reading mid-piece. An HTTP speech request from client B starts streaming within the in-flight
-  piece plus 1 s. Client A is closed with 1008.
+  piece plus 1 s. Client A, which never reads again, is dropped and its slot freed.
 
 ### Implementation
 
@@ -851,18 +859,24 @@ rules.
       generator and releases the gate.
   - One ordered outbox bounded at `WS_OUTBOX_BYTES`, plus a sender task. On overflow: cancel the
     piece in flight, then close with 1008 `client too slow`.
-  - Every server-initiated close (slow client, shutdown) is bounded by us, not by
-    `close_timeout` (T070 found `ws.close()` blocks forever on a peer that stopped reading): cancel
-    the sender, run `ws.close()` inside `asyncio.timeout(2)`, and on timeout set `SO_LINGER(1, 0)`
-    (packed per platform) and call `ws.transport.abort()`. Shutdown uses
-    `server.close(close_connections=False)`, then this close on each connection.
-    `TCP_USER_TIMEOUT` goes on the listening socket as a backstop where the platform has it.
+  - The sender bounds each `ws.send()` by `WS_SEND_TIMEOUT_SECONDS`; expiry is a slow client too.
+  - Every server-initiated close is bounded by us, not by `close_timeout` (T070 found
+    `ws.close()` blocks forever on a peer that stopped reading): cancel the sender, run
+    `ws.close()` inside `asyncio.timeout(WS_CLOSE_TIMEOUT_SECONDS)`, and on timeout set
+    `SO_LINGER(1, 0)` (packed per platform) and call `ws.transport.abort()`. The paths: outbox
+    overflow, send stall, shutdown, and every handler exit (in its `finally`).
+  - Track connections in our own set, from `process_request` to the handler's `finally`, for the
+    cap and for shutdown. Shutdown sets a flag (new handshakes get `503 shutting_down`), calls
+    `server.close(close_connections=False)`, then the bounded close on each tracked connection.
+  - `TCP_USER_TIMEOUT` goes on the listening socket as a backstop where the platform has it.
     `process_response` also rewrites the library's own `400`/`426`/`500` refusals into the JSON
-    envelope. See `research/ws-prototype.md` for the other gotchas.
+    envelope. `ws.closed` carries the code sent, `aborted` and `reason`. See
+    `research/ws-prototype.md` ("Decision" and the gotchas).
   - On disconnect: bump the epoch, cancel, and join.
   - Emit the `ws.*` events with `session_id` and `piece_index`.
 - [ ] T078 [US4] Wire the WebSocket into `breeze_infer/api.py`:
-  - Unless `ws_port` is `disabled`, pre-bind the socket on `settings.host:ws_port`.
+  - Unless `ws_port` is `disabled`, pre-bind the sockets on `settings.host:ws_port` (every
+    address the host resolves to, like the HTTP sockets), with one `serve()` per socket.
   - On `OSError`, emit `ws.bind_failed` and report 0 (`test_bc_24_ws_bind_failure_reports_zero`
     goes in `tests/test_health.py`).
   - `/health`'s `ws_port` provider returns the bound port.
@@ -970,7 +984,7 @@ runs `--warmup 3 --runs 10`, and compares its 10-run medians with the T002 10-ru
 - **Phase 4:** tests T030–T033 in parallel; T035 and T036 in parallel with T034.
 - **Phase 5:** T044, T045 and T046 in parallel.
 - **Phase 7:** T055–T060 in parallel; T061 and T064 in parallel.
-- **Phase 8:** T071–T074 in parallel once T070 passes.
+- **Phase 8:** T071–T074 in parallel once T070's findings are recorded and the design settled.
 - **Phase 9:** T080, T081 and T083 in parallel.
 
 Example: launching the Phase 2 pure modules together.

@@ -20,23 +20,40 @@ sending audio (the BC-42 case), `ws.close(1008, "client too slow")` never return
 the keepalive ping timeout or `Server.close()`. The same stall also hangs the shutdown path of
 check 4. The design isn't changed here; possible fixes are listed under check 1.
 
-## Decision (user, 2026-09-26)
+## Decision (user, 2026-09-26; completed after review 44)
 
 Keep `websockets`, and bound every server-initiated close ourselves (check 1's measured
 workaround), with the kernel as a backstop:
 
-- **Bounded close**: for a slow client, a shutdown and a disconnect, cancel the sender, run
-  `ws.close(code, reason)` inside `asyncio.timeout(2)`, and on timeout set `SO_LINGER(1, 0)` and
-  call `ws.transport.abort()`. Shutdown uses `server.close(close_connections=False)`, then this
-  close on each connection. A client that starts reading again within 2 s gets the 1008; one that
-  never reads again sees 1006, which no design can avoid.
+- **Bounded close**: cancel the sender, run `ws.close(code, reason)` inside
+  `asyncio.timeout(WS_CLOSE_TIMEOUT_SECONDS)` (2 s, the same constant as `close_timeout`), and on
+  timeout set `SO_LINGER(1, 0)` and call `ws.transport.abort()`. A client that starts reading again
+  in time gets the close code; one that never reads again sees 1006, which no design can avoid.
+- **Every close path uses it**:
+  1. a slow client: the outbox would overflow `WS_OUTBOX_BYTES` (1008);
+  2. a slow client: one `ws.send()` blocked for `WS_SEND_TIMEOUT_SECONDS` (30 s, as for HTTP),
+     which catches a client that stalls with less than 2 MiB pending, where nothing overflows and
+     the keepalive ping is stuck behind the same full buffer (1008);
+  3. shutdown (1001);
+  4. every handler exit, normal or by error, in the handler's `finally`, so the library's own
+     close after the handler (and its `close(1011)` after an error) is already done and can't
+     hang in `drain()`. The keepalive's own `fail(1011)` also goes through `drain()`; it can only
+     stall once the buffer is full, which means we were sending, so path 2 reaches it.
+- **Our own connection set**: the server tracks every connection from `process_request` until
+  its handler's `finally`, in any state, for the 16-connection cap (reserved in
+  `process_request`, so concurrent handshakes can't exceed it) and for shutdown. Shutdown walks
+  that set, not `server.connections` (OPEN only).
+- **Shutdown refusal**: a shutdown flag is set before `server.close(close_connections=False)`;
+  `process_request` then refuses new handshakes with our JSON `503 shutting_down` and
+  `X-Breeze-Version`, so FR-037a holds with no exception.
 - **Backstop**: `TCP_USER_TIMEOUT` (`limits.TCP_USER_TIMEOUT_MS`, 30 s) on the WebSocket listening
-  socket too, where the platform has it (Linux). Windows has no equivalent, so there the bounded
-  close is the only eviction; the `SO_LINGER` value is packed per platform (two ints on Linux, two
-  unsigned shorts on Windows).
+  socket too, where the platform has it (Linux). Windows' `TCP_MAXRT` was not evaluated, so there
+  the bounded close is the only eviction. The `SO_LINGER` value is packed per platform (two ints on
+  Linux, two unsigned shorts on Windows).
 - **Library refusals** (its own `400`, `426` and `500`) are rewritten into the JSON envelope in
-  `process_response`. The `503` the library substitutes during `Server.close()` stays plain text
-  without `X-Breeze-Version`, a known difference limited to shutdown.
+  `process_response`.
+- **Events**: `ws.closed` carries the code we sent, plus `aborted` and `reason`, so a BC-42
+  eviction is distinguishable from a client that vanished (both look like 1006 to `close_code`).
 - **Rejected**: aborting without a close frame (breaks BC-42's 1008), the kernel option alone
   (holds a connection slot for 30 s, doesn't unblock shutdown, Linux only), and other libraries
   (uvicorn never aborts; `wsproto` means hand-rolled I/O; `aiohttp` and Hypercorn are untested
@@ -59,11 +76,14 @@ calls `await ws.close(1008, "client too slow")`. Settings: `close_timeout=2`, `p
 [ 15.055s] server: ws.close STILL BLOCKED after 15.015s (state=CLOSING, fd_alive=True)
 ```
 
-**Why**: in `websockets/asyncio/connection.py`, `send_context()` calls `self.send_data()` and
-then `await self.drain()` (lines 913-915). Only *after* that does it wait on `close_deadline`.
+**Why**: in `websockets/asyncio/connection.py`, `send_context()` sets
+`close_deadline = now + close_timeout` (line 911), then calls `self.send_data()` and
+`await self.drain()` (lines 913-915). The deadline is set on time, but it is only *enforced*
+(`timeout_at(close_deadline)`) after `drain()` returns. So a client that resumes reading at
+1.9 s has only about 0.1 s left before the library aborts it.
 Once the transport's write buffer is above `write_limit` (32 KiB by default), `drain()` waits for
 `resume_writing()`, which never comes while the peer is not reading. So `close_timeout` never
-starts counting. The kernel keeps the connection alive indefinitely, because the peer still ACKs
+is enforced. The kernel keeps the connection alive indefinitely, because the peer still ACKs
 the zero-window probes.
 
 **`ping_timeout` doesn't help either.** With `ping_interval=1` and `ping_timeout=1`, the same
@@ -261,9 +281,8 @@ These are all keyword arguments of `serve()`. The defaults differ from the plan 
 ## Gotchas for T077/T078
 
 1. **Never rely on `close_timeout` or `ping_timeout` alone** while the connection may have
-   unsent output. Every close path needs its own timeout plus `transport.abort()`: the
-   slow-client 1008 close, the shutdown 1001 close, and a close after a handler error. This
-   depends on how the plan resolves check 1.
+   unsent output. Every close path uses the bounded close: the four paths listed under
+   "Decision".
 2. **Catch `websockets.exceptions.ConnectionClosed` in the handler.** Otherwise every abnormal
    close (1002/1007/1009, aborts) is logged by the library at ERROR as
    "connection handler failed", with a traceback, and it then tries `close(1011)`.
@@ -276,11 +295,10 @@ These are all keyword arguments of `serve()`. The defaults differ from the plan 
    Use `headers.get_all("Origin")`: `headers.get` raises `MultipleValuesError` on duplicates.
 6. **`server.connections` counts OPEN connections only.** A connection is added after its 101
    has been written, which involves an `await`. Two simultaneous handshakes can therefore both
-   pass a `len(server.connections) >= 16` check. For a strict cap, reserve a slot in
-   `process_request` and release it when that connection closes.
+   pass a `len(server.connections) >= 16` check. Use our own set (see "Decision").
 7. **`compression` defaults to permessage-deflate.** PCM compresses poorly and costs CPU, so
    `compression=None` is probably wanted. `max_size` counts decompressed bytes if compression
    stays on.
 8. **One socket per `serve()`** (see check 3).
 9. **During `Server.close()` the library's own `503` lacks `X-Breeze-Version`** (see check 2).
-   Refuse with our own closing flag first.
+   Refuse with our own shutdown flag first (see "Decision").

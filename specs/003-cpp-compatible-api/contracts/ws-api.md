@@ -16,9 +16,8 @@ breaking change `BC-nn` or an additive change is marked.
   With CORS off, no browser origin is allowed (BC-31).
 - `503 loading` while the model loads.
 - `503 too_many_connections` above 16 connections.
+- `503 shutting_down` once the server has started shutting down.
 - The handshake must complete within 10 s.
-- A handshake that arrives while the server is shutting down may get the library's plain-text
-  `503` without `X-Breeze-Version`.
 
 **Frames**
 - Text frames carry JSON messages. Binary frames from the server carry PCM.
@@ -29,10 +28,10 @@ breaking change `BC-nn` or an additive change is marked.
 
 | Code | When |
 |---|---|
-| 1000 | echoed on a client close; also on server shutdown (1001) |
+| 1000 | echoed on a client close; also on server shutdown (1001). A client that doesn't read the shutdown close frame within 2 s is dropped without one (it sees 1006) |
 | 1002 | protocol error (for example an unmasked frame) |
 | 1007 | invalid UTF-8 |
-| 1008 | `client too slow`: more than 2 MiB of undelivered output; the piece in flight is cancelled first (BC-42). A client that doesn't read the close frame within 2 s is dropped without one (it sees 1006) |
+| 1008 | `client too slow`: more than 2 MiB of undelivered output, or one send blocked for 30 s; the piece in flight is cancelled first (BC-42). A client that doesn't read the close frame within 2 s is dropped without one (it sees 1006) |
 | 1009 | message too big |
 | 1011 | ping timeout or internal error |
 

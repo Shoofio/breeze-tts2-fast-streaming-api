@@ -316,8 +316,9 @@ rule).
    Mitigated by exact pins and a real-server test.
 6. **Performance (SC-007).** One executor hop per chunk, plus parsing overhead, could cost TTFA.
    Measured in Phase 2, not assumed.
-7. **Windows.** `TCP_USER_TIMEOUT` is Linux-only; on Windows, stalled HTTP streams rely on the
-   30 s send timeout. The NTFS rename-retry and case-insensitivity behavior needs one real run on
+7. **Windows.** `TCP_USER_TIMEOUT` is Linux-only (Windows' `TCP_MAXRT` was not evaluated); on
+   Windows, stalled HTTP streams rely on the 30 s send timeout, and stalled WebSocket peers on
+   the send-stall timer and the bounded close alone, which were measured on WSL2 only. The NTFS rename-retry and case-insensitivity behavior needs one real run on
    `/mnt/m`.
 8. **SillyTavern extension coordination.** The replace flow depends on the extension change
    (spec Clarifications). Until it lands, only that step is recorded as blocked.

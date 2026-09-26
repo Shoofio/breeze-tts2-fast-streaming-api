@@ -44,6 +44,8 @@ choice and doesn't change the contract. Limits are constants in `limits.py` rath
 | `WS_MAX_CONNECTIONS` | 16 | Concurrent WebSocket connections |
 | `WS_HANDSHAKE_SECONDS` | 10 | `open_timeout` |
 | `WS_OUTBOX_BYTES` | 2 MiB | Outgoing backlog per connection |
+| `WS_SEND_TIMEOUT_SECONDS` | 30 | One WebSocket send blocked this long evicts the client (1008) |
+| `WS_CLOSE_TIMEOUT_SECONDS` | 2 | `close_timeout`, and the bound on every server-initiated close before `transport.abort()` |
 | `HTTP_SEND_TIMEOUT_SECONDS` | 30 | Per-chunk send on streamed speech |
 | `TCP_USER_TIMEOUT_MS` | 30,000 | Listening sockets |
 
@@ -438,5 +440,5 @@ offending record's field names), so one bad field never breaks the request emitt
     `speech.piece_done` (`piece_index`, `frames`), `speech.completed` (`rtf`),
     `speech.failed`, `speech.aborted`, `speech.frame_prediction_mismatch`
     (`predicted_frames`, `actual_frames`);
-  - WebSocket: `ws.connected`, `ws.rejected` (`reason`), `ws.closed` (`code`), `ws.piece`;
+  - WebSocket: `ws.connected`, `ws.rejected` (`reason`), `ws.closed` (`code` sent, `aborted`, `reason`), `ws.piece`;
   - errors: `request.failed`.

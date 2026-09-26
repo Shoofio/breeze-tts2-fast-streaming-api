@@ -106,7 +106,7 @@ These are also listed in the README development section (Constitution X).
    `done`/`cancelled` per message and no lost pieces (SC-005).
 2. **Protocol conformance:** `.venv/bin/pytest tests/test_ws_server.py` checks the `\uXXXX`
    round-trip, the close-code matrix, the Origin `403`, the connection cap, and eviction of a
-   slow client (1008).
+   slow client (1008 if it reads the close frame, dropped otherwise).
 3. **Stalled client:** `.venv/bin/pytest tests/test_ws_isolation.py` stops one client from reading
    while an HTTP speech request starts. The HTTP request starts streaming within the in-flight
    piece plus 1 s (SC-006).
