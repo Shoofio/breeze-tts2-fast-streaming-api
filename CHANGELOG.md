@@ -65,6 +65,21 @@ exposes a C++-server-compatible HTTP and WebSocket API; see the README and
   or when the server is shutting down; the later pieces then use voice design, so the speaker
   can change after the first piece. The opening piece is at most 200 characters, or
   `split_chars` if that is smaller.
+- **BC-25**: Voice files with invalid names or contents are skipped at startup with a
+  `voice.skipped` event instead of breaking `GET /v1/voices`, and the list order is fixed: saved
+  voices sorted by id, then unnamed voices in registration order.
+- **BC-26**: Voice names may not start with `v_` (any case), which is reserved for generated ids,
+  and names differing only by case count as the same name.
+- **BC-27**: `POST /v1/voices` with a name that already exists (in any case) is
+  `409 voice_exists` instead of silently overwriting it; delete the voice first to replace it.
+- **BC-28**: `DELETE /v1/voices/{id}` removes the file, so the voice stays gone after a restart;
+  `file_kept` is always `false`. The id must match the listed id exactly.
+- **BC-29**: Voices are stored in the server's own versioned `.voice.json` format. C++ `.breeze`
+  files are ignored (and counted), so voices from the C++ server must be registered again.
+- **BC-48**: The 64-voice cap counts only unnamed voices, so saved voices no longer use up room.
+- **New voice and speech errors**: `400 voice_too_long` when a voice's reference plus transcript
+  wouldn't leave the model room to speak, and `503 gpu_out_of_memory` when a voice's prompt can't
+  be built for lack of GPU memory and the fallback doesn't fit either.
 
 ### Fixed
 
