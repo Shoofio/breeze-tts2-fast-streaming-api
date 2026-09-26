@@ -107,6 +107,16 @@ uvicorn. Configuration:
 **Plan check (first WebSocket task)**: before building on it, a prototype must confirm that
 `close_timeout` aborts a stalled peer, and that `process_request` can return a JSON `403`/`503`.
 
+**Amendment after the plan check (T070, 2026-09-26)**: `close_timeout` does *not* evict a peer
+that stopped reading while we were sending: `ws.close()` writes the close frame and awaits
+`drain()` before its deadline starts, so it blocks forever, and so do the keepalive ping and
+`Server.close()` (`research/ws-prototype.md`). The rationale bullet above holds only for an idle
+peer. Decision (user): keep `websockets` and bound every server-initiated close ourselves:
+`asyncio.timeout(2)` around `ws.close()`, then `SO_LINGER(1, 0)` and `ws.transport.abort()`, with
+`TCP_USER_TIMEOUT` (30 s) on the WebSocket listening socket as a Linux-only backstop. Other
+libraries were not adopted: uvicorn never aborts, `wsproto` means hand-rolled I/O, and the rest
+are untested and would need the same bounded close.
+
 **Alternatives considered**:
 - uvicorn with `websockets-sansio` on a second `uvicorn.Server`: works and conforms, but needs a
   `TCP_USER_TIMEOUT` kernel option to evict stalled peers, a signal-handling override, and a

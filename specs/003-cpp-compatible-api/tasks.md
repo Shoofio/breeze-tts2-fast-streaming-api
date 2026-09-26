@@ -767,7 +767,7 @@ rules.
 **Independent Test**: quickstart Scenario 4; the SillyTavern `full` live gate; the extension's
 `npm run test:live`.
 
-- [ ] T070 [US4] *(Opus)* **Prototype first (R4 plan check)** in the session scratchpad, not the
+- [X] T070 [US4] *(Opus)* **Prototype first (R4 plan check)** in the session scratchpad, not the
   repo. Confirm with a `websockets` native server that:
   1. a peer that stops reading is aborted after `close_timeout`, and the socket is gone;
   2. `process_request` can return a JSON `403` and `503` with the envelope;
@@ -851,6 +851,14 @@ rules.
       generator and releases the gate.
   - One ordered outbox bounded at `WS_OUTBOX_BYTES`, plus a sender task. On overflow: cancel the
     piece in flight, then close with 1008 `client too slow`.
+  - Every server-initiated close (slow client, shutdown) is bounded by us, not by
+    `close_timeout` (T070 found `ws.close()` blocks forever on a peer that stopped reading): cancel
+    the sender, run `ws.close()` inside `asyncio.timeout(2)`, and on timeout set `SO_LINGER(1, 0)`
+    (packed per platform) and call `ws.transport.abort()`. Shutdown uses
+    `server.close(close_connections=False)`, then this close on each connection.
+    `TCP_USER_TIMEOUT` goes on the listening socket as a backstop where the platform has it.
+    `process_response` also rewrites the library's own `400`/`426`/`500` refusals into the JSON
+    envelope. See `research/ws-prototype.md` for the other gotchas.
   - On disconnect: bump the epoch, cancel, and join.
   - Emit the `ws.*` events with `session_id` and `piece_index`.
 - [ ] T078 [US4] Wire the WebSocket into `breeze_infer/api.py`:
