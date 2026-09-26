@@ -7,7 +7,7 @@
   - `2.0.0.dev3` at `f6e4b68`: Scenario 2, the SillyTavern `speech` phase and the first benchmark.
   - `2.0.0.dev4` at `bebe8ce`: the deterministic reference encode (research.md R18), the SillyTavern
     `speech` phase again, and the benchmark again across two server processes.
-- **Result: the gate passes, apart from the listening check, which is pending the user.** Voice
+- **Result: the gate passes**, including the user's listening check (one speaker throughout). Voice
   design, the malformed corpus, the mid-stream abort, long text and the CFG values all behave as
   the contract says. SillyTavern's page can call the speech route and read the CORS-exposed
   headers. SC-007 passes on both versions.
@@ -28,7 +28,8 @@
 | 2.6 SillyTavern `speech` | 9/11 on dev3 and on dev4: `POST /v1/audio/speech` from the page is `200`, `X-Sample-Rate` is readable, the body is even-length PCM, `cfg_scale=banana` is `400 invalid_field`, the settings were restored and verified on disk. The 2 failures are the expected voices gap above. Harness record: `research/live-speech.md` (the dev4 run) |
 
 **Listening check (SC-004, US3's independent test):** `research/long-text-sample.wav` (208 s,
-written by the GPU run at `6dc966c`; not committed). **Pending the user's answer.**
+written by the GPU run at `6dc966c`; not committed). **Passed:** the user listened to the whole
+file and heard the same speaker throughout (2026-09-25).
 
 ## Benchmark (SC-007)
 
