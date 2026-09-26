@@ -32,6 +32,11 @@ ANCHOR_SIZING_TIMEOUT_SECONDS = 5.0
 
 UNNAMED_VOICE_CAP = 64
 
+# KV prefixes kept for registered voices (voice_prefix.VoicePrefixCache). Ported from the
+# old server's --voice-cache-size default; the contract defines no flag for it, and a miss
+# only costs one prefix build.
+VOICE_PREFIX_CACHE_SIZE = 16
+
 # The largest *.voice.json the startup scan reads; anything bigger is skipped unread
 # (voice_store.scan). A documented generous constant, not computed from the loaded codec:
 # the biggest file the server can write is MAX_REF_SECONDS of codes -- at most 376 frames

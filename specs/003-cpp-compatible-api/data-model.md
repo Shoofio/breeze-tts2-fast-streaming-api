@@ -337,7 +337,10 @@ offending record's field names), so one bad field never breaks the request emitt
     answers `503 gpu_unavailable` until restart);
   - voices: `voices.loaded`, `voice.skipped`, `voice.created`, `voice.deleted`,
     `voice.cleanup_failed` (`file`, `op`: `sweep`, `stat`, `unlink_tmp` or `unlink`, `error`: a
-    leftover the store couldn't remove or examine; it is left for the next startup's sweep);
+    leftover the store couldn't remove or examine; it is left for the next startup's sweep),
+    `voice.prefix_built` (`voice_id`), `voice.prefix_evicted` (`voice_id`, `reason`: `lru` or
+    `deleted`). The prefix cache holds `VOICE_PREFIX_CACHE_SIZE` (16) entries and isn't warmed at
+    startup: a voice's first request builds its prefix;
   - speech: `speech.accepted`, `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`
     (`piece_index`, `requested`, `cap`, `room`), `speech.anchor_skipped` (`piece_index`,
     `reason`: `piece_truncated`, `no_room`, `sizing_failed`, `sizing_timeout` or `shutdown`),

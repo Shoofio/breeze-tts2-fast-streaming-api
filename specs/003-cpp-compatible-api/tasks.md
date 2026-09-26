@@ -672,7 +672,7 @@ rules.
   - oldest unnamed voice evicted first;
   - an identical unnamed registration returns the existing entry;
   - `test_bc_25_list_order_is_saved_sorted_then_unnamed_by_registration`.
-- [ ] T058 [P] [US1] Port `A:tests/test_voice_prefix_cache.py` to `tests/test_voice_prefix_cache.py`,
+- [X] T058 [P] [US1] Port `A:tests/test_voice_prefix_cache.py` to `tests/test_voice_prefix_cache.py`,
   re-keyed by `(voice_id, codes_sha256)`. Add the delete-and-re-register case: the stale KV is
   never returned.
 - [ ] T059 [P] [US1] Create `tests/test_routes_voices.py` (TestClient, `FakeRuntime`, `tmp_path`):
@@ -714,7 +714,7 @@ rules.
   - the clock used for `encode_ms` timing is injected.
 
   Borrow `api_record` and `voice_seconds` from `A:breeze_infer/voice_index.py` (~61–85).
-- [ ] T064 [P] [US1] Port `A:breeze_infer/voice_prefix.py` to `breeze_infer/voice_prefix.py`: an
+- [X] T064 [P] [US1] Port `A:breeze_infer/voice_prefix.py` to `breeze_infer/voice_prefix.py`: an
   LRU of `ReferencePrefix` keyed by `(voice_id, codes_sha256)`, built on the `GpuThread` while the
   gate is held. On out-of-memory it falls back to the codes path. Delete invalidates the entry.
 - [ ] T065 [US1] Create `breeze_infer/routes_voices.py`:
