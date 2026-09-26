@@ -36,7 +36,14 @@ def encode_prompt_waveform(
     wav = np.asarray(wav, dtype=np.float32)
     if wav.ndim > 1:
         wav = np.mean(wav, axis=1)
-    encoded = audio_tokenizer.encode(wav, sr=int(sample_rate))
+    # `--fast-all` turns cudnn.benchmark on process-wide, so each server process can autotune
+    # a different conv algorithm; they round differently and flip about 1% of the fine codes,
+    # changing the audio for the same reference after a restart (research.md R18). Only the
+    # encode is pinned; decode keeps its tuned algorithms.
+    with torch.backends.cudnn.flags(
+        enabled=torch.backends.cudnn.enabled, benchmark=False, deterministic=True
+    ):
+        encoded = audio_tokenizer.encode(wav, sr=int(sample_rate))
     codes = torch.as_tensor(encoded["audio_codes"][0], dtype=torch.int16)
     if codes.ndim != 2:
         raise ValueError(f"Expected 2D audio codes, got shape {tuple(codes.shape)}")

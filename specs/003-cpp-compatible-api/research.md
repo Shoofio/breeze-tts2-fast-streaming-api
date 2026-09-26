@@ -493,3 +493,49 @@ The 002 baseline (RTX 4090: short design 75 ms / 0.379) is for reference only; i
 different branch.
 
 **Rationale**: The comparison has to be made on the same machine and branch.
+
+## R18. Cross-process determinism of inline reference codes
+
+**Decision**: `breeze_infer/audio.py`'s `encode_prompt_waveform` scopes the codec's `encode` call
+in `torch.backends.cudnn.flags(enabled=torch.backends.cudnn.enabled, benchmark=False,
+deterministic=True)`. `enabled` is read from whatever the caller already has, never forced;
+`benchmark` and `deterministic` are the only two flags this scope changes, and only for the
+duration of the encode call -- the codec's decode path outside this scope keeps cuDNN's
+autotuned algorithms. `infer.py` and `breeze_infer/synthesis.py`'s `resolve_reference` are the
+only two places that encode reference audio in the live serving path, and both already call
+`encode_prompt_waveform` rather than the codec directly, so no other call site needed changing.
+(`models/breeze.py`'s `_get_audio_token_from_batch` also calls a codec's `.encode(...)` directly,
+but it has no caller anywhere in this repo -- dead training-script code ported from the base
+model, not part of the inference server -- so it was left alone.)
+
+This is a deviation the user approved on 2026-09-25, not a BC item: `--fast-all` sets
+`torch.backends.cudnn.benchmark = True` for the whole process
+(`models/stream_runtime/stream/runtime.py`'s `MultiRequestStreamRuntime.__init__`), so cuDNN
+autotunes whichever conv algorithm looks fastest *in that process* on first use and reuses it.
+Autotuning races candidate kernels against a wall clock, so two separate server processes can
+settle on different algorithms for the identical convolution, and those algorithms round
+differently -- about 1% of the fine-codebook codes (codebooks 6-15) then differ for the same
+input. The observable symptom: the same inline reference wav, the same text and the same seed
+produced audio 5.20 s long in one process and 6.96 s long after a restart, at `bea6767`. Pinning
+the encoded codes (bypassing a fresh `encode` call) gave byte-identical output at both `bea6767`
+and `HEAD`, isolating the divergence to the encode step rather than generation or decode. A probe
+that forced `benchmark=False` around only the encode call, in two otherwise-identical fresh
+processes, produced identical codes both times; without it, the same two processes produced
+22-23 differing entries out of 2,064 (129 frames x 16 codebooks) -- consistent with the ~1%
+figure above.
+
+**Rationale**: Scoping the fix to the encode call, rather than turning `cudnn.benchmark` off for
+the whole process, keeps the decode path's autotuned performance (the reason `--fast-all` sets
+`benchmark = True` in the first place) while making the one thing that must be reproducible --
+what a saved or inline reference encodes to -- independent of which process encoded it.
+Measured cost (bench reference wav, median of 20 calls after 5 warm-up calls, one process, fast
+codec's `cudnn.benchmark=True` already enabled): ~25.6 ms/call with the scoped flags versus
+~24.9 ms/call without them -- the two are within each other's run-to-run noise, so the fix has no
+measurable cost once cuDNN has already picked an algorithm during warm-up.
+
+**Evidence**: `tests/test_audio.py`'s
+`test_encode_prompt_waveform_scopes_cudnn_to_deterministic_no_benchmark` (a fake codec records
+the flags in effect during its own `encode`, on the CPU suite) and
+`tests/gpu/test_reference_encode_determinism.py` (encodes the bench reference wav in two fresh
+Python processes, with the same `MultiRequestStreamRuntime`-based fast codec runtime production
+uses, and asserts identical codes).

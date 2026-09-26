@@ -67,3 +67,10 @@ exposes a C++-server-compatible HTTP and WebSocket API; see the README and
   `split_chars` if that is smaller.
 
 Later phases append their own `BC-nn` entries to this section as they land.
+
+### Fixed
+
+- An inline reference wav now encodes to the same codec codes regardless of which server process
+  handled the request, so the same reference, text and seed give the same audio across a
+  restart. (Previously, `--fast-all`'s process-wide `cudnn.benchmark = True` let cuDNN settle on
+  a different, differently-rounding conv algorithm per process for the reference encode step.)

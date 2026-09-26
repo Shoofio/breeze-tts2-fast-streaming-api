@@ -52,6 +52,51 @@ def test_encode_prompt_waveform_rejects_non_2d_codes() -> None:
         encode_prompt_waveform(_FlatCodec(), np.zeros(1920, dtype=np.float32), 24000)
 
 
+def test_encode_prompt_waveform_scopes_cudnn_to_deterministic_no_benchmark() -> None:
+    """`--fast-all` leaves `torch.backends.cudnn.benchmark = True` set for the whole
+    process (models/stream_runtime/stream/runtime.py), so cuDNN autotunes a conv
+    algorithm on first use and reuses it -- different processes can pick different
+    algorithms, which round differently and give ~1% different fine-codebook codes for
+    the identical reference wav (2026-09-25 finding). `encode_prompt_waveform` must
+    force `benchmark=False, deterministic=True` for just the codec's `encode` call so
+    the same wav always encodes to the same codes, regardless of what the rest of the
+    process has autotuned.
+    """
+    seen_flags: dict[str, bool] = {}
+
+    class _FlagRecordingCodec(FakeCodec):
+        def encode(self, wav, sr, return_dict=True):
+            seen_flags["benchmark"] = torch.backends.cudnn.benchmark
+            seen_flags["deterministic"] = torch.backends.cudnn.deterministic
+            return super().encode(wav, sr, return_dict=return_dict)
+
+    with torch.backends.cudnn.flags(enabled=True, benchmark=True, deterministic=False):
+        encode_prompt_waveform(
+            _FlagRecordingCodec(), np.zeros(1920, dtype=np.float32), 24000
+        )
+
+        assert seen_flags == {"benchmark": False, "deterministic": True}
+        # Restored to the caller's own flags once the encode call returns, not left
+        # at the scoped values.
+        assert torch.backends.cudnn.benchmark is True
+        assert torch.backends.cudnn.deterministic is False
+
+
+def test_encode_prompt_waveform_restores_cudnn_flags_when_encode_raises() -> None:
+    class _RaisingCodec(FakeCodec):
+        def encode(self, wav, sr, return_dict=True):
+            raise RuntimeError("boom")
+
+    with torch.backends.cudnn.flags(enabled=True, benchmark=True, deterministic=False):
+        with pytest.raises(RuntimeError, match="boom"):
+            encode_prompt_waveform(
+                _RaisingCodec(), np.zeros(1920, dtype=np.float32), 24000
+            )
+
+        assert torch.backends.cudnn.benchmark is True
+        assert torch.backends.cudnn.deterministic is False
+
+
 # --- pcm16 --------------------------------------------------------------------------
 
 
