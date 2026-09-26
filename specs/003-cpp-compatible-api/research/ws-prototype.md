@@ -31,28 +31,44 @@ workaround), with the kernel as a backstop:
   in time gets the close code; one that never reads again sees 1006, which no design can avoid.
 - **Every close path uses it**:
   1. a slow client: the outbox would overflow `WS_OUTBOX_BYTES` (1008);
-  2. a slow client: one `ws.send()` blocked for `WS_SEND_TIMEOUT_SECONDS` (30 s, as for HTTP),
-     which catches a client that stalls with less than 2 MiB pending, where nothing overflows and
-     the keepalive ping is stuck behind the same full buffer (1008);
+  2. a slow client: a per-connection stall watchdog sees the transport's write buffer non-empty
+     and not shrinking for `WS_SEND_TIMEOUT_SECONDS` (30 s, as for HTTP), whether or not a
+     `ws.send()` of ours is pending (1008). It catches a client that stalls with less than 2 MiB
+     pending, where nothing overflows, and one that stops reading while idle but keeps sending
+     pings: the library's automatic pongs (`data_received` -> `send_data`, no drain) fill the
+     buffer, and the keepalive ping then blocks in `drain()` with its timeout never started;
   3. shutdown (1001);
   4. every handler exit, normal or by error, in the handler's `finally`, so the library's own
      close after the handler (and its `close(1011)` after an error) is already done and can't
-     hang in `drain()`. The keepalive's own `fail(1011)` also goes through `drain()`; it can only
-     stall once the buffer is full, which means we were sending, so path 2 reaches it.
-- **Our own connection set**: the server tracks every connection from `process_request` until
-  its handler's `finally`, in any state, for the 16-connection cap (reserved in
-  `process_request`, so concurrent handshakes can't exceed it) and for shutdown. Shutdown walks
-  that set, not `server.connections` (OPEN only).
-- **Shutdown refusal**: a shutdown flag is set before `server.close(close_connections=False)`;
-  `process_request` then refuses new handshakes with our JSON `503 shutting_down` and
-  `X-Breeze-Version`, so FR-037a holds with no exception.
+     hang in `drain()`. The keepalive's own `fail(1011)` and ping also go through `drain()`; they
+     stall only on a full buffer, which path 2's watchdog sees.
+- **Our own connection set**: one registry, shared by every `serve()` instance (one per bound
+  address), holds the connection set, the 16-connection cap and the shutdown flag. A connection
+  is added in `process_request` (reserving its slot, so concurrent handshakes can't exceed the
+  cap) and removed when its transport closes (a done-callback on the connection's
+  connection-lost future), not in the handler's `finally`: the library never calls the handler
+  for a handshake it refuses or that the client abandons (a plain GET without Upgrade, a bad key,
+  a disconnect before the 101), and those must not leak a slot. Shutdown walks this set, not
+  `server.connections` (OPEN only).
+- **Shutdown**: set the shared flag, call `close(close_connections=False)` on every server, then
+  run the bounded close on a snapshot of the set (`list(...)`, since closes remove entries)
+  concurrently with `asyncio.gather(..., return_exceptions=True)`, so 16 stalled peers take about
+  2 s, not 32. `process_request` refuses new handshakes with our JSON `503 shutting_down` and
+  `X-Breeze-Version`, so FR-037a holds with no exception. A peer that connected over TCP but never
+  sent its HTTP request isn't in the set; the library aborts it at `open_timeout` (10 s), which
+  bounds shutdown for that kind of peer.
+- **Both handshake hooks are synchronous.** The library checks `is_serving()` after
+  `process_response`; if either hook awaited, `Server.close()` could run in between and the
+  library would replace our 101 with its plain-text 503 without `X-Breeze-Version`.
 - **Backstop**: `TCP_USER_TIMEOUT` (`limits.TCP_USER_TIMEOUT_MS`, 30 s) on the WebSocket listening
   socket too, where the platform has it (Linux). Windows' `TCP_MAXRT` was not evaluated, so there
   the bounded close is the only eviction. The `SO_LINGER` value is packed per platform (two ints on
   Linux, two unsigned shorts on Windows).
 - **Library refusals** (its own `400`, `426` and `500`) are rewritten into the JSON envelope in
   `process_response`.
-- **Events**: `ws.closed` carries the code we sent, plus `aborted` and `reason`, so a BC-42
+- **Events**: `ws.closed` carries the code actually sent (from `ws.protocol.close_sent`, not the
+  argument we passed, since the library may have closed first with 1002/1007/1009/1011 or an
+  echoed client code), plus `aborted` and `reason`, so a BC-42
   eviction is distinguishable from a client that vanished (both look like 1006 to `close_code`).
 - **Rejected**: aborting without a close frame (breaks BC-42's 1008), the kernel option alone
   (holds a connection slot for 30 s, doesn't unblock shutdown, Linux only), and other libraries

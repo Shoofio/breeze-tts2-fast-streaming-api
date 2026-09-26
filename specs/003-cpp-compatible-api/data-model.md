@@ -343,6 +343,16 @@ busy depending on `work`), then `closed`.
 - Any message other than `start` before `started` gets `error{code: not_started}`.
 - A `start` with an unknown `voice_id`, or with `ref_text` and no `voice_id`, gets an `error`, and
   the state is unchanged.
+- A valid `start` always resets the session (buffer, anchor, opening flag, `piece_index`). It counts
+  as interrupting pending work, and so sends one `cancelled` first, only when a `Piece` is queued or
+  in flight. A queued `EndMark` alone still gets its `done` before `started`; buffered text alone is
+  dropped silently by the reset.
+- `cancel` keeps the anchor and `piece_index` (seeds keep counting from `start`). It turns the
+  opening budget back on only when piece 0 is cancelled before it anchored.
+- The first piece that succeeds provides the anchor. If piece 0 fails, the opening budget turns
+  back on only when no piece is queued.
+- A message rejected with an `error` has no other effect: a `flush` or `end` whose `text` would
+  exceed the buffer limit (`text_too_long`) neither drains nor queues its `EndMark`.
 
 **Worker loop**: one work item at a time.
 

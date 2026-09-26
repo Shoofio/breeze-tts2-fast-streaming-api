@@ -28,10 +28,11 @@ breaking change `BC-nn` or an additive change is marked.
 
 | Code | When |
 |---|---|
-| 1000 | echoed on a client close; also on server shutdown (1001). A client that doesn't read the shutdown close frame within 2 s is dropped without one (it sees 1006) |
+| 1000 | echoed on a client close |
+| 1001 | server shutdown. A client that doesn't read the close frame within 2 s is dropped without one (it sees 1006) |
 | 1002 | protocol error (for example an unmasked frame) |
 | 1007 | invalid UTF-8 |
-| 1008 | `client too slow`: more than 2 MiB of undelivered output, or one send blocked for 30 s; the piece in flight is cancelled first (BC-42). A client that doesn't read the close frame within 2 s is dropped without one (it sees 1006) |
+| 1008 | `client too slow`: more than 2 MiB of undelivered output, or no output delivered for 30 s while some is waiting; the piece in flight is cancelled first (BC-42). A client that doesn't read the close frame within 2 s is dropped without one (it sees 1006) |
 | 1009 | message too big |
 | 1011 | ping timeout or internal error |
 
@@ -61,7 +62,9 @@ On connect, before any client message, the server sends
 
 Messages are JSON objects with a string `type`, parsed with a real JSON parser, so `\uXXXX`
 escapes work (BC-32). Rules for every message:
-- Unknown fields are ignored.
+- Unknown fields are ignored, and a field whose value is JSON `null` counts as absent.
+- A message that is valid JSON but not an object gets `invalid_json`; a missing or non-string
+  `type` gets `invalid_field`.
 - Wrong types or out-of-range values produce `error{code: invalid_field}`, and the message has no
   other effect.
 - Invalid JSON produces `error{code: invalid_json}`.
@@ -104,7 +107,8 @@ escapes work (BC-32). Rules for every message:
 - A piece with no letter or digit (for example emoji-only or punctuation-only) is dropped.
 - If the buffer plus the new text would exceed 10,000 characters, the server sends
   `error{code: text_too_long}` and does not append the text (BC-40).
-- Control characters are rejected with `invalid_field` (BC-46).
+- Control characters are rejected with `invalid_field` (BC-46), in `text` and, as on HTTP, in
+  `instruction` and `ref_text` (on `start` and on `instruction`).
 
 **Other rules**
 - Any message other than `start` before a successful `start` gets

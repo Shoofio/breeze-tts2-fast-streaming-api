@@ -821,17 +821,23 @@ rules.
   - `test_bc_45_binary_frame_gets_error`;
   - `test_bc_41_generation_failure_is_an_error_event_and_session_continues`;
   - `test_bc_42_slow_client_closed_1008_and_gpu_freed`, split in two: a client that resumes
-    reading within `WS_CLOSE_TIMEOUT_SECONDS` receives 1008; one that never reads is dropped, its
+    reading promptly (well under `WS_CLOSE_TIMEOUT_SECONDS`, with small socket buffers so the
+    close frame isn't stuck behind megabytes) receives 1008; one that never reads is dropped, its
     slot is freed and the gate released; `ws.closed` shows `aborted`;
-  - a client that stalls with less than `WS_OUTBOX_BYTES` pending is evicted after
-    `WS_SEND_TIMEOUT_SECONDS` (monkeypatched small);
-  - shutdown with a stalled raw-socket peer finishes within `WS_CLOSE_TIMEOUT_SECONDS` plus a
-    margin (the T070 check 4 hang);
+  - a client that stalls with less than `WS_OUTBOX_BYTES` pending, and an idle client that stops
+    reading but keeps sending pings, are evicted after `WS_SEND_TIMEOUT_SECONDS` (monkeypatched
+    small);
+  - refused and abandoned handshakes (a plain GET, a bad key, a disconnect before the 101) don't
+    leak cap slots: 17+ of them, then a normal connection still succeeds;
+  - shutdown with several stalled post-handshake raw-socket peers finishes within
+    `WS_CLOSE_TIMEOUT_SECONDS` plus a margin (the T070 check 4 hang; several peers catch a serial
+    loop or an unsnapshotted set);
   - `queued` sent only when actually waiting;
   - piece seeds continue from `start`.
 - [ ] T074 [P] [US4] Create `tests/test_ws_isolation.py` (SC-006): WebSocket client A stops
   reading mid-piece. An HTTP speech request from client B starts streaming within the in-flight
-  piece plus 1 s. Client A, which never reads again, is dropped and its slot freed.
+  piece plus 1 s. Client A, which never reads again, is dropped and its slot freed within
+  `WS_SEND_TIMEOUT_SECONDS` (monkeypatched small) plus `WS_CLOSE_TIMEOUT_SECONDS` and a margin.
 
 ### Implementation
 
@@ -844,11 +850,12 @@ rules.
   work-deque operations the worker consumes (`next_item`, `mark_piece_done(anchor)`,
   `is_stale(piece)`). No I/O, no GPU, no locks.
 - [ ] T077 [US4] *(Opus)* Create `breeze_infer/ws_server.py`:
-  - `serve(settings, components, sock)` using `websockets.asyncio.server.serve`, with
-    `process_request` handling the Origin check via `cors.origin_allowed`, loading, and the
-    connection cap, and a `process_response` hook that adds `X-Breeze-Version` to every handshake
-    response; `open_timeout=10`, `max_size=1 MiB`, `ping_interval=20`, `ping_timeout=20`,
-    `close_timeout=2`.
+  - `serve(settings, components, sock, registry)` using `websockets.asyncio.server.serve`, with
+    `process_request` handling the Origin check via `cors.origin_allowed`, loading, shutdown and
+    the connection cap, and a `process_response` hook that adds `X-Breeze-Version` to every
+    handshake response; both hooks synchronous (never awaiting); `open_timeout=10`,
+    `max_size=1 MiB`, `ping_interval=20`, `ping_timeout=20`, `close_timeout=2`. `registry` is one
+    object shared by every `serve()` instance: the connection set, the cap and the shutdown flag.
   - Per connection: send `ready`, then run a reader task (parse, `session.apply`, enqueue
     immediate events) and one worker coroutine:
     - `CancelMark` sends `cancelled`, `StartMark` sends `started`, and `EndMark` sends `done` if
@@ -859,24 +866,29 @@ rules.
       generator and releases the gate.
   - One ordered outbox bounded at `WS_OUTBOX_BYTES`, plus a sender task. On overflow: cancel the
     piece in flight, then close with 1008 `client too slow`.
-  - The sender bounds each `ws.send()` by `WS_SEND_TIMEOUT_SECONDS`; expiry is a slow client too.
+  - A per-connection stall watchdog: the transport's write buffer non-empty and not shrinking for
+    `WS_SEND_TIMEOUT_SECONDS` is a slow client too, whether or not a send is pending (automatic
+    pong replies can fill the buffer on an idle session).
   - Every server-initiated close is bounded by us, not by `close_timeout` (T070 found
     `ws.close()` blocks forever on a peer that stopped reading): cancel the sender, run
     `ws.close()` inside `asyncio.timeout(WS_CLOSE_TIMEOUT_SECONDS)`, and on timeout set
     `SO_LINGER(1, 0)` (packed per platform) and call `ws.transport.abort()`. The paths: outbox
     overflow, send stall, shutdown, and every handler exit (in its `finally`).
-  - Track connections in our own set, from `process_request` to the handler's `finally`, for the
-    cap and for shutdown. Shutdown sets a flag (new handshakes get `503 shutting_down`), calls
-    `server.close(close_connections=False)`, then the bounded close on each tracked connection.
+  - Track connections in the shared registry, from `process_request` until the transport closes
+    (not the handler's `finally`, which never runs for refused or abandoned handshakes), for the
+    cap and for shutdown. Shutdown sets the flag (new handshakes get `503 shutting_down`), calls
+    `close(close_connections=False)` on every server, then runs the bounded close on a snapshot
+    of the set, concurrently (`asyncio.gather(..., return_exceptions=True)`).
   - `TCP_USER_TIMEOUT` goes on the listening socket as a backstop where the platform has it.
     `process_response` also rewrites the library's own `400`/`426`/`500` refusals into the JSON
-    envelope. `ws.closed` carries the code sent, `aborted` and `reason`. See
+    envelope. `ws.closed` carries the code actually sent (`ws.protocol.close_sent`), `aborted` and `reason`. See
     `research/ws-prototype.md` ("Decision" and the gotchas).
   - On disconnect: bump the epoch, cancel, and join.
   - Emit the `ws.*` events with `session_id` and `piece_index`.
 - [ ] T078 [US4] Wire the WebSocket into `breeze_infer/api.py`:
   - Unless `ws_port` is `disabled`, pre-bind the sockets on `settings.host:ws_port` (every
-    address the host resolves to, like the HTTP sockets), with one `serve()` per socket.
+    address the host resolves to, like the HTTP sockets), with one `serve()` per socket, all
+    sharing one registry (one cap of 16, one shutdown flag).
   - On `OSError`, emit `ws.bind_failed` and report 0 (`test_bc_24_ws_bind_failure_reports_zero`
     goes in `tests/test_health.py`).
   - `/health`'s `ws_port` provider returns the bound port.

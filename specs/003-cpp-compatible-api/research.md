@@ -449,7 +449,8 @@ CUDA).
     enqueues exactly one `CancelMark`.
   - `end` enqueues exactly one `EndMark`.
   - `start` validates first, cancels only when work is pending, and then enqueues `StartMark`.
-- **Slow client:** if the outgoing queue would overflow, the piece in flight is cancelled (the GPU
+- **Slow client:** if the outgoing queue would overflow, or the connection's write buffer makes no
+  progress for `WS_SEND_TIMEOUT_SECONDS` (the stall watchdog, R4 amendment), the piece in flight is cancelled (the GPU
   is freed within one chunk) and the connection closes with 1008 and reason `client too slow`.
 
 **Rationale**:
