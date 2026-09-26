@@ -7,7 +7,11 @@ timestamp/filename behaviour are deterministic and instant.
 
 from __future__ import annotations
 
+import errno
+import logging
 import os
+import threading
+import tracemalloc
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,10 +19,12 @@ import numpy as np
 import pytest
 
 from breeze_infer import voice_file, voice_store
+from breeze_infer.limits import MAX_VOICE_FILE_BYTES
 from breeze_infer.voice_store import VoiceExists, VoiceStore
 from tests.fakes import RecordingEvents
 
 CODEBOOK_SIZE = 2048
+CODEBOOKS = 16
 FINGERPRINT = "f" * 64
 
 
@@ -47,6 +53,7 @@ def _store(tmp_path: Path, *, events=None, clock=None, sleep=None, nonce=None) -
     counter = iter(range(10_000))
     return VoiceStore(
         tmp_path,
+        codebooks=CODEBOOKS,
         codebook_size=CODEBOOK_SIZE,
         codec_fingerprint=FINGERPRINT,
         events=events if events is not None else RecordingEvents(),
@@ -67,7 +74,10 @@ def test_create_writes_a_readable_file(tmp_path: Path):
     path = tmp_path / "alice.voice.json"
     assert path.is_file()
     loaded = voice_file.decode(
-        path.read_bytes(), expected_id="alice", codebook_size=CODEBOOK_SIZE, codec_fingerprint=FINGERPRINT
+        path.read_bytes(), expected_id="alice",
+        codebooks=CODEBOOKS,
+        codebook_size=CODEBOOK_SIZE,
+        codec_fingerprint=FINGERPRINT,
     )
     assert loaded.id == "alice"
     assert np.array_equal(loaded.codes, written.codes)
@@ -83,6 +93,7 @@ def test_create_never_overwrites_an_existing_file(tmp_path: Path):
     loaded = voice_file.decode(
         (tmp_path / "alice.voice.json").read_bytes(),
         expected_id="alice",
+        codebooks=CODEBOOKS,
         codebook_size=CODEBOOK_SIZE,
         codec_fingerprint=FINGERPRINT,
     )
@@ -114,11 +125,16 @@ def test_remove_deletes_the_file(tmp_path: Path):
     assert not (tmp_path / "alice.voice.json").exists()
 
 
-def test_remove_is_case_insensitive(tmp_path: Path):
+def test_remove_matches_the_id_exactly(tmp_path: Path):
+    """Review finding #5: DELETE takes the id exactly as GET /v1/voices lists it (what
+    the SillyTavern extension sends back); only create's uniqueness ignores case. The
+    registry's remove matches exactly too, so the two can't disagree."""
     store = _store(tmp_path)
-    store.create(_voice("alice"))
-    assert store.remove("ALICE") is True
-    assert not (tmp_path / "alice.voice.json").exists()
+    store.create(_voice("Carol"))
+    assert store.remove("carol") is False
+    assert (tmp_path / "Carol.voice.json").is_file()
+    assert store.remove("Carol") is True
+    assert not (tmp_path / "Carol.voice.json").exists()
 
 
 def test_remove_of_an_unknown_id_returns_false(tmp_path: Path):
@@ -274,3 +290,329 @@ def test_scan_rebuilds_the_known_index_so_create_still_refuses_a_duplicate(tmp_p
     fresh.scan()
     with pytest.raises(VoiceExists):
         fresh.create(_voice("alice"))
+
+
+# ---------------------------------------------------------------- review findings
+#
+# Helpers for writing files straight onto disk, bypassing create(): another process, a
+# hand-copied file, or a file left behind by an older build.
+
+
+def _write_valid(tmp_path: Path, voice_id: str, *, ref_text: str = "hi") -> Path:
+    path = tmp_path / f"{voice_id}{voice_store.SUFFIX}"
+    path.write_bytes(
+        voice_file.encode(
+            id=voice_id,
+            ref_text=ref_text,
+            codes=_codes(seed=1),
+            codec_fingerprint=FINGERPRINT,
+            encode_ms=1,
+            created_at="1970-01-01T00:00:00Z",
+        )
+    )
+    return path
+
+
+def _require_case_sensitive(tmp_path: Path) -> None:
+    probe = tmp_path / "CaseProbe"
+    probe.write_text("x")
+    try:
+        if (tmp_path / "caseprobe").exists():
+            pytest.skip("tmp_path is on a case-insensitive filesystem; this case needs two files differing only by case")
+    finally:
+        probe.unlink()
+
+
+# ---- #2: create never overwrites, enforced on disk
+
+
+def test_create_refuses_a_file_added_after_the_scan(tmp_path: Path):
+    store = _store(tmp_path)
+    store.scan()
+    _write_valid(tmp_path, "alice", ref_text="from outside")
+
+    with pytest.raises(VoiceExists):
+        store.create(_voice("alice", ref_text="mine"))
+
+    assert json_ref_text(tmp_path / "alice.voice.json") == "from outside"
+    assert [p.name for p in tmp_path.iterdir()] == ["alice.voice.json"]  # no temp file left
+
+
+def test_create_refuses_the_name_of_a_skipped_file(tmp_path: Path):
+    (tmp_path / "bob.voice.json").write_bytes(b"not json")
+    store = _store(tmp_path)
+    store.scan()
+
+    with pytest.raises(VoiceExists):
+        store.create(_voice("bob"))
+    assert (tmp_path / "bob.voice.json").read_bytes() == b"not json"
+
+
+def test_create_refuses_a_case_variant_of_a_skipped_file(tmp_path: Path):
+    _require_case_sensitive(tmp_path)
+    (tmp_path / "Bob.voice.json").write_bytes(b"not json")
+    store = _store(tmp_path)
+    store.scan()
+
+    with pytest.raises(VoiceExists):
+        store.create(_voice("bob"))
+    assert not (tmp_path / "bob.voice.json").exists()
+
+
+def test_create_without_hardlinks_still_never_overwrites(tmp_path: Path, monkeypatch):
+    """Where os.link isn't supported (EPERM on FAT/exFAT, for example), create falls
+    back to an exclusive create of the final file: still no overwrite."""
+    def no_links(src, dst):
+        raise OSError(errno.EPERM, "simulated: hard links not supported")
+
+    monkeypatch.setattr(os, "link", no_links)
+    store = _store(tmp_path)
+    store.scan()
+
+    store.create(_voice("alice", ref_text="first"))
+    assert json_ref_text(tmp_path / "alice.voice.json") == "first"
+
+    _write_valid(tmp_path, "bob", ref_text="from outside")
+    with pytest.raises(VoiceExists):
+        store.create(_voice("bob", ref_text="mine"))
+    assert json_ref_text(tmp_path / "bob.voice.json") == "from outside"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["alice.voice.json", "bob.voice.json"]
+
+
+def json_ref_text(path: Path) -> str:
+    return voice_file.decode(
+        path.read_bytes(),
+        expected_id=path.name[: -len(voice_store.SUFFIX)],
+        codebooks=CODEBOOKS,
+        codebook_size=CODEBOOK_SIZE,
+        codec_fingerprint=FINGERPRINT,
+    ).ref_text
+
+
+# ---- #3: remove deletes a skipped file and frees its name
+
+
+def test_remove_deletes_a_skipped_file_and_frees_its_name(tmp_path: Path):
+    (tmp_path / "bob.voice.json").write_bytes(b"not json")
+    store = _store(tmp_path)
+    store.scan()
+
+    assert store.remove("bob") is True
+    assert not (tmp_path / "bob.voice.json").exists()
+
+    store.create(_voice("bob"))
+    assert json_ref_text(tmp_path / "bob.voice.json") == "hello"
+
+
+def test_remove_of_a_skipped_file_matches_its_stem_exactly(tmp_path: Path):
+    (tmp_path / "Carol.voice.json").write_bytes(b"not json")
+    store = _store(tmp_path)
+    store.scan()
+
+    assert store.remove("carol") is False
+    assert (tmp_path / "Carol.voice.json").exists()
+    assert store.remove("Carol") is True
+    assert not (tmp_path / "Carol.voice.json").exists()
+
+
+# ---- #4: a remove can never delete a concurrent create's file
+
+
+def test_remove_cannot_delete_a_concurrent_create_of_the_same_name(tmp_path: Path):
+    """Pauses remove() inside path_for() -- after its lookup, before its rename -- and
+    tries to create the same name meanwhile. The create must either wait for the remove
+    to finish or be refused; whichever, a create that returns has a file on disk at the
+    end. The join timeout only decides how long the create gets to slip in; it can't
+    change the outcome once remove holds the write lock across lookup and rename."""
+    store = _store(tmp_path)
+    store.create(_voice("alice", ref_text="old"))
+
+    remove_paused = threading.Event()
+    let_remove_go = threading.Event()
+    real_path_for = store.path_for
+    remover = {}
+
+    def pausing_path_for(voice_id: str) -> Path:
+        if threading.current_thread() is remover.get("thread") and not remove_paused.is_set():
+            remove_paused.set()
+            assert let_remove_go.wait(timeout=10)
+        return real_path_for(voice_id)
+
+    store.path_for = pausing_path_for  # type: ignore[method-assign]
+
+    results: dict[str, object] = {}
+
+    def do_remove():
+        results["remove"] = store.remove("alice")
+
+    def do_create():
+        try:
+            results["create"] = store.create(_voice("alice", ref_text="new"))
+        except VoiceExists as exc:
+            results["create"] = exc
+
+    remover["thread"] = threading.Thread(target=do_remove)
+    remover["thread"].start()
+    assert remove_paused.wait(timeout=10)
+
+    creator = threading.Thread(target=do_create)
+    creator.start()
+    creator.join(timeout=0.5)  # give the create every chance to run inside the gap
+    let_remove_go.set()
+    remover["thread"].join(timeout=10)
+    creator.join(timeout=10)
+
+    assert results["remove"] is True
+    assert isinstance(results["create"], voice_file.VoiceFile)  # the name was free once remove ran
+    assert json_ref_text(tmp_path / "alice.voice.json") == "new"
+
+
+# ---- #6: after the rename, the unlink is best-effort, and the rename is fsynced
+
+
+def test_remove_survives_an_unlink_failure_and_leaves_the_del_file_for_the_sweep(
+    tmp_path: Path, monkeypatch, caplog
+):
+    store = _store(tmp_path)
+    store.create(_voice("alice"))
+    real_unlink = os.unlink
+
+    def denied_for_del_files(path, *args, **kwargs):
+        if Path(path).name.startswith(voice_store.DEL_PREFIX):
+            raise PermissionError("simulated: a handle is still open")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", denied_for_del_files)
+    with caplog.at_level(logging.WARNING, logger="breeze_infer.voice_store"):
+        assert store.remove("alice") is True
+
+    assert not (tmp_path / "alice.voice.json").exists()
+    leftovers = [p.name for p in tmp_path.iterdir()]
+    assert len(leftovers) == 1 and leftovers[0].startswith(voice_store.DEL_PREFIX)
+    assert "simulated" in caplog.text
+
+    monkeypatch.setattr(os, "unlink", real_unlink)
+    _store(tmp_path).scan()  # the next start sweeps it
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_remove_fsyncs_the_directory_after_the_rename(tmp_path: Path, monkeypatch):
+    """BC-28: the rename to .del-* must reach the disk before remove returns, so a power
+    loss can't bring the voice back."""
+    store = _store(tmp_path)
+    store.create(_voice("alice"))
+    steps: list[str] = []
+    real_replace, real_fsync_dir, real_unlink = os.replace, voice_store._fsync_dir, os.unlink
+
+    def replace(src, dst):
+        steps.append("rename")
+        return real_replace(src, dst)
+
+    def fsync_dir(path):
+        steps.append("fsync_dir")
+        return real_fsync_dir(path)
+
+    def unlink(path, *args, **kwargs):
+        steps.append("unlink")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(voice_store, "_fsync_dir", fsync_dir)
+    monkeypatch.setattr(os, "unlink", unlink)
+
+    assert store.remove("alice") is True
+    assert steps[:2] == ["rename", "fsync_dir"]
+
+
+# ---- #8: the case-duplicate rule follows sort order over every file, valid or not
+
+
+def test_a_case_duplicate_of_an_earlier_invalid_file_is_skipped(tmp_path: Path):
+    _require_case_sensitive(tmp_path)
+    (tmp_path / "Alice.voice.json").write_bytes(b"not json")  # sorts first ('A' < 'a')
+    _write_valid(tmp_path, "alice")
+    store = _store(tmp_path)
+
+    result = store.scan()
+
+    assert result.voices == []
+    by_file = {item.file: item for item in result.skipped}
+    assert set(by_file) == {"Alice.voice.json", "alice.voice.json"}
+    assert "case-duplicate of Alice.voice.json" in by_file["alice.voice.json"].reason
+    assert by_file["Alice.voice.json"].name == "Alice"  # the earlier file reserves the name
+
+
+# ---- #9: filesystem trouble during scan is logged and skipped, never fatal
+
+
+def test_scan_skips_a_leftover_directory(tmp_path: Path, caplog):
+    (tmp_path / ".tmp-x").mkdir()
+    _write_valid(tmp_path, "alice")
+    with caplog.at_level(logging.WARNING, logger="breeze_infer.voice_store"):
+        result = _store(tmp_path).scan()
+
+    assert [v.id for v in result.voices] == ["alice"]
+    assert (tmp_path / ".tmp-x").is_dir()
+    assert ".tmp-x" in caplog.text
+
+
+def test_scan_survives_a_leftover_it_cannot_unlink(tmp_path: Path, monkeypatch, caplog):
+    (tmp_path / ".del-bob-n1.voice.json").write_text("garbage")
+    _write_valid(tmp_path, "alice")
+    real_unlink = os.unlink
+
+    def denied(path, *args, **kwargs):
+        if Path(path).name.startswith(voice_store.DEL_PREFIX):
+            raise PermissionError("simulated: a handle is still open")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", denied)
+    with caplog.at_level(logging.WARNING, logger="breeze_infer.voice_store"):
+        result = _store(tmp_path).scan()
+
+    assert [v.id for v in result.voices] == ["alice"]
+    assert (tmp_path / ".del-bob-n1.voice.json").exists()
+    assert "simulated" in caplog.text
+
+
+def test_scan_skips_a_file_larger_than_the_bound(tmp_path: Path):
+    (tmp_path / "huge.voice.json").write_bytes(b" " * (MAX_VOICE_FILE_BYTES + 1))
+    events = RecordingEvents()
+
+    result = _store(tmp_path, events=events).scan()
+
+    assert result.voices == []
+    assert [item.file for item in result.skipped] == ["huge.voice.json"]
+    assert f"larger than {MAX_VOICE_FILE_BYTES} bytes" in result.skipped[0].reason
+    assert result.skipped[0].name == "huge"  # still reserves its name, like any skipped file
+    assert ("voice.skipped", {"file": "huge.voice.json", "reason": result.skipped[0].reason}) in events.calls
+
+
+def test_a_file_at_the_bound_is_read_and_judged_on_its_content(tmp_path: Path):
+    """A file of exactly MAX_VOICE_FILE_BYTES is not skipped for its size: the
+    padding keeps it valid JSON, so it loads."""
+    path = _write_valid(tmp_path, "alice")
+    data = path.read_bytes()
+    path.write_bytes(data + b" " * (MAX_VOICE_FILE_BYTES - len(data)))
+
+    result = _store(tmp_path).scan()
+
+    assert [v.id for v in result.voices] == ["alice"]
+
+
+def test_scan_reads_an_oversized_file_only_up_to_the_bound(tmp_path: Path):
+    """A 64 MiB (sparse) file must not be read into memory whole: tracemalloc's peak
+    over the scan stays far below the file's size."""
+    with open(tmp_path / "huge.voice.json", "wb") as handle:
+        handle.truncate(64 * 1024 * 1024)
+    store = _store(tmp_path)
+
+    tracemalloc.start()
+    try:
+        result = store.scan()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert [item.file for item in result.skipped] == ["huge.voice.json"]
+    assert peak < 4 * MAX_VOICE_FILE_BYTES

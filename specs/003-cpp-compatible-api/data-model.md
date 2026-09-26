@@ -38,6 +38,7 @@ choice and doesn't change the contract. Limits are constants in `limits.py` rath
 | `MAX_NEW_TOKENS_CEILING` | 1,500 | `max_new_tokens` upper bound |
 | `ANCHOR_CHARS` | 200 | Opening budget with no reference |
 | `UNNAMED_VOICE_CAP` | 64 | Unnamed voices in memory |
+| `MAX_VOICE_FILE_BYTES` | 256 KiB | Largest `*.voice.json` the startup scan reads (about six times the largest valid file) |
 | `WS_MAX_MESSAGE_BYTES` | 1 MiB | Inbound WebSocket message |
 | `WS_MAX_CONNECTIONS` | 16 | Concurrent WebSocket connections |
 | `WS_HANDSHAKE_SECONDS` | 10 | `open_timeout` |
@@ -198,7 +199,9 @@ frames, `sizing_timeout`), and when the request ends before the anchor decision 
 `{"id", "frames", "seconds" (2 decimals), "encode_ms" (integer ms), "saved", "ref_text"}`.
 
 **Registry rules**:
-- Names are unique ignoring case, including names reserved by skipped files.
+- Names are unique ignoring case, including names reserved by skipped files. Case is ignored
+  only at create: `DELETE` matches an id exactly, as `GET /v1/voices` lists it, or a skipped
+  file's exact file stem.
 - Unnamed voices are capped at `UNNAMED_VOICE_CAP`, and the oldest unnamed voice is evicted first.
 - An identical unnamed registration (same id) returns the existing entry.
 - List order: saved voices sorted by id, then unnamed voices in registration order.
@@ -210,7 +213,9 @@ POST (named)   → [validate] → [409 if name taken, ignoring case] → [decode
                → [write file under lock, re-checking the name] → registered (saved)
 POST (unnamed) → [validate] → [hash → existing? return it] → [decode] → [gate] → [encode]
                → registered (unnamed; may evict the oldest unnamed voice)
-DELETE         → saved: rename to .del-*, then unlink → unregistered; prefix cache entry dropped
+DELETE         → saved: rename to .del-* and fsync the directory, then unlink (best-effort: a
+                 failure leaves the .del-* file for the next startup's sweep) → unregistered;
+                 prefix cache entry dropped
                → unnamed: unregistered; prefix cache entry dropped
                → skipped-file name: file removed, name released
 restart        → saved voices reloaded from files; unnamed voices gone
@@ -238,16 +243,20 @@ Path: `<voices_dir>/<id>.voice.json`, UTF-8 JSON. A consumer rejects any file wh
 ```
 
 A file is skipped at startup, with a `voice.skipped{file, reason}` event, when any of these holds:
-- JSON or schema error;
+- it is larger than `MAX_VOICE_FILE_BYTES` (only that much is read);
+- JSON or schema error: not UTF-8, a missing field, a field of the wrong JSON type (integers
+  must be integers, not floats or booleans), a blank `ref_text` or one over 2,000 characters,
+  `frames` below 1, or `codebooks` other than the model's codebook count;
 - the file stem differs from `id`;
 - invalid name or a `v_` prefix;
-- a case-duplicate of a file that sorts earlier;
+- a case-duplicate of a file that sorts earlier, whether that file loaded or was skipped;
 - the byte length or sha256 of `codes` doesn't match;
 - a code is out of range;
 - the fingerprint doesn't match.
 
 Other files in the directory:
-- Leftover `.del-*` and `.tmp-*` files are removed.
+- Leftover `.del-*` and `.tmp-*` files are removed. One that can't be removed, or a directory
+  with such a name, is logged and left.
 - `*.breeze` files are counted and reported in `voices.loaded{loaded, skipped, breeze_ignored}`.
 
 ## WebSocket Session

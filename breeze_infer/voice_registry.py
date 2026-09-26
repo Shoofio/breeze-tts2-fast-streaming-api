@@ -145,7 +145,11 @@ class VoiceRegistry:
         self._lock = threading.Lock()
         self._saved: dict[str, SavedVoice] = {}  # id (as saved) -> SavedVoice
         self._name_index: dict[str, str] = {}  # lowercased name -> saved id
-        self._reserved: dict[str, str] = {}  # lowercased name -> reason (skipped files)
+        # exact name -> reason, for skipped files. Keyed exactly, not lowercased: DELETE
+        # releases a skipped file's name by its exact stem (the store deletes that exact
+        # file), and two skipped files differing only by case each hold the name until
+        # both are deleted. name_taken still compares ignoring case.
+        self._reserved: dict[str, str] = {}
         self._unnamed: dict[str, MemoryVoice] = {}
         self._unnamed_order: list[str] = []  # registration order, oldest first
 
@@ -158,7 +162,8 @@ class VoiceRegistry:
         if name[:2].lower() == "v_":
             return True
         lowered = name.lower()
-        return lowered in self._name_index or lowered in self._reserved
+        # A linear pass over the reserved names: only skipped files add them, a handful.
+        return lowered in self._name_index or any(n.lower() == lowered for n in self._reserved)
 
     # ------------------------------------------------------------------- startup
 
@@ -180,7 +185,7 @@ class VoiceRegistry:
                 self._name_index[voice.id.lower()] = voice.id
             for item in skipped:
                 if item.name is not None:
-                    self._reserved[item.name.lower()] = item.reason
+                    self._reserved[item.name] = item.reason
 
     # --------------------------------------------------------------- registering
 
@@ -237,7 +242,12 @@ class VoiceRegistry:
         """Drop `voice_id` from whichever tier holds it (or from the reserved-name
         set, for a skipped file's id). `None` if it's unknown. Only the in-memory
         registry changes here -- the caller also removes the file (if any) and the
-        prefix-cache entry."""
+        prefix-cache entry.
+
+        Every match is exact: DELETE takes the id as `GET /v1/voices` lists it (what
+        the SillyTavern extension sends back), or a skipped file's exact stem. Only
+        uniqueness at create ignores case. `VoiceStore.remove` follows the same rule,
+        so the two never disagree about which id a DELETE names."""
         with self._lock:
             if voice_id in self._saved:
                 del self._saved[voice_id]
@@ -247,8 +257,8 @@ class VoiceRegistry:
                 del self._unnamed[voice_id]
                 self._unnamed_order.remove(voice_id)
                 return RemovedVoice(id=voice_id, kind="unnamed")
-            if voice_id.lower() in self._reserved:
-                del self._reserved[voice_id.lower()]
+            if voice_id in self._reserved:
+                del self._reserved[voice_id]
                 return RemovedVoice(id=voice_id, kind="reserved")
             return None
 

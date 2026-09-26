@@ -208,3 +208,75 @@ def test_load_from_scan_clears_unnamed_voices_but_not_saved():
 
     assert registry.unnamed_count() == 0
     assert registry.saved_count() == 1
+
+
+# ------------------------------------------------- review finding #5: DELETE is exact
+
+
+def test_remove_of_a_reserved_name_matches_the_skipped_file_stem_exactly():
+    registry = _registry()
+    registry.load_from_scan(
+        voices=[], skipped=[SkippedVoiceFile(file="Carol.voice.json", reason="broken", name="Carol")]
+    )
+    assert registry.remove("carol") is None
+    assert registry.name_taken("carol") is True  # still reserved, ignoring case
+    removed = registry.remove("Carol")
+    assert removed is not None and removed.kind == "reserved"
+    assert registry.name_taken("carol") is False
+
+
+def test_two_reserved_names_differing_only_by_case_are_released_separately():
+    registry = _registry()
+    registry.load_from_scan(
+        voices=[],
+        skipped=[
+            SkippedVoiceFile(file="Carol.voice.json", reason="broken", name="Carol"),
+            SkippedVoiceFile(file="carol.voice.json", reason="case-duplicate", name="carol"),
+        ],
+    )
+    assert registry.remove("Carol") is not None
+    assert registry.name_taken("CAROL") is True  # carol.voice.json still holds it
+    assert registry.remove("carol") is not None
+    assert registry.name_taken("CAROL") is False
+
+
+@pytest.mark.parametrize("skipped", [False, True], ids=["saved", "skipped"])
+def test_store_and_registry_agree_on_which_id_delete_matches(tmp_path, skipped: bool):
+    """The routes (T065) call both; a DELETE for 'carol' against a file named Carol
+    must be a miss in both, and 'Carol' a hit in both."""
+    from datetime import datetime, timezone
+
+    from breeze_infer import voice_file
+    from breeze_infer.voice_store import VoiceStore
+    from tests.fakes import RecordingEvents
+
+    if skipped:
+        (tmp_path / "Carol.voice.json").write_bytes(b"not json")
+    else:
+        (tmp_path / "Carol.voice.json").write_bytes(
+            voice_file.encode(
+                id="Carol",
+                ref_text="hi",
+                codes=np.zeros((4, 16), dtype=np.int16),
+                codec_fingerprint="f" * 64,
+                encode_ms=1,
+                created_at="1970-01-01T00:00:00Z",
+            )
+        )
+    store = VoiceStore(
+        tmp_path,
+        codebooks=16,
+        codebook_size=2048,
+        codec_fingerprint="f" * 64,
+        events=RecordingEvents(),
+        clock=lambda: datetime(2026, 9, 24, tzinfo=timezone.utc),
+        sleep=lambda seconds: None,
+    )
+    scan = store.scan()
+    registry = _registry()
+    registry.load_from_scan(scan.voices, scan.skipped)
+
+    assert store.remove("carol") is False
+    assert registry.remove("carol") is None
+    assert store.remove("Carol") is True
+    assert registry.remove("Carol") is not None

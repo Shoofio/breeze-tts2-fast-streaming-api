@@ -2217,3 +2217,15 @@ def test_bc_08_duplicate_pass_still_runs_before_ref_audio_as_text_check_within_t
         "error": "seed was given more than once",
         "code": "duplicate_field",
     }
+
+
+def test_voice_id_names_are_checked_by_voice_file_is_valid_name(monkeypatch) -> None:
+    """Review finding #10: one saved-name rule, `voice_file.is_valid_name`, shared with the
+    voice store -- not a second copy of the pattern here. Swapping the shared helper for a
+    stand-in changes what `voice_id` accepts; the unnamed `v_` branch is unaffected."""
+    from breeze_infer import voice_file
+
+    monkeypatch.setattr(voice_file, "is_valid_name", lambda name: name == "only-this")
+    assert http_fields._is_valid_voice_id("only-this") is True
+    assert http_fields._is_valid_voice_id("alice") is False
+    assert http_fields._is_valid_voice_id("v_0123456789abcdef") is True

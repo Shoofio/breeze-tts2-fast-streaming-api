@@ -78,6 +78,7 @@ from python_multipart.multipart import parse_options_header
 from starlette.datastructures import FormData, QueryParams, UploadFile
 from starlette.formparsers import MultiPartException, MultiPartParser
 
+from breeze_infer import voice_file
 from breeze_infer.errors import ApiError
 from breeze_infer.limits import (
     MAX_AUDIO_BYTES,
@@ -946,17 +947,16 @@ class InlineRef:
 ReferenceSpec = NoReference | VoiceRef | InlineRef
 
 # `voice_id` is a *lookup* key, so it must accept either shape a real voice id can have: a
-# saved voice's name (contracts/http-api.md POST
-# /v1/voices `name` field, which BC-26 forbids from ever starting with `v_`), or an
-# unnamed voice's auto-generated `v_` + 16-lowercase-hex id (data-model.md). Whether the id
-# actually exists is Phase 7's concern (the stub 404 lookup); this only checks its shape.
-_VOICE_NAME_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,64}", re.ASCII)
+# saved voice's name (contracts/http-api.md POST /v1/voices `name` field, checked by the
+# one shared rule, `voice_file.is_valid_name`), or an unnamed voice's auto-generated `v_` +
+# 16-lowercase-hex id (data-model.md). Whether the id actually exists is Phase 7's concern
+# (the stub 404 lookup); this only checks its shape.
 _VOICE_UNNAMED_ID_PATTERN = re.compile(r"v_[0-9a-f]{16}", re.ASCII)
 
 
 def _is_valid_voice_id(value: str) -> bool:
-    """Branches on the `v_` prefix rather than just matching `_VOICE_NAME_PATTERN` alone:
-    that pattern's character class would also accept a `v_`-prefixed string that isn't a
+    """Branches on the `v_` prefix rather than just checking the saved-name shape alone:
+    that shape's character class would also accept a `v_`-prefixed string that isn't a
     real 16-hex id (e.g. `v_not-a-real-id`) as if it were a plausible saved name -- which it
     structurally can't be, since BC-26 forbids a saved name from ever starting with `v_`.
 
@@ -967,10 +967,13 @@ def _is_valid_voice_id(value: str) -> bool:
     into this branch, the match against `_VOICE_UNNAMED_ID_PATTERN` stays strictly
     case-sensitive: a real unnamed-voice id is always exactly lowercase, so `V_` followed by
     16 lowercase hex characters is still rejected here, same as before.
+
+    Called through the module (`voice_file.is_valid_name`), not a bare imported name, so
+    there is exactly one saved-name rule and a test can see this uses it.
     """
     if value[:2].lower() == "v_":
         return _VOICE_UNNAMED_ID_PATTERN.fullmatch(value) is not None
-    return _VOICE_NAME_PATTERN.fullmatch(value) is not None
+    return voice_file.is_valid_name(value)
 
 
 def _build_reference(fields: Fields) -> ReferenceSpec:
