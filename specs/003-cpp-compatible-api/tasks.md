@@ -383,12 +383,12 @@ the GPU smoke test.
   - Port `A:`'s override tests (backbone only, NaN and inf rejected, temperature floor),
     `max_new_tokens_room` tests (~463–610) and prefix-guard tests (~678–705).
   - The runtime raises `ValueError` on invalid overrides; it doesn't coerce.
-- [ ] T031 [P] [US1] Port the `A:` codes-path, prefix and suffix tests into
+- [X] T031 [P] [US1] Port the `A:` codes-path, prefix and suffix tests into
   `tests/test_templates.py` (`ref_audio_codes`, `_check_reference_source`,
   `split_reference_prefix`, `prepare_prefix_inputs` / `prepare_suffix_inputs`). Drop the
   empty-instruction pass-through test (BC-09 now maps a blank instruction to the default at the
   boundary).
-- [ ] T032 [P] [US1] Port the `A:` audio tests into `tests/test_audio.py`: `encode_prompt_waveform`,
+- [X] T032 [P] [US1] Port the `A:` audio tests into `tests/test_audio.py`: `encode_prompt_waveform`,
   `pcm16` clipping, and `codec_fingerprint`, which must not change when the checkpoint is moved to
   another absolute path.
 - [X] T033 [P] [US1] Port `A:tests/gpu/test_runtime_request_overrides.py` and
@@ -410,7 +410,7 @@ the GPU smoke test.
     `config.max_new_tokens` (1500) is the ceiling.
   - Warmup exercises the top-k/top-p and penalty kernels.
   - Add the repetition-penalty semantics docstring in `models/cudagraph/sampling.py`.
-- [ ] T035 [P] [US1] Update `breeze_infer/templates.py` and `breeze_infer/audio.py`:
+- [X] T035 [P] [US1] Update `breeze_infer/templates.py` and `breeze_infer/audio.py`:
   - Port the `A:6fb3736` hunks: `ref_audio_codes` segments, `required_fields` without the path,
     `_check_reference_source`, the prefix/suffix split, `encode_prompt_waveform(tokenizer, wav,
     sr)`, and `codec_fingerprint` (sha256 of the codec config's required identity fields from
@@ -420,7 +420,7 @@ the GPU smoke test.
     not a retrain of same-shaped weights).
   - Move `_pcm16` from the old `api.py` to `audio.pcm16`.
   - Remove `encode_prompt_audio(path)` and the temporary-file upload path.
-- [ ] T036 [P] [US1] Create `breeze_infer/reference_audio.py` (R9):
+- [X] T036 [P] [US1] Create `breeze_infer/reference_audio.py` (R9):
   - `decode(blob) -> DecodedAudio`: open with `sf.SoundFile` and check the header (format, 1–8
     channels, 8–192 kHz). A trustworthy, over-30 s frame count is rejected without decoding;
     otherwise decode in bounded blocks (capped at 30 s + 1 sample) and let the actual decoded
