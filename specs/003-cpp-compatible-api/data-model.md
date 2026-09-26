@@ -150,8 +150,16 @@ skipped, with `speech.anchor_skipped` (`piece_index` 0, `reason`), when:
   own preparation and generation on the GPU thread; no prompt is kept. Once piece 0 has finished,
   and before piece 1 starts, the decision is arithmetic on those lengths plus the anchor's frame
   count, with each room taken from the runtime (CFG rows and prefill bucket padding included).
+- `sizing_failed`: measuring the later pieces raised (a template or tokenizer error). The error
+  is also reported as `request.failed`; the stream goes on.
+- `sizing_timeout`: the measurement was still unfinished `ANCHOR_SIZING_TIMEOUT_SECONDS` (5 s)
+  after piece 0 finished. The GPU thread does not wait longer: a disconnect's close would queue
+  behind it, and a close past 30 s poisons the GPU gate.
+- `shutdown`: server shutdown cancelled the measurement before it ran.
 
-A skipped anchor leaves the later pieces as voice design.
+A skipped anchor leaves the later pieces as voice design. A request that ends before the
+anchor decision (an error, a `400`, or a disconnect before or after the `200`) cancels its
+measurement if it is still queued, so it never delays another request's own room check.
 
 ## Piece
 
@@ -307,7 +315,7 @@ offending record's field names), so one bad field never breaks the request emitt
   - voices: `voices.loaded`, `voice.skipped`, `voice.created`, `voice.deleted`;
   - speech: `speech.accepted`, `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`
     (`piece_index`, `requested`, `cap`, `room`), `speech.anchor_skipped` (`piece_index`,
-    `reason`: `piece_truncated` or `no_room`), `speech.piece_done` (`piece_index`, `frames`), `speech.completed` (`rtf`),
+    `reason`: `piece_truncated`, `no_room`, `sizing_failed`, `sizing_timeout` or `shutdown`), `speech.piece_done` (`piece_index`, `frames`), `speech.completed` (`rtf`),
     `speech.failed`, `speech.aborted`, `speech.frame_prediction_mismatch`
     (`predicted_frames`, `actual_frames`);
   - WebSocket: `ws.connected`, `ws.rejected` (`reason`), `ws.closed` (`code`), `ws.piece`;

@@ -30,7 +30,10 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
    on the CPU tokenizer's executor right after the lease (`_start_anchor_sizing`), not before
    the busy check (review #2 on 2d9070a): it runs on the CPU while piece 0 itself prepares and
    generates on the `GpuThread` below, and `_anchor_for_later_pieces` only blocks on the result
-   once piece 0 has actually finished, by which point it has usually already;
+   once piece 0 has actually finished, by which point it has usually already. Every exit that
+   doesn't reach that point cancels it (review 33 on 10f0c29), and the anchor is skipped
+   rather than the stream aborted if it fails or is still unfinished after
+   `ANCHOR_SIZING_TIMEOUT_SECONDS`;
 7. reference resolution and piece 0's preparation run on the `GpuThread` (`synthesis.py`),
    each awaited through `asyncio.shield` (finding 7): a cancelled or failed request must not
    release the lease while that GPU-thread call is still actually running -- the executor is
@@ -100,7 +103,7 @@ from breeze_infer.http_fields import (
     parse_speech,
     read_fields,
 )
-from breeze_infer.limits import ANCHOR_CHARS
+from breeze_infer.limits import ANCHOR_CHARS, ANCHOR_SIZING_TIMEOUT_SECONDS
 from breeze_infer.routes_health import Readiness
 from breeze_infer.settings import Settings
 from breeze_infer.streaming import SpeechResponse
@@ -212,9 +215,12 @@ class CpuTokenizer:
             raise RuntimeError("no CPU tokenizer: the model load installs one before ready")
         return fn(self._tokenizer, *args)
 
-    def shutdown(self) -> None:
-        """Refuse new work and let the thread end once any running call has finished."""
-        self._executor.shutdown(wait=False, cancel_futures=True)
+    def shutdown(self, *, wait: bool = False) -> None:
+        """Refuse new work, cancel queued calls, and let the thread end once any running call
+        has finished. `wait=True` also blocks until it has: a test teardown needs that, since
+        the GPU tests share one tokenizer copy across tests, each with its own executor.
+        """
+        self._executor.shutdown(wait=wait, cancel_futures=True)
 
 
 class SpeechComponents(Protocol):
@@ -429,63 +435,72 @@ def _iter_pieces(
     here, one at a time. Only piece 0 can anchor (data-model.md "Reference"); without an anchor
     the later pieces stay voice design. A cancelled or failed piece 0 never reaches the
     anchoring step.
+
+    However this generator ends -- exhausted, failed, or closed by a disconnect -- the sizing
+    is cancelled if still queued (review 33 on 10f0c29): an abandoned sizing of a long text
+    would otherwise hold the CPU tokenizer's one worker, and every later request's pre-gate
+    check would wait behind it. One already running or done is left alone.
     """
-    for index, text in enumerate(pieces):
-        if index == 0:
-            inputs, room = first_inputs, first_room
-        else:
-            inputs = prepare_piece(
-                runtime.tokenizer,
-                runtime.model,
-                reference,
-                text,
-                request.instruction,
-                request.cfg_scale,
-            )
-            room = piece_room(runtime, inputs, request.max_new_tokens)
-        max_new_tokens = piece_frame_limit(
-            room,
-            events,
-            request_id=request_id,
-            piece_index=index,
-            requested=request.max_new_tokens,
-        )
-        frames: list[Any] | None = [] if sizing_future is not None and index == 0 else None
-        piece_bytes = 0
-        for chunk in generate_piece(
-            runtime,
-            inputs,
-            request_id=request_id,
-            seed=piece_seed(request.seed, index),
-            chunk_first=chunk_first,
-            chunk_max=chunk_max,
-            samples_per_frame=samples_per_frame,
-            temperature=request.temperature,
-            top_k=request.top_k,
-            top_p=request.top_p,
-            repetition_penalty=request.repetition_penalty,
-            max_new_tokens=max_new_tokens,
-            token_observer=None if frames is None else frames.append,
-        ):
-            piece_bytes += len(chunk)
-            yield chunk
-        events.emit(
-            "speech.piece_done",
-            request_id=request_id,
-            piece_index=index,
-            frames=piece_bytes // _PCM_BYTES_PER_SAMPLE // samples_per_frame,
-        )
-        if frames is not None:
-            reference = _anchor_for_later_pieces(
-                runtime,
-                frames,
-                text,
-                sizing_future,
-                request,
+    try:
+        for index, text in enumerate(pieces):
+            if index == 0:
+                inputs, room = first_inputs, first_room
+            else:
+                inputs = prepare_piece(
+                    runtime.tokenizer,
+                    runtime.model,
+                    reference,
+                    text,
+                    request.instruction,
+                    request.cfg_scale,
+                )
+                room = piece_room(runtime, inputs, request.max_new_tokens)
+            max_new_tokens = piece_frame_limit(
+                room,
                 events,
                 request_id=request_id,
-                frame_limit=max_new_tokens,
+                piece_index=index,
+                requested=request.max_new_tokens,
             )
+            frames: list[Any] | None = [] if sizing_future is not None and index == 0 else None
+            piece_bytes = 0
+            for chunk in generate_piece(
+                runtime,
+                inputs,
+                request_id=request_id,
+                seed=piece_seed(request.seed, index),
+                chunk_first=chunk_first,
+                chunk_max=chunk_max,
+                samples_per_frame=samples_per_frame,
+                temperature=request.temperature,
+                top_k=request.top_k,
+                top_p=request.top_p,
+                repetition_penalty=request.repetition_penalty,
+                max_new_tokens=max_new_tokens,
+                token_observer=None if frames is None else frames.append,
+            ):
+                piece_bytes += len(chunk)
+                yield chunk
+            events.emit(
+                "speech.piece_done",
+                request_id=request_id,
+                piece_index=index,
+                frames=piece_bytes // _PCM_BYTES_PER_SAMPLE // samples_per_frame,
+            )
+            if frames is not None:
+                reference = _anchor_for_later_pieces(
+                    runtime,
+                    frames,
+                    text,
+                    sizing_future,
+                    request,
+                    events,
+                    request_id=request_id,
+                    frame_limit=max_new_tokens,
+                )
+    finally:
+        if sizing_future is not None:
+            sizing_future.cancel()
 
 
 def _anchor_for_later_pieces(
@@ -506,17 +521,26 @@ def _anchor_for_later_pieces(
     - `piece_truncated`: piece 0 used its whole limit, so it stopped at its cap or room
       rather than at EOS, and its audio may end mid-word -- not a clean reference;
     - `no_room`: the anchor would leave some later piece a smaller effective frame limit than
-      it would have without it (`_anchor_costs_frames`), or `sizing_future` never got to run at
-      all because `shutdown()` cancelled it while still queued (review #3 on 2d9070a) -- the
-      same 200 is already out by then, so "skip the anchor" is the only safe answer left.
-      The anchor is never trimmed to fit instead: its codes must stay paired with its text.
+      it would have without it (`_anchor_costs_frames`). The anchor is never trimmed to fit
+      instead: its codes must stay paired with its text.
+    Or the later pieces' lengths never arrived (review 33 on 10f0c29). The `200` is already out
+    by then, so skipping the anchor is the only safe answer left, not aborting the stream:
+    - `shutdown`: `CpuTokenizer.shutdown()` cancelled the sizing while it was still queued
+      (review #3 on 2d9070a). The route's own cancels run only once this generator is done
+      with it (`_iter_pieces`, `_serve_speech`);
+    - `sizing_timeout`: it was still unfinished after `ANCHOR_SIZING_TIMEOUT_SECONDS`, so the
+      CPU tokenizer's executor is backlogged. This GPU thread must not wait on it for long: a
+      disconnect's `gen.close()` would queue behind this wait and, past
+      `GPU_CLOSE_TIMEOUT_SECONDS`, poison the gate;
+    - `sizing_failed`: it raised (a template or tokenizer error, or no CPU tokenizer). That is
+      still a server bug, so it is also reported as `request.failed`.
     Zero non-pad frames means there is nothing to anchor on; that needs no event.
 
     This runs on the GPU thread between piece 0 and piece 1, so it tokenizes nothing: every
     later piece's length was already queued right after the lease (`sizing_future`,
     `_start_anchor_sizing`), running on the CPU while piece 0 itself generated here, and the
     anchor's frame count is all that was missing -- `.result()` only blocks for whatever, if
-    anything, is left of that by now.
+    anything, is left of that by now, and for at most `ANCHOR_SIZING_TIMEOUT_SECONDS`.
     """
     if len(frames) >= frame_limit:
         _skip_anchor(events, request_id, "piece_truncated")
@@ -525,9 +549,18 @@ def _anchor_for_later_pieces(
     if codes is None:
         return NoRef()
     try:
-        sizing = sizing_future.result()
+        sizing = sizing_future.result(timeout=ANCHOR_SIZING_TIMEOUT_SECONDS)
     except FutureCancelledError:
-        _skip_anchor(events, request_id, "no_room")
+        _skip_anchor(events, request_id, "shutdown")
+        return NoRef()
+    except TimeoutError:
+        # Cancelled in case it is still queued; one already running finishes on its own.
+        sizing_future.cancel()
+        _skip_anchor(events, request_id, "sizing_timeout")
+        return NoRef()
+    except Exception as error:  # noqa: BLE001 - reported; piece 0 is already out
+        report_unhandled(events, request_id, error)
+        _skip_anchor(events, request_id, "sizing_failed")
         return NoRef()
     if _anchor_costs_frames(runtime, sizing, int(codes.shape[0]), request.max_new_tokens):
         _skip_anchor(events, request_id, "no_room")
@@ -696,6 +729,7 @@ async def _serve_speech(
 
     session: GpuSession[bytes] | None = None
     gpu_task: asyncio.Task[Any] | None = None
+    sizing_future: Future[AnchorSizing] | None = None
     try:
         # Queued right after the lease (review #2 on 2d9070a), not before the busy check: a
         # request that gets 409 above must never run this at all. `None` with a reference or a
@@ -766,6 +800,15 @@ async def _serve_speech(
         # cancelling *this* await doesn't cancel work already submitted to the (single-
         # threaded) GPU executor (gpu.py), so releasing early would tell the next request
         # "free" while our own abandoned work is still really queued ahead of it there.
+        #
+        # The anchor sizing is cancelled first (review 33 on 10f0c29), so a failed request
+        # leaves nothing queued ahead of the next request's pre-gate check. Only the anchor
+        # decision after piece 0 waits on it, and before the `200` the stream has not got that
+        # far unless piece 0 produced no audio at all -- a request failing anyway, whose wait
+        # would then just end early with a skipped anchor. If the generator started, closing
+        # it cancels the sizing too (`_iter_pieces`); this covers every exit before that.
+        if sizing_future is not None:
+            sizing_future.cancel()
         if gpu_task is not None and not gpu_task.done():
             # Released from a done-callback, not from code below that only runs if this
             # `except` block itself runs to completion (T046 review, finding 2 -- a lease

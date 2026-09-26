@@ -20,6 +20,14 @@ MAX_NEW_TOKENS_CEILING = 1_500
 # first audio, long enough to give the later pieces a usable anchor.
 ANCHOR_CHARS = 200
 
+# How long the GPU thread waits, once piece 0 has finished, for the later pieces' anchor sizing
+# (routes_speech._anchor_for_later_pieces) before skipping the anchor instead. Sizing the
+# largest text (MAX_TEXT_CHARS) takes well under a second on the CPU, and it started when piece
+# 0 did, so a wait this long means the CPU tokenizer's executor is backlogged. While it waits,
+# the GPU thread is idle and a disconnect's gen.close() queues behind it, so it must stay well
+# under gpu.GPU_CLOSE_TIMEOUT_SECONDS (30 s), past which that close poisons the GPU gate.
+ANCHOR_SIZING_TIMEOUT_SECONDS = 5.0
+
 UNNAMED_VOICE_CAP = 64
 
 WS_MAX_MESSAGE_BYTES = 1 * _MIB

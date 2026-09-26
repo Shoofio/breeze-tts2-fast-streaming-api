@@ -22,12 +22,18 @@ import httpx
 import pytest
 import torch
 
-from breeze_infer import routes_speech
+from breeze_infer import limits, routes_speech
 from breeze_infer.api import Components, create_app
-from breeze_infer.gpu import GpuGate, GpuUnavailable
+from breeze_infer.gpu import GPU_CLOSE_TIMEOUT_SECONDS, GpuGate, GpuUnavailable
 from breeze_infer.limits import ANCHOR_CHARS
 from breeze_infer.routes_health import Readiness
-from breeze_infer.synthesis import CodesRef, NoRef, anchor_codes, prepare_piece
+from breeze_infer.synthesis import (
+    CodesRef,
+    NoRef,
+    PieceRoom,
+    anchor_codes,
+    prepare_piece,
+)
 from breeze_infer.text_split import split_text
 from tests.fakes import (
     CODEC_CODEBOOKS,
@@ -679,6 +685,219 @@ def test_split_chars_below_the_opening_budget_does_not_make_piece_0_the_largest(
     assert lengths[0] <= max(lengths[1:])
 
 
+# --- the anchor sizing future on every exit path (review 33 on 10f0c29) ----------------------
+#
+# `_start_anchor_sizing` queues the later pieces' sizing on the CPU tokenizer's one worker right
+# after the lease. A request that ends without consuming it must cancel it: abandoned sizing of
+# a 10k-character text would otherwise hold that worker, and every later request's pre-gate
+# room check (and the next lease holder's own `.result()`) would queue behind it. And the GPU
+# thread's `.result()` must never abort a stream that is already out, nor stall it for long.
+
+
+class _SizingHeldInQueue:
+    """Keeps the request's anchor sizing *queued*, not running: right before
+    `_start_anchor_sizing` queues it, the CPU tokenizer's one worker is given a call that waits
+    until `release()`. Records every real `anchor_sizing` call, so a test can tell whether the
+    sizing ever ran once the worker was free again."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.futures: list[Any] = []
+        self.sized: list[Any] = []
+        self._released = threading.Event()
+        real_start = routes_speech._start_anchor_sizing
+        real_sizing = routes_speech.anchor_sizing
+
+        def start(runtime: Any, cpu_tokenizer: Any, request: Any, pieces: list[str]) -> Any:
+            if not self._released.is_set():
+                cpu_tokenizer.submit(lambda _tokenizer: self._released.wait(5))
+            future = real_start(runtime, cpu_tokenizer, request, pieces)
+            self.futures.append(future)
+            return future
+
+        def spy(*args: Any) -> Any:
+            self.sized.append(args)
+            return real_sizing(*args)
+
+        monkeypatch.setattr(routes_speech, "_start_anchor_sizing", start)
+        monkeypatch.setattr(routes_speech, "anchor_sizing", spy)
+
+    def release(self) -> None:
+        self._released.set()
+
+
+def _no_room_on_the_gpu(runtime: Any, reference: Any, text: str, request: Any) -> Any:
+    """Piece 0 fits by the CPU's prediction but not once prepared on the GPU thread: the
+    `400 text_too_long` the route raises after the lease (a codec that encodes more frames
+    than predicted)."""
+    inputs = prepare_piece(
+        runtime.tokenizer, runtime.model, reference, text, request.instruction, request.cfg_scale
+    )
+    return inputs, PieceRoom(cap=runtime.frame_cap(request.max_new_tokens), room=0)
+
+
+def _prepare_fails(runtime: Any, reference: Any, text: str, request: Any) -> Any:
+    raise RuntimeError("piece 0 preparation failed")
+
+
+@pytest.mark.parametrize(
+    ("prepare_first_piece", "status"), [(_no_room_on_the_gpu, 400), (_prepare_fails, 500)]
+)
+def test_a_request_that_fails_before_the_200_cancels_its_queued_sizing(
+    envs: list[Env], monkeypatch: pytest.MonkeyPatch, prepare_first_piece: Any, status: int
+) -> None:
+    """Finding 1: the `400 text_too_long` after the lease, or a failing preparation, ends the
+    request with its sizing still queued. It is cancelled, so it never runs: the next
+    request's pre-gate check, queued on the same worker after it, finds nothing ahead."""
+    runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(6), _frame(7)])
+    env = _env(envs, runtime, split_chars=100)
+    held = _SizingHeldInQueue(monkeypatch)
+    real_prepare_first_piece = routes_speech._prepare_first_piece
+    monkeypatch.setattr(routes_speech, "_prepare_first_piece", prepare_first_piece)
+    try:
+        response = env.speak(text=SENTENCES)
+        assert response.status_code == status
+        [future] = held.futures
+        assert future.cancelled()
+    finally:
+        held.release()
+
+    monkeypatch.setattr(routes_speech, "_prepare_first_piece", real_prepare_first_piece)
+    next_response = env.speak(text="Short one.")  # one piece: nothing of its own to size
+
+    assert next_response.status_code == 200
+    assert held.sized == []  # the failed request's sizing never ran on the worker
+
+
+def test_a_disconnect_after_the_200_cancels_the_queued_sizing(
+    envs: list[Env], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Finding 1: a client that leaves while piece 0 is still generating ends the stream with
+    the sizing still queued. Closing the generator (`gen.close()` on the GPU thread) cancels
+    it, so it never runs on the worker."""
+    hold = threading.Event()
+    runtime = _fake_runtime(chunks=10, gate=hold, gate_at=2)
+    env = _env(envs, runtime, split_chars=100)
+    held = _SizingHeldInQueue(monkeypatch)
+    server = LiveServer(create_app(env.components))
+    try:
+        url = f"http://127.0.0.1:{server.port}{SPEECH_PATH}"
+        data = {"text": SENTENCES, "instruction": INSTRUCTION}
+        with (
+            httpx.Client(timeout=10) as client,
+            client.stream("POST", url, data=data) as response,
+        ):
+            assert response.status_code == 200
+            next(response.iter_raw())
+        # Leaving both blocks closed the connection while piece 0 was still generating.
+        hold.set()
+        wait_until(lambda: _events(env.events, "speech.aborted") != [])
+        server.wait_for_handlers()
+
+        [future] = held.futures
+        assert future.cancelled()
+    finally:
+        hold.set()
+        held.release()
+        server.stop()
+    assert held.sized == []
+
+
+def test_a_sizing_failure_skips_the_anchor_instead_of_aborting_the_stream(
+    envs: list[Env], monkeypatch: pytest.MonkeyPatch, prepared: list[dict[str, Any]]
+) -> None:
+    """Finding 2: the sizing can fail for reasons of its own (a template or tokenizer error,
+    or no CPU tokenizer installed). Piece 0 is already out by then, so the request degrades:
+    the anchor is skipped (`sizing_failed`), every later piece is generated as voice design,
+    and the error is still reported as a server failure (`request.failed`)."""
+    runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(6), _frame(7)])
+    env = _env(envs, runtime, split_chars=100)
+
+    def broken_sizing(*_args: Any) -> Any:
+        raise ValueError("the template broke")
+
+    monkeypatch.setattr(routes_speech, "anchor_sizing", broken_sizing)
+
+    response = env.speak(text=SENTENCES)
+
+    assert response.status_code == 200
+    [skipped] = _events(env.events, "speech.anchor_skipped")
+    assert skipped["reason"] == "sizing_failed"
+    assert skipped["request_id"] == response.headers["x-request-id"]
+    pieces = _no_reference_pieces(SENTENCES, 100)
+    assert [p["text"] for p in prepared] == pieces
+    assert all(isinstance(p["reference"], NoRef) for p in prepared)
+    [failed] = _events(env.events, "request.failed")
+    assert "the template broke" in str(failed["error"])
+    assert failed["request_id"] == response.headers["x-request-id"]
+    assert len(_events(env.events, "speech.completed")) == 1
+
+
+def test_a_sizing_that_outlasts_its_timeout_skips_the_anchor(
+    envs: list[Env], monkeypatch: pytest.MonkeyPatch, prepared: list[dict[str, Any]]
+) -> None:
+    """Finding 3: the GPU thread waits for the sizing at most `ANCHOR_SIZING_TIMEOUT_SECONDS`
+    (shortened here). A sizing still running past that is abandoned (`sizing_timeout`), and
+    the stream goes on as voice design instead of holding the GPU thread -- and, behind it, a
+    disconnect's `gen.close()` -- for as long as the CPU takes."""
+    runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(6), _frame(7)])
+    env = _env(envs, runtime, split_chars=100)
+    finish_sizing = threading.Event()
+    real_sizing = routes_speech.anchor_sizing
+
+    def slow_sizing(*args: Any) -> Any:
+        finish_sizing.wait(5)
+        return real_sizing(*args)
+
+    monkeypatch.setattr(routes_speech, "anchor_sizing", slow_sizing)
+    monkeypatch.setattr(routes_speech, "ANCHOR_SIZING_TIMEOUT_SECONDS", 0.05)
+    try:
+        response = env.speak(text=SENTENCES)
+        assert not finish_sizing.is_set()  # the stream finished without the sizing
+    finally:
+        finish_sizing.set()
+
+    assert response.status_code == 200
+    [skipped] = _events(env.events, "speech.anchor_skipped")
+    assert skipped["reason"] == "sizing_timeout"
+    assert all(isinstance(p["reference"], NoRef) for p in prepared)
+    assert len(_events(env.events, "speech.completed")) == 1
+
+
+def test_the_sizing_timeout_is_well_under_the_gpu_close_timeout() -> None:
+    """Finding 3: a disconnect's `gen.close()` queues behind a step blocked on the sizing, and
+    a close past `GPU_CLOSE_TIMEOUT_SECONDS` poisons the gate. The wait must leave the close
+    most of that budget."""
+    assert 0 < limits.ANCHOR_SIZING_TIMEOUT_SECONDS <= GPU_CLOSE_TIMEOUT_SECONDS / 4
+
+
+def test_a_sizing_cancelled_by_shutdown_is_reported_as_shutdown(
+    envs: list[Env], monkeypatch: pytest.MonkeyPatch, prepared: list[dict[str, Any]]
+) -> None:
+    """Finding 4: `CpuTokenizer.shutdown()` cancels a sizing still queued. The anchor is
+    skipped for that reason (`shutdown`), not reported as `no_room`, which it wasn't."""
+    runtime = _fake_runtime(chunks=3, frames=[_frame(5), _frame(6), _frame(7)])
+    env = _env(envs, runtime, split_chars=100)
+    held = _SizingHeldInQueue(monkeypatch)
+    queue_sizing = routes_speech._start_anchor_sizing
+
+    def start_then_shut_down(runtime: Any, cpu_tokenizer: Any, request: Any, pieces: Any) -> Any:
+        future = queue_sizing(runtime, cpu_tokenizer, request, pieces)
+        cpu_tokenizer.shutdown()  # cancels the sizing, still queued behind the held worker
+        return future
+
+    monkeypatch.setattr(routes_speech, "_start_anchor_sizing", start_then_shut_down)
+    try:
+        response = env.speak(text=SENTENCES)
+    finally:
+        held.release()
+
+    assert response.status_code == 200
+    [skipped] = _events(env.events, "speech.anchor_skipped")
+    assert skipped["reason"] == "shutdown"
+    assert all(isinstance(p["reference"], NoRef) for p in prepared)
+    assert held.sized == []
+
+
 # --- CpuTokenizer shutdown races (review #3 on 2d9070a) ---------------------------------------
 #
 # Direct unit tests against `routes_speech.CpuTokenizer` itself, not through the HTTP route:
@@ -741,3 +960,24 @@ def test_cpu_tokenizer_run_queued_call_cancelled_by_shutdown_raises_gpu_unavaila
         assert task.cancelling() == cancelling_before  # never itself cancelled
 
     asyncio.run(scenario())
+
+
+def test_cpu_tokenizer_shutdown_can_wait_for_a_running_call() -> None:
+    """Finding 7: `shutdown(wait=True)` returns only once a call already running has finished,
+    so a test's teardown can't leave it running into the next test, which uses the same
+    session-shared tokenizer copy from its own executor."""
+    tokenizer = routes_speech.CpuTokenizer()
+    tokenizer.install(object())
+    running = threading.Event()
+    finished = threading.Event()
+
+    def slow(_tokenizer: Any) -> None:
+        running.set()
+        time.sleep(0.1)
+        finished.set()
+
+    tokenizer.submit(slow)
+    assert running.wait(5)
+    tokenizer.shutdown(wait=True)
+
+    assert finished.is_set()

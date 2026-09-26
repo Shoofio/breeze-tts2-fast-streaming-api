@@ -88,7 +88,9 @@ def _shared_cpu_tokenizer_copy(runtime: Any) -> Any:
     own multi-run test even calls it once per run -- so repeating that deep copy each time
     only adds test wall-clock for no safety benefit: `CpuTokenizer` docstring's "one thread at
     a time" rule is about concurrent use, not object identity, and these tests never run two
-    GPU tests at once.
+    GPU tests at once. Each test's own `CpuTokenizer` executor does use the copy, though, so
+    every teardown shuts it down with `wait=True` (review 33 on 10f0c29): a sizing still
+    running there must finish before the next test's executor can touch the same copy.
     """
     global _cpu_tokenizer_copy
     if _cpu_tokenizer_copy is None:
@@ -136,7 +138,8 @@ def speech_app(gpu_env) -> Iterator[tuple[TestClient, RecordingEvents]]:
         try:
             components.gpu.shutdown()
         finally:
-            components.cpu_tokenizer.shutdown()
+            # Waits: the next test's executor uses the same tokenizer copy (see above).
+            components.cpu_tokenizer.shutdown(wait=True)
 
 
 def _pcm_stats(body: bytes) -> tuple[int, bool]:

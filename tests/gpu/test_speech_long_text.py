@@ -158,8 +158,10 @@ def _run_once(
         finally:
             # Nested, not sequential (review 32, review-of-2d9070a #4/#7 in the same pass): a
             # `gpu.shutdown()` failure must not leave the CPU tokenizer's own executor running
-            # past the test, which would leak its thread into the next one.
-            components.cpu_tokenizer.shutdown()
+            # past the test, which would leak its thread into the next one. It waits, too
+            # (review 33 on 10f0c29): the next run's executor uses the same tokenizer copy
+            # (`test_speech_http._shared_cpu_tokenizer_copy`).
+            components.cpu_tokenizer.shutdown(wait=True)
 
 
 def _save_wav(body: bytes) -> None:
@@ -282,24 +284,29 @@ def test_long_voice_design_completes_every_run(gpu_env) -> None:
     # algorithm selection, TF32 accumulation and CUDA-graph replay are not guaranteed
     # bit-reproducible across invocations -- not a bug this test should chase; forcing full
     # determinism is a runtime-wide, production change, well outside a single test file). One
-    # flipped token can move a piece's EOS by a frame or more, and because piece 0's own audio
-    # anchors every later piece (T050/T052/T053), a change there can propagate to all of them,
-    # so an exact frame-count match per run is flaky (review 32, review-of-2d9070a #2 in the
-    # same pass). Comparing each run's per-piece `speech.piece_done` frame counts against the
-    # first run's, with a small tolerance, still catches a real divergence in shape (a piece
-    # actually cut short or overrun) without failing on ordinary kernel noise.
-    FRAME_TOLERANCE = 2
+    # flipped token can move a piece's EOS by a frame or more.
+    #
+    # Only piece 0 is compared frame by frame: it is voice design from the same seed, so kernel
+    # noise moves it by a frame or two at most. Every later piece is anchored to piece 0's own
+    # audio (T050/T052/T053), so any change in piece 0 changes every later piece's prompt and
+    # can move its length by far more than that (review 33 on 10f0c29). For those, the piece
+    # count must match exactly and the total length within 5%, which still catches a piece
+    # actually cut short, dropped or overrun without failing on that propagated noise.
+    FIRST_PIECE_FRAME_TOLERANCE = 2
+    TOTAL_FRAMES_TOLERANCE = 0.05
     baseline = per_run_piece_frames[0]
+    all_runs = f"all runs' per-piece frames: {per_run_piece_frames}"
     for run_index, frames in enumerate(per_run_piece_frames):
-        mismatches = [
-            (piece_index, frames[piece_index], baseline[piece_index])
-            for piece_index in range(len(frames))
-            if abs(frames[piece_index] - baseline[piece_index]) > FRAME_TOLERANCE
-        ]
-        assert not mismatches, (
-            f"run {run_index} piece frames differ from run 0 by more than "
-            f"{FRAME_TOLERANCE} frames (piece_index, run_frames, run_0_frames): {mismatches}\n"
-            f"all runs' per-piece frames: {per_run_piece_frames}"
+        assert len(frames) == len(baseline), (
+            f"run {run_index} has {len(frames)} pieces, run 0 has {len(baseline)}\n{all_runs}"
+        )
+        assert abs(frames[0] - baseline[0]) <= FIRST_PIECE_FRAME_TOLERANCE, (
+            f"run {run_index} piece 0 has {frames[0]} frames, run 0 has {baseline[0]} "
+            f"(tolerance {FIRST_PIECE_FRAME_TOLERANCE})\n{all_runs}"
+        )
+        assert abs(sum(frames) - sum(baseline)) <= TOTAL_FRAMES_TOLERANCE * sum(baseline), (
+            f"run {run_index} has {sum(frames)} frames in total, run 0 has {sum(baseline)} "
+            f"(tolerance {TOTAL_FRAMES_TOLERANCE:.0%})\n{all_runs}"
         )
 
 
