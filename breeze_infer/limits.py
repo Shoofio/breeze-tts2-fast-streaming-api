@@ -32,10 +32,15 @@ ANCHOR_SIZING_TIMEOUT_SECONDS = 5.0
 
 UNNAMED_VOICE_CAP = 64
 
-# KV prefixes kept for registered voices (voice_prefix.VoicePrefixCache). Ported from the
-# old server's --voice-cache-size default; the contract defines no flag for it, and a miss
-# only costs one prefix build.
-VOICE_PREFIX_CACHE_SIZE = 16
+# GPU memory the voice prefix cache (voice_prefix.VoicePrefixCache) may hold, in bytes of KV.
+# Bounded by bytes, not by a count of prefixes, since a prefix's size grows with its
+# reference: each entry is estimated as prefix_len x bytes per token, where bytes per token is
+# 2 (key and value) x layers x KV heads x head_dim x dtype size (voice_prefix
+# .kv_bytes_per_token) -- 114,688 B for this checkpoint (28 x 8 x 128, bf16). 1 GiB is about
+# what the old server held: 16 prefixes (its --voice-cache-size default) x its 548-token cap
+# x 114,688 B = 0.94 GiB. The contract defines no flag for it, and a miss only costs one
+# prefix build.
+VOICE_PREFIX_CACHE_BYTES = 1024 * _MIB
 
 # The largest *.voice.json the startup scan reads; anything bigger is skipped unread
 # (voice_store.scan). A documented generous constant, not computed from the loaded codec:

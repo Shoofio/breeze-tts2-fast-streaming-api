@@ -42,6 +42,12 @@ class GpuLease:
         release is a caller bug, and honouring it would free a gate someone else now holds."""
         self._gate._release(self)
 
+    @property
+    def held(self) -> bool:
+        """Whether this lease still holds the gate: code that must only run under the lease
+        (voice_prefix.VoicePrefixCache.get_or_build) checks it."""
+        return self._gate._owner is self
+
     def poison(self) -> None:
         """Mark the GPU unusable for the rest of the process: this lease's `gen.close()` never
         finished (`GpuCloseTimeout`), so the GPU may still be busy. See `GpuGate.poison`."""

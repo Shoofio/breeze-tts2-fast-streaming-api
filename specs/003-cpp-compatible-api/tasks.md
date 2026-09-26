@@ -673,8 +673,9 @@ rules.
   - an identical unnamed registration returns the existing entry;
   - `test_bc_25_list_order_is_saved_sorted_then_unnamed_by_registration`.
 - [X] T058 [P] [US1] Port `A:tests/test_voice_prefix_cache.py` to `tests/test_voice_prefix_cache.py`,
-  re-keyed by `(voice_id, codes_sha256)`. Add the delete-and-re-register case: the stale KV is
-  never returned.
+  re-keyed by `(voice_id, content_hash)` (`voice_file.prefix_key`: `ref_text` and codes). Add the
+  delete-and-re-register case: the stale KV is never returned, including when the delete lands
+  during the build.
 - [ ] T059 [P] [US1] Create `tests/test_routes_voices.py` (TestClient, `FakeRuntime`, `tmp_path`):
   - the POST check order from contracts/http-api.md;
   - `test_bc_27_existing_name_gets_409_voice_exists`, also for different case;
@@ -715,8 +716,10 @@ rules.
 
   Borrow `api_record` and `voice_seconds` from `A:breeze_infer/voice_index.py` (~61–85).
 - [X] T064 [P] [US1] Port `A:breeze_infer/voice_prefix.py` to `breeze_infer/voice_prefix.py`: an
-  LRU of `ReferencePrefix` keyed by `(voice_id, codes_sha256)`, built on the `GpuThread` while the
-  gate is held. On out-of-memory it falls back to the codes path. Delete invalidates the entry.
+  LRU of `ReferencePrefix` keyed by `(voice_id, content_hash)` (`voice_file.prefix_key`) and
+  bounded by `VOICE_PREFIX_CACHE_BYTES`, built on the `GpuThread` while the gate is held. A
+  build's out-of-memory error propagates with nothing cached; the codes-path fallback is T066's.
+  Delete invalidates the entry.
 - [ ] T065 [US1] Create `breeze_infer/routes_voices.py`:
   - `POST /v1/voices`, in the contract order, with a commit-time name re-check under the store
     lock;
@@ -730,7 +733,9 @@ rules.
 - [ ] T066 [US1] Connect `VoiceRef` to `breeze_infer/synthesis.py` and `routes_speech.py`:
   - replace the stub lookup with the real one;
   - with no override, use the prefix path;
-  - with an override, use the codes path.
+  - with an override, use the codes path;
+  - on a prefix build that raises CUDA out-of-memory, fall back to the codes path for that
+    request (emit an event) instead of a 500.
 - [ ] T067 [P] [US1] Port `A:tests/gpu/{test_voice_equivalence,test_voice_prefill_buckets,
   test_voice_tier1_equivalence}.py` to `tests/gpu/`, adapted to the new store (register through the
   route). Include a prefix longer than 548 tokens that now builds (R12, point 4).

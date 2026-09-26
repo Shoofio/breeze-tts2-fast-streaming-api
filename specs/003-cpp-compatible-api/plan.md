@@ -125,7 +125,7 @@ breeze_infer/
 ├── voice_file.py        # v1 record encode/decode and validation (pure)       [new, R13]
 ├── voice_store.py       # directory I/O: scan, create, remove-with-retry      [port parts of A:voices.py]
 ├── voice_registry.py    # in-memory voices, name rules, cap, order            [new]
-├── voice_prefix.py      # LRU of KV prefixes keyed (id, codes_sha256)         [port A:6fb3736, re-keyed]
+├── voice_prefix.py      # byte-bounded LRU of KV prefixes, key (id, content)  [port A:6fb3736, re-keyed]
 ├── ws_messages.py       # strict client-message schema (pure)                 [new]
 ├── ws_session.py        # pure session state machine (R15)                    [new]
 ├── ws_server.py         # websockets server: handshake, reader, worker, outbox   [new, R4]

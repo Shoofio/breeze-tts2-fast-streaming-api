@@ -155,6 +155,29 @@ def _codes_bytes(codes: np.ndarray) -> bytes:
     return np.ascontiguousarray(codes, dtype="<i2").tobytes()
 
 
+def prefix_key(voice_id: str, ref_text: str, codes: np.ndarray) -> tuple[str, str]:
+    """The voice prefix cache's key: `(voice_id, content_hash)` (data-model.md "Voice").
+
+    The prefix's KV is computed from the transcript as well as the audio, so the hash
+    covers both, not `codes_sha256` alone: the same audio re-registered with another
+    `ref_text` must not reuse the old KV. Each part is length-prefixed (fixed 8 bytes,
+    big-endian, as in `voice_registry.unnamed_id`) so no two different inputs hash the
+    same byte string, and the codes' shape is included because a `[frames, codebooks]`
+    swap has the same bytes. The one place this key is built; callers never assemble
+    it by hand.
+    """
+    codes = np.asarray(codes)
+    if codes.ndim != 2:
+        raise ValueError(f"codes must be 2D [frames, codebooks], got shape {codes.shape}")
+    text = ref_text.encode("utf-8")
+    digest = hashlib.sha256()
+    for part in (len(text), *codes.shape):
+        digest.update(int(part).to_bytes(8, "big"))
+    digest.update(text)
+    digest.update(_codes_bytes(codes))
+    return voice_id, digest.hexdigest()
+
+
 def encode(
     *,
     id: str,

@@ -38,6 +38,7 @@ choice and doesn't change the contract. Limits are constants in `limits.py` rath
 | `MAX_NEW_TOKENS_CEILING` | 1,500 | `max_new_tokens` upper bound |
 | `ANCHOR_CHARS` | 200 | Opening budget with no reference |
 | `UNNAMED_VOICE_CAP` | 64 | Unnamed voices in memory |
+| `VOICE_PREFIX_CACHE_BYTES` | 1 GiB | Estimated KV the voice prefix cache holds (about the old server's 16 prefixes × 548 tokens × 114,688 B) |
 | `MAX_VOICE_FILE_BYTES` | 256 KiB | Largest `*.voice.json` the startup scan reads (about six times the largest valid file) |
 | `WS_MAX_MESSAGE_BYTES` | 1 MiB | Inbound WebSocket message |
 | `WS_MAX_CONNECTIONS` | 16 | Concurrent WebSocket connections |
@@ -189,11 +190,18 @@ frames, `sizing_timeout`), and when the request ends before the anchor decision 
 | `id` | str | Saved: the name, `[A-Za-z0-9_-]{1,64}` and not `v_*`. Unnamed: `v_` + 16 lowercase hex characters |
 | `ref_text` | str | ≤ 2,000 |
 | `codes` | int16 `[frames, codebooks]` | Every value within `[0, codebook_size)` |
-| `codes_sha256` | hex | Part of the prefix-cache key |
+| `codes_sha256` | hex | Checksum of `codes` in the voice file |
 | `frames` | int | ≥ 1 |
 | `seconds` | float | `frames × samples_per_frame / sample_rate` |
 | `encode_ms` | float | Measured at creation |
 | `saved` | bool | True when named |
+
+**Prefix-cache key**: `(id, content_hash)` from `voice_file.prefix_key`, where `content_hash` is
+a sha256 over the length-prefixed `ref_text`, the codes' shape and the codes' bytes. The KV
+depends on the transcript as well as the audio, so the same codes with another `ref_text` are a
+different key. Delete also bumps the voice's generation in the cache, so a prefix build still
+running when its voice is deleted is never cached, even if the voice is re-registered with the
+same audio and text.
 
 **Wire shape** (unchanged from C++):
 `{"id", "frames", "seconds" (2 decimals), "encode_ms" (integer ms), "saved", "ref_text"}`.
@@ -338,9 +346,15 @@ offending record's field names), so one bad field never breaks the request emitt
   - voices: `voices.loaded`, `voice.skipped`, `voice.created`, `voice.deleted`,
     `voice.cleanup_failed` (`file`, `op`: `sweep`, `stat`, `unlink_tmp` or `unlink`, `error`: a
     leftover the store couldn't remove or examine; it is left for the next startup's sweep),
-    `voice.prefix_built` (`voice_id`), `voice.prefix_evicted` (`voice_id`, `reason`: `lru` or
-    `deleted`). The prefix cache holds `VOICE_PREFIX_CACHE_SIZE` (16) entries and isn't warmed at
-    startup: a voice's first request builds its prefix;
+    `voice.prefix_built` (`voice_id`, `tokens`: the prefix length, `bytes`: its estimated KV
+    size), `voice.prefix_evicted` (`voice_id`, `reason`: `budget` (dropped, least recently used
+    first, to make room), `deleted` (the voice was deleted, including a build that finished
+    after its delete, which is returned to its request but not cached) or `too_large` (a prefix
+    bigger than the whole budget, returned to its request but never cached)). Both are emitted
+    only after the cache's state is final. The prefix cache holds at most
+    `VOICE_PREFIX_CACHE_BYTES` (1 GiB) of estimated KV, where an entry costs `prefix_len` × 2
+    (key and value) × layers × KV heads × `head_dim` × dtype size (114,688 B per token for
+    this checkpoint). It isn't warmed at startup: a voice's first request builds its prefix;
   - speech: `speech.accepted`, `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`
     (`piece_index`, `requested`, `cap`, `room`), `speech.anchor_skipped` (`piece_index`,
     `reason`: `piece_truncated`, `no_room`, `sizing_failed`, `sizing_timeout` or `shutdown`),

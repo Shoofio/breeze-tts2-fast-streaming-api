@@ -40,6 +40,16 @@ def test_try_acquire_takes_a_free_gate_and_fails_while_held() -> None:
     assert gate.try_acquire() is not None
 
 
+def test_held_is_true_only_while_the_lease_owns_the_gate() -> None:
+    gate = GpuGate()
+    first = _hold(gate)
+    assert first.held
+    first.release()
+    assert not first.held
+    second = _hold(gate)
+    assert second.held and not first.held  # a stale lease never reads as held again
+
+
 def test_acquire_on_a_free_gate_does_not_signal_queued() -> None:
     async def main() -> None:
         gate = GpuGate()
