@@ -734,7 +734,7 @@ rules.
 - [ ] T067 [P] [US1] Port `A:tests/gpu/{test_voice_equivalence,test_voice_prefill_buckets,
   test_voice_tier1_equivalence}.py` to `tests/gpu/`, adapted to the new store (register through the
   route). Include a prefix longer than 548 tokens that now builds (R12, point 4).
-- [ ] T068 [US1] Coordinate with `sillytavern-agent` via SendMessage: confirm whether the
+- [X] T068 [US1] Coordinate with `sillytavern-agent` via SendMessage: confirm whether the
   extension's DELETE-then-POST replace flow and the new delete wording have landed. Record the
   answer in `research/live-phase3.md`.
 - [ ] T069 [US1] **Live gate (voices)**:
