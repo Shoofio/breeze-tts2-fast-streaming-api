@@ -1559,3 +1559,172 @@ def test_42_7_a_scanned_voice_carries_its_measured_prefix_length(start: Any, tmp
     voice = restarted.services.registry.lookup("alice")
     assert voice.prefix_len == _prefix_len("kept", _expected_frames(wav))
     assert voice.prefix_key == voice_file.prefix_key("alice", "kept", voice.codes)
+
+
+# --- review 43 on c2e3a69 -------------------------------------------------------------------
+
+
+def test_43_2_a_change_after_the_voice_thread_shut_down_is_503_gpu_unavailable(start: Any) -> None:
+    """As `CpuTokenizer.run` answers the same race: a request that arrives as the server stops
+    gets `503 gpu_unavailable`, not a `500` from the executor's `RuntimeError`."""
+    server = start()
+    assert server.post(audio=_wav(), name="alice").status_code == 200
+    server.services.shutdown()
+
+    _assert_error(server.delete("alice"), 503, "gpu_unavailable")
+    assert server.events_named("request.failed") == []
+    assert (server.voices_dir / "alice.voice.json").exists()
+
+
+def test_43_2_a_queued_change_cancelled_by_the_shutdown_is_gpu_unavailable(start: Any) -> None:
+    """A change still queued when `shutdown()` cancels it reaches its caller as a bare
+    `CancelledError` unless mapped; this task itself was never cancelled."""
+    from breeze_infer.gpu import GpuUnavailable
+
+    services = start().services
+    running = threading.Event()
+    release = threading.Event()
+
+    def blocking_change() -> str:
+        running.set()
+        assert release.wait(5.0)
+        return "first"
+
+    async def main() -> None:
+        first = asyncio.ensure_future(services.change(blocking_change, lambda _result: None))
+        await _until(running.is_set)
+        queued = asyncio.ensure_future(services.change(lambda: "never", lambda _result: None))
+        await asyncio.sleep(0)  # queued on the voice thread behind `first`
+        services.shutdown()
+        release.set()
+        with pytest.raises(GpuUnavailable):
+            await queued
+        assert await first == "first"
+
+    asyncio.run(main())
+
+
+def test_43_6_a_voice_whose_prefix_cannot_be_measured_is_skipped_and_its_name_reserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BC-25: one bad file never stops startup. A file that decodes but whose prefix can't be
+    measured is skipped (`voice.skipped`) like a file that doesn't decode, and keeps its name."""
+    first = _Server(tmp_path)
+    try:
+        assert first.post(audio=_wav(), name="alice").status_code == 200
+        assert first.post(audio=_wav(), name="bad", ref_text="unmeasurable").status_code == 200
+    finally:
+        first.close()
+    events = RecordingEvents()
+    real_measure = api.measure_voice_prefix
+
+    def measure(runtime: Any, tokenizer: Any, codes: Any, ref_text: str) -> int:
+        if ref_text == "unmeasurable":
+            raise ValueError("the template refused this transcript (fake)")
+        return real_measure(runtime, tokenizer, codes, ref_text)
+
+    monkeypatch.setattr(api, "measure_voice_prefix", measure)
+
+    services = api.open_voices(
+        _loaded(),
+        VoicePrefixCache(bytes_per_token=1, on_event=events.emit),
+        voices_dir=tmp_path,
+        events=events,
+        codec_fingerprint=FINGERPRINT,
+        now=lambda: datetime(2026, 9, 26, tzinfo=timezone.utc),
+        nonce=lambda: "n",
+    )
+
+    assert [record["id"] for record in services.registry.list_records(
+        sample_rate=24000, samples_per_frame=1920
+    )] == ["alice"]
+    assert services.registry.lookup("bad") is None
+    assert services.registry.name_taken("BAD")
+    skipped = [fields for name, fields in events.calls if name == "voice.skipped"]
+    assert skipped == [
+        {"file": "bad.voice.json", "reason": "ValueError: the template refused this transcript (fake)"}
+    ]
+
+
+def test_43_7_a_rollback_that_cannot_remove_the_file_is_still_409_and_reported(start: Any) -> None:
+    """The registry refused the name after the file was written, and taking the file back out
+    failed: the name is taken either way, so the answer is `409 voice_exists`, and the file left
+    on disk is reported as drift between the store and the registry."""
+    server = start()
+    registry = server.services.registry
+    store = server.services.store
+
+    def refuse(voice: Any, **kwargs: Any) -> Any:
+        raise NameTaken(voice.id)
+
+    def fail_remove(voice_id: str) -> bool:
+        raise PermissionError(13, "Permission denied (fake)")
+
+    registry.register_saved = refuse  # type: ignore[method-assign]
+    store.remove = fail_remove  # type: ignore[method-assign]
+
+    response = server.post(audio=_wav(), name="alice")
+
+    _assert_error(response, 409, "voice_exists")
+    assert server.events_named("request.failed") == []
+    assert server.events_named("voice.created") == []
+    assert server.events_named("voice.store_mismatch") == [
+        {
+            "level": "warning",
+            "request_id": response.headers["x-request-id"],
+            "voice_id": "alice",
+            "file_removed": False,
+            "kind": None,
+            "error": "[Errno 13] Permission denied (fake)",
+        }
+    ]
+    assert (server.voices_dir / "alice.voice.json").exists()
+    assert server.gate_is_free()
+
+
+def test_43_8_a_change_that_finishes_after_the_loop_closed_keeps_its_result(start: Any) -> None:
+    """The change has committed by the time it schedules `then`; a loop that closed meanwhile
+    (the server stopped) must not turn that committed result into a `RuntimeError` on the voice
+    thread."""
+    import dataclasses
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    class RecordingExecutor(ThreadPoolExecutor):
+        def __init__(self) -> None:
+            super().__init__(max_workers=1)
+            self.futures: list[Future[Any]] = []
+
+        def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
+            future = super().submit(fn, *args, **kwargs)
+            self.futures.append(future)
+            return future
+
+    executor = RecordingExecutor()
+    services = dataclasses.replace(start().services, executor=executor)
+    running = threading.Event()
+    release = threading.Event()
+    then_calls: list[Any] = []
+
+    def change() -> str:
+        running.set()
+        assert release.wait(5.0)
+        return "committed"
+
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(services.change(change, then_calls.append))
+        for _ in range(500):
+            if running.is_set():
+                break
+            loop.run_until_complete(asyncio.sleep(0.01))
+        assert running.is_set()
+        task.cancel()  # the request goes away with the loop
+        loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+    finally:
+        loop.close()
+    release.set()
+
+    [future] = executor.futures
+    assert future.result(timeout=5.0) == "committed"
+    assert then_calls == []
+    executor.shutdown(wait=True)

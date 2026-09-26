@@ -1341,30 +1341,151 @@ def test_42_1_a_stored_prefix_the_runtime_would_not_build_is_refused_before_the_
 
 class _CodesPathTightRuntime(FakeRuntime):
     """No room on the codes path (a whole prompt carrying the reference audio, no prefix); the
-    ordinary room everywhere else, the prefix path included."""
+    ordinary room everywhere else, the prefix path included. Records the thread every codes-path
+    measurement ran on."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.codes_path_threads: list[str] = []
 
     def max_new_tokens_room(self, requested: Any, inputs: Any, *, prefix_len: int = 0) -> int:
         if prefix_len == 0 and inputs.get("input_values") is not None:
+            self.codes_path_threads.append(threading.current_thread().name)
             return 0
         return super().max_new_tokens_room(requested, inputs, prefix_len=prefix_len)
 
 
-def test_42_3_a_voice_whose_codes_path_has_no_room_is_refused_before_the_gate(
+def test_43_4_a_voice_only_its_prefix_path_fits_is_served(
     voice_server: Callable[..., SimpleNamespace],
 ) -> None:
-    """The out-of-memory fallback speaks through the codes path: a request only the prefix
-    path fits would turn into a `400` after the gate (or a later-piece abort) whenever the
-    fallback runs. Both paths are measured before the gate."""
+    """Review 43 #4 (reversing review 42 #3): the pre-gate check sizes a voice without an
+    override on its prefix path only. The codes path is the out-of-memory fallback's, and is
+    measured only when that fallback is needed, so a voice near the limit isn't refused on every
+    request because of a rare out-of-memory."""
     runtime = _voice_runtime(_CodesPathTightRuntime())
     server = voice_server(runtime)
     voice_id = _add_unnamed_voice(server)
 
     response = _speech(server, voice_id=voice_id)
 
+    assert response.status_code == 200
+    assert len(runtime.prefix_builds) == 1
+    assert runtime.calls[-1]["prefix"] is not None
+    assert runtime.codes_path_threads == []  # the codes path isn't tokenised per request
+
+
+def test_43_4_a_voice_with_an_override_still_needs_its_codes_path_to_fit(
+    voice_server: Callable[..., SimpleNamespace],
+) -> None:
+    runtime = _voice_runtime(_CodesPathTightRuntime())
+    server = voice_server(runtime)
+    voice_id = _add_unnamed_voice(server)
+
+    response = _speech(server, voice_id=voice_id, ref_text="a client transcript")
+
     assert response.status_code == 400
     assert response.json()["code"] == "text_too_long"
     assert runtime.prefix_builds == []
     assert runtime.calls == []
+
+
+class _OutOfMemoryCodesTightRuntime(_CodesPathTightRuntime):
+    def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> Any:
+        self.prefix_builds.append(prefix_inputs)
+        raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB (fake)")
+
+
+def test_43_4_an_out_of_memory_build_whose_codes_path_has_no_room_is_a_503(
+    voice_server: Callable[..., SimpleNamespace],
+) -> None:
+    """The fallback's room is measured when the fallback is needed, on the CPU tokenizer's
+    worker. With none, the request can't be served right now: a `503` with its own code, before
+    the `200`, not a `400` after the gate that blames the text."""
+    runtime = _voice_runtime(_OutOfMemoryCodesTightRuntime())
+    server = voice_server(runtime)
+    voice_id = _add_unnamed_voice(server)
+
+    response = _speech(server, voice_id=voice_id)
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": "not enough GPU memory for this voice right now",
+        "code": "gpu_out_of_memory",
+    }
+    assert len(runtime.prefix_builds) == 1
+    assert runtime.calls == []
+    [thread] = runtime.codes_path_threads
+    assert thread.startswith("breeze-cpu-tokenizer")
+    [fallback] = _named(server, "speech.prefix_fallback")
+    assert fallback["level"] == "warning"
+    assert fallback["request_id"] == response.headers["x-request-id"]
+    assert fallback["voice_id"] == voice_id
+    assert fallback["reason"] == "no_room"
+    assert "CUDA out of memory" in fallback["error"]
+    assert _named(server, "speech.accepted") == []
+    assert _named(server, "request.failed") == []
+    assert _gate_is_free(server.components)
+
+
+class _OutOfMemoryOnDemandRuntime(FakeRuntime):
+    """Builds prefixes normally until `out_of_memory` is set, then runs out of memory."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.out_of_memory = False
+
+    def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> Any:
+        if not self.out_of_memory:
+            return super().build_reference_prefix(prefix_inputs)
+        self.prefix_builds.append(prefix_inputs)
+        raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB (fake)")
+
+
+def test_43_3_an_out_of_memory_build_evicts_every_cached_prefix_before_the_fallback(
+    voice_server: Callable[..., SimpleNamespace], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Other voices' cached KV (up to 1 GiB) would still be on the GPU when the codes path,
+    which needs more memory than the failed build, starts. So every entry is evicted
+    (`reason: oom`) and PyTorch's cache emptied, on the GPU thread, before the fallback runs."""
+    runtime = _voice_runtime(_OutOfMemoryOnDemandRuntime())
+    server = voice_server(runtime)
+    warm_id = _save_voice(server, name="Other")
+    assert _speech(server, voice_id=warm_id).status_code == 200
+    assert len(server.services.prefix_cache) == 1
+    voice_id = _add_unnamed_voice(server)
+    runtime.out_of_memory = True
+    emptied: list[tuple[int, str]] = []
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: emptied.append((len(server.services.prefix_cache), threading.current_thread().name)),
+    )
+    emptied_at_fallback: list[list[tuple[int, str]]] = []
+    recording_prepare_piece = routes_speech.prepare_piece
+
+    def checking_prepare_piece(*args: Any) -> Any:
+        emptied_at_fallback.append(list(emptied))
+        return recording_prepare_piece(*args)
+
+    monkeypatch.setattr(routes_speech, "prepare_piece", checking_prepare_piece)
+
+    response = _speech(server, voice_id=voice_id)
+
+    assert response.status_code == 200
+    assert len(server.services.prefix_cache) == 0
+    evicted = [fields for fields in _named(server, "voice.prefix_evicted") if fields["reason"] == "oom"]
+    assert evicted == [
+        {"voice_id": warm_id, "reason": "oom", "request_id": response.headers["x-request-id"]}
+    ]
+    # The last empty_cache before the fallback ran after the eviction, on the GPU thread.
+    cache_size, thread = emptied_at_fallback[0][-1]
+    assert cache_size == 0
+    assert thread.startswith("breeze-gpu")
+    [fallback] = _named(server, "speech.prefix_fallback")
+    assert fallback["reason"] == "out_of_memory"
+    assert runtime.calls[-1]["prefix"] is None
+    assert _gate_is_free(server.components)
 
 
 class _OutOfMemoryHoldingRuntime(FakeRuntime):
@@ -1453,3 +1574,34 @@ def test_42_7_a_warm_voice_request_neither_reassembles_the_prefix_nor_rehashes_i
     assert hashes == []
     voice = server.services.registry.lookup(voice_id)
     assert voice.prefix_len == server.runtime.prefix_builds[0]["attention_mask"].shape[1]
+
+
+def test_43_3_a_request_cancelled_during_the_cache_release_leaves_the_gate_held_until_it_ends() -> None:
+    """The fallback's GPU-thread call (emptying PyTorch's cache) has no slot in the route's
+    cleanup, so a cancel while it runs hands the gate to the call, as a prefix build does."""
+    gate = GpuGate()
+    gpu = GpuThread("cpu", lambda _device: None)
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_release() -> None:
+        started.set()
+        assert release.wait(5.0)
+
+    async def main() -> None:
+        lease = gate.try_acquire()
+        assert lease is not None
+        task = asyncio.ensure_future(routes_speech._gpu_call_under_lease(gpu, lease, slow_release))
+        await _until(started.is_set)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        lease.release()  # the route's own cleanup: a no-op once handed over
+        assert gate.try_acquire() is None  # the call still holds it
+        release.set()
+        await _until(lambda: _gate_is_free(SimpleNamespace(gate=gate)))
+
+    try:
+        asyncio.run(main())
+    finally:
+        gpu.shutdown()

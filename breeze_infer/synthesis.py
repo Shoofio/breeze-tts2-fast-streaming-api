@@ -190,16 +190,28 @@ def build_voice_prefix(runtime: Any, codes: Any, ref_text: str) -> Any:
     by a task or a future would keep them until the cyclic collector ran. So the error is
     dropped here (the ``except`` block ends before the raise, which also leaves the marker
     with no ``__context__``), the inputs go with it, and PyTorch's cached blocks are returned.
+
+    Assembling the inputs allocates on the GPU too, so it runs inside the same ``try``: running
+    out of memory there is the same failure, with the same marker (review 43 #1).
     """
-    prefix_inputs, _prefix_len = voice_prefix_inputs(runtime.tokenizer, runtime.model, codes, ref_text)
+    prefix_inputs: dict[str, Any] | None = None
     try:
+        prefix_inputs, _prefix_len = voice_prefix_inputs(
+            runtime.tokenizer, runtime.model, codes, ref_text
+        )
         return runtime.build_reference_prefix(prefix_inputs)
     except torch.OutOfMemoryError as error:
         message = f"{type(error).__name__}: {error}"
-    del prefix_inputs
+    prefix_inputs = None  # dropped before the cache is emptied, so its blocks are returned
+    release_cached_gpu_memory()
+    raise PrefixBuildOutOfMemory(message)
+
+
+def release_cached_gpu_memory() -> None:
+    """Return PyTorch's cached, unused GPU blocks to the driver (GPU-thread only). A no-op when
+    CUDA was never initialised (the CPU tests, or a CPU-only run)."""
     if torch.cuda.is_initialized():
         torch.cuda.empty_cache()
-    raise PrefixBuildOutOfMemory(message)
 
 
 def anchor_codes(frames: list[Any], pad_id: int) -> Any | None:

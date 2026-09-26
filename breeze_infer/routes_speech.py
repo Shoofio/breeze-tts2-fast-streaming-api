@@ -29,8 +29,10 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
 5a. piece 0's room is checked on the CPU, on the CPU tokenizer's own thread (`_size_first_piece`:
    its tokenized text plus the reference's *predicted* frames), so "no room" is a `400
    text_too_long` even while the GPU is busy -- the "first piece has no room" half of BC-47. A
-   voice on the prefix path must fit on its codes path too (the out-of-memory fallback), and a
-   stored prefix the runtime would refuse to build has no room at all;
+   voice is sized on the path it will take: its prefix without an override (a stored prefix the
+   runtime would refuse to build has no room at all), its codes with one. The codes path of a
+   voice without an override is the out-of-memory fallback's, sized only when that fallback is
+   needed (step 7);
 6. `gate.try_acquire()`, else `409 busy` -- or `GpuUnavailable` if the gate is poisoned,
    which propagates past this route to `errors.py`'s own handler (`503 gpu_unavailable`);
 6a. with no reference and more than one piece, every later piece's prompt length is queued
@@ -51,8 +53,10 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
    codes path; nothing to run), otherwise its cached KV prefix (the prefix path), built under
    this lease on a miss (`VoicePrefixCache.get_or_build`). A cancel during that build hands the
    lease to the build, which releases it when the GPU work ends, so the route's own release is
-   then a no-op. A build that runs out of GPU memory falls back to the codes path for this
-   request (`speech.prefix_fallback`), never a `500`;
+   then a no-op. A build that runs out of GPU memory evicts every cached prefix and falls back
+   to the codes path for this request (`speech.prefix_fallback`), never a `500`: if piece 0 has
+   room on that path, measured then on the CPU tokenizer's worker; if not, `503
+   gpu_out_of_memory`;
 8. piece 0's room is checked again on the `GpuThread`, on its real inputs, right after they are
    built (`FastBreezeStreamingRuntime.max_new_tokens_room`): the backstop for a codec whose
    frame count differs from 5a's prediction. Every later piece is prepared and sized on the
@@ -102,6 +106,7 @@ from starlette.responses import Response
 from breeze_infer import reference_audio
 from breeze_infer.errors import ApiError, error_fields, report_unhandled
 from breeze_infer.events import Emitter
+from breeze_infer.executors import SHUTDOWN_MESSAGE, run_until_shutdown
 from breeze_infer.gpu import (
     DONE,
     GpuCloseTimeout,
@@ -145,6 +150,7 @@ from breeze_infer.synthesis import (
     predicted_room,
     prefix_of,
     prepare_piece,
+    release_cached_gpu_memory,
     resolve_reference,
     stand_in_reference,
     voice_reference,
@@ -155,9 +161,6 @@ from breeze_infer.voice_registry import ResolvedVoice
 from models.fast_streaming import NoRoomError
 
 _T = TypeVar("_T")
-
-
-_SHUTDOWN_MESSAGE = "cannot schedule new futures after shutdown"
 
 
 class CpuTokenizer:
@@ -227,29 +230,11 @@ class CpuTokenizer:
 
     async def run(self, fn: Callable[..., _T], *args: Any) -> _T:
         """`fn(tokenizer, *args)` on the pre-gate worker, the only thread that uses its copy.
-
-        A call still queued when `shutdown()` cancels it surfaces here as an ordinary
-        `asyncio.CancelledError` -- indistinguishable, by type alone, from this coroutine's
-        own task being cancelled for a real reason (a client disconnect, or `_drain_gpu`'s own
-        `task.cancel()` on a request it *did* know about). Told apart by this task's own
-        cancel count (`Task.cancelling()`): `shutdown()` cancelling a queued future out from
-        under an otherwise-uncancelled task can only be that race, never a real cancellation of
-        *this* task, so only that case is remapped to `GpuUnavailable`; a genuine one is
-        re-raised unchanged.
-        """
-        loop = asyncio.get_running_loop()
-        task = asyncio.current_task()
-        cancelling_before = 0 if task is None else task.cancelling()
-        try:
-            return await loop.run_in_executor(self._executor, self._call, fn, args)
-        except RuntimeError as error:
-            if _SHUTDOWN_MESSAGE not in str(error):
-                raise
-            raise GpuUnavailable("the CPU tokenizer is shutting down") from error
-        except asyncio.CancelledError:
-            if task is not None and task.cancelling() > cancelling_before:
-                raise
-            raise GpuUnavailable("the CPU tokenizer is shutting down") from None
+        After `shutdown()`, or for a call it cancelled while still queued, `GpuUnavailable`
+        (`executors.run_until_shutdown`)."""
+        return await run_until_shutdown(
+            self._executor, self._call, fn, args, what="the CPU tokenizer"
+        )
 
     def submit(self, fn: Callable[..., _T], *args: Any) -> Future[_T]:
         """`fn(sizing tokenizer, *args)`, queued on the sizing worker, for a caller on another
@@ -264,7 +249,7 @@ class CpuTokenizer:
         try:
             return self._sizing_executor.submit(self._call_sizing, fn, args)
         except RuntimeError as error:
-            if _SHUTDOWN_MESSAGE not in str(error):
+            if SHUTDOWN_MESSAGE not in str(error):
                 raise
             raise GpuUnavailable("the CPU tokenizer is shutting down") from error
 
@@ -377,6 +362,8 @@ async def _voice_reference(
     lookup: _VoiceLookup,
     runtime: Any,
     components: SpeechComponents,
+    request: SpeechRequest,
+    first_text: str,
     *,
     lease: Any,
     request_id: str,
@@ -392,9 +379,8 @@ async def _voice_reference(
     build, `get_or_build` hands `lease` to the build (module docstring, step 7).
 
     A build that runs out of GPU memory is not cached (`VoicePrefixCache`), and has already
-    freed what it held (`PrefixBuildOutOfMemory`); this request then uses the codes path with
-    the stored text instead, which the pre-gate check also sized, and `speech.prefix_fallback`
-    records it. Any other build error propagates (a `500`).
+    freed what it held (`PrefixBuildOutOfMemory`); `_fall_back_to_codes` then decides what this
+    request gets (`first_text` is piece 0's text). Any other build error propagates (a `500`).
     """
     voice = lookup.voice
     shape = voice_reference(voice, lookup.spec.ref_text_override)
@@ -413,19 +399,89 @@ async def _voice_reference(
             request_id=request_id,
         )
     except PrefixBuildOutOfMemory as error:
-        components.events.emit(
-            "speech.prefix_fallback",
-            level="warning",
+        return await _fall_back_to_codes(
+            lookup,
+            shape,
+            runtime,
+            components,
+            request,
+            first_text,
+            lease=lease,
             request_id=request_id,
-            voice_id=voice.id,
-            reason="out_of_memory",
             error=str(error),
         )
-        return shape.codes_path(), {"reference": "voice_codes"}
     return PrefixRef(prefix=prefix, ref_text=shape.ref_text), {
         "reference": "voice_prefix",
         "warm": warm,
     }
+
+
+async def _fall_back_to_codes(
+    lookup: _VoiceLookup,
+    shape: UnbuiltPrefix,
+    runtime: Any,
+    components: SpeechComponents,
+    request: SpeechRequest,
+    first_text: str,
+    *,
+    lease: Any,
+    request_id: str,
+    error: str,
+) -> tuple[Reference, dict[str, Any]]:
+    """After a prefix build ran out of GPU memory: the voice's codes path with its stored text,
+    if piece 0 has room on it, else `503 gpu_out_of_memory` (review 43 #3, #4).
+
+    The codes path needs more memory than the build that failed, so every cached prefix is
+    evicted first (`voice.prefix_evicted`, reason `oom`; up to `VOICE_PREFIX_CACHE_BYTES` of
+    other voices' KV), and PyTorch's cache is emptied on the GPU thread once they are gone.
+
+    The pre-gate check sized this voice on its prefix path only, so piece 0's room on the codes
+    path is measured here, on the CPU tokenizer's worker (off the loop, with its own copy). No
+    room means the request can't be served right now, which is not the text's fault: a `503`
+    with its own code, before the `200`, rather than `400 text_too_long` after the gate.
+    `speech.prefix_fallback` records either outcome (`reason`: `out_of_memory` for the fallback,
+    `no_room` for the refusal). Only piece 0 is sized here; a later piece is sized when it runs,
+    and on the codes path can still find no room after the `200` (data-model.md "Reference").
+    """
+    lookup.prefix_cache.evict_all(reason="oom", request_id=request_id)
+    await _gpu_call_under_lease(components.gpu, lease, release_cached_gpu_memory)
+    codes_path = shape.codes_path()
+    room = await components.cpu_tokenizer.run(
+        _measure_first_piece, runtime, request, first_text, codes_path
+    )
+    fits = room.room > 0
+    components.events.emit(
+        "speech.prefix_fallback",
+        level="warning",
+        request_id=request_id,
+        voice_id=lookup.voice.id,
+        reason="out_of_memory" if fits else "no_room",
+        error=error,
+    )
+    if not fits:
+        raise ApiError(503, "gpu_out_of_memory", "not enough GPU memory for this voice right now")
+    return codes_path, {"reference": "voice_codes"}
+
+
+async def _gpu_call_under_lease(gpu: GpuThread, lease: Any, fn: Callable[..., _T], *args: Any) -> _T:
+    """`gpu.run(fn, *args)` from a step with no `gpu_task` slot in `_serve_speech`'s cleanup.
+    If this request is cancelled while the call runs, the call keeps the gate
+    (`GpuLease.hand_over`) until it has really finished, as a cancelled prefix build does
+    (`VoicePrefixCache.get_or_build`); the route's own `release()` is then a no-op."""
+    call = asyncio.ensure_future(gpu.run(fn, *args))
+    try:
+        return await asyncio.shield(call)
+    except asyncio.CancelledError:
+        if not call.done() and lease.held:
+            successor = lease.hand_over()
+
+            def finished(done: asyncio.Future[Any]) -> None:
+                successor.release()
+                if not done.cancelled():
+                    done.exception()  # retrieved: nobody is left to receive it
+
+            call.add_done_callback(finished)
+        raise
 
 
 def _check_frame_prediction(
@@ -498,7 +554,7 @@ async def _size_first_piece(
         int(runtime.model.config.num_codebooks),
         voice=voice,
     )
-    room = await cpu_tokenizer.run(_measure_first_piece, runtime, request, pieces, stand_in)
+    room = await cpu_tokenizer.run(_measure_first_piece, runtime, request, pieces[0], stand_in)
     if room.room <= 0:
         raise ApiError(400, "text_too_long", "text is too long")
 
@@ -507,30 +563,22 @@ def _measure_first_piece(
     tokenizer: Any,
     runtime: Any,
     request: SpeechRequest,
-    pieces: list[str],
-    stand_in: Reference | UnbuiltPrefix,
+    text: str,
+    reference: Reference | UnbuiltPrefix,
 ) -> PieceRoom:
-    """`_size_first_piece`'s blocking part, run by `CpuTokenizer.run` with its copy.
-
-    A voice on the prefix path is measured on its codes path too, and gets the smaller room:
-    the prefix build's out-of-memory fallback speaks through the codes path
-    (`_voice_reference`), and must never turn a request accepted here into a `400` after the
-    gate. Only piece 0 is measured; a later piece is sized when it runs, on whichever path the
-    request took (BC-47)."""
-    paths = [stand_in, stand_in.codes_path()] if isinstance(stand_in, UnbuiltPrefix) else [stand_in]
-    rooms = [
-        predicted_room(
-            runtime,
-            tokenizer,
-            path,
-            pieces[0],
-            request.instruction,
-            request.cfg_scale,
-            request.max_new_tokens,
-        )
-        for path in paths
-    ]
-    return min(rooms, key=lambda room: room.room)
+    """Piece 0's room (its text `text`) with `reference`, run by `CpuTokenizer.run` with its
+    copy: `_size_first_piece`'s blocking part before the gate, and the out-of-memory fallback's
+    codes-path check after it (`_fall_back_to_codes`). Only piece 0 is measured; a later piece is
+    sized when it runs, on whichever path the request took (BC-47)."""
+    return predicted_room(
+        runtime,
+        tokenizer,
+        reference,
+        text,
+        request.instruction,
+        request.cfg_scale,
+        request.max_new_tokens,
+    )
 
 
 def _start_anchor_sizing(
@@ -965,7 +1013,13 @@ async def _serve_speech(
         sizing_job = _start_anchor_sizing(runtime, components.cpu_tokenizer, request, pieces)
         if voice_lookup is not None:
             reference, accepted_fields = await _voice_reference(
-                voice_lookup, runtime, components, lease=lease, request_id=request_id
+                voice_lookup,
+                runtime,
+                components,
+                request,
+                pieces[0],
+                lease=lease,
+                request_id=request_id,
             )
         else:
             gpu_task = asyncio.ensure_future(

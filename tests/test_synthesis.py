@@ -761,3 +761,34 @@ def test_42_6_one_rule_decides_a_voices_reference_shape() -> None:
     assert (stored.ref_text, stored.prefix_len) == ("stored", 42)
     fallback = stored.codes_path()
     assert isinstance(fallback, CodesRef) and fallback.ref_text == "stored"
+
+
+# --- review 43 on c2e3a69 -----------------------------------------------------------------
+
+
+def test_43_1_an_out_of_memory_while_assembling_the_inputs_raises_the_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prefix inputs are GPU tensors too: running out of memory while assembling them is
+    the same failure as running out while building, so it raises the same tensor-free marker
+    (the route falls back instead of answering `500`), and the cache is emptied the same way."""
+    from breeze_infer import synthesis
+    from breeze_infer.synthesis import PrefixBuildOutOfMemory
+
+    def out_of_memory(*_args: Any) -> Any:
+        raise torch.OutOfMemoryError("CUDA out of memory while assembling (fake)")
+
+    emptied: list[bool] = []
+    monkeypatch.setattr(synthesis, "prepare_prefix_inputs", out_of_memory)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: emptied.append(True))
+    runtime = FakeRuntime()
+    runtime.tokenizer = FakeTokenizer()
+    runtime.model = model_with_codec_facts()
+
+    with pytest.raises(PrefixBuildOutOfMemory, match="while assembling") as caught:
+        build_voice_prefix(runtime, VOICE.codes, VOICE.ref_text)
+
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert emptied == [True]
+    assert runtime.prefix_builds == []

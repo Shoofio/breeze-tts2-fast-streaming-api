@@ -630,3 +630,29 @@ def test_a_build_failure_that_races_the_cancel_is_still_reported() -> None:
     _run(main())
 
     assert [e["event"] for e in events] == ["voice.prefix_build_failed"]
+
+
+def test_43_3_evict_all_drops_every_entry_and_reports_each_with_its_reason() -> None:
+    """After a build runs out of GPU memory, the speech route drops every cached prefix so the
+    codes-path fallback has their memory too: one `voice.prefix_evicted` per entry."""
+    cache, events = _cache()
+    builder = _Builder()
+    a, b = ("voice_a", "ha"), ("voice_b", "hb")
+    lease = _lease()
+
+    async def main() -> None:
+        await _get(cache, a, builder.for_key(a), lease)
+        await _get(cache, b, builder.for_key(b), lease)
+        events.clear()
+        assert cache.evict_all(reason="oom", request_id="req-oom") == 2
+        assert cache.evict_all(reason="oom", request_id="req-oom") == 0
+        _, warm = await _get(cache, a, builder.for_key(a), lease)
+        assert warm is False  # rebuilt, not resurrected
+
+    _run(main())
+
+    assert events[:2] == [
+        {"event": "voice.prefix_evicted", "voice_id": "voice_a", "reason": "oom", "request_id": "req-oom"},
+        {"event": "voice.prefix_evicted", "voice_id": "voice_b", "reason": "oom", "request_id": "req-oom"},
+    ]
+    assert b not in cache

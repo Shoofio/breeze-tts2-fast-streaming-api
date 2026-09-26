@@ -53,9 +53,10 @@ from breeze_infer.settings import Settings, settings_from_args
 from breeze_infer.streaming import ClientAbortLogFilter
 from breeze_infer.synthesis import measure_voice_prefix
 from breeze_infer.version_header import VersionHeaderMiddleware
+from breeze_infer.voice_file import VoiceFile
 from breeze_infer.voice_prefix import VoicePrefixCache, kv_bytes_per_token
 from breeze_infer.voice_registry import VoiceRegistry
-from breeze_infer.voice_store import VoiceStore
+from breeze_infer.voice_store import SkippedVoiceFile, VoiceStore
 
 
 @dataclass(frozen=True)
@@ -345,6 +346,11 @@ def open_voices(
     file I/O and tokenizing: `load_in_background` runs it on a worker thread. The measuring uses
     the model load's pre-gate tokenizer copy, which nothing else uses until `mark_ready` installs
     it. `now` stamps a saved voice's `created_at` and `nonce` names the store's temporary files.
+
+    A voice whose prefix can't be measured (its transcript breaks a template, say) is skipped
+    like a file that doesn't decode (BC-25, review 43 #6): `voice.skipped` with the error as its
+    reason, after the store's own `voices.loaded`, which counted it as loaded. Its name stays
+    reserved, and a `DELETE` of it removes the file.
     """
     runtime = loaded.runtime
     model_config = runtime.model.config
@@ -358,12 +364,20 @@ def open_voices(
         nonce=nonce,
     )
     scan = store.scan()
-    measured = [
-        (voice, measure_voice_prefix(runtime, loaded.cpu_tokenizer, voice.codes, voice.ref_text))
-        for voice in scan.voices
-    ]
+    measured: list[tuple[VoiceFile, int]] = []
+    skipped = list(scan.skipped)
+    for voice in scan.voices:
+        try:
+            prefix_len = measure_voice_prefix(runtime, loaded.cpu_tokenizer, voice.codes, voice.ref_text)
+        except Exception as error:  # noqa: BLE001 - one bad file must not stop startup (BC-25)
+            reason = f"{type(error).__name__}: {error}"
+            file = store.path_for(voice.id).name
+            skipped.append(SkippedVoiceFile(file=file, reason=reason, name=voice.id))
+            events.emit("voice.skipped", file=file, reason=reason)
+            continue
+        measured.append((voice, prefix_len))
     registry = VoiceRegistry()
-    registry.load_from_scan(measured, scan.skipped)
+    registry.load_from_scan(measured, skipped)
     return VoiceServices(store=store, registry=registry, prefix_cache=prefix_cache)
 
 

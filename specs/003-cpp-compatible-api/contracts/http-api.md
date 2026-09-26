@@ -150,7 +150,7 @@ Generation stops within one chunk, and the GPU is released.
 | 400 | `invalid_field` | `content type must be multipart/form-data or application/x-www-form-urlencoded` |
 | 400 | `duplicate_field` | `<field> was given more than once` |
 | 400 | `text_required` | `text is required` |
-| 400 | `text_too_long` | `text is too long` (over the limit, or the first piece doesn't fit the context, BC-47; for a `voice_id` without `ref_text`, the first piece must fit both with the voice's cached prefix and with its codes, the fallback when the prefix can't be built, and a stored prefix the model can't build at all is refused here too) |
+| 400 | `text_too_long` | `text is too long` (over the limit, or the first piece doesn't fit the context, BC-47; for a `voice_id` without `ref_text`, the first piece must fit with the voice's cached prefix, and a stored prefix the model can't build at all is refused here too; with `ref_text`, it must fit with the voice's codes) |
 | 400 | `reference_conflict` | `voice_id and ref_audio cannot be used together` |
 | 400 | `ref_text_required` | `ref_text is required with ref_audio` |
 | 400 | `reference_required` | `ref_text needs ref_audio or voice_id` |
@@ -160,6 +160,7 @@ Generation stops within one chunk, and the GPU is released.
 | 404 | `unknown_voice` | `unknown voice_id` |
 | 409 | `busy` | `busy` |
 | 413 | `payload_too_large` | `request body is too large` |
+| 503 | `gpu_out_of_memory` | `not enough GPU memory for this voice right now` (a `voice_id` without `ref_text` whose prefix ran out of GPU memory while building, when the first piece doesn't fit the context with the voice's codes, the fallback; when it does fit, the request is served that way instead. Retrying later may succeed) |
 
 ## `POST /v1/voices`
 
@@ -261,7 +262,7 @@ Files that failed validation at startup are not listed.
 `ref_text_required`, `reference_required`, `invalid_audio`, `audio_too_long`, `audio_too_short`,
 `voice_fields_required`, `invalid_name`, `voice_too_long`, `unknown_voice`, `voice_exists`, `busy`,
 `loading`,
-`gpu_unavailable`,
+`gpu_unavailable`, `gpu_out_of_memory`,
 `not_found`, `method_not_allowed`, `payload_too_large`, `origin_not_allowed`,
 `voice_write_failed`, `voice_delete_failed`, `internal_error`.
 

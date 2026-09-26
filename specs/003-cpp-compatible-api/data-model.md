@@ -139,14 +139,24 @@ The resolved reference for a request or session. It is never exposed on the wire
 | prefix | `ReferencePrefix` (cached KV) plus the stored `ref_text`, for a saved or unnamed voice with no override |
 
 A voice with an overridden transcript uses the codes path: its stored codes with the given
-`ref_text`. A prefix build that runs out of GPU memory is not cached, frees what it held on the
-GPU thread before anything else runs there, and that request falls back to the codes path with
-the stored `ref_text` (`speech.prefix_fallback`), never a `500` (T066). So the fallback can't
-change the outcome, the room check before the gate measures a voice without an override on both
-paths (the prefix path by its stored `prefix_len`, the codes path by its whole prompt) and needs
-piece 0 to fit both; a stored prefix longer than the model builds (`prefix_len > max_seq_len - 1 -
-MIN_SUFFIX_ROOM`) is `400 text_too_long` there too. Later pieces are sized when they run, on the
-path the request took (BC-47).
+`ref_text`. The room check before the gate sizes a voice on the path it will take: without an
+override, the prefix path, by its stored `prefix_len` (a stored prefix longer than the model builds,
+`prefix_len > max_seq_len - 1 - MIN_SUFFIX_ROOM`, is `400 text_too_long` there); with one, the codes
+path, by its whole prompt.
+
+A prefix build that runs out of GPU memory, while assembling its inputs or while building, is not
+cached and frees what it held on the GPU thread before anything else runs there; it is never a
+`500` (T066). The request then evicts every cached prefix (`voice.prefix_evicted`, reason `oom`),
+since the codes path needs more memory than the build did, and empties PyTorch's cache on the GPU
+thread. Whether it may fall back to the codes path is decided only then (decided with the user on
+2026-09-26, reversing review 42's rule that piece 0 must fit both paths before the gate, which
+refused a voice near the limit on every request because of a rare out-of-memory): piece 0's room
+on the codes path is measured on the CPU tokenizer's worker. With room, the request uses the codes
+path with the stored `ref_text` (`speech.prefix_fallback`, reason `out_of_memory`); without, it is
+refused before the `200` with `503 gpu_out_of_memory` (`speech.prefix_fallback`, reason
+`no_room`). Only piece 0 is sized for the codes path then, so after a fallback a later piece can
+still find no room and abort the stream after the `200` (BC-47): a case that only follows an
+out-of-memory. Later pieces are always sized when they run, on the path the request took.
 
 Transitions: `none` becomes `codes(anchor)` after piece 0 succeeds with at least one non-pad
 frame. It never happens on cancel, on failure, or when piece 0 produced zero frames. It is also
@@ -260,7 +270,11 @@ larger `max_seq_len`) still loads, and a request for it is `400 text_too_long` b
 **Changes**: every store and registry change (create, register, delete) runs on one worker thread
 of the voice services' own, never the event loop or asyncio's shared pool, one at a time. What
 goes with a change on the event loop (dropping a cached prefix, the `voice.*` events) is scheduled
-by that thread right after the change, so a request cancelled mid-change still gets them.
+by that thread right after the change, so a request cancelled mid-change still gets them. A
+change that arrives after server stop has shut that thread down, or that was still queued when it
+did, answers `503 gpu_unavailable`, as the CPU tokenizer's room check does in the same race. A
+change that finishes after the event loop has closed keeps its result; what goes with it is
+dropped.
 
 ## Voice file v1
 
@@ -299,7 +313,11 @@ A file is skipped at startup, with a `voice.skipped{file, reason}` event, when a
 - a case-duplicate of a file that sorts earlier, whether that file loaded or was skipped;
 - the byte length or sha256 of `codes` doesn't match;
 - a code is out of range;
-- the fingerprint doesn't match.
+- the fingerprint doesn't match;
+- the voice's prefix can't be measured (its `ref_text` breaks the prompt template, say): the
+  reason is the error. This check runs after the scan, so this `voice.skipped` follows
+  `voices.loaded`, which counted the file as loaded; the name is reserved as for any other
+  skipped file, and a `DELETE` of it removes the file.
 
 Other files in the directory:
 - Leftover `.del-*` and `.tmp-*` files are removed. One that can't be removed or stat'ed, or a
@@ -385,7 +403,10 @@ offending record's field names), so one bad field never breaks the request emitt
     `saved`, `unnamed` or `reserved`), `voice.store_mismatch` (level `warning`; `request_id`,
     `voice_id`, `file_removed`, `kind`: a `DELETE` where the store and the registry disagreed
     about whether the voice has a file, e.g. a file removed for an id the registry didn't hold
-    (`kind` null, no `voice.deleted`); the delete still answers `200`),
+    (`kind` null, no `voice.deleted`); the delete still answers `200`. Also a named `POST` whose
+    name the registry refused after the file was written, when taking the file back out failed:
+    `file_removed` false, `kind` null, plus `error`; the file stays on disk and the `POST` answers
+    `409 voice_exists`, since the name is taken either way),
     `voice.frame_prediction_mismatch` (level `warning`; `request_id`, `predicted_frames`,
     `actual_frames`: a `POST /v1/voices` encode, as `speech.frame_prediction_mismatch`),
     `voice.cleanup_failed` (`file`, `op`: `sweep`, `stat`, `unlink_tmp` or `unlink`, `error`: a
@@ -394,8 +415,9 @@ offending record's field names), so one bad field never breaks the request emitt
     size, `request_id`), `voice.prefix_evicted` (`voice_id`, `reason`: `budget` (dropped, least
     recently used first, to make room), `deleted` (the voice was deleted, including a build by a
     request that resolved the voice before its delete, which is returned to that request but not
-    cached) or `too_large` (a prefix bigger than the whole budget, returned to its request but
-    never cached); `request_id`: the request whose build caused it, or the DELETE's), and
+    cached), `too_large` (a prefix bigger than the whole budget, returned to its request but
+    never cached) or `oom` (every cached prefix, dropped after a prefix build ran out of GPU
+    memory, "Reference"); `request_id`: the request whose build caused it, or the DELETE's), and
     `voice.prefix_build_failed` (`voice_id`, `error`, `request_id`: a build that raised after
     its request was cancelled, so no caller received the error). All three are emitted only
     after the cache's state is final, and an `on_event` error is logged through the event
@@ -405,8 +427,9 @@ offending record's field names), so one bad field never breaks the request emitt
     token for this checkpoint). It isn't warmed at startup: a voice's first request builds its prefix;
   - speech: `speech.accepted` (`pieces`, `reference`: `none`, `inline`, `voice_prefix` (with
     `warm`: whether the prefix was already cached) or `voice_codes`), `speech.prefix_fallback`
-    (level `warning`; `voice_id`, `reason`: `out_of_memory`, `error`: a voice's prefix build ran
-    out of GPU memory, so the request used the codes path; T066),
+    (level `warning`; `voice_id`, `error`, `reason`: a voice's prefix build ran out of GPU memory,
+    and the request either used the codes path (`out_of_memory`) or, with no room for piece 0
+    there, was refused with `503 gpu_out_of_memory` (`no_room`); T066, "Reference"),
     `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`
     (`piece_index`, `requested`, `cap`, `room`), `speech.anchor_skipped` (`piece_index`,
     `reason`: `piece_truncated`, `no_room`, `sizing_failed`, `sizing_timeout` or `shutdown`),

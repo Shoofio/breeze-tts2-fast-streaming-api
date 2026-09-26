@@ -17,7 +17,8 @@ Ported from `A:breeze_infer/voice_prefix.py` (research.md R13), with these chang
   the model config. A prefix bigger than the whole budget is returned but not cached.
 - `get_or_build` is async, since the real build is a `GpuThread.run(...)` coroutine.
 - `build()`'s exceptions, CUDA out-of-memory included, propagate unchanged with nothing
-  cached; T066 catches out-of-memory and falls back to the codes path.
+  cached; T066 catches out-of-memory, drops every entry (`evict_all`) and falls back to the
+  codes path.
 - `A:`'s startup `warm()` is dropped: the spec doesn't ask for one.
 
 Concurrency. Everything here runs on the event loop, and the cache has no locks:
@@ -223,6 +224,17 @@ class VoicePrefixCache:
             self._discard(key)
         self._emit([_evicted(voice_id, "deleted", request_id) for _key in removed])
         return bool(removed)
+
+    def evict_all(self, *, reason: str, request_id: str | None) -> int:
+        """Drop every entry, with one `voice.prefix_evicted` (`reason`) each, and return how many
+        there were. The speech route's out-of-memory fallback (`reason="oom"`): the codes path
+        needs more memory than the build that failed, so every other voice's KV goes too. Not a
+        delete, so nothing here affects `get_or_build`'s staleness check."""
+        evicted = list(self._entries)
+        self._entries.clear()
+        self._used_bytes = 0
+        self._emit([_evicted(voice_id, reason, request_id) for voice_id, _hash in evicted])
+        return len(evicted)
 
     def _deleted_since(self, voice_id: str, resolved_token: int) -> bool:
         return (

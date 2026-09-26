@@ -58,6 +58,7 @@ from breeze_infer import reference_audio, voice_file
 from breeze_infer.audio import encode_prompt_waveform
 from breeze_infer.errors import ApiError, api_error_response, report_unhandled
 from breeze_infer.events import Emitter
+from breeze_infer.executors import run_until_shutdown
 from breeze_infer.gpu import GpuGate, GpuLease, GpuThread
 from breeze_infer.http_fields import parse_voice_create, read_fields
 from breeze_infer.routes_health import Readiness
@@ -103,15 +104,23 @@ class VoiceServices:
         caller running it after its `await`: a request cancelled while its change runs (a client
         disconnect) can't stop the change, so it must not skip what goes with it either. `then`
         is on the loop because the prefix cache has no locks; it runs before the caller resumes.
+
+        After `shutdown()`, or for a change it cancelled while still queued, `GpuUnavailable`
+        (`503 gpu_unavailable`), as for the CPU tokenizer (`executors.run_until_shutdown`).
         """
         loop = asyncio.get_running_loop()
 
         def run() -> _T:
             result = change()
-            loop.call_soon_threadsafe(then, result)
+            try:
+                loop.call_soon_threadsafe(then, result)
+            except RuntimeError:
+                # The loop closed while the change ran (the server stopped): nothing is left to
+                # run `then` on, and the change has committed, so its result stands.
+                pass
             return result
 
-        return await loop.run_in_executor(self.executor, run)
+        return await run_until_shutdown(self.executor, run, what="the voice store")
 
     def shutdown(self) -> None:
         """Refuse new changes and drop queued ones; one already running finishes on its own."""
@@ -239,18 +248,38 @@ class _Registered:
     evicted: str | None = None
 
 
-def _commit_saved(services: VoiceServices, voice: voice_file.VoiceFile, prefix_len: int) -> _Registered:
+def _commit_saved(
+    services: VoiceServices,
+    events: Emitter,
+    request_id: str,
+    voice: voice_file.VoiceFile,
+    prefix_len: int,
+) -> _Registered:
     """Voice thread: write the file (the store re-checks the name under its own lock, and its
     commit refuses a file already on disk), then register it.
 
     The registry refusing a name the store had free means the two have drifted apart. The file
     is then taken back out before `NameTaken` propagates: a `409` must leave nothing on disk to
-    reappear at the next restart. If that removal fails, its `OSError` propagates instead."""
+    reappear at the next restart. If that removal fails, the name is still taken, so `NameTaken`
+    still propagates (`409`, not a `500` for a write that succeeded), and the file left on disk
+    is reported as `voice.store_mismatch` (review 43 #7). Emitted from this thread (`Emitter` is
+    thread-safe), so a request cancelled meanwhile still reports it."""
     stored = services.store.create(voice)
     try:
         entry = services.registry.register_saved(stored, prefix_len=prefix_len)
     except NameTaken:
-        services.store.remove(stored.id)
+        try:
+            services.store.remove(stored.id)
+        except OSError as error:
+            events.emit(
+                "voice.store_mismatch",
+                level="warning",
+                request_id=request_id,
+                voice_id=stored.id,
+                file_removed=False,
+                kind=None,
+                error=str(error),
+            )
         raise
     return _Registered(entry, created=True)
 
@@ -423,7 +452,10 @@ async def _create_voice(
         created_at="",  # stamped by the store when it writes the file
     )
     try:
-        registered = await services.change(partial(_commit_saved, services, voice, prefix_len), after)
+        registered = await services.change(
+            partial(_commit_saved, services, components.events, request_id, voice, prefix_len),
+            after,
+        )
     except (VoiceExists, NameTaken):
         raise ApiError(409, "voice_exists", "voice already exists") from None
     except OSError as error:
