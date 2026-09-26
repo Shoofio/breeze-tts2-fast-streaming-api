@@ -355,23 +355,6 @@ runtime changes; everything else is orchestration outside `models/`.
 the warmup set, and changes memory and TTFA. It stays deferred until measurements justify it, and
 BC-47 documents the limit.
 
-**Open item: codec decode variation** (found while porting `tests/gpu/test_voice_tier1_equivalence.py`,
-tasks.md T067). Only the reference *encode* is pinned deterministic
-(`breeze_infer/audio.py`'s `_deterministic_cudnn_encode`: `benchmark=False, deterministic=True`,
-scoped to that one call); codec *decode* keeps `--fast-all`'s autotuned, non-deterministic
-`cudnn.benchmark=True`. This was known to make decode differ across a server restart, but a GPU
-investigation for T067 found it also differs **within one warmed server process, request to
-request, for the exact same generated codec tokens**: decoding one identical set of captured
-token frames twice, under two different request ids, left 72,960 of 76,800 samples different,
-max absolute difference about 0.072 of the codec's [-1, 1] float output -- about 2,365 to 2,654
-int16 steps (roughly 8% of full scale), measured across a few such pairs on an RTX 4090. Pinning
-decode deterministic the same way as encode was not evaluated (it would cost every request's own
-decode, not a one-time reference encode, so the trade-off needs its own benchmark before deciding
-either way). Until then, no test in this repo may assert PCM/audio-sample equality across two
-separate requests, even with identical inputs and seed; `test_voice_tier1_equivalence.py` instead
-asserts the generated *token frames* match exactly and checks the decoded PCM only for basic
-plausibility (non-empty, not silent, matching length).
-
 ## R13. Voice storage
 
 **Decision**: One file per saved voice, `<voices_dir>/<id>.voice.json`, format
@@ -669,3 +652,20 @@ and `tests/gpu/test_reference_encode_determinism.py`:
   time (four fresh processes: three encode workers plus this one) is still several minutes on
   this machine, not "a few seconds" -- but the ~85 s to ~7 s improvement inside the construction
   itself is real and is what this test isolates.
+
+**Open item: codec decode variation** (found while porting `tests/gpu/test_voice_tier1_equivalence.py`,
+tasks.md T067). Only the reference *encode* is pinned deterministic
+(`breeze_infer/audio.py`'s `_deterministic_cudnn_encode`: `benchmark=False, deterministic=True`,
+scoped to that one call); codec *decode* keeps `--fast-all`'s autotuned, non-deterministic
+`cudnn.benchmark=True`. This was known to make decode differ across a server restart, but a GPU
+investigation for T067 found it also differs **within one warmed server process, request to
+request, for the exact same generated codec tokens**: decoding one identical set of captured
+token frames twice, under two different request ids, left 72,960 of 76,800 samples different,
+max absolute difference about 0.072 of the codec's [-1, 1] float output -- about 2,365 to 2,654
+int16 steps (roughly 8% of full scale), measured across a few such pairs on an RTX 4090. Pinning
+decode deterministic the same way as encode was not evaluated (it would cost every request's own
+decode, not a one-time reference encode, so the trade-off needs its own benchmark before deciding
+either way). Until then, no test in this repo may assert PCM/audio-sample equality across two
+separate requests, even with identical inputs and seed; `test_voice_tier1_equivalence.py` instead
+asserts the generated *token frames* match exactly and checks the decoded PCM only for basic
+plausibility (non-empty, not silent, matching length).
