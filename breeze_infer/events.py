@@ -1,7 +1,7 @@
 """Structured events: one JSON object per line, nothing else.
 
-Telemetry must never break a request (Constitution VII), so ``emit`` distinguishes two kinds of
-failure. A programming error — an empty event name, an invalid ``level``, or a field that
+Telemetry must never break a request (this module's own rule), so ``emit`` distinguishes two
+kinds of failure. A programming error — an empty event name, an invalid ``level``, or a field that
 collides with a reserved key — raises, because the caller's code is wrong and should be fixed.
 A serialisation problem in the *data* (NaN/inf, a circular reference, or a value ``json`` can't
 encode) does not raise; the offending field(s) are dropped and replaced with a minimal

@@ -189,7 +189,7 @@ def test_emit_serialises_numpy_scalars_via_the_item_hook() -> None:
 def test_emit_swallows_an_oserror_from_a_gone_sink() -> None:
     events = Emitter(sink=_BrokenSink(), clock=lambda: 0.0)
 
-    # Telemetry must never break a request (Constitution VII): a dead sink is silently dropped.
+    # Telemetry must never break a request: a dead sink is silently dropped.
     events.emit("voice.used")
 
 

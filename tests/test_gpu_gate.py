@@ -50,6 +50,28 @@ def test_held_is_true_only_while_the_lease_owns_the_gate() -> None:
     assert second.held and not first.held  # a stale lease never reads as held again
 
 
+def test_hand_over_moves_the_hold_without_a_free_window() -> None:
+    gate = GpuGate()
+    lease = _hold(gate)
+    successor = lease.hand_over()
+    assert successor.held and not lease.held
+    assert gate.try_acquire() is None  # still held, by the successor
+    lease.release()  # the original holder's usual release: a no-op now
+    assert gate.try_acquire() is None
+    successor.release()
+    assert gate.try_acquire() is not None
+    with pytest.raises(RuntimeError):
+        successor.release()  # a real double release still fails
+
+
+def test_hand_over_needs_a_held_lease() -> None:
+    gate = GpuGate()
+    lease = _hold(gate)
+    lease.release()
+    with pytest.raises(RuntimeError):
+        lease.hand_over()
+
+
 def test_acquire_on_a_free_gate_does_not_signal_queued() -> None:
     async def main() -> None:
         gate = GpuGate()

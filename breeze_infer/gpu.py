@@ -36,11 +36,28 @@ class GpuLease:
 
     def __init__(self, gate: GpuGate) -> None:
         self._gate = gate
+        self._handed_over = False
 
     def release(self) -> None:
         """Hand the gate on. Raises `RuntimeError` if this lease no longer holds it: a double
-        release is a caller bug, and honouring it would free a gate someone else now holds."""
+        release is a caller bug, and honouring it would free a gate someone else now holds.
+        A no-op after `hand_over()`: the successor releases instead."""
+        if self._handed_over:
+            return
         self._gate._release(self)
+
+    def hand_over(self) -> GpuLease:
+        """Move this lease's hold on the gate to a new lease and return it, with no free
+        window in between. For GPU work that outlives its holder (a cancelled caller's
+        prefix build, voice_prefix.py): the work releases the successor when it finishes,
+        and this lease's own `release()` becomes a no-op, so the holder's usual `finally:
+        lease.release()` stays correct. Raises `RuntimeError` if this lease isn't held."""
+        if not self.held:
+            raise RuntimeError("GpuLease.hand_over() called by a lease that doesn't hold the gate")
+        successor = GpuLease(self._gate)
+        self._gate._owner = successor
+        self._handed_over = True
+        return successor
 
     @property
     def held(self) -> bool:

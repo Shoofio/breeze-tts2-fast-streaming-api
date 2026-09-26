@@ -199,9 +199,9 @@ frames, `sizing_timeout`), and when the request ends before the anchor decision 
 **Prefix-cache key**: `(id, content_hash)` from `voice_file.prefix_key`, where `content_hash` is
 a sha256 over the length-prefixed `ref_text`, the codes' shape and the codes' bytes. The KV
 depends on the transcript as well as the audio, so the same codes with another `ref_text` are a
-different key. Delete also bumps the voice's generation in the cache, so a prefix build still
-running when its voice is deleted is never cached, even if the voice is re-registered with the
-same audio and text.
+different key. Deletes are ordered against builds by one counter: a request reads the cache's
+token when it resolves the voice, and a build by a request that resolved the voice before its
+delete is never cached, even if the voice is re-registered with the same audio and text.
 
 **Wire shape** (unchanged from C++):
 `{"id", "frames", "seconds" (2 decimals), "encode_ms" (integer ms), "saved", "ref_text"}`.
@@ -347,14 +347,18 @@ offending record's field names), so one bad field never breaks the request emitt
     `voice.cleanup_failed` (`file`, `op`: `sweep`, `stat`, `unlink_tmp` or `unlink`, `error`: a
     leftover the store couldn't remove or examine; it is left for the next startup's sweep),
     `voice.prefix_built` (`voice_id`, `tokens`: the prefix length, `bytes`: its estimated KV
-    size), `voice.prefix_evicted` (`voice_id`, `reason`: `budget` (dropped, least recently used
-    first, to make room), `deleted` (the voice was deleted, including a build that finished
-    after its delete, which is returned to its request but not cached) or `too_large` (a prefix
-    bigger than the whole budget, returned to its request but never cached)). Both are emitted
-    only after the cache's state is final. The prefix cache holds at most
-    `VOICE_PREFIX_CACHE_BYTES` (1 GiB) of estimated KV, where an entry costs `prefix_len` × 2
-    (key and value) × layers × KV heads × `head_dim` × dtype size (114,688 B per token for
-    this checkpoint). It isn't warmed at startup: a voice's first request builds its prefix;
+    size, `request_id`), `voice.prefix_evicted` (`voice_id`, `reason`: `budget` (dropped, least
+    recently used first, to make room), `deleted` (the voice was deleted, including a build by a
+    request that resolved the voice before its delete, which is returned to that request but not
+    cached) or `too_large` (a prefix bigger than the whole budget, returned to its request but
+    never cached); `request_id`: the request whose build caused it, or the DELETE's), and
+    `voice.prefix_build_failed` (`voice_id`, `error`, `request_id`: a build that raised after
+    its request was cancelled, so no caller received the error). All three are emitted only
+    after the cache's state is final, and an `on_event` error is logged through the event
+    loop's exception handler without failing the request or the delete. The prefix cache holds
+    at most `VOICE_PREFIX_CACHE_BYTES` (1 GiB) of estimated KV, where an entry costs
+    `prefix_len` × 2 (key and value) × layers × KV heads × `head_dim` × dtype size (114,688 B per
+    token for this checkpoint). It isn't warmed at startup: a voice's first request builds its prefix;
   - speech: `speech.accepted`, `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`
     (`piece_index`, `requested`, `cap`, `room`), `speech.anchor_skipped` (`piece_index`,
     `reason`: `piece_truncated`, `no_room`, `sizing_failed`, `sizing_timeout` or `shutdown`),

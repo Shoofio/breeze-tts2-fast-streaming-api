@@ -735,7 +735,10 @@ rules.
   - with no override, use the prefix path;
   - with an override, use the codes path;
   - on a prefix build that raises CUDA out-of-memory, fall back to the codes path for that
-    request (emit an event) instead of a 500.
+    request (emit an event) instead of a 500;
+  - read `VoicePrefixCache.token()` in the same event-loop step that resolves the voice from the
+    registry (before waiting for the gate), and pass it to `get_or_build` as `resolved_token`,
+    with the request's `request_id`; DELETE passes its `request_id` to `invalidate`.
 - [ ] T067 [P] [US1] Port `A:tests/gpu/{test_voice_equivalence,test_voice_prefill_buckets,
   test_voice_tier1_equivalence}.py` to `tests/gpu/`, adapted to the new store (register through the
   route). Include a prefix longer than 548 tokens that now builds (R12, point 4).
