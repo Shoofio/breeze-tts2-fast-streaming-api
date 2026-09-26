@@ -280,3 +280,49 @@ def test_store_and_registry_agree_on_which_id_delete_matches(tmp_path, skipped: 
     assert registry.remove("carol") is None
     assert store.remove("Carol") is True
     assert registry.remove("Carol") is not None
+
+
+# ------------------------------------------------------------------- review 38
+
+
+def test_name_taken_holds_the_registry_lock():
+    """#1: name_taken used to read the reserved names without the lock, so a
+    concurrent remove() or load_from_scan() changed the dict mid-iteration ("dictionary
+    changed size during iteration", a 500 on POST). Deterministic: while this test
+    holds the lock, name_taken must not be able to finish."""
+    import threading
+
+    registry = _registry()
+    registry.load_from_scan(
+        voices=[], skipped=[SkippedVoiceFile(file="carol.voice.json", reason="broken", name="carol")]
+    )
+    finished = threading.Event()
+    answer = {}
+
+    def check():
+        answer["taken"] = registry.name_taken("CAROL")
+        finished.set()
+
+    with registry._lock:
+        worker = threading.Thread(target=check)
+        worker.start()
+        assert not finished.wait(timeout=0.3)
+    assert finished.wait(timeout=10)
+    worker.join()
+    assert answer["taken"] is True
+
+
+def test_case_insensitive_names_groups_exact_names_by_their_folded_key():
+    """#9: the one case-folding structure both the store and the registry use."""
+    from breeze_infer.voice_file import CaseInsensitiveNames
+
+    names: CaseInsensitiveNames[str] = CaseInsensitiveNames()
+    names.set("Carol", "first")
+    names.set("carol", "second")
+    assert names.taken("CAROL") and not names.taken("dave")
+    assert names.get("Carol") == "first" and names.get("CAROL") is None
+    assert names.pop("Carol") == "first"
+    assert names.taken("CAROL")  # carol still holds it
+    assert names.pop("carol") == "second"
+    assert not names.taken("carol")
+    assert names.pop("carol") is None

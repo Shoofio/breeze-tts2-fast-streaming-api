@@ -259,3 +259,74 @@ def test_a_codebook_count_other_than_the_models_is_rejected():
     raw, _ = _encode(codes=_codes(codebooks=8))  # self-consistent, but 8 != 16
     with pytest.raises(voice_file.VoiceFileError):
         _decode(raw)
+
+
+# ------------------------------------------------------------------- review 38
+
+
+@pytest.mark.parametrize(
+    "ref_text",
+    [
+        "a\x00\x1bb",  # NUL and ESC: POST /v1/voices rejects these (BC-46)
+        "hi\x7f",  # DEL
+        "hi\x85",  # NEL, a C1 control
+        "\ud800 hi",  # a lone surrogate: valid JSON (\\ud800), but not encodable as UTF-8
+    ],
+    ids=["nul-esc", "del", "nel", "lone-surrogate"],
+)
+def test_ref_text_the_api_would_reject_or_cannot_send_is_rejected(ref_text: str):
+    # json.dumps escapes a lone surrogate as \ud800, exactly as a hand-edited file would.
+    raw, _ = _encode(ref_text=ref_text)
+    with pytest.raises(voice_file.VoiceFileError):
+        _decode(raw)
+
+
+def test_ref_text_with_tab_cr_and_lf_is_accepted():
+    raw, _ = _encode(ref_text="line one\r\n\tline two")
+    assert _decode(raw).ref_text == "line one\r\n\tline two"
+
+
+def test_frames_above_the_reference_limit_are_rejected():
+    from breeze_infer.reference_audio import MAX_REF_FRAMES
+
+    raw, _ = _encode(codes=_codes(frames=MAX_REF_FRAMES + 1))
+    with pytest.raises(voice_file.VoiceFileError):
+        _decode(raw)
+
+
+def test_frames_at_the_reference_limit_are_accepted():
+    from breeze_infer.reference_audio import MAX_REF_FRAMES
+
+    raw, _ = _encode(codes=_codes(frames=MAX_REF_FRAMES))
+    assert _decode(raw).frames == MAX_REF_FRAMES
+
+
+@pytest.mark.parametrize("encode_ms", [-1, 3_600_001])
+def test_encode_ms_out_of_range_is_rejected(encode_ms: int):
+    raw, _ = _encode(encode_ms=encode_ms)
+    with pytest.raises(voice_file.VoiceFileError):
+        _decode(raw)
+
+
+@pytest.mark.parametrize("encode_ms", [0, 3_600_000])
+def test_encode_ms_at_its_bounds_is_accepted(encode_ms: int):
+    raw, _ = _encode(encode_ms=encode_ms)
+    assert _decode(raw).encode_ms == encode_ms
+
+
+@pytest.mark.parametrize(
+    "created_at",
+    [
+        "not a date",
+        "2026-9-24T20:15:00Z",  # strptime alone accepts this: the round trip doesn't
+        "2026-09-24 20:15:00Z",
+        "2026-09-24T20:15:00+00:00",
+        "2026-09-24T20:15:00.123Z",
+        "2026-02-30T00:00:00Z",  # right shape, not a real date
+        "2026-09-24T20:15:00z",
+    ],
+)
+def test_created_at_not_in_the_exact_utc_shape_is_rejected(created_at: str):
+    raw, _ = _encode(created_at=created_at)
+    with pytest.raises(voice_file.VoiceFileError):
+        _decode(raw)

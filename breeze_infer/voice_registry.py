@@ -28,7 +28,7 @@ from typing import Any
 import numpy as np
 
 from breeze_infer.limits import UNNAMED_VOICE_CAP
-from breeze_infer.voice_file import VoiceFile
+from breeze_infer.voice_file import CaseInsensitiveNames, VoiceFile
 from breeze_infer.voice_store import SkippedVoiceFile
 
 
@@ -144,12 +144,11 @@ class VoiceRegistry:
         self._cap = int(cap)
         self._lock = threading.Lock()
         self._saved: dict[str, SavedVoice] = {}  # id (as saved) -> SavedVoice
-        self._name_index: dict[str, str] = {}  # lowercased name -> saved id
-        # exact name -> reason, for skipped files. Keyed exactly, not lowercased: DELETE
-        # releases a skipped file's name by its exact stem (the store deletes that exact
-        # file), and two skipped files differing only by case each hold the name until
-        # both are deleted. name_taken still compares ignoring case.
-        self._reserved: dict[str, str] = {}
+        self._name_index: dict[str, str] = {}  # CaseInsensitiveNames.key(id) -> saved id
+        # Skipped files' names (value: the skip reason). Taken ignoring case, but
+        # released by the exact stem: the store deletes that exact file, and two
+        # skipped files differing only by case each hold the name until both are gone.
+        self._reserved: CaseInsensitiveNames[str] = CaseInsensitiveNames()
         self._unnamed: dict[str, MemoryVoice] = {}
         self._unnamed_order: list[str] = []  # registration order, oldest first
 
@@ -158,12 +157,18 @@ class VoiceRegistry:
     def name_taken(self, name: str) -> bool:
         """Case-insensitive: true for an existing saved voice's id, a name a skipped
         file reserves, or any name in the `v_` namespace (BC-26) -- reserved outright,
-        whether or not any specific unnamed id has actually been minted."""
+        whether or not any specific unnamed id has actually been minted.
+
+        Takes the lock: without it, a concurrent `remove` or `load_from_scan` could
+        change the indexes mid-check."""
+        with self._lock:
+            return self._name_taken_locked(name)
+
+    def _name_taken_locked(self, name: str) -> bool:
+        """`name_taken`, for a caller already holding `_lock`."""
         if name[:2].lower() == "v_":
             return True
-        lowered = name.lower()
-        # A linear pass over the reserved names: only skipped files add them, a handful.
-        return lowered in self._name_index or any(n.lower() == lowered for n in self._reserved)
+        return CaseInsensitiveNames.key(name) in self._name_index or self._reserved.taken(name)
 
     # ------------------------------------------------------------------- startup
 
@@ -182,10 +187,10 @@ class VoiceRegistry:
             self._unnamed_order.clear()
             for voice in voices:
                 self._saved[voice.id] = SavedVoice.from_file(voice)
-                self._name_index[voice.id.lower()] = voice.id
+                self._name_index[CaseInsensitiveNames.key(voice.id)] = voice.id
             for item in skipped:
                 if item.name is not None:
-                    self._reserved[item.name] = item.reason
+                    self._reserved.set(item.name, item.reason)
 
     # --------------------------------------------------------------- registering
 
@@ -195,11 +200,11 @@ class VoiceRegistry:
         should have ruled this out already; this is the in-memory side of the same
         guarantee, not a second source of truth."""
         with self._lock:
-            if self.name_taken(voice.id):
+            if self._name_taken_locked(voice.id):
                 raise NameTaken(voice.id)
             saved = SavedVoice.from_file(voice)
             self._saved[voice.id] = saved
-            self._name_index[voice.id.lower()] = voice.id
+            self._name_index[CaseInsensitiveNames.key(voice.id)] = voice.id
             return _entry(saved, saved=True)
 
     def find_unnamed(self, voice_id: str) -> VoiceEntry | None:
@@ -251,14 +256,13 @@ class VoiceRegistry:
         with self._lock:
             if voice_id in self._saved:
                 del self._saved[voice_id]
-                self._name_index.pop(voice_id.lower(), None)
+                self._name_index.pop(CaseInsensitiveNames.key(voice_id), None)
                 return RemovedVoice(id=voice_id, kind="saved")
             if voice_id in self._unnamed:
                 del self._unnamed[voice_id]
                 self._unnamed_order.remove(voice_id)
                 return RemovedVoice(id=voice_id, kind="unnamed")
-            if voice_id in self._reserved:
-                del self._reserved[voice_id]
+            if self._reserved.pop(voice_id) is not None:
                 return RemovedVoice(id=voice_id, kind="reserved")
             return None
 

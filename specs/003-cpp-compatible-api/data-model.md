@@ -217,7 +217,8 @@ DELETE         → saved: rename to .del-* and fsync the directory, then unlink 
                  failure leaves the .del-* file for the next startup's sweep) → unregistered;
                  prefix cache entry dropped
                → unnamed: unregistered; prefix cache entry dropped
-               → skipped-file name: file removed, name released
+               → skipped-file name: file removed, name released; a skipped entry that is a
+                 directory is refused (`500 voice_delete_failed`) and stays reserved
 restart        → saved voices reloaded from files; unnamed voices gone
 ```
 
@@ -244,9 +245,15 @@ Path: `<voices_dir>/<id>.voice.json`, UTF-8 JSON. A consumer rejects any file wh
 
 A file is skipped at startup, with a `voice.skipped{file, reason}` event, when any of these holds:
 - it is larger than `MAX_VOICE_FILE_BYTES` (only that much is read);
+- it can't be stat'ed (the reason is the OS error), or isn't a regular file (a directory, say:
+  reason `not a regular file`);
 - JSON or schema error: not UTF-8, a missing field, a field of the wrong JSON type (integers
-  must be integers, not floats or booleans), a blank `ref_text` or one over 2,000 characters,
-  `frames` below 1, or `codebooks` other than the model's codebook count;
+  must be integers, not floats or booleans), a `ref_text` that is blank, over 2,000
+  characters, holds control characters (BC-46, the same rule as `POST`) or a lone surrogate,
+  `frames` outside 1 to `reference_audio.MAX_REF_FRAMES` (376: the most a 30 s reference
+  encodes to at any accepted sample rate), `codebooks` other than the model's codebook count,
+  `encode_ms` outside 0 to 3,600,000 (an hour), or a `created_at` not exactly
+  `YYYY-MM-DDTHH:MM:SSZ` and a real date;
 - the file stem differs from `id`;
 - invalid name or a `v_` prefix;
 - a case-duplicate of a file that sorts earlier, whether that file loaded or was skipped;
@@ -255,8 +262,8 @@ A file is skipped at startup, with a `voice.skipped{file, reason}` event, when a
 - the fingerprint doesn't match.
 
 Other files in the directory:
-- Leftover `.del-*` and `.tmp-*` files are removed. One that can't be removed, or a directory
-  with such a name, is logged and left.
+- Leftover `.del-*` and `.tmp-*` files are removed. One that can't be removed or stat'ed, or a
+  directory with such a name, is reported with `voice.cleanup_failed` and left.
 - `*.breeze` files are counted and reported in `voices.loaded{loaded, skipped, breeze_ignored}`.
 
 ## WebSocket Session
@@ -328,7 +335,9 @@ offending record's field names), so one bad field never breaks the request emitt
     `model.load_failed` (the process then exits non-zero), `gpu.close_failed`,
     `gpu.close_timeout` (a `gen.close()` ran past 30 s: the GPU gate is poisoned and `/health`
     answers `503 gpu_unavailable` until restart);
-  - voices: `voices.loaded`, `voice.skipped`, `voice.created`, `voice.deleted`;
+  - voices: `voices.loaded`, `voice.skipped`, `voice.created`, `voice.deleted`,
+    `voice.cleanup_failed` (`file`, `op`: `sweep`, `stat`, `unlink_tmp` or `unlink`, `error`: a
+    leftover the store couldn't remove or examine; it is left for the next startup's sweep);
   - speech: `speech.accepted`, `speech.first_audio` (`ttfa_ms`), `speech.piece_clamped`
     (`piece_index`, `requested`, `cap`, `room`), `speech.anchor_skipped` (`piece_index`,
     `reason`: `piece_truncated`, `no_room`, `sizing_failed`, `sizing_timeout` or `shutdown`),

@@ -15,8 +15,9 @@ root (T065), never a module-level global.
 
 from __future__ import annotations
 
-import logging
+import errno
 import os
+import stat
 import threading
 import time
 from collections.abc import Callable
@@ -27,12 +28,12 @@ from typing import Any
 
 from breeze_infer import voice_file
 from breeze_infer.limits import MAX_VOICE_FILE_BYTES
-from breeze_infer.voice_file import VoiceFile, VoiceFileError
-
-# Trouble that must not stop startup or fail a request that has already done its job (a
-# leftover that can't be swept, a .del-* file that can't be unlinked yet) is logged here
-# and left for the next scan's sweep.
-_log = logging.getLogger(__name__)
+from breeze_infer.voice_file import (
+    CREATED_AT_FORMAT,
+    CaseInsensitiveNames,
+    VoiceFile,
+    VoiceFileError,
+)
 
 SUFFIX = ".voice.json"
 BREEZE_SUFFIX = ".breeze"
@@ -44,6 +45,14 @@ DEL_PREFIX = ".del-"
 # for the handle to go away before giving up (ported from `A:voices.py`).
 DELETE_RENAME_ATTEMPTS = 5
 DELETE_RENAME_BACKOFF_SECONDS = 0.05
+
+# The os.link errors that mean "this filesystem has no hard links" (FAT/exFAT, some
+# network shares): EPERM is what Linux returns for vfat, the rest cover other kernels
+# and a link across devices. Only these take create's non-atomic fallback; any other
+# link failure (EIO, ENOSPC, EMLINK, ...) is a failed write.
+_LINKS_UNSUPPORTED = frozenset(
+    {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.ENOSYS}
+)
 
 
 class VoiceExists(Exception):
@@ -87,13 +96,18 @@ def _rename_with_retry(src: Path, dst: Path, *, sleep: Callable[[float], None]) 
             sleep(DELETE_RENAME_BACKOFF_SECONDS)
 
 
+def _write_fsynced(handle: Any, payload: bytes) -> None:
+    """Write, then fsync the file itself so its content survives a crash before the
+    directory entry pointing at it does (ported from `A:voices.py` ~563-567). Shared by
+    the temp-file write and create's exclusive-create fallback."""
+    handle.write(payload)
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
 def _write_bytes(path: Path, payload: bytes) -> None:
-    """Ported from `A:voices.py` ~563-567: write, then fsync the file itself so its
-    content survives a crash before the directory entry pointing at it does."""
     with open(path, "wb") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
+        _write_fsynced(handle, payload)
 
 
 def _commit_no_overwrite(tmp_path: Path, final_path: Path, data: bytes) -> None:
@@ -107,30 +121,29 @@ def _commit_no_overwrite(tmp_path: Path, final_path: Path, data: bytes) -> None:
     case-insensitive filesystem (NTFS, WSL drvfs, macOS), a target differing only by
     case. `os.replace` can't do this: it overwrites by design.
 
-    Where hard links aren't supported (FAT/exFAT, some network shares: any `OSError`
-    other than EEXIST), this falls back to creating `final_path` with O_CREAT|O_EXCL and
-    writing `data` into it. That is just as atomic about *existence* -- the kernel
-    refuses an existing file, whatever its case on a case-insensitive filesystem -- but
-    not about content: a crash mid-write leaves a truncated file, which `scan()` then
-    skips (its name reserved, and removable through DELETE) rather than loading. Python
-    has no portable rename-without-replace (Linux's renameat2 RENAME_NOREPLACE isn't in
-    the stdlib), so this is the safest no-overwrite commit available there.
+    Only where hard links aren't supported (`_LINKS_UNSUPPORTED`) does this fall back to
+    creating `final_path` with O_CREAT|O_EXCL and writing `data` into it. That is just
+    as atomic about *existence* -- the kernel refuses an existing file, whatever its
+    case on a case-insensitive filesystem -- but not about content: a crash mid-write
+    leaves a truncated file, which `scan()` then skips (its name reserved, and removable
+    through DELETE) rather than loading. Python has no portable rename-without-replace
+    (Linux's renameat2 RENAME_NOREPLACE isn't in the stdlib), so this is the safest
+    no-overwrite commit available there. Any other link failure propagates.
     """
     try:
         os.link(tmp_path, final_path)
         return
     except FileExistsError:
         raise
-    except OSError:
-        pass  # no hard links here; fall through to the exclusive create
+    except OSError as exc:
+        if exc.errno not in _LINKS_UNSUPPORTED:
+            raise
 
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     fd = os.open(final_path, flags, 0o644)
     try:
         with open(fd, "wb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+            _write_fsynced(handle, data)
     except BaseException:
         # O_EXCL means this process created the file, so removing the partial copy can
         # never touch anyone else's.
@@ -147,21 +160,6 @@ def _read_bounded(path: Path) -> bytes:
     if len(raw) > MAX_VOICE_FILE_BYTES:
         raise VoiceFileError(f"larger than {MAX_VOICE_FILE_BYTES} bytes")
     return raw
-
-
-def _sweep_leftover(entry: Path) -> None:
-    """Remove one `.tmp-*`/`.del-*` leftover, best-effort: a leftover still held open by
-    another process, or a directory that happens to carry such a name (not ours; unlink
-    would fail on it anyway), is logged and left, never a reason to stop startup."""
-    if entry.is_dir() and not entry.is_symlink():
-        _log.warning("voices: leaving %s alone: a directory, not a leftover file", entry)
-        return
-    try:
-        os.unlink(entry)
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        _log.warning("voices: could not remove leftover %s: %s", entry, exc)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -184,15 +182,16 @@ def _format_utc(moment: datetime) -> str:
     """data-model.md "Voice file v1"'s `created_at` shape: `"2026-09-24T20:15:00Z"`."""
     if moment.tzinfo is not None:
         moment = moment.astimezone(timezone.utc)
-    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+    return moment.strftime(CREATED_AT_FORMAT)
 
 
 class VoiceStore:
     """`scan()`, `create()` and `remove()` over `<voices_dir>/*.voice.json`.
 
-    Two indexes, rebuilt by `scan()` and kept current by `create()`/`remove()`:
-    `_known` (lowercased id -> id) for loaded voices, and `_skipped` (exact name -> path)
-    for skipped files whose stem is a valid name. Together they let `create()` refuse a
+    Two indexes, rebuilt by `scan()` and kept current by `create()`/`remove()`, both
+    `CaseInsensitiveNames` of exact name -> path (the registry uses the same structure):
+    `_known` for loaded voices, and `_skipped` for skipped entries whose stem is a valid
+    name. Together they let `create()` refuse a
     taken name, ignoring case, without re-reading the directory, and let `remove()`
     delete a skipped file as well as a loaded voice's.
 
@@ -228,31 +227,65 @@ class VoiceStore:
         self._nonce = nonce
         self._lock = threading.Lock()
         self._write_lock = threading.Lock()
-        self._known: dict[str, str] = {}  # lowercased id -> id, loaded voices
-        self._skipped: dict[str, Path] = {}  # exact name -> path, skipped files
+        self._known: CaseInsensitiveNames[Path] = CaseInsensitiveNames()
+        self._skipped: CaseInsensitiveNames[Path] = CaseInsensitiveNames()
 
     def path_for(self, voice_id: str) -> Path:
         return self.voices_dir / f"{voice_id}{SUFFIX}"
 
+    def _cleanup_failed(self, entry: Path, op: str, exc: OSError | str) -> None:
+        """data-model.md's `voice.cleanup_failed{file, op, error}`: a leftover the
+        store couldn't remove or even look at. Never raised: the file is left for the
+        next scan's sweep, and whatever the store was doing carries on. `op` names the
+        step -- `sweep` (a startup leftover), `stat` (classifying one), `unlink_tmp`
+        (create's temp file) or `unlink` (a delete's `.del-*` file)."""
+        self._events.emit("voice.cleanup_failed", file=entry.name, op=op, error=str(exc))
+
     # ------------------------------------------------------------------ startup
+
+    def _sweep_leftover(self, entry: Path) -> None:
+        """Remove one `.tmp-*`/`.del-*` leftover, best-effort: one that can't even be
+        stat'ed (a Windows ACL on drvfs), a directory that happens to carry such a name
+        (not ours; unlink would fail on it anyway), or one still held open by another
+        process is reported and left, never a reason to stop startup."""
+        try:
+            is_dir = stat.S_ISDIR(entry.lstat().st_mode)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            self._cleanup_failed(entry, "stat", exc)
+            return
+        if is_dir:
+            self._cleanup_failed(entry, "sweep", "is a directory")
+            return
+        try:
+            os.unlink(entry)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            self._cleanup_failed(entry, "sweep", exc)
 
     def scan(self) -> ScanResult:
         """Load every valid `*.voice.json`, in filename order (so "sorts earlier" in
         the case-duplicate rule means exactly this iteration order); skip and report
         the rest; sweep `.tmp-*`/`.del-*` leftovers; count `.breeze` files (BC-29).
 
-        Filesystem trouble with any one entry is skipped or logged, never raised: one
-        bad file must not stop the server from starting (BC-25).
+        Filesystem trouble with any one entry is reported and skipped, never raised:
+        one bad entry must not stop the server from starting (BC-25). A `*.voice.json`
+        that can't be stat'ed or isn't a regular file (a directory, say) is skipped
+        like an invalid one, and its name reserved, since it still occupies that name
+        on disk.
 
-        Emits `voices.loaded` and one `voice.skipped` per rejected file.
+        Emits `voices.loaded`, one `voice.skipped` per rejected entry, and
+        `voice.cleanup_failed` for a leftover it couldn't remove.
         """
         self.voices_dir.mkdir(parents=True, exist_ok=True)
         voices: list[VoiceFile] = []
         skipped: list[SkippedVoiceFile] = []
         breeze_count = 0
-        known: dict[str, str] = {}
-        skipped_paths: dict[str, Path] = {}
-        # Every validly named file seen so far, loaded or skipped (lowercased name ->
+        known: CaseInsensitiveNames[Path] = CaseInsensitiveNames()
+        skipped_paths: CaseInsensitiveNames[Path] = CaseInsensitiveNames()
+        # Every validly named entry seen so far, loaded or skipped (folded name ->
         # filename): data-model.md's case-duplicate rule is about files that sort
         # earlier, not only about files that loaded. An invalid Alice.voice.json still
         # holds the name, so a valid alice.voice.json after it is the duplicate.
@@ -261,27 +294,37 @@ class VoiceStore:
         def skip(entry: Path, reason: str, name: str | None) -> None:
             skipped.append(SkippedVoiceFile(file=entry.name, reason=reason, name=name))
             if name is not None:
-                skipped_paths[name] = entry
+                skipped_paths.set(name, entry)
 
         for entry in sorted(self.voices_dir.iterdir(), key=lambda p: p.name):
             fname = entry.name
             if fname.startswith((TMP_PREFIX, DEL_PREFIX)):
-                _sweep_leftover(entry)
+                self._sweep_leftover(entry)
                 continue
             if fname.endswith(BREEZE_SUFFIX):
                 breeze_count += 1
                 continue
-            if not entry.is_file() or not fname.endswith(SUFFIX):
+            if not fname.endswith(SUFFIX):
                 continue
 
             stem = fname[: -len(SUFFIX)]
             name = stem if voice_file.is_valid_name(stem) else None
             if name is not None:
-                earlier = first_seen.get(name.lower())
+                earlier = first_seen.get(CaseInsensitiveNames.key(name))
                 if earlier is not None:
                     skip(entry, f"case-duplicate of {earlier}", name)
                     continue
-                first_seen[name.lower()] = fname
+                first_seen[CaseInsensitiveNames.key(name)] = fname
+            try:
+                # stat() follows a symlink, as is_file() did: a link to a real voice
+                # file still loads.
+                is_regular = stat.S_ISREG(entry.stat().st_mode)
+            except OSError as exc:
+                skip(entry, str(exc), name)
+                continue
+            if not is_regular:
+                skip(entry, "not a regular file", name)
+                continue
             try:
                 voice = voice_file.decode(
                     _read_bounded(entry),
@@ -295,7 +338,7 @@ class VoiceStore:
                 continue
 
             voices.append(voice)
-            known[voice.id.lower()] = voice.id  # decode() checked id == stem, a valid name
+            known.set(voice.id, entry)  # decode() checked id == stem, a valid name
 
         with self._lock:
             self._known = known
@@ -312,16 +355,15 @@ class VoiceStore:
     # ------------------------------------------------------------------- writing
 
     def _name_taken_locked(self, name: str) -> bool:
-        """Ignoring case: a loaded voice's id or a skipped file's name. Caller holds
-        `_lock`. A linear pass over the skipped names: there are only ever a handful."""
-        lowered = name.lower()
-        return lowered in self._known or any(n.lower() == lowered for n in self._skipped)
+        """Ignoring case: a loaded voice's id or a skipped entry's name. Caller holds
+        `_lock`."""
+        return self._known.taken(name) or self._skipped.taken(name)
 
     def create(self, voice: VoiceFile) -> VoiceFile:
         """Atomically write `voice` under `<voices_dir>/<voice.id>.voice.json`.
 
         Never overwrites, checked twice: first against the index (a loaded voice or a
-        skipped file with the same name, ignoring case), then on disk by the commit
+        skipped entry with the same name, ignoring case), then on disk by the commit
         itself (`_commit_no_overwrite`), which refuses any existing file -- one added
         after the scan, or, on a case-insensitive filesystem, one differing only by
         case. Either refusal is `VoiceExists`. The whole create holds `_write_lock`.
@@ -360,16 +402,16 @@ class VoiceStore:
                 except FileNotFoundError:
                     pass
                 except OSError as exc:
-                    _log.warning("voices: could not remove temp file %s: %s", tmp_path, exc)
+                    self._cleanup_failed(tmp_path, "unlink_tmp", exc)
             _fsync_dir(self.voices_dir)
             with self._lock:
-                self._known[stamped.id.lower()] = stamped.id
+                self._known.set(stamped.id, final_path)
         return stamped
 
     # ------------------------------------------------------------------ deleting
 
     def remove(self, voice_id: str) -> bool:
-        """Delete a loaded voice's file, or a skipped file, named exactly `voice_id`;
+        """Delete a loaded voice's file, or a skipped entry, named exactly `voice_id`;
         `False` if nothing matches.
 
         The lookup, the rename to `.del-<id>-<nonce>` and the index update all happen
@@ -380,13 +422,20 @@ class VoiceStore:
         alone and the failure propagates: the voice stays registered (DELETE's
         `500 voice_delete_failed`).
 
+        A skipped entry that is a directory is refused the same way, with
+        `IsADirectoryError`: deleting a directory tree nobody asked this server to
+        write is too much for a DELETE to do, and renaming it to `.del-*` would only
+        leave it for a sweep that won't remove directories either. It stays reserved
+        until someone removes it by hand.
+
         Once the rename has succeeded the voice is gone, so the final unlink is
-        best-effort: a failure is logged and the `.del-*` file left for the next
-        scan's sweep, rather than turning a finished delete into a 500.
+        best-effort: a failure is reported (`voice.cleanup_failed`) and the `.del-*`
+        file left for the next scan's sweep, rather than turning a finished delete into
+        a 500.
         """
         with self._write_lock:
             with self._lock:
-                is_loaded = self._known.get(voice_id.lower()) == voice_id
+                is_loaded = self._known.get(voice_id) is not None
                 skipped_path = self._skipped.get(voice_id)
             if is_loaded:
                 path = self.path_for(voice_id)
@@ -397,6 +446,10 @@ class VoiceStore:
 
             trash = self.voices_dir / f"{DEL_PREFIX}{voice_id}-{self._nonce()}{SUFFIX}"
             try:
+                if stat.S_ISDIR(os.lstat(path).st_mode):
+                    raise IsADirectoryError(
+                        errno.EISDIR, "a directory, not a voice file; remove it by hand", str(path)
+                    )
                 _rename_with_retry(path, trash, sleep=self._sleep)
                 renamed = True
             except FileNotFoundError:
@@ -405,13 +458,13 @@ class VoiceStore:
                 _fsync_dir(self.voices_dir)
             with self._lock:
                 if is_loaded:
-                    del self._known[voice_id.lower()]
+                    self._known.pop(voice_id)
                 else:
-                    del self._skipped[voice_id]
+                    self._skipped.pop(voice_id)
 
         if renamed:
             try:
                 os.unlink(trash)
             except OSError as exc:
-                _log.warning("voices: could not remove %s, left for the next scan: %s", trash, exc)
+                self._cleanup_failed(trash, "unlink", exc)
         return True

@@ -67,7 +67,6 @@ from __future__ import annotations
 
 import asyncio
 import re
-import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -88,6 +87,7 @@ from breeze_infer.limits import (
     MAX_TEXT_CHARS,
 )
 from breeze_infer.settings import Settings
+from breeze_infer.text_rules import has_control_characters
 from breeze_infer.text_split import speakable
 
 # contracts/http-api.md "Fields": the defaults for POST /v1/audio/speech.
@@ -881,16 +881,11 @@ def _optional_decimal(
 
 
 def _check_no_control_characters(value: str, field: str) -> None:
-    """BC-46: reject any Unicode general-category `Cc` (control) character except tab, CR
-    and LF. `Cc` is precisely C0 (`\\x00`-`\\x1f`, e.g. NUL and ESC), DEL (`\\x7f`) and the
-    C1 controls (`\\x80`-`\\x9f`, e.g. NEL `\\x85`) -- exactly the set the contract means by
-    "control characters", so this is checked via `unicodedata.category` rather than a fixed
-    codepoint list.
-    """
-    for ch in value:
-        if ch not in "\t\r\n" and unicodedata.category(ch) == "Cc":
-            # contract wording, "<field> must be <rule>".
-            raise ApiError(400, "invalid_field", f"{field} must be free of control characters")
+    """BC-46, via the shared rule (`text_rules.has_control_characters`, which the voice
+    file reader applies to a saved `ref_text` too)."""
+    if has_control_characters(value):
+        # contract wording, "<field> must be <rule>".
+        raise ApiError(400, "invalid_field", f"{field} must be free of control characters")
 
 
 def _validated_text_field(fields: Fields, name: str, max_chars: int) -> str | None:

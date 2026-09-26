@@ -718,3 +718,23 @@ def test_predicted_frames_matches_actual_librosa_resample() -> None:
                 resampled_len = len(librosa.resample(y=wav, orig_sr=sr, target_sr=CODEC_SAMPLE_RATE))
             expected = -(-resampled_len // CODEC_SAMPLES_PER_FRAME)
             assert predicted_frames(n, sr) == expected, (n, sr)
+
+
+@pytest.mark.parametrize(
+    "sample_rate", [8_000, 11_025, 16_000, 22_050, 24_000, 44_100, 48_000, 88_200, 96_000, 176_400, 192_000]
+)
+def test_max_ref_frames_covers_a_full_length_reference_at_every_rate(sample_rate: int) -> None:
+    """voice_file bounds a saved voice's frames by MAX_REF_FRAMES; a 30 s reference at
+    any accepted rate must fit under it."""
+    from breeze_infer.reference_audio import MAX_REF_FRAMES
+
+    assert predicted_frames(30 * sample_rate, sample_rate) <= MAX_REF_FRAMES
+
+
+def test_max_ref_frames_is_reached_by_float_rounding_at_some_rates() -> None:
+    """Why MAX_REF_FRAMES is 376, not 30 s x 12.5 fps = 375: at 191,995 Hz the
+    resampler's float ratio pushes a full 30 s one sample past 720,000."""
+    from breeze_infer.reference_audio import MAX_REF_FRAMES
+
+    assert MAX_REF_FRAMES == 376
+    assert predicted_frames(30 * 191_995, 191_995) == MAX_REF_FRAMES

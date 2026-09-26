@@ -34,11 +34,11 @@ UNNAMED_VOICE_CAP = 64
 
 # The largest *.voice.json the startup scan reads; anything bigger is skipped unread
 # (voice_store.scan). A documented generous constant, not computed from the loaded codec:
-# the biggest file the server can write is MAX_REF_SECONDS of codes -- 30 s x 12.5 fps =
-# 375 frames x 16 codebooks x 2 bytes = 12,000 bytes, 16,000 as base64 -- plus
-# MAX_REF_TEXT_CHARS of ref_text, at worst 24,000 bytes if a hand-edited file escapes
-# every character as a \uXXXX surrogate pair, plus well under 1 KiB of field names and
-# indentation: about 41 KB. 256 KiB leaves six times that. A codec with a different frame
+# the biggest file the server can write is MAX_REF_SECONDS of codes -- at most 376 frames
+# (reference_audio.MAX_REF_FRAMES) x 16 codebooks x 2 bytes = 12,032 bytes, 16,044 as
+# base64 -- plus MAX_REF_TEXT_CHARS of ref_text, at worst 24,000 bytes if a hand-edited
+# file escapes every character as a \uXXXX surrogate pair, plus well under 1 KiB of field
+# names and indentation: about 41 KB. 256 KiB leaves six times that. A codec with a different frame
 # rate or codebook count also changes the codec fingerprint, so its files are rejected
 # anyway; the bound only has to be comfortably above anything valid.
 MAX_VOICE_FILE_BYTES = 256 * 1024

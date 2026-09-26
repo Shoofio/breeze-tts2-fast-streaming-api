@@ -8,8 +8,8 @@ timestamp/filename behaviour are deterministic and instant.
 from __future__ import annotations
 
 import errno
-import logging
 import os
+import stat
 import threading
 import tracemalloc
 from datetime import datetime, timezone
@@ -313,6 +313,10 @@ def _write_valid(tmp_path: Path, voice_id: str, *, ref_text: str = "hi") -> Path
     return path
 
 
+def _cleanup_events(events: RecordingEvents) -> list[dict[str, object]]:
+    return [fields for name, fields in events.calls if name == "voice.cleanup_failed"]
+
+
 def _require_case_sensitive(tmp_path: Path) -> None:
     probe = tmp_path / "CaseProbe"
     probe.write_text("x")
@@ -471,9 +475,10 @@ def test_remove_cannot_delete_a_concurrent_create_of_the_same_name(tmp_path: Pat
 
 
 def test_remove_survives_an_unlink_failure_and_leaves_the_del_file_for_the_sweep(
-    tmp_path: Path, monkeypatch, caplog
+    tmp_path: Path, monkeypatch
 ):
-    store = _store(tmp_path)
+    events = RecordingEvents()
+    store = _store(tmp_path, events=events)
     store.create(_voice("alice"))
     real_unlink = os.unlink
 
@@ -483,13 +488,14 @@ def test_remove_survives_an_unlink_failure_and_leaves_the_del_file_for_the_sweep
         return real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "unlink", denied_for_del_files)
-    with caplog.at_level(logging.WARNING, logger="breeze_infer.voice_store"):
-        assert store.remove("alice") is True
+    assert store.remove("alice") is True
 
     assert not (tmp_path / "alice.voice.json").exists()
     leftovers = [p.name for p in tmp_path.iterdir()]
     assert len(leftovers) == 1 and leftovers[0].startswith(voice_store.DEL_PREFIX)
-    assert "simulated" in caplog.text
+    assert _cleanup_events(events) == [
+        {"file": leftovers[0], "op": "unlink", "error": "simulated: a handle is still open"}
+    ]
 
     monkeypatch.setattr(os, "unlink", real_unlink)
     _store(tmp_path).scan()  # the next start sweeps it
@@ -545,18 +551,18 @@ def test_a_case_duplicate_of_an_earlier_invalid_file_is_skipped(tmp_path: Path):
 # ---- #9: filesystem trouble during scan is logged and skipped, never fatal
 
 
-def test_scan_skips_a_leftover_directory(tmp_path: Path, caplog):
+def test_scan_skips_a_leftover_directory(tmp_path: Path):
     (tmp_path / ".tmp-x").mkdir()
     _write_valid(tmp_path, "alice")
-    with caplog.at_level(logging.WARNING, logger="breeze_infer.voice_store"):
-        result = _store(tmp_path).scan()
+    events = RecordingEvents()
+    result = _store(tmp_path, events=events).scan()
 
     assert [v.id for v in result.voices] == ["alice"]
     assert (tmp_path / ".tmp-x").is_dir()
-    assert ".tmp-x" in caplog.text
+    assert _cleanup_events(events) == [{"file": ".tmp-x", "op": "sweep", "error": "is a directory"}]
 
 
-def test_scan_survives_a_leftover_it_cannot_unlink(tmp_path: Path, monkeypatch, caplog):
+def test_scan_survives_a_leftover_it_cannot_unlink(tmp_path: Path, monkeypatch):
     (tmp_path / ".del-bob-n1.voice.json").write_text("garbage")
     _write_valid(tmp_path, "alice")
     real_unlink = os.unlink
@@ -567,12 +573,14 @@ def test_scan_survives_a_leftover_it_cannot_unlink(tmp_path: Path, monkeypatch, 
         return real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "unlink", denied)
-    with caplog.at_level(logging.WARNING, logger="breeze_infer.voice_store"):
-        result = _store(tmp_path).scan()
+    events = RecordingEvents()
+    result = _store(tmp_path, events=events).scan()
 
     assert [v.id for v in result.voices] == ["alice"]
     assert (tmp_path / ".del-bob-n1.voice.json").exists()
-    assert "simulated" in caplog.text
+    assert _cleanup_events(events) == [
+        {"file": ".del-bob-n1.voice.json", "op": "sweep", "error": "simulated: a handle is still open"}
+    ]
 
 
 def test_scan_skips_a_file_larger_than_the_bound(tmp_path: Path):
@@ -616,3 +624,159 @@ def test_scan_reads_an_oversized_file_only_up_to_the_bound(tmp_path: Path):
 
     assert [item.file for item in result.skipped] == ["huge.voice.json"]
     assert peak < 4 * MAX_VOICE_FILE_BYTES
+
+
+# ------------------------------------------------------------------- review 38
+
+
+def test_create_reports_a_temp_file_it_cannot_remove(tmp_path: Path, monkeypatch):
+    """#4: the create itself succeeds; the stray temp file is reported and left for the
+    next scan's sweep."""
+    real_unlink = os.unlink
+
+    def denied_for_tmp_files(path, *args, **kwargs):
+        if Path(path).name.startswith(voice_store.TMP_PREFIX):
+            raise PermissionError("simulated: a handle is still open")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", denied_for_tmp_files)
+    events = RecordingEvents()
+    store = _store(tmp_path, events=events)
+    store.create(_voice("alice"))
+
+    assert json_ref_text(tmp_path / "alice.voice.json") == "hello"
+    assert _cleanup_events(events) == [
+        {"file": ".tmp-alice-n0.voice.json", "op": "unlink_tmp", "error": "simulated: a handle is still open"}
+    ]
+
+
+def test_voice_store_no_longer_logs_through_the_stdlib():
+    """#4 (Constitution VI): cleanup trouble is a named event, not a stray log line."""
+    assert not hasattr(voice_store, "_log")
+
+
+def _stat_denied_for(monkeypatch, names: set[str]) -> None:
+    """Make stat() and lstat() of the named entries fail the way a Windows ACL on drvfs
+    does: PermissionError with EACCES, which pathlib's is_file()/is_dir() re-raise."""
+    real_stat, real_lstat = Path.stat, Path.lstat
+
+    def stat_(self, *args, **kwargs):
+        if self.name in names:
+            raise PermissionError(errno.EACCES, "simulated: access denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    def lstat_(self):
+        if self.name in names:
+            raise PermissionError(errno.EACCES, "simulated: access denied", str(self))
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "stat", stat_)
+    monkeypatch.setattr(Path, "lstat", lstat_)
+
+
+def test_scan_skips_a_voice_file_it_cannot_stat_and_reserves_its_name(tmp_path: Path, monkeypatch):
+    """#5"""
+    _write_valid(tmp_path, "alice")
+    _write_valid(tmp_path, "bob")
+    _stat_denied_for(monkeypatch, {"bob.voice.json"})
+    events = RecordingEvents()
+    store = _store(tmp_path, events=events)
+
+    result = store.scan()
+
+    assert [v.id for v in result.voices] == ["alice"]
+    assert [(item.file, item.name) for item in result.skipped] == [("bob.voice.json", "bob")]
+    assert "simulated: access denied" in result.skipped[0].reason
+    with pytest.raises(VoiceExists):
+        store.create(_voice("bob"))
+
+
+def test_scan_reports_a_leftover_it_cannot_stat(tmp_path: Path, monkeypatch):
+    """#5"""
+    (tmp_path / ".tmp-x").write_text("garbage")
+    _write_valid(tmp_path, "alice")
+    _stat_denied_for(monkeypatch, {".tmp-x"})
+    events = RecordingEvents()
+
+    result = _store(tmp_path, events=events).scan()
+
+    assert [v.id for v in result.voices] == ["alice"]
+    [event] = _cleanup_events(events)
+    assert (event["file"], event["op"]) == (".tmp-x", "stat")
+    assert "simulated: access denied" in str(event["error"])
+
+
+@pytest.mark.parametrize("code", [errno.EIO, errno.ENOSPC, errno.EMLINK])
+def test_create_does_not_fall_back_on_a_real_link_failure(tmp_path: Path, monkeypatch, code: int):
+    """#6: only "links not supported" may take the non-atomic O_EXCL fallback; any other
+    link failure is a failed write, and the temp file is still cleaned up."""
+    def failing_link(src, dst):
+        raise OSError(code, "simulated link failure")
+
+    monkeypatch.setattr(os, "link", failing_link)
+    store = _store(tmp_path)
+    store.scan()
+
+    with pytest.raises(OSError) as info:
+        store.create(_voice("alice"))
+    assert info.value.errno == code
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("code", [errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV, errno.ENOSYS])
+def test_create_falls_back_when_links_are_not_supported(tmp_path: Path, monkeypatch, code: int):
+    """#6"""
+    def unsupported_link(src, dst):
+        raise OSError(code, "simulated: links not supported")
+
+    monkeypatch.setattr(os, "link", unsupported_link)
+    store = _store(tmp_path)
+    store.scan()
+
+    store.create(_voice("alice"))
+    assert json_ref_text(tmp_path / "alice.voice.json") == "hello"
+    assert [p.name for p in tmp_path.iterdir()] == ["alice.voice.json"]
+
+
+def test_a_directory_with_a_voice_file_name_is_skipped_and_reserved(tmp_path: Path):
+    """#7: reported, its name reserved (so POST gets 409 from the index rather than an
+    EEXIST at commit), and DELETE refuses it rather than deleting a directory tree."""
+    (tmp_path / "bob.voice.json").mkdir()
+    events = RecordingEvents()
+    store = _store(tmp_path, events=events)
+
+    result = store.scan()
+
+    assert [(item.file, item.reason, item.name) for item in result.skipped] == [
+        ("bob.voice.json", "not a regular file", "bob")
+    ]
+    assert ("voice.skipped", {"file": "bob.voice.json", "reason": "not a regular file"}) in events.calls
+    with pytest.raises(VoiceExists):
+        store.create(_voice("bob"))
+    with pytest.raises(IsADirectoryError):
+        store.remove("bob")
+    assert (tmp_path / "bob.voice.json").is_dir()
+    assert [p.name for p in tmp_path.iterdir()] == ["bob.voice.json"]  # not renamed to .del-*
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs /proc to name an fd's file")
+def test_the_exclusive_create_fallback_fsyncs_the_file(tmp_path: Path, monkeypatch):
+    """#10: the fallback shares _write_bytes' write-flush-fsync helper, so the final
+    file is fsynced exactly as the temp file is."""
+    def no_links(src, dst):
+        raise OSError(errno.EPERM, "simulated: hard links not supported")
+
+    fsynced: list[str] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd):
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISREG(mode):
+            fsynced.append(os.readlink(f"/proc/self/fd/{fd}").rsplit("/", 1)[-1])
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "link", no_links)
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    _store(tmp_path).create(_voice("alice"))
+
+    assert fsynced == [".tmp-alice-n0.voice.json", "alice.voice.json"]

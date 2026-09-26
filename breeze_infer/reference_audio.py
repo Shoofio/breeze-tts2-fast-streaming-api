@@ -173,6 +173,16 @@ def predicted_frames(duration_samples: int, sample_rate: int) -> int:
     return -(-resampled_length // _CODEC_SAMPLES_PER_FRAME)
 
 
+# The most codec frames an accepted reference can become: `decode` accepts at most
+# MAX_REF_SECONDS * sample_rate samples, which resample to MAX_REF_SECONDS * 24 kHz --
+# plus one sample, because `_resampled_length` ceils a product computed with a float
+# ratio, and at some rates (191,995 Hz, for one) that product lands a hair above the
+# whole number. 30 s is 375 frames, and that extra sample makes it 376. voice_file uses
+# this to bound a saved voice's `frames` to what POST /v1/voices could ever have
+# produced.
+MAX_REF_FRAMES = predicted_frames(MAX_REF_SECONDS * _CODEC_SAMPLE_RATE + 1, _CODEC_SAMPLE_RATE)
+
+
 def _is_too_short(num_samples: int, sample_rate: int) -> bool:
     """The exact 80 ms minimum (module docstring, point 5): equivalent to
     `num_samples / sample_rate < 1920 / 24000`, cross-multiplied into integer
