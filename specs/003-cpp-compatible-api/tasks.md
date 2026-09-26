@@ -742,7 +742,7 @@ rules.
   - the registry's saved and unnamed records must carry codes and ref_text (or a way to load
     them) so a VoiceRef can be resolved; decide which during T066. Decided: the records hold
     the codes and `ref_text` in memory, loaded at scan or registration (`VoiceRegistry.lookup`).
-- [ ] T067 [P] [US1] Port `A:tests/gpu/{test_voice_equivalence,test_voice_prefill_buckets,
+- [X] T067 [P] [US1] Port `A:tests/gpu/{test_voice_equivalence,test_voice_prefill_buckets,
   test_voice_tier1_equivalence}.py` to `tests/gpu/`, adapted to the new store (register through the
   route). Include a prefix longer than 548 tokens that now builds (R12, point 4).
 - [X] T068 [US1] Coordinate with `sillytavern-agent` via SendMessage: confirm whether the
