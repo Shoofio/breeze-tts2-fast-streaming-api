@@ -900,7 +900,7 @@ rules.
   - `/health`'s `ws_port` provider returns the bound port.
   - Run the WebSocket server on the same loop as uvicorn, and shut both down on the one signal
     handler.
-- [ ] T079 [US4] **Live gate (full)**:
+- [X] T079 [US4] **Live gate (full)**:
   1. Set the version to `2.0.0.dev4`, and add BC-30–BC-45 to the CHANGELOG.
   2. Start the server with `--cors http://127.0.0.1:8000`.
   3. Run `node tests/live/sillytavern/run.mjs full`, then
