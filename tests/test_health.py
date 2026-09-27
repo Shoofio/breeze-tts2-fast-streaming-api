@@ -6,6 +6,8 @@ never used, and the runtime is `FakeRuntime`.
 """
 
 import io
+import json
+import socket
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
@@ -16,7 +18,7 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
 from breeze_infer import __version__
-from breeze_infer.api import Components, create_app
+from breeze_infer.api import Components, bind_ws_sockets, bound_port, create_app
 from breeze_infer.events import Emitter
 from breeze_infer.gpu import GpuGate, GpuThread
 from breeze_infer.routes_health import Readiness, install_health
@@ -215,3 +217,52 @@ def test_unhealthy_wins_over_a_later_ready_and_over_loading(
     readiness.mark_ready(FakeRuntime())
     assert client.get("/health").json() == GPU_UNAVAILABLE
     assert readiness.runtime is None
+
+
+def test_bc_24_ws_bind_failure_reports_zero(readiness: Readiness) -> None:
+    """C++ reports its configured WebSocket port even when nothing listens there. Here a
+    WebSocket port that can't be bound is reported, the HTTP server carries on, and `/health`
+    says `ws_port: 0`."""
+    sink = io.StringIO()
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        port = taken.getsockname()[1]
+        settings = settings_from_args([str(Path(__file__).parent), "--ws-port", str(port)])
+
+        sockets = bind_ws_sockets(settings, Emitter(sink, lambda: 0.0))
+
+    assert sockets == []
+    [event] = [json.loads(line) for line in sink.getvalue().splitlines()]
+    assert (event["event"], event["level"], event["port"]) == ("ws.bind_failed", "error", port)
+    components = replace(_components(readiness), ws_port=lambda: bound_port(sockets))
+    readiness.mark_ready(FakeRuntime())
+    try:
+        assert TestClient(create_app(components)).get("/health").json()["ws_port"] == 0
+    finally:
+        components.gpu.shutdown()
+
+
+def test_bc_24_health_reports_the_bound_ws_port(readiness: Readiness) -> None:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        free = probe.getsockname()[1]
+    settings = settings_from_args([str(Path(__file__).parent), "--ws-port", str(free)])
+    sockets = bind_ws_sockets(settings, Emitter(io.StringIO(), lambda: 0.0))
+    components = replace(_components(readiness), ws_port=lambda: bound_port(sockets))
+    readiness.mark_ready(FakeRuntime())
+    try:
+        assert TestClient(create_app(components)).get("/health").json()["ws_port"] == free
+    finally:
+        for sock in sockets:
+            sock.close()
+        components.gpu.shutdown()
+
+
+def test_a_disabled_ws_port_binds_nothing_and_reports_zero() -> None:
+    settings = settings_from_args([str(Path(__file__).parent), "--ws-port", "disabled"])
+
+    sockets = bind_ws_sockets(settings, Emitter(io.StringIO(), lambda: 0.0))
+
+    assert sockets == []
+    assert bound_port(sockets) == 0

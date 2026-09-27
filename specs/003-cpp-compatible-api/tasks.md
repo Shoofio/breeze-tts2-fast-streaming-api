@@ -834,7 +834,7 @@ rules.
     loop or an unsnapshotted set);
   - `queued` sent only when actually waiting;
   - piece seeds continue from `start`.
-- [ ] T074 [P] [US4] Create `tests/test_ws_isolation.py` (SC-006): WebSocket client A stops
+- [X] T074 [P] [US4] Create `tests/test_ws_isolation.py` (SC-006): WebSocket client A stops
   reading mid-piece. An HTTP speech request from client B starts streaming within the in-flight
   piece plus 1 s. Client A, which never reads again, is dropped and its slot freed within
   `WS_SEND_TIMEOUT_SECONDS` (monkeypatched small) plus `WS_CLOSE_TIMEOUT_SECONDS` and a margin.
@@ -889,7 +889,7 @@ rules.
   - On disconnect: `session.close()` (bumps the epoch and clears the whole deque, so nothing more
     is sent, not even a `done` an earlier session left queued), then join.
   - Emit the `ws.*` events with `session_id` and `piece_index`.
-- [ ] T078 [US4] Wire the WebSocket into `breeze_infer/api.py`:
+- [X] T078 [US4] Wire the WebSocket into `breeze_infer/api.py`:
   - Unless `ws_port` is `disabled`, pre-bind the sockets on `settings.host:ws_port` (every
     address the host resolves to, like the HTTP sockets), with one `serve()` per socket, all
     sharing one registry (one cap of 16, one shutdown flag); `api.serve(..., *, ws_sockets=[...])`.

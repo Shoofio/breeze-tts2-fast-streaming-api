@@ -1,4 +1,5 @@
-"""Composition root: settings, then components, then the HTTP server (Constitution III).
+"""Composition root: settings, then components, then the HTTP and WebSocket servers
+(Constitution III).
 
 This is the only module that reads the process environment, the clock or stdout, and the only
 one that knows about signals and sockets. Everything else gets what it needs passed in.
@@ -31,7 +32,7 @@ import uvicorn
 from fastapi import FastAPI
 from starlette.types import ASGIApp
 
-from breeze_infer import __version__, audio
+from breeze_infer import __version__, audio, ws_server
 from breeze_infer.body_limit import BodyLimitMiddleware
 from breeze_infer.cors import CorsMiddleware, CorsPolicy
 from breeze_infer.errors import install_error_handlers
@@ -61,7 +62,7 @@ from breeze_infer.voice_store import SkippedVoiceFile, VoiceStore
 
 @dataclass(frozen=True)
 class Components:
-    """Everything the routes (and, later, the WebSocket server) are built from."""
+    """Everything the routes and the WebSocket server are built from."""
 
     settings: Settings
     events: Emitter
@@ -176,6 +177,32 @@ def bind_http_sockets(host: str, port: int) -> list[socket.socket]:
             sock.close()
         raise
     return sockets
+
+
+def bind_ws_sockets(settings: Settings, events: Emitter) -> list[socket.socket]:
+    """The WebSocket's listening sockets: every address `settings.host` resolves to, bound as
+    the HTTP ones are (`bind_http_sockets`), on `settings.ws_port` (BC-30: the configured host
+    only, never a wildcard). Empty when the WebSocket is disabled, or when the bind fails: that
+    is reported (`ws.bind_failed`) and the HTTP server carries on without it, with `/health`
+    saying `ws_port: 0` (BC-24)."""
+    if settings.ws_port is None:
+        return []
+    try:
+        return bind_http_sockets(settings.host, settings.ws_port)
+    except OSError as exc:
+        events.emit(
+            "ws.bind_failed",
+            level="error",
+            host=settings.host,
+            port=settings.ws_port,
+            error=str(exc),
+        )
+        return []
+
+
+def bound_port(sockets: Sequence[socket.socket]) -> int:
+    """The port `sockets` listen on (they share one), or 0 for none: `/health`'s `ws_port`."""
+    return sockets[0].getsockname()[1] if sockets else 0
 
 
 def _address(sock: socket.socket) -> str:
@@ -439,13 +466,18 @@ async def serve(
     sockets: list[socket.socket],
     load: Callable[[], LoadedModel],
     outcome: ServeOutcome,
+    *,
+    ws_sockets: Sequence[socket.socket] = (),
 ) -> None:
-    """Serve HTTP on `sockets` while the model loads in the background, until a signal or a
-    failed load stops it; then drain the GPU thread (see `_stop_gpu`). Records how it ended in
-    `outcome`.
+    """Serve HTTP on `sockets`, and the WebSocket on `ws_sockets` (one `ws_server.serve()` per
+    socket, sharing one registry, so one connection cap covers them all), on this one loop,
+    while the model loads in the background, until a signal or a failed load stops it; then
+    drain the GPU thread (see `_stop_gpu`). Records how it ended in `outcome`.
 
-    Signals: the first stops uvicorn gracefully, a second forces it (`request_exit`); one
-    arriving after uvicorn has returned, while the GPU drains, cuts the drain short.
+    Signals: the first stops uvicorn gracefully and starts the WebSocket shutdown, a second
+    forces uvicorn (`request_exit`); one arriving after uvicorn has returned, while the GPU
+    drains, cuts the drain short. The WebSocket shutdown is always finished before the GPU
+    drain starts, since its sessions generate on the GPU too.
     """
     # Streams the client ended are already `speech.aborted` events; no traceback for each.
     # One shared instance, so repeated calls don't stack filters (addFilter skips duplicates).
@@ -464,10 +496,19 @@ async def serve(
     )
     serving = True
     drain_interrupted = asyncio.Event()
+    registry = ws_server.ConnectionRegistry()
+    ws_stopping: asyncio.Future[None] | None = None
+
+    def stop_websockets() -> asyncio.Future[None]:
+        nonlocal ws_stopping
+        if ws_stopping is None:
+            ws_stopping = asyncio.ensure_future(registry.shutdown())
+        return ws_stopping
 
     def on_signal() -> None:
         if serving:
             request_exit(server)
+            stop_websockets()
         else:
             drain_interrupted.set()
 
@@ -481,12 +522,17 @@ async def serve(
         )
         crash: BaseException | None = None
         try:
+            for ws_sock in ws_sockets:
+                await ws_server.serve(components.settings, components, ws_sock, registry)
             await server.serve(sockets=sockets)
         except BaseException as exc:
             crash = exc
             raise
         finally:
             serving = False
+            # Bounded: every close in it is (ws_server), so a stalled client can't hold it.
+            with contextlib.suppress(Exception):
+                await asyncio.shield(stop_websockets())
             hard_exit_reason: str | None = None
             stop_error: BaseException | None = None
             try:
@@ -755,6 +801,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"breeze: cannot listen on {settings.host}:{settings.port}: {exc}"
         ) from None
 
+    # The WebSocket is optional: a port that can't be bound is reported and left out.
+    ws_sockets = bind_ws_sockets(settings, events)
+    ws_port = bound_port(ws_sockets)
+
     # The one read of the process environment (Constitution III): the device choice, and the
     # mapping the compile-cache setup exports TORCHINDUCTOR_CACHE_DIR into.
     environ = os.environ
@@ -767,7 +817,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         gate=GpuGate(on_poisoned=partial(_gpu_unresponsive, events, readiness)),
         gpu=GpuThread(device, set_device, partial(report_close_failed, events)),
         readiness=readiness,
-        ws_port=lambda: 0,  # the WebSocket server arrives in Phase 8 (T077)
+        ws_port=lambda: ws_port,
         cpu_tokenizer=CpuTokenizer(),
         open_voices=partial(_open_checkpoint_voices, settings=settings, events=events),
     )
@@ -776,7 +826,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     outcome = ServeOutcome()
     with asyncio.Runner() as runner:
         try:
-            runner.run(serve(components, app, sockets, load, outcome))
+            runner.run(serve(components, app, sockets, load, outcome, ws_sockets=ws_sockets))
         finally:
             # Inside the runner on purpose: its cleanup, and then the interpreter's exit, both
             # wait for the GPU thread, which is still busy. In a `finally`, so an exception out

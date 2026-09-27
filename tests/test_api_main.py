@@ -207,6 +207,49 @@ def test_a_taken_port_on_one_address_closes_the_others(
     assert all(sock.fileno() == -1 for sock in opened)
 
 
+def test_bc_30_ws_sockets_bind_only_the_configured_host() -> None:
+    """C++ binds the WebSocket to 0.0.0.0 whenever `--host` isn't an IPv4 literal, so it
+    listens on every interface; here it binds the configured host only, as HTTP does."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        free = probe.getsockname()[1]
+    settings = settings_from_args([MODEL_DIR, "--host", "127.0.0.1", "--ws-port", str(free)])
+
+    sockets = api.bind_ws_sockets(settings, Emitter(io.StringIO(), lambda: 0.0))
+    try:
+        assert [sock.getsockname() for sock in sockets] == [("127.0.0.1", free)]
+        assert api.bound_port(sockets) == free
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
+def test_bc_30_ws_sockets_cover_every_address_the_host_resolves_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`localhost` is both ::1 and 127.0.0.1: both are bound, each served by its own
+    `ws_server.serve()` (T078), and nothing else."""
+    if not _has_ipv6_loopback():
+        pytest.skip("no IPv6 loopback here")
+    port = _free_port()
+    _resolving_to(
+        monkeypatch,
+        (socket.AF_INET, ("127.0.0.1", port)),
+        (socket.AF_INET6, ("::1", port, 0, 0)),
+    )
+    settings = settings_from_args([MODEL_DIR, "--host", "localhost", "--ws-port", str(port)])
+
+    sockets = api.bind_ws_sockets(settings, Emitter(io.StringIO(), lambda: 0.0))
+    try:
+        assert [api._address(sock) for sock in sockets] == [
+            f"127.0.0.1:{port}",
+            f"[::1]:{port}",
+        ]
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
 def test_main_exits_non_zero_with_a_message_when_the_port_is_taken(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
