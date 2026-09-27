@@ -17,8 +17,9 @@ Interface these tests pin (T076 implements to it):
   `done` come from the worker, through the work deque, so they keep message order.
 - `session.next_item()` returns, in order, `Piece(epoch, index, text)`, `EndMark(epoch)`, a
   `CancelMark` instance, `StartMark(config)`, or `None` when the deque is empty.
-- `session.is_stale(item)`: for a `Piece`, true once its epoch is not current. It also takes an
-  `EndMark` and always says False: a cancel that supersedes one removes it from the deque.
+- `session.is_stale(piece)` takes a `Piece`: true once its epoch is not current. An `EndMark`
+  needs no check: a cancel that supersedes one removes it from the deque, so the worker sends
+  `done` for every EndMark it gets.
 - `session.mark_piece_done(anchor)`: the worker calls it exactly once for every `Piece` that
   `next_item` returned, when it stops working on it (finished, failed, cancelled, or skipped as
   stale). `anchor` is the reference built from a piece that succeeded, or `None` when it failed
@@ -26,9 +27,9 @@ Interface these tests pin (T076 implements to it):
   first anchor from a current (non-stale) piece, and ignores the rest. A current piece ending with
   `None` and no anchor yet counts as a failure (data-model "States").
 - `session.config.voice_id` (`""` when none; `StartMark.config` has it too, for `started`),
-  `session.config.instruction` (read by the worker when each piece starts), `session.anchor`,
-  and `session.work` (data-model's work deque; only iterated, by the SC-005 driver, to know
-  whether a `Piece` is queued).
+  `session.config.instruction` (read by the worker when each piece starts), `session.anchor`.
+- `session.close()` on disconnect: the piece in flight goes stale and the deque is emptied, with
+  no `CancelMark`, so nothing more is sent; `apply` is not called again.
 
 Session rules pinned here (data-model.md "WebSocket Session", States):
 - "Pending work" for `start` (BC-36) is a `Piece` queued or in flight. A queued `EndMark` alone
@@ -110,7 +111,8 @@ class FakeWorker:
     piece), or emit one audio frame of the piece in flight. Events are wire-shaped dicts plus
     bookkeeping keys starting with `_`: `_at` is the number of client messages applied when the
     event was emitted (`now`, set by the driver), `_aborted` marks a piece cut short, `_index`
-    is the piece index. Pieces whose index is in `fail` fail before their first frame, as a
+    is the piece index, and `_ended_at` is `now` when the piece ended however it ended. Pieces
+    whose index is in `fail` fail before their first frame, as a
     generation error does: `error{generation_failed}`, then `mark_piece_done(None)`.
     """
 
@@ -130,6 +132,7 @@ class FakeWorker:
         return event
 
     def _finish(self, anchor: object) -> None:
+        self._speaking["_ended_at"] = self.now
         self._current = None
         self.session.mark_piece_done(anchor)
 
@@ -158,8 +161,7 @@ class FakeWorker:
         elif isinstance(item, StartMark):
             self._emit({"type": "started", "voice_id": item.config.voice_id})
         elif isinstance(item, EndMark):
-            if not self.session.is_stale(item):
-                self._emit({"type": "done"})
+            self._emit({"type": "done"})
         elif isinstance(item, Piece):
             if self.session.is_stale(item):
                 self.session.mark_piece_done(None)
@@ -393,6 +395,35 @@ def test_cancel_in_a_new_session_keeps_the_previous_sessions_done() -> None:
     session.apply(msg("cancel"))
     worker.run()
     assert worker.kinds()[3:] == ["done", "started", "cancelled"]
+
+
+def test_close_empties_the_queue_including_an_earlier_sessions_done() -> None:
+    """Review 47 #4: after a disconnect nothing may be sent, not even the `done` an earlier
+    session left queued (a cancel would keep that one)."""
+    session, worker = started_session()
+    session.apply(msg("end"))
+    session.apply(msg("start"))  # interrupts nothing: the EndMark stays queued
+    session.apply(msg("text", text="One. Two. Tail"))
+    session.close()
+    assert session.next_item() is None
+    worker.run()
+    assert worker.events == []
+
+
+def test_close_stops_the_piece_in_flight_without_a_cancelled() -> None:
+    session, worker = started_session()
+    session.apply(msg("end", text="One. Two."))
+    worker.step()
+    piece = worker._current
+    assert piece is not None
+    session.close()
+    assert session.is_stale(piece)
+    assert session.next_item() is None
+    # The piece ends; its anchor is ignored, as for any stale piece.
+    session.mark_piece_done(("anchor", piece.epoch, piece.index))
+    worker._current = None
+    assert session.anchor is None
+    assert worker.kinds() == ["speaking"]
 
 
 def test_start_drops_buffered_text_silently() -> None:
@@ -716,13 +747,12 @@ def random_start(rng: random.Random) -> dict:
     return fields
 
 
-def run_sequence(seed: int) -> tuple[list[tuple[str, str]], list[dict], set[int]]:
+def run_sequence(seed: int) -> tuple[list[tuple[str, str]], list[dict]]:
     """Apply a random sequence of messages with random worker progress (and the odd failed
     piece) in between.
 
-    Returns the boundary-relevant messages as `(kind, letters of its text)`, the events, and the
-    indices of the `start`s that found a `Piece` queued or in flight, so must send `cancelled`
-    first. `instruction`, rejected `start`s, oversized text and frames `parse` rejects are not
+    Returns the boundary-relevant messages as `(kind, letters of its text)` and the events.
+    `instruction`, rejected `start`s, oversized text and frames `parse` rejects are not
     recorded: they emit no markers, and a rejected message must have no other effect, which the
     checker would see as unexplained markers or unsent letters ("zulu") being spoken.
     """
@@ -731,13 +761,8 @@ def run_sequence(seed: int) -> tuple[list[tuple[str, str]], list[dict], set[int]
     worker = FakeWorker(session, chunks=rng.randint(1, 3))
     worker.fail = {i for i in range(200) if rng.random() < 0.05}
     messages: list[tuple[str, str]] = []
-    interrupts: set[int] = set()
 
     def send(kind: str, **fields: object) -> None:
-        if kind == "start":
-            in_flight = worker._current is not None and not session.is_stale(worker._current)
-            if in_flight or any(isinstance(item, Piece) for item in session.work):
-                interrupts.add(len(messages))
         assert session.apply(msg(kind, **fields)) == [], (seed, kind)
         messages.append((kind, letters(str(fields.get("text", "")))))
         worker.now = len(messages)
@@ -779,12 +804,11 @@ def run_sequence(seed: int) -> tuple[list[tuple[str, str]], list[dict], set[int]
         else:
             assert isinstance(ws_messages.parse(rng.choice(INVALID_FRAMES)), ws_messages.WsError)
     worker.run()
-    return messages, worker.events, interrupts
+    return messages, worker.events
 
 
-def check_sequence(
-    seed: int, messages: list[tuple[str, str]], events: list[dict], interrupts: set[int]
-) -> None:
+def check_sequence(seed: int, messages: list[tuple[str, str]], events: list[dict]) -> int:
+    """Assert SC-005 and BC-36 over one sequence; returns how many starts interrupted work."""
     markers = [e for e in events if e["type"] in ("cancelled", "done", "started")]
     owner: dict[int, int] = {}  # id(marker event) -> index of the message that caused it
     interrupting: set[int] = set()  # starts that cancelled pending work
@@ -797,13 +821,13 @@ def check_sequence(
         owner[id(markers[p])] = i
         p += 1
 
-    # `cancelled`/`done`/`started` come strictly in the order of the messages that caused them,
-    # and a `start` sends `cancelled` exactly when a Piece was queued or in flight (BC-36).
+    # `cancelled`/`done`/`started` come strictly in the order of the messages that caused them.
+    # Whether a `start` rightly sent a `cancelled` first (BC-36) is checked further down.
     for i, (kind, _) in enumerate(messages):
         if kind == "cancel":
             take("cancelled", i)
         elif kind == "start":
-            if i in interrupts:
+            if p < len(markers) and markers[p]["type"] == "cancelled":
                 interrupting.add(i)
                 take("cancelled", i)
             take("started", i)
@@ -850,6 +874,7 @@ def check_sequence(
             flushed[k] = sent[k]
 
     spoken: dict[int, str] = {}
+    speaking_in: dict[int, list[dict]] = {}
     aborted_in: set[int] = set()
     current = 0
     # Piece indices (and so seeds) count from 0 at each start and keep counting through
@@ -879,6 +904,7 @@ def check_sequence(
             last_index = event["_index"]
             cancelled_since = False
             spoken[current] = spoken.get(current, "") + letters(event["text"])
+            speaking_in.setdefault(current, []).append(event)
             if event["_aborted"]:
                 aborted_in.add(current)
 
@@ -893,6 +919,28 @@ def check_sequence(
         assert len(said) >= len(flushed.get(k, "")), (seed, k, "lost uncancelled text")
 
 
+    # BC-36, from this checker's own model: when start i was applied, was a piece of the
+    # segment it ends queued or in flight? In flight: spoken before i and not yet ended. Queued:
+    # letters drained but not yet spoken. Everything up to the last flush/end was drained for
+    # sure; later text maybe, so "pending" has a floor and a ceiling. A start that sent
+    # `cancelled` needs the ceiling to allow pending work, one that didn't the floor to rule it
+    # out.
+    for i, (kind, _) in enumerate(messages):
+        if kind != "start" or i == 0:
+            continue
+        k = segment_of[i] - 1
+        before = [e for e in speaking_in.get(k, []) if e["_at"] <= i]
+        in_flight = any(e["_ended_at"] > i for e in before)
+        spoken_before = len("".join(letters(e["text"]) for e in before))
+        surely_pending = in_flight or len(flushed.get(k, "")) > spoken_before
+        maybe_pending = in_flight or len(sent.get(k, "")) > spoken_before
+        if i in interrupting:
+            assert maybe_pending, (seed, i, "start cancelled with nothing pending")
+        else:
+            assert not surely_pending, (seed, i, "start left pending work uncancelled")
+    return len(interrupting)
+
+
 def sent_up_to(messages: list[tuple[str, str]], segment_of: list[int], i: int) -> str:
     k = segment_of[i]
     return "".join(text for j, (_, text) in enumerate(messages[: i + 1]) if segment_of[j] == k)
@@ -905,11 +953,8 @@ def test_sc_005_random_sequences_keep_done_and_cancelled_exact() -> None:
         "cancelled": 0, "done": 0, "speaking": 0, "error": 0, "aborted": 0, "interrupting_start": 0
     }
     for seed in SEEDS:
-        messages, events, interrupts = run_sequence(seed)
-        check_sequence(seed, messages, events, interrupts)
-        cancels = sum(kind == "cancel" for kind, _ in messages)
-        assert sum(e["type"] == "cancelled" for e in events) == cancels + len(interrupts), seed
-        totals["interrupting_start"] += len(interrupts)
+        messages, events = run_sequence(seed)
+        totals["interrupting_start"] += check_sequence(seed, messages, events)
         for e in events:
             if e["type"] in totals:
                 totals[e["type"]] += 1

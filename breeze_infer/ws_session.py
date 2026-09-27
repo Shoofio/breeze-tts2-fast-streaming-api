@@ -18,7 +18,8 @@ begins a new epoch, and the worker checks `is_stale(piece)` between audio chunks
 A superseded `done` needs no epoch check: a `cancel` (or interrupting `start`) removes its own
 session's EndMarks from the deque, and only those, so an EndMark still in the deque always owes
 its `done`, including one a previous session left queued when a `start` interrupted nothing.
-The worker sends it as soon as `next_item` returns it, with no `apply` in between.
+The worker sends it as soon as `next_item` returns it, with no `apply` in between. On disconnect,
+`close` empties the deque outright, since nothing more can be sent.
 
 Text is cut by the shared segmenter (`text_split.segment`, R11), so a text gives the same pieces
 over HTTP and WebSocket.
@@ -121,13 +122,6 @@ def _instruction_or_default(instruction: str | None) -> str:
     return instruction
 
 
-def _request_type(message: Message) -> str:
-    """The client's `type` for an error's `request_type`. Each ws_messages class is named for
-    its wire type (`Start` for `"start"`, ...), so the name gives it without a second table
-    to keep in step with the parser."""
-    return type(message).__name__.lower()
-
-
 class Session:
     """The session state of one connection (data-model.md "WebSocket Session").
 
@@ -164,7 +158,7 @@ class Session:
         """Apply one parsed client message. Returns the events to send at once (`error`,
         `instruction_set`); `started`, `cancelled` and `done` go through the work deque
         instead, so they keep their place after the audio queued before them."""
-        request_type = _request_type(message)
+        request_type = message.TYPE
         if isinstance(message, Start):
             return self._start(message)
         if self.config is None:
@@ -223,14 +217,17 @@ class Session:
         later `cancel` replace a pending `done`, but an EndMark a previous session left queued
         (older epoch) keeps its `done`. The anchor and the piece index survive: seeds keep
         counting from `start`, and a voice the session already anchored stays anchored."""
-        self.work = deque(
-            item
-            for item in self.work
-            if not (isinstance(item, Piece | EndMark) and item.epoch == self._epoch)
-        )
+        self.work = deque(item for item in self.work if not self._superseded_by_cancel(item))
         self._epoch += 1
         self._buffer = ""
         self.work.append(CancelMark())
+
+    def _superseded_by_cancel(self, item: WorkItem) -> bool:
+        # Every queued Piece is this session's (a start that interrupts nothing has none
+        # queued), but an EndMark can be an earlier session's, whose `done` is still owed.
+        if isinstance(item, Piece):
+            return True
+        return isinstance(item, EndMark) and item.epoch == self._epoch
 
     def _add_text(self, message: Text | Flush | End, request_type: str) -> list[dict]:
         text = message.text or ""
@@ -299,16 +296,19 @@ class Session:
             self._in_flight = item
         return item
 
-    def is_stale(self, item: Piece | EndMark) -> bool:
-        """For a piece: true once a `cancel` or a `start` has begun a new epoch, so the piece
-        stops at its next chunk (or is skipped).
+    def is_stale(self, piece: Piece) -> bool:
+        """True once a `cancel`, a `start` or `close` has begun a new epoch: the piece stops at
+        its next chunk (or is skipped). EndMarks need no such check: a cancel that supersedes
+        one removes it from the deque, so the worker sends `done` for every EndMark it gets."""
+        return piece.epoch != self._epoch
 
-        An EndMark is never stale: a cancel that supersedes one removes it from the deque, so
-        any EndMark `next_item` returns owes its `done`. (Accepted because ws_server's worker
-        asks about both.)"""
-        if isinstance(item, EndMark):
-            return False
-        return item.epoch != self._epoch
+    def close(self) -> None:
+        """The connection is gone: stop the piece in flight (new epoch) and drop every queued
+        item, an earlier session's EndMark included, with no `CancelMark`, since nothing more
+        can be sent. `apply` is not called after this."""
+        self._epoch += 1
+        self.work.clear()
+        self._buffer = ""
 
     def mark_piece_done(self, anchor: object | None) -> None:
         """The piece in flight has ended, however it ended: finished, failed, cut short or

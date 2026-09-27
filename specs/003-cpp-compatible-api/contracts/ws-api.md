@@ -14,7 +14,8 @@ breaking change `BC-nn` or an additive change is marked.
 `X-Breeze-Version: <server version>` (additive, FR-037a). Refusals get a JSON body `{"error","code"}`:
 - `403 origin_not_allowed` if an `Origin` header is present and not allowed by the CORS setting.
   With CORS off, no browser origin is allowed (BC-31).
-- `503 loading` while the model loads.
+- `503 loading` while the model loads, and `503 gpu_unavailable` once the GPU has stopped
+  responding (as on HTTP).
 - `503 too_many_connections` above 16 connections.
 - `503 shutting_down` once the server has started shutting down.
 - A request that isn't a valid WebSocket upgrade gets the same envelope: `426 upgrade_required`
@@ -54,7 +55,7 @@ On connect, before any client message, the server sends
 | *(binary)* | — | Mono s16le PCM at `sample_rate` for the current piece |
 | `instruction_set` | — | An `instruction` message was applied |
 | `cancelled` | — | Exactly one per `cancel`, and per `start` that interrupts pending work, after the last audio frame of the cancelled work (BC-35, BC-36) |
-| `done` | — | Exactly one per `end`, after every piece queued before it, even when nothing was left (BC-34). A later `cancel` replaces it with `cancelled` |
+| `done` | — | Exactly one per `end`, after every piece queued before it, even when nothing was left (BC-34). A later `cancel` in the same session (before any further `start`) replaces it with `cancelled` |
 | `error` | `message`, `code`, `request_type` | See error codes. `request_type` (additive) is the client message type that caused the error, or `null` |
 
 **Ordering**: all events and audio frames go through one ordered queue.
@@ -82,7 +83,7 @@ escapes work (BC-32). Rules for every message:
 | `flush` | `text` (optional) | Appends, then speaks everything buffered. |
 | `end` | `text` (optional) | Like `flush`, then one `done` once everything before it has been spoken. The session stays usable afterwards. |
 | `instruction` | `instruction` | Applies to pieces that start after this message. Blank means the default instruction (BC-37). Replies `instruction_set`. |
-| `cancel` | — | Discards buffered text and queued pieces, stops the piece in flight, replaces a pending `done`, and replies with one `cancelled`, even when idle (BC-35). |
+| `cancel` | — | Discards buffered text and queued pieces, stops the piece in flight, replaces a pending `done` of the same session (one owed from before the latest `start` is still sent), and replies with one `cancelled`, even when idle (BC-35). |
 
 **`start` details**
 - `split_chars` is 0–10,000. `0` means no length limit: each drain's ready text becomes one piece, and unpunctuated text
@@ -125,6 +126,13 @@ escapes work (BC-32). Rules for every message:
 - The GPU is never held while waiting on the socket (BC-42).
 - If generating a piece fails, the server sends `error{code: generation_failed}` and moves on to
   the next item. The session and server keep running (BC-41).
+- A piece that doesn't fit the model's context with its reference gets
+  `error{code: text_too_long, request_type: null}` (as BC-47 on HTTP) and is skipped; the session
+  continues.
+- Without a voice, the first piece that succeeds becomes the anchor for the later pieces (as on
+  HTTP). Each later piece uses it only if it doesn't make that piece shorter than it would be
+  without it; otherwise that piece is spoken without the anchor (decided 2026-09-26: HTTP checks
+  every piece up front, but a streaming session can't see its later pieces yet).
 
 ## Error codes
 

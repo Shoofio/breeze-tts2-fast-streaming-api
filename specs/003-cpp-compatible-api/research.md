@@ -445,10 +445,13 @@ CUDA).
 - **I/O shell:** `ws_server.py` runs a reader task, one worker coroutine, and one ordered outgoing
   queue (bounded at 2 MiB) with a sender task.
 - **Message semantics:**
-  - `cancel` bumps the epoch, drops pieces and end markers, and signals the piece in flight. It
-    enqueues exactly one `CancelMark`.
+  - `cancel` drops the queued pieces and the current epoch's end markers (an end marker an
+    earlier session left queued keeps its `done`), bumps the epoch, which signals the piece in
+    flight, and enqueues exactly one `CancelMark`.
   - `end` enqueues exactly one `EndMark`.
-  - `start` validates first, cancels only when work is pending, and then enqueues `StartMark`.
+  - `start` validates first, cancels only when a piece is queued or in flight, begins a new epoch
+    (every accepted `start` does), and then enqueues `StartMark`.
+  - Disconnect: `Session.close()` bumps the epoch and clears the whole deque; nothing more is sent.
 - **Slow client:** if the outgoing queue would overflow, or the connection's write buffer makes no
   progress for `WS_SEND_TIMEOUT_SECONDS` (the stall watchdog, R4 amendment), the piece in flight is cancelled (the GPU
   is freed within one chunk) and the connection closes with 1008 and reason `client too slow`.

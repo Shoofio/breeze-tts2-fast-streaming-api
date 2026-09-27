@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from typing import ClassVar
 
 from breeze_infer.http_fields import (
     CFG_SCALE_RANGE,
@@ -23,10 +24,12 @@ from breeze_infer.http_fields import (
     TEMPERATURE_RANGE,
     TOP_K_RANGE,
     TOP_P_RANGE,
+    TextFieldError,
     decimal_literal_in_range,
     is_valid_voice_id,
     is_zero_literal,
     significant_int_digits,
+    validate_bounded_text,
 )
 from breeze_infer.limits import MAX_INSTRUCTION_CHARS, MAX_REF_TEXT_CHARS
 from breeze_infer.text_rules import has_control_characters, is_utf8_encodable
@@ -38,6 +41,8 @@ class Start:
     client left it unset -- absent, `null`, or (BC-02, `start` only) an empty string;
     `ws_session` applies each field's own default.
     """
+
+    TYPE: ClassVar[str] = "start"
 
     voice_id: str | None
     instruction: str | None
@@ -56,27 +61,37 @@ class Start:
 class Text:
     """`text` is required -- unlike `flush`/`end`, never marked "(optional)"."""
 
+    TYPE: ClassVar[str] = "text"
+
     text: str
 
 
 @dataclass(frozen=True)
 class Flush:
+    TYPE: ClassVar[str] = "flush"
+
     text: str | None
 
 
 @dataclass(frozen=True)
 class End:
+    TYPE: ClassVar[str] = "end"
+
     text: str | None
 
 
 @dataclass(frozen=True)
 class Instruction:
+    TYPE: ClassVar[str] = "instruction"
+
     instruction: str
 
 
 @dataclass(frozen=True)
 class Cancel:
     """No fields."""
+
+    TYPE: ClassVar[str] = "cancel"
 
 
 Message = Start | Text | Flush | End | Instruction | Cancel
@@ -218,38 +233,28 @@ def _int_field(
     return parsed
 
 
-def _capped(value: str | None, max_chars: int, *, name: str, request_type: str) -> None:
-    """`instruction`'s length cap: a blank (whitespace-only) value skips it entirely,
-    matching http_fields' own order (control, then blank -- meaning "use the default" --
-    then length) -- a value that's blank purely because it's very long spaces is still
-    blank, never "too long".
+def _bounded_text(
+    raw: str | None, max_chars: int, *, name: str, request_type: str
+) -> str | None:
+    """`http_fields.validate_bounded_text` (control characters, then UTF-8, then blank,
+    then length -- shared with `ref_text`'s own HTTP validation, review 46/47), raising
+    this module's `_Invalid` for whichever reason it returns instead of a bare value.
+    `raw` is already known to be a JSON string or `None` (`_string_field`'s job).
     """
-    if value is not None and value.strip() and len(value) > max_chars:
+    result = validate_bounded_text(raw, max_chars, check_utf8=True)
+    if result is TextFieldError.CONTROL_CHARACTERS:
+        raise _Invalid(
+            WsError("invalid_field", f"{name} must be free of control characters", request_type)
+        )
+    if result is TextFieldError.NOT_UTF8:
+        raise _Invalid(WsError("invalid_field", f"{name} must be valid UTF-8 text", request_type))
+    if result is TextFieldError.TOO_LONG:
         raise _Invalid(
             WsError(
                 "invalid_field", f"{name} must be at most {max_chars:,} characters", request_type
             )
         )
-
-
-def _validated_ref_text(data: dict[str, object], *, request_type: str) -> str | None:
-    """Mirrors `http_fields._validated_text_field` for `ref_text`: after `_text_field`'s
-    control-character/UTF-8 checks, a whitespace-only value counts as absent (so it can
-    neither override a stored transcript nor trigger BC-13), and a real value is capped
-    at `MAX_REF_TEXT_CHARS`.
-    """
-    value = _text_field(data, "ref_text", request_type=request_type)
-    if value is None or not value.strip():
-        return None
-    if len(value) > MAX_REF_TEXT_CHARS:
-        raise _Invalid(
-            WsError(
-                "invalid_field",
-                f"ref_text must be at most {MAX_REF_TEXT_CHARS:,} characters",
-                request_type,
-            )
-        )
-    return value
+    return result
 
 
 def _parse_start(data: dict[str, object]) -> Start | WsError:
@@ -259,10 +264,18 @@ def _parse_start(data: dict[str, object]) -> Start | WsError:
             raise _Invalid(
                 WsError("invalid_field", "voice_id must be a voice name or v_ id", "start")
             )
-        instruction = _text_field(data, "instruction", request_type="start")
-        _capped(instruction, MAX_INSTRUCTION_CHARS, name="instruction", request_type="start")
-        instruction = _blank_means_absent(instruction)
-        ref_text = _validated_ref_text(data, request_type="start")
+        instruction = _bounded_text(
+            _string_field(data, "instruction", request_type="start"),
+            MAX_INSTRUCTION_CHARS,
+            name="instruction",
+            request_type="start",
+        )
+        ref_text = _bounded_text(
+            _string_field(data, "ref_text", request_type="start"),
+            MAX_REF_TEXT_CHARS,
+            name="ref_text",
+            request_type="start",
+        )
         cfg_scale = _decimal_field(
             data, "cfg_scale", *CFG_SCALE_RANGE,
             low_inclusive=True, zero_means_default=False, request_type="start",
@@ -345,21 +358,25 @@ def _parse_end(data: dict[str, object]) -> End | WsError:
 
 def _parse_instruction(data: dict[str, object]) -> Instruction | WsError:
     try:
-        instruction = _text_field(data, "instruction", request_type="instruction")
-        if instruction is None:
+        raw = _string_field(data, "instruction", request_type="instruction")
+        if raw is None:
             return WsError("invalid_field", "instruction is required", "instruction")
-        _capped(instruction, MAX_INSTRUCTION_CHARS, name="instruction", request_type="instruction")
+        # `_bounded_text`'s result is discarded, not kept: a blank `raw` must stay valid
+        # as itself (BC-37 lives in `ws_session`, not here) rather than collapse to
+        # `None` the way `start`'s `instruction` does -- this call is only for its
+        # control-character/UTF-8/length side effect, raising `_Invalid` on failure.
+        _bounded_text(raw, MAX_INSTRUCTION_CHARS, name="instruction", request_type="instruction")
     except _Invalid as exc:
         return exc.error
-    return Instruction(instruction=instruction)
+    return Instruction(instruction=raw)
 
 
 _PARSERS = {
-    "start": _parse_start,
-    "text": _parse_text,
-    "flush": _parse_flush,
-    "end": _parse_end,
-    "instruction": _parse_instruction,
+    Start.TYPE: _parse_start,
+    Text.TYPE: _parse_text,
+    Flush.TYPE: _parse_flush,
+    End.TYPE: _parse_end,
+    Instruction.TYPE: _parse_instruction,
 }
 
 
@@ -404,8 +421,14 @@ def parse(raw: str) -> Message | WsError:
         # request_type stays None: it is only ever "the client's type when it was a
         # readable string", which a missing/null/number/bool/array/object never was.
         return WsError("invalid_field", "type must be a string", None)
+    if not is_utf8_encodable(type_value):
+        # A lone surrogate from a \uXXXX escape (BC-32) is a "readable string" as far
+        # as `_is_json_string` is concerned, but echoing it back as `unknown_type`'s
+        # `request_type` would hand `ws_server.py` a string its own frame encode can't
+        # send. Checked before dispatch, so request_type stays None here too.
+        return WsError("invalid_field", "type must be valid UTF-8 text", None)
 
-    if type_value == "cancel":
+    if type_value == Cancel.TYPE:
         return Cancel()
     parser = _PARSERS.get(type_value)
     if parser is None:

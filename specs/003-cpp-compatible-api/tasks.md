@@ -886,7 +886,8 @@ rules.
     `process_response` also rewrites the library's own `400`/`426`/`500` refusals into the JSON
     envelope. `ws.closed` carries the code actually sent (`ws.protocol.close_sent`), `aborted` and `reason`. See
     `research/ws-prototype.md` ("Decision" and the gotchas).
-  - On disconnect: bump the epoch, cancel, and join.
+  - On disconnect: `session.close()` (bumps the epoch and clears the whole deque, so nothing more
+    is sent, not even a `done` an earlier session left queued), then join.
   - Emit the `ws.*` events with `session_id` and `piece_index`.
 - [ ] T078 [US4] Wire the WebSocket into `breeze_infer/api.py`:
   - Unless `ws_port` is `disabled`, pre-bind the sockets on `settings.host:ws_port` (every

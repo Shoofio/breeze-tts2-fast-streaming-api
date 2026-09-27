@@ -330,7 +330,7 @@ Other files in the directory:
 
 | Field | Notes |
 |---|---|
-| `epoch` | Incremented by `cancel`, by every accepted `start`, and on disconnect. A `cancel` drops only the current epoch's pieces and `EndMark`s, so an `EndMark` an earlier session left queued keeps its `done` |
+| `epoch` | Incremented by `cancel`, by every accepted `start`, and on disconnect (`close()`, which also clears the whole deque). A `cancel` drops the queued pieces and only the current epoch's `EndMark`s, so an `EndMark` an earlier session left queued keeps its `done` |
 | `config` | Snapshot from `start`: reference, instruction, cfg, seed, sampling, `split_chars`. `instruction` is mutable via the `instruction` message and read when each piece starts |
 | `buffer` | Pending text: the unfinished clause after the last complete sentence or closed clause, weighing at most max(2 × budget, 93), where 93 is one capped grapheme cluster of 31 non-ASCII code points (with `split_chars` 0, unbounded except by the character limit); total characters ≤ 10,000 |
 | `opening_pending` | True while there is no reference and no anchor yet (and none queued) |

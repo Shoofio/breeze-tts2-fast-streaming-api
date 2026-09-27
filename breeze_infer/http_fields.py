@@ -70,6 +70,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from enum import Enum
 from urllib.parse import parse_qsl, unquote_to_bytes
 
 from fastapi import Request
@@ -87,7 +88,7 @@ from breeze_infer.limits import (
     MAX_TEXT_CHARS,
 )
 from breeze_infer.settings import Settings
-from breeze_infer.text_rules import has_control_characters
+from breeze_infer.text_rules import has_control_characters, is_utf8_encodable
 from breeze_infer.text_split import speakable
 
 # contracts/http-api.md "Fields": the defaults for POST /v1/audio/speech.
@@ -919,29 +920,55 @@ def _check_no_control_characters(value: str, field: str) -> None:
         raise ApiError(400, "invalid_field", f"{field} must be free of control characters")
 
 
-def _validated_text_field(fields: Fields, name: str, max_chars: int) -> str | None:
-    """`ref_text`'s value (`None` when absent, BC-02), control-character- and length-checked
-    (BC-46/BC-05), in that order: control characters first, since `str.strip()` (and
-    `str.isspace()`) treats several `Cc` control characters (`\\x1c`-`\\x1f`, `\\x85` NEL) as
-    whitespace, so checking blank-ness first would let a value that's *only* one of those
+class TextFieldError(Enum):
+    """Why `validate_bounded_text` rejected a value -- raise-agnostic, so each caller
+    phrases and raises its own protocol's error (an HTTP `ApiError`, a WebSocket
+    `WsError`) from the reason alone."""
+
+    CONTROL_CHARACTERS = "control_characters"
+    NOT_UTF8 = "not_utf8"
+    TOO_LONG = "too_long"
+
+
+def validate_bounded_text(
+    value: str | None, max_chars: int, *, check_utf8: bool = False
+) -> str | None | TextFieldError:
+    """The control-characters -> (UTF-8, only when `check_utf8`) -> blank -> length
+    order shared by `_validated_text_field` below (`ref_text` on HTTP) and
+    `ws_messages`'s `ref_text`/`instruction` fields (previously three near-identical
+    copies of this same order, review 46/47). Control characters first, since
+    `str.strip()` treats several `Cc` characters (`\\x1c`-`\\x1f`, `\\x85` NEL) as
+    whitespace -- checking blank-ness first would let a value that's *only* one of those
     slip through as "blank" instead of being caught as the control-character violation it
-    actually is; then blank (a whitespace-only value counts as absent here, the same as the
-    general BC-02 "empty means absent"); only once it's known to be a real, non-blank value
-    is its length checked -- a whitespace-only value of any length is still absent, not
-    "too long". `instruction`, in `parse_speech`, applies this same order (control, then
-    blank -- with its own meaning, the default -- then length); `text` is the one exception,
-    checking length before control characters, since only it has a dedicated `text_too_long`
-    code cheap enough to short-circuit an over-length scan for control characters.
+    actually is. `None` in, or a whitespace-only value, means absent (the caller decides
+    what "absent" means for its own field). `check_utf8` is off by default: an
+    HTTP-decoded field can never hold a lone surrogate (a raw UTF-8 byte stream can't
+    encode one), so only WebSocket, where a `\\uXXXX` escape can produce one, turns it on.
     """
-    raw = _first(fields, name)
-    if raw is None:
+    if value is None:
         return None
-    _check_no_control_characters(raw, name)
-    if not raw.strip():
+    if has_control_characters(value):
+        return TextFieldError.CONTROL_CHARACTERS
+    if check_utf8 and not is_utf8_encodable(value):
+        return TextFieldError.NOT_UTF8
+    if not value.strip():
         return None
-    if len(raw) > max_chars:
+    if len(value) > max_chars:
+        return TextFieldError.TOO_LONG
+    return value
+
+
+def _validated_text_field(fields: Fields, name: str, max_chars: int) -> str | None:
+    """`ref_text`'s value (`None` when absent, BC-02, or whitespace-only), via
+    `validate_bounded_text` -- this wrapper only ever adds the HTTP wording and status
+    for the two ways that can fail (BC-46 control characters; BC-05 too long).
+    """
+    result = validate_bounded_text(_first(fields, name), max_chars)
+    if result is TextFieldError.CONTROL_CHARACTERS:
+        raise ApiError(400, "invalid_field", f"{name} must be free of control characters")
+    if result is TextFieldError.TOO_LONG:
         raise ApiError(400, "invalid_field", f"{name} must be at most {max_chars:,} characters")
-    return raw
+    return result
 
 
 @dataclass(frozen=True)

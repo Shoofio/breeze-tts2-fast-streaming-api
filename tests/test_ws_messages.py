@@ -44,6 +44,7 @@ from breeze_infer.limits import (
     MAX_NEW_TOKENS_CEILING,
     MAX_REF_TEXT_CHARS,
 )
+from breeze_infer.text_rules import is_utf8_encodable
 from breeze_infer.ws_messages import (
     Cancel,
     End,
@@ -654,6 +655,27 @@ def test_unknown_fields_are_ignored() -> None:
     assert parse(raw) == Text(text="hi")
 
 
+# --- review 47 #9: each message dataclass names its own wire type -----------------------
+
+
+@pytest.mark.parametrize(
+    ("message_class", "expected_type"),
+    [
+        (Start, "start"),
+        (Text, "text"),
+        (Flush, "flush"),
+        (End, "end"),
+        (Instruction, "instruction"),
+        (Cancel, "cancel"),
+    ],
+)
+def test_message_class_type_matches_its_wire_type(message_class: type, expected_type: str) -> None:
+    """`ws_session.py` reads `message.TYPE` instead of keeping its own copy of this
+    mapping -- one source for "which wire type does this dataclass parse".
+    """
+    assert message_class.TYPE == expected_type
+
+
 # --- review 46: deeply nested JSON must not crash the reader ---------------------------
 
 
@@ -719,6 +741,44 @@ def test_lone_surrogate_rejected_in_instruction_message() -> None:
     raw = _msg("instruction", instruction='"a\\ud800b"')
 
     _assert_error(raw, "invalid_field", request_type="instruction")
+
+
+# --- review 47 #1 (SERIOUS): a lone surrogate in `type` itself must never be echoed ----
+
+_SURROGATE_RAW_MESSAGES = [
+    '{"type":"\\ud800"}',
+    '{"type":"text","text":"a\\ud800b"}',
+    _start(instruction='"a\\ud800b"'),
+    _start(voice_id='"alice"', ref_text='"a\\ud800b"'),
+    _msg("instruction", instruction='"a\\ud800b"'),
+]
+
+
+def test_bc_32_type_lone_surrogate_gets_invalid_field_not_unknown_type() -> None:
+    """A `type` that decodes to a lone surrogate can't be UTF-8 encoded -- echoing it
+    back as `unknown_type`'s `request_type` would crash the server's own frame encode
+    when it tries to send the `error` event. Checked before dispatch, so this is
+    `invalid_field` with `request_type` `None` instead of `unknown_type` with the
+    surrogate.
+    """
+    result = parse('{"type":"\\ud800"}')
+
+    assert isinstance(result, WsError)
+    assert result.code == "invalid_field"
+    assert result.request_type is None
+
+
+@pytest.mark.parametrize("raw", _SURROGATE_RAW_MESSAGES)
+def test_no_ws_error_ever_carries_a_non_utf8_encodable_string(raw: str) -> None:
+    """General rule behind the fix above: whatever field a lone surrogate hides in,
+    neither `message` nor `request_type` on the resulting `WsError` may themselves be
+    unencodable -- `ws_server.py` would crash trying to send either one back.
+    """
+    result = parse(raw)
+
+    assert isinstance(result, WsError)
+    assert is_utf8_encodable(result.message)
+    assert result.request_type is None or is_utf8_encodable(result.request_type)
 
 
 # --- review 46: ref_text mirrors http_fields._validated_text_field ---------------------
