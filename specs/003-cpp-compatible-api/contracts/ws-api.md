@@ -15,7 +15,8 @@ breaking change `BC-nn` or an additive change is marked.
 - `403 origin_not_allowed` if an `Origin` header is present and not allowed by the CORS setting.
   With CORS off, no browser origin is allowed (BC-31).
 - `503 loading` while the model loads, and `503 gpu_unavailable` once the GPU has stopped
-  responding (as on HTTP).
+  responding (as on HTTP). The GPU's health is checked again just before the `101`, so a
+  handshake under way when the GPU stops responding still gets the `503`.
 - `503 too_many_connections` above 16 connections.
 - `503 shutting_down` once the server has started shutting down.
 - A request that isn't a valid WebSocket upgrade gets the same envelope: `426 upgrade_required`
@@ -45,7 +46,7 @@ breaking change `BC-nn` or an additive change is marked.
 | 1007 | invalid UTF-8 |
 | 1008 | `client too slow`: more than 2 MiB of undelivered output, or no output delivered for 30 s while some is waiting; the piece in flight is cancelled first (BC-42). A client that doesn't read the close frame within 2 s is dropped without one (it sees 1006) |
 | 1009 | message too big |
-| 1011 | ping timeout or internal error |
+| 1011 | ping timeout or internal error; also `gpu is not responding` when the GPU stopped responding in the moment between the `101` and the session's start (a backstop: the handshake's own check answers `503 gpu_unavailable`) |
 
 ## Server → client
 
@@ -133,6 +134,9 @@ escapes work (BC-32). Rules for every message:
 - The GPU is never held while waiting on the socket (BC-42).
 - If generating a piece fails, the server sends `error{code: generation_failed}` and moves on to
   the next item. The session and server keep running (BC-41).
+- If the GPU stops responding during a session, each later piece gets
+  `error{code: generation_failed}` in the same way, and the session stays open; new
+  connections are refused with `503 gpu_unavailable`.
 - A piece that doesn't fit the model's context with its reference gets
   `error{code: text_too_long, request_type: null}` (as BC-47 on HTTP) and is skipped; the session
   continues.

@@ -235,8 +235,8 @@ class CpuTokenizer:
         (`executors.run_until_shutdown`).
 
         WebSocket pieces' anchor checks queue here too (ws_server), since they also run before
-        the gate: at most one per session (16), each two small prompts, so they can only delay
-        a piece-0 check a little, never change its outcome."""
+        the gate: at most one per session (16 sessions), each at most two small prompts, so
+        they can delay a piece-0 check."""
         return await run_until_shutdown(
             self._executor, self._call, fn, args, what="the CPU tokenizer"
         )

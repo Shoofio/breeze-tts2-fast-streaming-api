@@ -1621,3 +1621,30 @@ def test_a_signal_while_the_websocket_servers_start_closes_them_all(
         components.gpu.shutdown()
 
     assert closed == [True, True]
+
+
+@posix_only
+@pytest.mark.usefixtures("keep_sigint")
+def test_two_quick_signals_cut_a_stuck_websocket_stop_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two Ctrl+C always end it: a second signal that lands during uvicorn's graceful
+    shutdown, before serve() is waiting on the WebSocket stop, still cuts that wait short."""
+    monkeypatch.setattr(ws_server.ConnectionRegistry, "shutdown", _stuck_websocket_shutdown)
+    sink = io.StringIO()
+    components = _components(sink)
+
+    async def scenario() -> ServeOutcome:
+        serving, _port = _serving(components, _loaded)
+        await _wait_until(lambda: components.readiness.runtime is not None)
+        # Both handlers run in the same loop step, while uvicorn is still serving.
+        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), signal.SIGTERM)
+        return await asyncio.wait_for(serving, 10)
+
+    try:
+        outcome = asyncio.run(scenario())
+    finally:
+        components.gpu.shutdown()
+
+    assert outcome.exit_code == 0

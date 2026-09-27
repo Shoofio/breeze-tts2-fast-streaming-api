@@ -26,6 +26,8 @@ arguments, so tests can shrink them.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import http
 import json
@@ -41,7 +43,8 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from websockets.asyncio.server import Server, ServerConnection
 from websockets.asyncio.server import serve as websockets_serve
 from websockets.datastructures import Headers
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidHeader
+from websockets.headers import parse_connection, parse_upgrade
 from websockets.http11 import Request, Response
 
 from breeze_infer import __version__
@@ -62,14 +65,11 @@ from breeze_infer.limits import (
     WS_OUTBOX_BYTES,
     WS_SEND_TIMEOUT_SECONDS,
 )
-from breeze_infer.routes_speech import (
-    PrefixOutOfMemory,
-    report_prefix_fallback,
-    voice_prefix,
-)
+from breeze_infer.routes_speech import PrefixOutOfMemory, voice_prefix
 from breeze_infer.synthesis import (
     CodesRef,
     NoRef,
+    PieceRoom,
     Reference,
     anchor_codes,
     codec_samples_per_frame,
@@ -138,35 +138,51 @@ class _Refusal(NamedTuple):
     headers: tuple[tuple[str, str], ...] = ()
 
 
+_UPGRADE_REQUIRED = _Refusal(
+    426,
+    "upgrade_required",
+    "a WebSocket upgrade is required",
+    # RFC 9110: a 426 names the protocol to upgrade to.
+    (("Upgrade", "websocket"),),
+)
+_BAD_HANDSHAKE = _Refusal(400, "bad_handshake", "invalid WebSocket handshake")
+# RFC 6455 section 4.4: a version mismatch names the version the server speaks.
+_BAD_VERSION = _BAD_HANDSHAKE._replace(headers=(("Sec-WebSocket-Version", "13"),))
+
+
 def _malformed_handshake(headers: Headers) -> _Refusal | None:
-    """A request that isn't a WebSocket upgrade, classified as the library would (426 for the
-    upgrade headers, 400 for the rest), but checked before readiness and the cap: so it is told
-    what is wrong even while loading or at the cap, and never takes a slot. The library still
-    validates the rest (the key's format, for one) after this."""
+    """A request that isn't a valid WebSocket upgrade, checked before readiness and the cap, so
+    it is told what is wrong even while loading or at the cap and never takes a slot.
 
-    def tokens(name: str) -> set[str]:
-        return {
-            token.strip().lower() for value in headers.get_all(name) for token in value.split(",")
-        }
-
-    if "websocket" not in tokens("Upgrade") or "upgrade" not in tokens("Connection"):
-        # RFC 9110: a 426 names the protocol to upgrade to.
-        return _Refusal(
-            426,
-            "upgrade_required",
-            "a WebSocket upgrade is required",
-            (("Upgrade", "websocket"),),
-        )
-    if not headers.get_all("Sec-WebSocket-Key"):
-        return _Refusal(400, "bad_handshake", "invalid WebSocket handshake")
+    The same rules, in the same order and with the same answer, as the library's own check
+    (`websockets.server.ServerProtocol.process_request`): its `InvalidUpgrade` is a 426 and any
+    other handshake error a 400. Its own header parsers are used, so a malformed header value
+    is a 400 here too."""
+    try:
+        connection = [
+            option for value in headers.get_all("Connection") for option in parse_connection(value)
+        ]
+        if not any(option.lower() == "upgrade" for option in connection):
+            return _UPGRADE_REQUIRED
+        upgrade = [
+            protocol for value in headers.get_all("Upgrade") for protocol in parse_upgrade(value)
+        ]
+    except InvalidHeader:
+        return _BAD_HANDSHAKE
+    # Exactly one protocol: `Upgrade: websocket, h2c` is refused too.
+    if not (len(upgrade) == 1 and upgrade[0].lower() == "websocket"):
+        return _UPGRADE_REQUIRED
+    keys = headers.get_all("Sec-WebSocket-Key")
+    if len(keys) != 1:
+        return _BAD_HANDSHAKE
+    try:
+        key = base64.b64decode(keys[0].encode(), validate=True)
+    except binascii.Error:
+        return _BAD_HANDSHAKE
+    if len(key) != 16:
+        return _BAD_HANDSHAKE
     if headers.get_all("Sec-WebSocket-Version") != ["13"]:
-        # RFC 6455 section 4.4: name the version the server speaks.
-        return _Refusal(
-            400,
-            "bad_handshake",
-            "invalid WebSocket handshake",
-            (("Sec-WebSocket-Version", "13"),),
-        )
+        return _BAD_VERSION
     return None
 
 
@@ -272,7 +288,12 @@ class ConnectionRegistry:
             for connection, channel in list(self._connections.items())
         ]
         await asyncio.gather(*closes, return_exceptions=True)
-        # Again for any server added while this waited (`add_server` closed it already).
+        await self.wait_closed()
+
+    async def wait_closed(self) -> None:
+        """Wait until every server has closed, including one `add_server` closed after
+        `shutdown()` had already returned (api.serve awaits this again, so none is left
+        pending)."""
         waited = 0
         while waited < len(self._servers):
             servers = self._servers[waited:]
@@ -341,7 +362,16 @@ async def serve(
     def process_response(
         connection: ServerConnection, request: Request, response: Response
     ) -> Response:
-        if response.status_code != http.HTTPStatus.SWITCHING_PROTOCOLS and (
+        if response.status_code == http.HTTPStatus.SWITCHING_PROTOCOLS and (
+            components.readiness.unhealthy or components.readiness.runtime is None
+        ):
+            # The GPU stopped responding while this handshake was under way: checked again
+            # just before the 101, so the client still gets the handshake's answer rather than
+            # a session that closes at once (the handler's 1011 is only the backstop for the
+            # loop step after this).
+            events.emit("ws.rejected", reason="gpu_unavailable")
+            response = _json_refusal(503, "gpu_unavailable", "gpu is not responding")
+        elif response.status_code != http.HTTPStatus.SWITCHING_PROTOCOLS and (
             response.headers.get_all("Content-Type") != ["application/json"]
         ):
             # One of the library's own refusals, in text/plain.
@@ -405,7 +435,7 @@ def _anchor_shortens(
     can't see its later pieces up front. Run on the pre-gate worker (`CpuTokenizer.run`) with
     its copy, before the gate, from prompts built on the CPU (`predicted_room`)."""
 
-    def limit(reference: Reference) -> int:
+    def room(reference: Reference) -> PieceRoom:
         return predicted_room(
             runtime,
             tokenizer,
@@ -414,9 +444,14 @@ def _anchor_shortens(
             config.instruction,
             config.cfg_scale,
             config.max_new_tokens,
-        ).room
+        )
 
-    return limit(anchor) < limit(NoRef())
+    anchored = room(anchor)
+    if anchored.room >= anchored.cap:
+        # The whole cap even with the anchor: it can't be shorter without it, so the second
+        # prompt needn't be built.
+        return False
+    return anchored.room < room(NoRef()).room
 
 
 def _piece_audio(
@@ -498,6 +533,12 @@ class _Channel:
         # Voices (by prefix key) whose prefix build ran out of GPU memory in this session: they
         # take the codes path from then on, rather than failing the same build every piece.
         self._codes_fallback: set[tuple[str, str]] = set()
+        # An out-of-memory fallback not yet reported: its `speech.prefix_fallback` reason
+        # (`out_of_memory` or `no_room`) depends on whether the codes path has room, which the
+        # piece's frame limit then tells (`_report_prefix_fallback`). (voice id, build error)
+        self._fallback_to_report: tuple[str, str] | None = None
+        # Set once `session.close()` has run: the worker has nothing more to wait for.
+        self._session_closed = False
         loop = asyncio.get_running_loop()
         # The close code and reason, once anything decides the connection is over.
         self._stop: asyncio.Future[tuple[int, str]] = loop.create_future()
@@ -547,6 +588,8 @@ class _Channel:
             # a cancelled piece's generator is closed on the GPU thread before the gate is
             # released.
             self.session.close()
+            self._session_closed = True
+            self._work_ready.set()
             for task in others:
                 task.cancel()
             await asyncio.gather(*others, return_exceptions=True)
@@ -685,6 +728,8 @@ class _Channel:
             while True:
                 item = self.session.next_item()
                 if item is None:
+                    if self._session_closed:
+                        return  # `session.close()` cleared the deque: nothing will come
                     self._work_ready.clear()
                     await self._work_ready.wait()
                 elif isinstance(item, CancelMark):
@@ -714,7 +759,14 @@ class _Channel:
         except NoRoomError:
             outcome = "no_room"
             self._send_event(_error("text_too_long", "text is too long", None))
-        except Exception as error:  # noqa: BLE001 - a failed piece must not end the session
+        except Exception as error:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                # This task is being cancelled (a disconnect, a shutdown), and the error took
+                # the place of its CancelledError: `GpuSession.aclose()` raises
+                # `GpuCloseTimeout` for a close that outlasted the cancel. Treating that as a
+                # failed piece would let the session go on and swallow the cancel.
+                raise
             outcome = "failed"
             failure = error_fields(error)
             self._send_event(_error("generation_failed", "generation failed", None))
@@ -745,11 +797,14 @@ class _Channel:
         generation: GpuSession[bytes] | None = None
         try:
             audio, result = await self._prepare_audio(piece, config, anchor, lease)
+            # Before the session exists: this can raise `_SlowClient`, and until `async with`
+            # has started, only the `finally` below releases the lease.
+            self._send_event({"type": "speaking", "text": piece.text})
             # From here the session owns the lease: it releases it once the generator's close
             # has really finished on the GPU thread, even after a close timeout (which poisons
-            # the gate), so nothing below may release it too.
+            # the gate), so nothing below may release it too. Entered at once, with nothing in
+            # between that could raise.
             generation = GpuSession(lease, self.components.gpu, audio)
-            self._send_event({"type": "speaking", "text": piece.text})
             async with generation:
                 while not self.session.is_stale(piece):
                     chunk = await generation.step()
@@ -775,15 +830,7 @@ class _Channel:
 
         acquiring = asyncio.ensure_future(self.components.gate.acquire(on_wait=on_wait))
         try:
-            while not acquiring.done() and not self.session.is_stale(piece):
-                self._session_changed.clear()
-                changed = asyncio.ensure_future(self._session_changed.wait())
-                try:
-                    await asyncio.wait(
-                        {acquiring, changed}, return_when=asyncio.FIRST_COMPLETED
-                    )
-                finally:
-                    changed.cancel()
+            await self._until_done_or_stale(acquiring, piece)
         except BaseException:
             _give_up(acquiring)
             raise
@@ -791,6 +838,18 @@ class _Channel:
             return acquiring.result()  # raises GpuUnavailable for a poisoned gate
         _give_up(acquiring)
         return None
+
+    async def _until_done_or_stale(self, waiting: asyncio.Future[Any], piece: Piece) -> None:
+        """Wait for `waiting`, or until `piece` goes stale (a `cancel` or `start`, which the
+        reader signals through `_session_changed`), whichever comes first. The caller decides
+        what to do with `waiting` if it isn't done."""
+        while not waiting.done() and not self.session.is_stale(piece):
+            self._session_changed.clear()
+            changed = asyncio.ensure_future(self._session_changed.wait())
+            try:
+                await asyncio.wait({waiting, changed}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                changed.cancel()
 
     async def _usable_anchor(self, piece: Piece, config: SessionConfig) -> CodesRef | None:
         """The session's anchor, if this piece should use it: not with a voice, and not when
@@ -800,14 +859,28 @@ class _Channel:
         Measured before the gate, on the CPU tokenizer's pre-gate worker (`CpuTokenizer.run`),
         with HTTP's piece-0 checks: sizing before the gate is that worker's job. Not the
         anchor-sizing worker, which only the lease holder may use, since its timeout changes
-        HTTP's behaviour (`sizing_timeout`)."""
+        HTTP's behaviour (`sizing_timeout`).
+
+        A `cancel` or `start` doesn't wait behind that worker's queue: the sizing is abandoned
+        (a queued call is dropped; a running one finishes harmlessly, unread), and the caller's
+        stale check ends the piece."""
         anchor = self.session.anchor
         if config.voice is not None or not isinstance(anchor, CodesRef):
             return None
-        try:
-            shortens = await self.components.cpu_tokenizer.run(
+        sizing = asyncio.ensure_future(
+            self.components.cpu_tokenizer.run(
                 _anchor_shortens, self.runtime, anchor, piece.text, config
             )
+        )
+        try:
+            await self._until_done_or_stale(sizing, piece)
+        finally:
+            if not sizing.done():
+                sizing.cancel()
+        if sizing.cancelled():  # abandoned: the piece went stale
+            return None
+        try:
+            shortens = sizing.result()
         except GpuUnavailable:  # the CPU tokenizer is shutting down with the server
             self._skip_anchor(piece, "shutdown")
             return None
@@ -845,13 +918,18 @@ class _Channel:
         inputs, room = await gpu_call_under_lease(
             gpu, lease, _prepare, runtime, reference, piece.text, config
         )
-        frame_limit = piece_frame_limit(
-            room,
-            self.events,
-            request_id=self.session_id,
-            piece_index=piece.index,
-            requested=config.max_new_tokens,
-        )
+        try:
+            frame_limit = piece_frame_limit(
+                room,
+                self.events,
+                request_id=self.session_id,
+                piece_index=piece.index,
+                requested=config.max_new_tokens,
+            )
+        except NoRoomError:
+            self._report_prefix_fallback("no_room")
+            raise
+        self._report_prefix_fallback("out_of_memory")
         result = _PieceResult()
         audio = _piece_audio(
             runtime,
@@ -894,18 +972,33 @@ class _Channel:
         )
         if isinstance(built, PrefixOutOfMemory):
             # As on HTTP: the codes path, with every cached prefix already freed. A piece with
-            # no room left on it is then skipped like any other (`text_too_long`).
+            # no room left on it is then skipped like any other (`text_too_long`). Reported once
+            # this piece's room is known (`_report_prefix_fallback`).
             self._codes_fallback.add(voice.prefix_key)
-            report_prefix_fallback(
-                self.events,
-                request_id=self.session_id,
-                voice_id=voice.id,
-                reason="out_of_memory",
-                error=built.error,
-            )
+            self._fallback_to_report = (voice.id, built.error)
             return shape.codes_path()
         reference, _warm = built
         return reference
+
+    def _report_prefix_fallback(self, reason: str) -> None:
+        """`speech.prefix_fallback` for a fallback `_reference` just took, if any: `no_room`
+        when the codes path has no room for the piece either, as HTTP decides it, else
+        `out_of_memory`. `request_id` is the session's id, as the prefix cache's own events for
+        that build carry it (every request event has one, data-model.md "Events"); `session_id`
+        is there as on every WebSocket event."""
+        if self._fallback_to_report is None:
+            return
+        voice_id, error = self._fallback_to_report
+        self._fallback_to_report = None
+        self.events.emit(
+            "speech.prefix_fallback",
+            level="warning",
+            request_id=self.session_id,
+            session_id=self.session_id,
+            voice_id=voice_id,
+            reason=reason,
+            error=error,
+        )
 
 
 def _give_up(acquiring: asyncio.Future[GpuLease]) -> None:

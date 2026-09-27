@@ -30,6 +30,7 @@ Interface pinned here for T077 (written before `breeze_infer/ws_server.py` exist
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import socket
 import struct
@@ -38,6 +39,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, TypeVar
 
 import numpy as np
@@ -49,9 +51,11 @@ from websockets.sync.client import ClientConnection, connect
 from breeze_infer import __version__, gpu, ws_server
 from breeze_infer.api import Components, bind_http_sockets
 from breeze_infer.gpu import GpuGate, GpuLease, GpuThread, GpuUnavailable
+from breeze_infer.http_fields import DEFAULT_CFG_SCALE, DEFAULT_INSTRUCTION
 from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.settings import settings_from_args
+from breeze_infer.synthesis import CodesRef, prepare_piece
 from breeze_infer.templates import prepare_prefix_inputs
 
 # FakeRuntime imports this lazily on its first step, i.e. on the GPU thread mid-piece; on a slow
@@ -1225,33 +1229,48 @@ def test_an_out_of_memory_prefix_build_falls_back_to_codes_for_the_rest_of_the_s
     [connected] = [f for name, f in rig.events.calls if name == "ws.connected"]
     [fallback] = [f for name, f in rig.events.calls if name == "speech.prefix_fallback"]
     assert fallback["level"] == "warning"
+    assert fallback["session_id"] == connected["session_id"]
     assert fallback["request_id"] == connected["session_id"]
     assert fallback["voice_id"] == VOICE_ID
     assert fallback["reason"] == "out_of_memory"
     assert "CUDA out of memory" in fallback["error"]
 
 
-class _PoisonedAfterHandshake(Readiness):
-    """Ready for the handshake's checks, then gone: the gate was poisoned in between."""
+class _PoisonedAfter(Readiness):
+    """Ready for its first `good_reads` reads of `runtime`, then gone: the gate was poisoned
+    in between. The handshake reads it in `process_request` (1), then just before the 101 in
+    `process_response` (2); the session reads it when its handler starts (3)."""
 
-    def __init__(self, runtime: Any) -> None:
+    def __init__(self, runtime: Any, good_reads: int) -> None:
         super().__init__()
         self.mark_ready(runtime)
+        self.good_reads = good_reads
         self.reads = 0
 
     @property
     def runtime(self) -> Any:
         self.reads += 1
-        return super().runtime if self.reads == 1 else None
+        return super().runtime if self.reads <= self.good_reads else None
 
 
-def test_a_gpu_that_stops_responding_during_the_handshake_closes_1011(
+def test_a_gpu_that_stops_responding_during_the_handshake_gets_503(
     start_ws: Callable[..., WsRig],
 ) -> None:
-    """No `ready` without a runtime: the session closes at once with 1011 `gpu is not
-    responding` (the handshake's `503 gpu_unavailable` is already too late to send)."""
+    """Checked again just before the 101, so a gate poisoned while the handshake was in
+    progress still gets the handshake's `503 gpu_unavailable`."""
     runtime = PacedRuntime()
-    rig = start_ws(runtime, ready=False, readiness=_PoisonedAfterHandshake(runtime))
+    rig = start_ws(runtime, ready=False, readiness=_PoisonedAfter(runtime, good_reads=1))
+
+    assert_json_refusal(rig.raw().handshake(), 503, "gpu_unavailable")
+
+
+def test_a_gpu_that_stops_responding_before_the_session_starts_closes_1011(
+    start_ws: Callable[..., WsRig],
+) -> None:
+    """The backstop for the loop step between the 101 and the handler: no `ready` without a
+    runtime; the session closes at once with 1011 `gpu is not responding`."""
+    runtime = PacedRuntime()
+    rig = start_ws(runtime, ready=False, readiness=_PoisonedAfter(runtime, good_reads=2))
     client = rig.raw()
 
     assert client.handshake().status == 101
@@ -1299,27 +1318,195 @@ def test_anchor_sizing_queues_on_the_pre_gate_worker(start_ws: Callable[..., WsR
     assert prompt_lengths(runtime) == [62, 100]
 
 
+# A second, valid key: two keys are refused even when each is well formed.
+OTHER_KEY = base64.b64encode(b"0123456789abcdef").decode()
+
+
 @pytest.mark.parametrize(
-    ("request_kwargs", "status", "code"),
+    ("headers", "request_kwargs", "status", "code"),
     [
-        ({"upgrade": False}, 426, "upgrade_required"),
-        ({"version": "8"}, 400, "bad_handshake"),
+        ((), {"upgrade": False}, 426, "upgrade_required"),
+        ((), {"version": "8"}, 400, "bad_handshake"),
+        # Upgrade must name websocket alone, as the library requires.
+        ((("Upgrade", "h2c"),), {}, 426, "upgrade_required"),
+        ((("Sec-WebSocket-Key", OTHER_KEY),), {}, 400, "bad_handshake"),
+        ((), {"key": "not-a-base64-key"}, 400, "bad_handshake"),
+        ((), {"key": base64.b64encode(b"too short").decode()}, 400, "bad_handshake"),
     ],
-    ids=["plain GET", "unsupported version"],
+    ids=[
+        "plain GET",
+        "unsupported version",
+        "h2c alongside websocket",
+        "two keys",
+        "bad base64 key",
+        "key not 16 bytes",
+    ],
 )
 def test_a_malformed_handshake_is_refused_before_readiness_and_the_cap(
     start_ws: Callable[..., WsRig],
     monkeypatch: pytest.MonkeyPatch,
+    headers: tuple[tuple[str, str], ...],
     request_kwargs: dict[str, Any],
     status: int,
     code: str,
 ) -> None:
-    """A request that isn't a WebSocket upgrade is told so (426/400) even while the model
-    loads or every slot is taken, never `503`, and it never takes a slot."""
+    """A request that isn't a WebSocket upgrade is told so (426/400), classified as the
+    library would, even while the model loads or every slot is taken: never `503`, and it
+    never takes a slot."""
     monkeypatch.setattr(ws_server, "WS_MAX_CONNECTIONS", 1)
     rig = start_ws(ready=False)
-    assert_json_refusal(rig.raw().handshake(**request_kwargs), status, code)  # while loading
+    refused = rig.raw().handshake(headers, **request_kwargs)
+    assert_json_refusal(refused, status, code)  # while loading
 
     rig.call(lambda: rig.components.readiness.mark_ready(rig.runtime))
     rig.raw().open()  # the only slot
-    assert_json_refusal(rig.raw().handshake(**request_kwargs), status, code)  # at the cap
+    refused = rig.raw().handshake(headers, **request_kwargs)
+    assert_json_refusal(refused, status, code)  # at the cap
+
+
+# --- review 49 ---------------------------------------------------------------------------------
+
+
+def test_a_slow_client_at_speaking_does_not_leak_the_gate(
+    start_ws: Callable[..., WsRig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The outbox overflowing on the `speaking` event itself, before any audio: the lease
+    must still be released, or the GPU is lost to every client for good."""
+    monkeypatch.setattr(ws_server, "WS_OUTBOX_BYTES", 200)  # `ready` fits, `speaking` doesn't
+    rig = start_ws()
+    client = rig.raw()
+    client.open()
+
+    client.send_json({"type": "start", "split_chars": 0})
+    client.send_json({"type": "flush", "text": LONG_TEXT})
+    _, close = client.read_until_close()
+
+    assert close is not None and close.close_code == 1008
+    wait_until(lambda: rig.ws_closed_events() != [], what="ws.closed")
+    assert rig.gate_is_free()
+
+
+def test_shutdown_finishes_when_a_pieces_close_times_out(
+    start_ws: Callable[..., WsRig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stuck GPU: cancelling the piece in flight ends in `GpuCloseTimeout`, which replaces
+    the task's cancellation. It must not be mistaken for a failed piece (the session going on,
+    waiting for work that never comes) or the shutdown never finishes."""
+    monkeypatch.setattr(gpu, "GPU_CLOSE_TIMEOUT_SECONDS", 0.3)
+    runtime = PacedRuntime(chunks=50, delay=0.05, close_delay=1.5)
+    rig = start_ws(runtime)
+    client = rig.raw()
+    client.open()
+    client.send_json({"type": "start"})
+    client.send_json({"type": "flush", "text": SHORT_TEXT})
+    client.frames_until_event("speaking")
+
+    elapsed = rig.shutdown(timeout=15)
+
+    assert elapsed < 0.3 + 2.0 + 2.0, elapsed
+
+
+def test_a_cancel_stops_a_piece_waiting_for_its_anchor_sizing(
+    start_ws: Callable[..., WsRig],
+) -> None:
+    """The anchor check waits its turn on the pre-gate worker; a `cancel` doesn't wait behind
+    it: `cancelled` comes at once, and the piece is never generated."""
+    runtime = PacedRuntime()
+    rig = start_ws(runtime)
+    busy, release = threading.Event(), threading.Event()
+
+    def block(_tokenizer: Any) -> None:
+        busy.set()
+        release.wait(10)
+
+    with rig.client() as ws:
+        read_ready(ws)
+        send(ws, "start")
+        send(ws, "end", text=SHORT_TEXT)  # piece 0: the anchor
+        collect_until(ws, "done")
+        blocker = asyncio.run_coroutine_threadsafe(
+            rig.components.cpu_tokenizer.run(block), rig.loop
+        )
+        try:
+            assert busy.wait(5)
+            send(ws, "flush", text="Hi.")  # piece 1: its sizing queues behind `block`
+            time.sleep(0.2)
+            started = time.monotonic()
+            send(ws, "cancel")
+            after = collect_until(ws, "cancelled", timeout=5)
+            waited = time.monotonic() - started
+        finally:
+            release.set()
+            blocker.result(timeout=5)
+
+    assert kinds(after) == ["cancelled"]
+    assert waited < 1.0, waited
+    assert len(runtime.calls) == 1
+
+
+def test_the_unanchored_prompt_is_skipped_when_the_anchor_leaves_the_full_cap(
+    start_ws: Callable[..., WsRig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the anchor the piece still gets its whole cap, so it can't be shorter than without
+    it, and the second prompt isn't built."""
+    measured: list[str] = []
+    real_predicted_room = ws_server.predicted_room
+
+    def counting(runtime: Any, tokenizer: Any, reference: Any, *args: Any) -> Any:
+        measured.append(type(reference).__name__)
+        return real_predicted_room(runtime, tokenizer, reference, *args)
+
+    monkeypatch.setattr(ws_server, "predicted_room", counting)
+    rig = start_ws()
+
+    with rig.client() as ws:
+        read_ready(ws)
+        send(ws, "start")
+        send(ws, "flush", text=SHORT_TEXT)  # piece 0: the anchor
+        send(ws, "end", text="Hi.")  # piece 1: plenty of room either way
+        collect_until(ws, "done")
+
+    assert measured == ["CodesRef"]
+
+
+def test_a_server_added_after_the_shutdown_returned_is_awaited(
+    start_ws: Callable[..., WsRig],
+) -> None:
+    """`registry.wait_closed()` covers a server closed by `add_server` after `shutdown()` had
+    already returned, so nothing is left pending."""
+    rig = start_ws()
+    rig.shutdown()
+    rig.add_server()
+
+    rig.run(rig.registry.wait_closed(), timeout=5)
+
+    assert rig.call(lambda: all(server.close_task.done() for server in rig.servers))
+
+
+def test_no_room_after_an_out_of_memory_fallback_is_reported_as_no_room(
+    start_ws: Callable[..., WsRig],
+) -> None:
+    """As on HTTP (`speech.prefix_fallback`): `no_room` when the codes path the fallback
+    chose has no room either; the piece is then skipped with `text_too_long`."""
+    codes_prompt = prepare_piece(
+        FakeTokenizer(),
+        SimpleNamespace(config=model_with_codec_facts().config, device="cpu"),
+        CodesRef(codes=VOICE_CODES, ref_text=VOICE_TEXT),
+        "One.",
+        DEFAULT_INSTRUCTION,
+        DEFAULT_CFG_SCALE,
+    )
+    context = int(codes_prompt["attention_mask"].shape[1])  # no room left on the codes path
+    runtime = _OutOfMemoryPrefixRuntime(config=FakeStreamingConfig(max_seq_len=context))
+    rig = start_ws(runtime)
+    _add_voice(rig)
+
+    with rig.client() as ws:
+        read_ready(ws)
+        send(ws, "start", voice_id=VOICE_ID)
+        send(ws, "end", text="One.")
+        items = collect_until(ws, "done")
+
+    assert [item["code"] for item in items if item["type"] == "error"] == ["text_too_long"]
+    [fallback] = [f for name, f in rig.events.calls if name == "speech.prefix_fallback"]
+    assert fallback["reason"] == "no_room"

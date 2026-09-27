@@ -502,6 +502,11 @@ async def serve(
     drain_interrupted = asyncio.Event()
     registry = ws_server.ConnectionRegistry()
     ws_stopping: asyncio.Future[None] | None = None
+    # Set by any signal after the first: cuts a stuck WebSocket stop short, so two Ctrl+C
+    # always end it, even when the second lands during uvicorn's graceful shutdown (before
+    # serve() waits on the stop). Separate from `drain_interrupted`, which a signal sets only
+    # once uvicorn has returned, and which makes the GPU drain hard-exit.
+    ws_stop_cut = asyncio.Event()
 
     def stop_websockets() -> asyncio.Future[None]:
         nonlocal ws_stopping
@@ -511,10 +516,13 @@ async def serve(
 
     def on_signal() -> None:
         if serving:
+            if server.should_exit:  # a second signal, uvicorn still shutting down
+                ws_stop_cut.set()
             request_exit(server)
             stop_websockets()
         else:
             drain_interrupted.set()
+            ws_stop_cut.set()
 
     restore_signals = _install_signal_handlers(asyncio.get_running_loop(), on_signal)
     try:
@@ -540,7 +548,7 @@ async def serve(
                 # The WebSocket stop is part of stopping the GPU's users, so it shares the GPU
                 # stop's handling: a cancel or failure here is a failed stop (`_conclude`), not
                 # a reason to skip deciding how serve() ends.
-                await _await_websocket_stop(stop_websockets(), drain_interrupted)
+                await _await_websocket_stop(stop_websockets(), registry, ws_stop_cut)
                 hard_exit_reason = await _stop_gpu(
                     components, server, loading, drain_interrupted, outcome
                 )
@@ -558,19 +566,29 @@ async def serve(
 
 
 async def _await_websocket_stop(
-    stopping: asyncio.Future[None], drain_interrupted: asyncio.Event
+    stopping: asyncio.Future[None], registry: ws_server.ConnectionRegistry, cut: asyncio.Event
 ) -> None:
-    """Wait for the WebSocket shutdown, or until a signal cuts it short.
+    """Wait for the WebSocket shutdown and for every server to have closed, or until a signal
+    cuts it short (`cut`).
 
     Each connection's close is bounded (ws_server), but a session's piece in flight is closed
     on the GPU thread first, and a stuck `gen.close()` holds that for up to
-    `gpu.GPU_CLOSE_TIMEOUT_SECONDS`. A signal ends the wait at once; `_stop_gpu` then sees the
-    same signal and hard-exits, since the GPU may still be busy."""
-    interrupted = asyncio.ensure_future(drain_interrupted.wait())
+    `gpu.GPU_CLOSE_TIMEOUT_SECONDS`. A signal ends the wait at once. One that came after
+    uvicorn returned also makes `_stop_gpu` hard-exit, since the GPU may still be busy; one
+    during uvicorn's own shutdown leaves the GPU drain to its own bound."""
+
+    async def stopped() -> None:
+        await asyncio.wait([stopping])  # `wait`: the shutdown's outcome is its own to report
+        # Again, for a server `add_server` closed after the shutdown had returned.
+        await registry.wait_closed()
+
+    done = asyncio.ensure_future(stopped())
+    interrupted = asyncio.ensure_future(cut.wait())
     try:
-        # `wait`, not `await`: if this task is cancelled, the shutdown itself keeps going.
-        await asyncio.wait([stopping, interrupted], return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait([done, interrupted], return_when=asyncio.FIRST_COMPLETED)
     finally:
+        # If this task is cancelled, only the waiting stops: the shutdown itself goes on.
+        done.cancel()
         interrupted.cancel()
     if stopping.done() and not stopping.cancelled():
         stopping.exception()  # retrieved: `registry.shutdown()` gathers its own failures
