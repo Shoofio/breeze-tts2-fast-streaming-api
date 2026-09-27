@@ -36,7 +36,13 @@ from starlette.requests import Request
 from breeze_infer import routes_speech, voice_file
 from breeze_infer.api import Components, create_app, load_in_background
 from breeze_infer.events import Emitter
-from breeze_infer.gpu import GpuCloseTimeout, GpuGate, GpuSession, GpuThread
+from breeze_infer.gpu import (
+    GpuCloseTimeout,
+    GpuGate,
+    GpuSession,
+    GpuThread,
+    gpu_call_under_lease,
+)
 from breeze_infer.limits import ANCHOR_CHARS
 from breeze_infer.model_loading import LoadedModel
 from breeze_infer.routes_health import Readiness
@@ -1591,7 +1597,7 @@ def test_43_3_a_request_cancelled_during_the_cache_release_leaves_the_gate_held_
     async def main() -> None:
         lease = gate.try_acquire()
         assert lease is not None
-        task = asyncio.ensure_future(routes_speech.gpu_call_under_lease(gpu, lease, slow_release))
+        task = asyncio.ensure_future(gpu_call_under_lease(gpu, lease, slow_release))
         await _until(started.is_set)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

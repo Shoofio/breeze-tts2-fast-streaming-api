@@ -459,3 +459,24 @@ class GpuSession(Generic[T]):
 
     async def __aexit__(self, *exc_info: object) -> None:
         await self.aclose()
+
+
+async def gpu_call_under_lease(gpu: GpuThread, lease: GpuLease, fn: Callable[..., T], *args: Any) -> T:
+    """`gpu.run(fn, *args)` for a holder of `lease` (the speech route, a WebSocket piece).
+    If the caller is cancelled while the call runs, the call keeps the gate
+    (`GpuLease.hand_over`) until it has really finished, as a cancelled prefix build does
+    (`VoicePrefixCache.get_or_build`); the caller's own `release()` is then a no-op."""
+    call = asyncio.ensure_future(gpu.run(fn, *args))
+    try:
+        return await asyncio.shield(call)
+    except asyncio.CancelledError:
+        if not call.done() and lease.held:
+            successor = lease.hand_over()
+
+            def finished(done: asyncio.Future[Any]) -> None:
+                successor.release()
+                if not done.cancelled():
+                    done.exception()  # retrieved: nobody is left to receive it
+
+            call.add_done_callback(finished)
+        raise

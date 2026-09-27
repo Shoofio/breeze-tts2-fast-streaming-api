@@ -36,28 +36,34 @@ import struct
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, TypeVar
 
+import numpy as np
 import pytest
+import torch
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import ClientConnection, connect
 
-from breeze_infer import __version__, ws_server
+from breeze_infer import __version__, gpu, ws_server
 from breeze_infer.api import Components, bind_http_sockets
-from breeze_infer.gpu import GpuGate, GpuLease, GpuThread
+from breeze_infer.gpu import GpuGate, GpuLease, GpuThread, GpuUnavailable
 from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_speech import CpuTokenizer
 from breeze_infer.settings import settings_from_args
+from breeze_infer.templates import prepare_prefix_inputs
 
 # FakeRuntime imports this lazily on its first step, i.e. on the GPU thread mid-piece; on a slow
 # mount that takes long enough to blow the timing bounds below.
 from models import fast_streaming  # noqa: F401
 from tests.fakes import (
+    CODEC_CODEBOOK_SIZE,
+    CODEC_CODEBOOKS,
     FakeStreamingConfig,
     FakeTokenizer,
     RecordingEvents,
+    model_with_codec_facts,
     open_no_voices,
 )
 from tests.ws_helpers import (
@@ -145,12 +151,13 @@ class WsRig:
         self.sockets.append(sock)
         if self.sndbuf is not None:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.sndbuf)
+        port = sock.getsockname()[1]  # read first: a server started after a shutdown is closed
         self.servers.append(
             self.run(
                 ws_server.serve(self.components.settings, self.components, sock, self.registry)
             )
         )
-        return sock.getsockname()[1]
+        return port
 
     def run(self, coro: Any, timeout: float = 10.0) -> Any:
         return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
@@ -229,10 +236,13 @@ def start_ws() -> Iterator[Callable[..., WsRig]]:
         argv: Sequence[str] = (),
         ready: bool = True,
         sndbuf: int | None = None,
+        readiness: Readiness | None = None,
     ) -> WsRig:
         runtime = PacedRuntime() if runtime is None else runtime
         events = RecordingEvents()
         components = build_components(argv, events)
+        if readiness is not None:
+            components = replace(components, readiness=readiness)
         if ready:
             components.readiness.mark_ready(runtime)
         rig = WsRig(components, runtime, events, sndbuf)
@@ -1084,3 +1094,232 @@ def test_a_disconnect_ends_the_session_quietly(
     assert runtime.ended == len(runtime.calls) == 1
     assert rig.gate_is_free()
     assert [r for r in caplog.records if r.levelname in ("ERROR", "CRITICAL")] == []
+
+
+# --- review 48 ---------------------------------------------------------------------------------
+
+
+def test_a_server_added_after_the_shutdown_began_is_closed_at_once(
+    start_ws: Callable[..., WsRig],
+) -> None:
+    """T078 starts one server per address; a signal can start the shutdown between two of
+    them. The late server must not be left listening."""
+    rig = start_ws()
+    rig.shutdown()
+
+    late_port = rig.add_server()
+
+    def refused() -> bool:
+        try:
+            socket.create_connection(("127.0.0.1", late_port), timeout=2).close()
+        except ConnectionRefusedError:
+            return True
+        return False
+
+    # The library closes a server from a task, a loop step after `serve()` has returned.
+    wait_until(refused, what="the late server stops listening")
+    assert rig.sockets[-1].fileno() == -1
+
+
+def test_a_close_timeout_leaves_the_lease_to_the_generation(
+    start_ws: Callable[..., WsRig],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A `gen.close()` past `GPU_CLOSE_TIMEOUT_SECONDS` poisons the gate, and the lease is
+    released only when the close really ends (the session's own done-callback), as on HTTP:
+    releasing it earlier would free the GPU while it is still busy, then release twice."""
+    monkeypatch.setattr(gpu, "GPU_CLOSE_TIMEOUT_SECONDS", 0.3)
+    runtime = PacedRuntime(chunks=50, delay=0.02, close_delay=1.0)
+    rig = start_ws(runtime)
+
+    with rig.client() as ws:
+        read_ready(ws)
+        send(ws, "start")
+        send(ws, "flush", text=SHORT_TEXT)
+        collect_until(ws, "speaking")
+        send(ws, "cancel")  # stops the piece; its close then takes 1 s
+        items = collect_until(ws, "cancelled", timeout=10)
+
+    assert "error" in kinds(items)  # the piece failed: its close timed out
+    time.sleep(1.5)  # the close has finished, and its done-callback has run
+    with pytest.raises(GpuUnavailable):
+        rig.call(rig.components.gate.try_acquire)
+    assert [r.getMessage() for r in caplog.records if r.levelname == "ERROR"] == []
+
+
+def test_a_cancel_stops_a_piece_waiting_for_the_gate(start_ws: Callable[..., WsRig]) -> None:
+    """A piece queued behind another holder of the GPU stops waiting as soon as it is
+    cancelled: `cancelled` comes at once, no `queued` follows it, and the gate is never
+    taken."""
+    runtime = PacedRuntime()
+    rig = start_ws(runtime)
+    lease = rig.hold_gate()  # as an HTTP request would
+
+    with rig.client() as ws:
+        read_ready(ws)
+        send(ws, "start")
+        send(ws, "flush", text=SHORT_TEXT)
+        collect_until(ws, "queued")
+        started = time.monotonic()
+        send(ws, "cancel")
+        after = collect_until(ws, "cancelled", timeout=5)
+        waited = time.monotonic() - started
+        with pytest.raises(TimeoutError):
+            ws.recv(timeout=0.3)
+
+    assert kinds(after) == ["cancelled"]
+    assert waited < 1.0, waited
+    assert rig.call(lambda: lease.held)  # still ours: the piece never took it
+    assert runtime.calls == []
+
+
+class _OutOfMemoryPrefixRuntime(PacedRuntime):
+    def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> Any:
+        self.prefix_builds.append(prefix_inputs)
+        raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB (fake)")
+
+
+VOICE_ID = "v_0123456789abcdef"
+VOICE_TEXT = "stored transcript"
+VOICE_CODES = (np.arange(8 * CODEC_CODEBOOKS, dtype=np.int16) % CODEC_CODEBOOK_SIZE).reshape(
+    8, CODEC_CODEBOOKS
+)
+
+
+def _add_voice(rig: WsRig) -> None:
+    prefix_inputs = prepare_prefix_inputs(
+        FakeTokenizer(),
+        model_with_codec_facts(),
+        {"ref_text": VOICE_TEXT, "ref_audio_codes": VOICE_CODES},
+    )
+    rig.components.voices.get().registry.register_unnamed(
+        id=VOICE_ID,
+        ref_text=VOICE_TEXT,
+        codes=VOICE_CODES,
+        frames=8,
+        encode_ms=1,
+        prefix_len=int(prefix_inputs["attention_mask"].shape[1]),
+    )
+
+
+def test_an_out_of_memory_prefix_build_falls_back_to_codes_for_the_rest_of_the_session(
+    start_ws: Callable[..., WsRig],
+) -> None:
+    """As on HTTP: the voice's codes path, with `speech.prefix_fallback`. Remembered for the
+    session, so each later piece doesn't retry a build that just ran out of memory."""
+    runtime = _OutOfMemoryPrefixRuntime()
+    rig = start_ws(runtime)
+    _add_voice(rig)
+
+    with rig.client() as ws:
+        read_ready(ws)
+        send(ws, "start", voice_id=VOICE_ID)
+        send(ws, "flush", text="One.")
+        send(ws, "end", text="Two.")
+        items = collect_until(ws, "done")
+
+    assert kinds(items) == ["started", "speaking", "audio", "speaking", "audio", "done"]
+    assert len(runtime.prefix_builds) == 1
+    assert [call["prefix"] for call in runtime.calls] == [None, None]
+    [connected] = [f for name, f in rig.events.calls if name == "ws.connected"]
+    [fallback] = [f for name, f in rig.events.calls if name == "speech.prefix_fallback"]
+    assert fallback["level"] == "warning"
+    assert fallback["request_id"] == connected["session_id"]
+    assert fallback["voice_id"] == VOICE_ID
+    assert fallback["reason"] == "out_of_memory"
+    assert "CUDA out of memory" in fallback["error"]
+
+
+class _PoisonedAfterHandshake(Readiness):
+    """Ready for the handshake's checks, then gone: the gate was poisoned in between."""
+
+    def __init__(self, runtime: Any) -> None:
+        super().__init__()
+        self.mark_ready(runtime)
+        self.reads = 0
+
+    @property
+    def runtime(self) -> Any:
+        self.reads += 1
+        return super().runtime if self.reads == 1 else None
+
+
+def test_a_gpu_that_stops_responding_during_the_handshake_closes_1011(
+    start_ws: Callable[..., WsRig],
+) -> None:
+    """No `ready` without a runtime: the session closes at once with 1011 `gpu is not
+    responding` (the handshake's `503 gpu_unavailable` is already too late to send)."""
+    runtime = PacedRuntime()
+    rig = start_ws(runtime, ready=False, readiness=_PoisonedAfterHandshake(runtime))
+    client = rig.raw()
+
+    assert client.handshake().status == 101
+    frames, close = client.read_until_close()
+
+    assert frames == []  # no `ready`
+    assert close is not None
+    assert (close.close_code, close.close_reason) == (1011, "gpu is not responding")
+
+
+def test_anchor_sizing_queues_on_the_pre_gate_worker(start_ws: Callable[..., WsRig]) -> None:
+    """The per-piece anchor check runs before the gate, on the pre-gate worker HTTP's piece-0
+    checks use, and waits its turn there (no timeout): with that worker busy, the next piece
+    waits, then is spoken with its anchor."""
+    runtime = PacedRuntime()
+    rig = start_ws(runtime)
+    busy, release = threading.Event(), threading.Event()
+
+    def block(_tokenizer: Any) -> None:
+        busy.set()
+        release.wait(10)
+
+    with rig.client() as ws:
+        read_ready(ws)
+        send(ws, "start")
+        send(ws, "flush", text=SHORT_TEXT)  # piece 0: the anchor, which needs no sizing
+        collect_until(ws, "speaking")
+        blocker = asyncio.run_coroutine_threadsafe(
+            rig.components.cpu_tokenizer.run(block), rig.loop
+        )
+        assert busy.wait(5)
+        send(ws, "end", text="Hi.")  # piece 1: its sizing queues behind `block`
+        waiting: list[Any] = []  # whatever arrives while the worker is blocked
+        with pytest.raises(TimeoutError):
+            while True:
+                item = ws.recv(timeout=0.5)
+                waiting.append(item if isinstance(item, bytes) else json.loads(item))
+        release.set()
+        blocker.result(timeout=5)
+        after = collect_until(ws, "done")
+
+    assert "speaking" not in kinds(waiting)  # piece 1 waited for the worker
+    assert kinds(after) == ["speaking", "audio", "done"]
+    assert anchor_skips(rig) == []
+    assert prompt_lengths(runtime) == [62, 100]
+
+
+@pytest.mark.parametrize(
+    ("request_kwargs", "status", "code"),
+    [
+        ({"upgrade": False}, 426, "upgrade_required"),
+        ({"version": "8"}, 400, "bad_handshake"),
+    ],
+    ids=["plain GET", "unsupported version"],
+)
+def test_a_malformed_handshake_is_refused_before_readiness_and_the_cap(
+    start_ws: Callable[..., WsRig],
+    monkeypatch: pytest.MonkeyPatch,
+    request_kwargs: dict[str, Any],
+    status: int,
+    code: str,
+) -> None:
+    """A request that isn't a WebSocket upgrade is told so (426/400) even while the model
+    loads or every slot is taken, never `503`, and it never takes a slot."""
+    monkeypatch.setattr(ws_server, "WS_MAX_CONNECTIONS", 1)
+    rig = start_ws(ready=False)
+    assert_json_refusal(rig.raw().handshake(**request_kwargs), status, code)  # while loading
+
+    rig.call(lambda: rig.components.readiness.mark_ready(rig.runtime))
+    rig.raw().open()  # the only slot
+    assert_json_refusal(rig.raw().handshake(**request_kwargs), status, code)  # at the cap

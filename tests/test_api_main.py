@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 import uvicorn
 
-from breeze_infer import __version__, api
+from breeze_infer import __version__, api, ws_server
 from breeze_infer.api import (
     Components,
     ServeOutcome,
@@ -1499,3 +1499,125 @@ def test_off_the_main_thread_no_handlers_are_installed() -> None:
 
     assert results == [None]
     assert signal.getsignal(signal.SIGTERM) is before
+
+
+# --- the WebSocket stop in serve() (review 48 #1, #2) -------------------------------------
+
+
+async def _stuck_websocket_shutdown(self: ws_server.ConnectionRegistry) -> None:
+    """A WebSocket shutdown that never finishes, as one held by a hung `gen.close()` would."""
+    self.shutting_down = True
+    await asyncio.Event().wait()
+
+
+@posix_only
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_second_signal_cuts_a_stuck_websocket_stop_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ws_server.ConnectionRegistry, "shutdown", _stuck_websocket_shutdown)
+    sink = io.StringIO()
+    components = _components(sink)
+
+    async def scenario() -> tuple[ServeOutcome, float]:
+        serving, _port = _serving(components, _loaded)
+        await _wait_until(lambda: components.readiness.runtime is not None)
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(1.0)  # uvicorn has returned; serve() waits for the WebSocket stop
+        signalled_at = time.monotonic()
+        os.kill(os.getpid(), signal.SIGTERM)
+        outcome = await asyncio.wait_for(serving, 10)
+        return outcome, time.monotonic() - signalled_at
+
+    try:
+        outcome, after_signal = asyncio.run(scenario())
+    finally:
+        components.gpu.shutdown()
+
+    assert outcome.hard_exit
+    assert after_signal < 1.0
+    stopping = _events(sink)[-1]
+    assert (stopping["event"], stopping["reason"]) == ("server.stopping", "signal during drain")
+
+
+@posix_only
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_cancel_during_the_websocket_stop_still_concludes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CancelledError is not an Exception: it must not skip deciding how serve() ends."""
+    monkeypatch.setattr(ws_server.ConnectionRegistry, "shutdown", _stuck_websocket_shutdown)
+    sink = io.StringIO()
+    components = _components(sink)
+    outcome = ServeOutcome()
+
+    async def scenario() -> None:
+        sock = _bind_one("127.0.0.1", 0)
+        serving = asyncio.create_task(
+            _serve(components, create_app(components), [sock], _loaded, outcome)
+        )
+        await _wait_until(lambda: components.readiness.runtime is not None)
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(1.0)  # serve() now waits for the WebSocket stop
+        serving.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(serving, 10)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        components.gpu.shutdown()
+
+    assert outcome.hard_exit
+    stopping = _events(sink)[-1]
+    assert (stopping["event"], stopping["reason"]) == ("server.stopping", "gpu stop cancelled")
+
+
+@posix_only
+@pytest.mark.usefixtures("keep_sigint")
+def test_a_signal_while_the_websocket_servers_start_closes_them_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One `ws_server.serve()` per address: a signal that lands between two of them must not
+    leave the later ones listening."""
+    real_serve = ws_server.serve
+    calls = 0
+
+    async def signal_during_the_first(*args: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            os.kill(os.getpid(), signal.SIGTERM)
+            await asyncio.sleep(0.1)  # the handler runs: the shutdown starts
+        return await real_serve(*args)
+
+    monkeypatch.setattr(ws_server, "serve", signal_during_the_first)
+    sink = io.StringIO()
+    components = _components(sink)
+    ws_sockets = [_bind_one("127.0.0.1", 0), _bind_one("127.0.0.1", 0)]
+
+    async def scenario() -> list[bool]:
+        http_sock = _bind_one("127.0.0.1", 0)
+        # The load may still be running when the signal lands (a hard exit): only the sockets
+        # matter here.
+        await asyncio.wait_for(
+            serve(
+                components,
+                create_app(components),
+                [http_sock],
+                _loaded,
+                ServeOutcome(),
+                ws_sockets=ws_sockets,
+            ),
+            15,
+        )
+        return [sock.fileno() == -1 for sock in ws_sockets]
+
+    try:
+        closed = asyncio.run(scenario())
+    finally:
+        for sock in ws_sockets:
+            sock.close()
+        components.gpu.shutdown()
+
+    assert closed == [True, True]

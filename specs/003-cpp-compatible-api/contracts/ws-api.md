@@ -19,8 +19,15 @@ breaking change `BC-nn` or an additive change is marked.
 - `503 too_many_connections` above 16 connections.
 - `503 shutting_down` once the server has started shutting down.
 - A request that isn't a valid WebSocket upgrade gets the same envelope: `426 upgrade_required`
-  (no `Upgrade` header) or `400 bad_handshake` (for example a bad `Sec-WebSocket-Key`), and an
-  unexpected handshake failure `500 internal_error`.
+  (no `Upgrade: websocket` or no `Connection: upgrade`; the response names `Upgrade: websocket`)
+  or `400 bad_handshake` (no `Sec-WebSocket-Key`, a `Sec-WebSocket-Version` other than 13, which
+  the response names, or for example a malformed key), and an unexpected handshake failure
+  `500 internal_error`.
+- The checks run in this order, and the first that fails answers: `shutting_down`, then the
+  upgrade headers (`upgrade_required`, `bad_handshake`), then `origin_not_allowed`, then
+  `gpu_unavailable`, then `loading`, then `too_many_connections`. So a malformed request is told
+  what is wrong even while the model loads or every slot is taken, and only a request that
+  passes every check takes a connection slot.
 - The handshake must complete within 10 s.
 
 **Frames**

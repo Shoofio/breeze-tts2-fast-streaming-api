@@ -184,7 +184,11 @@ def bind_ws_sockets(settings: Settings, events: Emitter) -> list[socket.socket]:
     the HTTP ones are (`bind_http_sockets`), on `settings.ws_port` (BC-30: the configured host
     only, never a wildcard). Empty when the WebSocket is disabled, or when the bind fails: that
     is reported (`ws.bind_failed`) and the HTTP server carries on without it, with `/health`
-    saying `ws_port: 0` (BC-24)."""
+    saying `ws_port: 0` (BC-24).
+
+    `bind_http_sockets` also sets `TCP_USER_TIMEOUT`, which accepted sockets inherit: the
+    kernel backstop for a WebSocket peer that stops acknowledging altogether (Linux only). The
+    WebSocket server doesn't set it again."""
     if settings.ws_port is None:
         return []
     try:
@@ -530,12 +534,13 @@ async def serve(
             raise
         finally:
             serving = False
-            # Bounded: every close in it is (ws_server), so a stalled client can't hold it.
-            with contextlib.suppress(Exception):
-                await asyncio.shield(stop_websockets())
             hard_exit_reason: str | None = None
             stop_error: BaseException | None = None
             try:
+                # The WebSocket stop is part of stopping the GPU's users, so it shares the GPU
+                # stop's handling: a cancel or failure here is a failed stop (`_conclude`), not
+                # a reason to skip deciding how serve() ends.
+                await _await_websocket_stop(stop_websockets(), drain_interrupted)
                 hard_exit_reason = await _stop_gpu(
                     components, server, loading, drain_interrupted, outcome
                 )
@@ -550,6 +555,25 @@ async def serve(
         restore_signals()
         if outcome.hard_exit:
             _ignore_sigint()
+
+
+async def _await_websocket_stop(
+    stopping: asyncio.Future[None], drain_interrupted: asyncio.Event
+) -> None:
+    """Wait for the WebSocket shutdown, or until a signal cuts it short.
+
+    Each connection's close is bounded (ws_server), but a session's piece in flight is closed
+    on the GPU thread first, and a stuck `gen.close()` holds that for up to
+    `gpu.GPU_CLOSE_TIMEOUT_SECONDS`. A signal ends the wait at once; `_stop_gpu` then sees the
+    same signal and hard-exits, since the GPU may still be busy."""
+    interrupted = asyncio.ensure_future(drain_interrupted.wait())
+    try:
+        # `wait`, not `await`: if this task is cancelled, the shutdown itself keeps going.
+        await asyncio.wait([stopping, interrupted], return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        interrupted.cancel()
+    if stopping.done() and not stopping.cancelled():
+        stopping.exception()  # retrieved: `registry.shutdown()` gathers its own failures
 
 
 def _crash_exit_code(crash: BaseException) -> int:

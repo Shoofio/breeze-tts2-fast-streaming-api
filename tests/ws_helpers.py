@@ -61,6 +61,7 @@ class PacedRuntime(FakeRuntime):
     (`tokenizer`, `model`, `audio_tokenizer`), plus three things these tests need:
 
     - `delay`: seconds slept before each chunk, so a piece takes a known time on the GPU thread;
+    - `close_delay`: seconds a generation's close takes on the GPU thread (a stuck close);
     - `fail_first_call_after`: the first call raises after that many chunks (a mid-piece CUDA
       error once, then healthy calls);
     - `yielded`, `yielded_per_call` and `ended`: chunks yielded in all and per call, and
@@ -75,6 +76,7 @@ class PacedRuntime(FakeRuntime):
         self,
         *,
         delay: float = 0.0,
+        close_delay: float = 0.0,
         fail_first_call_after: int | None = None,
         **kwargs: Any,
     ) -> None:
@@ -85,6 +87,7 @@ class PacedRuntime(FakeRuntime):
         kwargs.setdefault("frames", [torch.full((CODEC_CODEBOOKS,), 5) for _ in range(frames)])
         super().__init__(**kwargs)
         self.delay = delay
+        self.close_delay = close_delay
         self.fail_first_call_after = fail_first_call_after
         self.yielded = 0
         self.yielded_per_call: list[int] = []
@@ -114,6 +117,8 @@ class PacedRuntime(FakeRuntime):
                 yield chunk
         finally:
             inner.close()  # type: ignore[attr-defined]
+            if self.close_delay:
+                time.sleep(self.close_delay)
             self.ended += 1
 
 
