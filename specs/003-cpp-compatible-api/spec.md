@@ -203,7 +203,7 @@ allowed origin, a disallowed origin and no origin, for every route and the WebSo
 
 1. **Given** CORS is enabled with `*`, **When** any origin calls an API route, **Then** it gets
    `Access-Control-Allow-Origin: *` and
-   `Access-Control-Expose-Headers: X-Sample-Rate, X-Sample-Format`.
+   `Access-Control-Expose-Headers: X-Sample-Rate, X-Sample-Format, X-Breeze-Version`.
 2. **Given** CORS is enabled with an allowlist, **When** an allowed origin calls, **Then** its
    origin is echoed back with `Vary: Origin`. Every response in allowlist mode carries
    `Vary: Origin`.

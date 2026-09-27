@@ -929,7 +929,7 @@ on the new server.
 - [ ] T082 Final benchmark (SC-007): `bench_api --api new` (`--warmup 3 --runs 10`), compared with the
   T002 baseline as described in "SC-007 method" below.
   Record it in `research/bench-final.md`. A regression over 10% blocks sign-off.
-- [ ] T083 [P] Rewrite `README.md`'s API section (SC-008, FR-038):
+- [X] T083 [P] Rewrite `README.md`'s API section (SC-008, FR-038):
   - every endpoint, field, range, default and error code, from the contracts;
   - every launch option;
   - the WebSocket messages and close codes;
