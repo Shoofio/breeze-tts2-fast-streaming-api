@@ -80,6 +80,41 @@ exposes a C++-server-compatible HTTP and WebSocket API; see the README and
 - **New voice and speech errors**: `400 voice_too_long` when a voice's reference plus transcript
   wouldn't leave the model room to speak, and `503 gpu_out_of_memory` when a voice's prompt can't
   be built for lack of GPU memory and the fallback doesn't fit either.
+- **BC-30**: The WebSocket binds only the configured host (every address it resolves to), never
+  `0.0.0.0`.
+- **BC-31**: A WebSocket handshake from a disallowed browser `Origin` is `403`; with CORS off, no
+  browser origin is allowed. Clients that send no `Origin` are unaffected.
+- **BC-32**: WebSocket messages are parsed as real JSON: `\uXXXX` escapes work, and invalid JSON,
+  unknown types and wrong or out-of-range fields get an `error` event (`invalid_json`,
+  `unknown_type`, `invalid_field`) with `request_type`, using the same ranges as HTTP.
+- **BC-33**: `ready.sample_rate` is the loaded model's rate.
+- **BC-34**: Every `end` gets exactly one `done`, even when nothing was left to speak.
+- **BC-35**: Every `cancel` gets exactly one `cancelled`, even when idle, and never swallows a later
+  piece. A cancel replaces only its own session's pending `done`.
+- **BC-36**: A `start` while a piece is queued or speaking cancels it (`cancelled`), then sends
+  `started`.
+- **BC-37**: A blank `instruction` message resets to the default instruction.
+- **BC-38**: `split_chars: 0` means no length splitting (as on HTTP); a negative value is an error.
+- **BC-39**: WebSocket text is cut by the same segmenter as HTTP: punctuation at the very end of
+  the buffer waits for more text, CJK without punctuation still drains, and the 200-character
+  opening budget applies to the first piece only.
+- **BC-40**: Buffered text over 10,000 characters is `text_too_long` and is not appended.
+- **BC-41**: A failed piece is an `error` event (`generation_failed`); the session and the server
+  keep running.
+- **BC-42**: A client that stops reading is disconnected (`1008 client too slow`) once 2 MiB of
+  output is waiting or nothing drains for 30 s, and the piece in flight is cancelled so the GPU is
+  freed; a client that doesn't read the close frame within 2 s is dropped. At most 16
+  connections, and the handshake must complete within 10 s.
+- **BC-43**: The WebSocket follows RFC 6455: a client close is echoed (1000), and protocol errors
+  close with 1002, bad UTF-8 with 1007 and oversized messages (over 1 MiB) with 1009.
+- **BC-44**: `speaking.text` is the exact piece text, tabs and carriage returns included.
+- **BC-45**: A binary frame from the client gets an `unsupported_binary` error.
+- **New WebSocket behaviour**: handshake refusals carry the JSON envelope and `X-Breeze-Version`
+  (`503 loading`, `503 gpu_unavailable`, `503 too_many_connections`, `503 shutting_down`,
+  `426 upgrade_required`, `400 bad_handshake`); server shutdown closes sessions with 1001. Without a
+  voice, the first piece anchors the later ones, unless the anchor would shorten a given piece,
+  which is then spoken without it; a piece that doesn't fit the context gets `text_too_long` and
+  the session continues.
 
 ### Fixed
 
