@@ -1591,7 +1591,7 @@ def test_43_3_a_request_cancelled_during_the_cache_release_leaves_the_gate_held_
     async def main() -> None:
         lease = gate.try_acquire()
         assert lease is not None
-        task = asyncio.ensure_future(routes_speech._gpu_call_under_lease(gpu, lease, slow_release))
+        task = asyncio.ensure_future(routes_speech.gpu_call_under_lease(gpu, lease, slow_release))
         await _until(started.is_set)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

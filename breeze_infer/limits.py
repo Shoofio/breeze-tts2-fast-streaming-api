@@ -58,6 +58,21 @@ WS_MAX_CONNECTIONS = 16
 WS_HANDSHAKE_SECONDS = 10
 WS_OUTBOX_BYTES = 2 * _MIB
 
+# A WebSocket client whose socket has stopped draining: the connection's write buffer non-empty
+# and not shrinking for this long evicts it with 1008 (ws_server's stall watchdog). The outbox
+# limit alone can't catch every such client: one stalled with less than WS_OUTBOX_BYTES pending
+# never overflows it, and on an idle session the library's automatic pongs fill the buffer while
+# its keepalive ping waits in drain() with its own timeout never started (research/
+# ws-prototype.md "Decision"). The same 30 s as HTTP_SEND_TIMEOUT_SECONDS.
+WS_SEND_TIMEOUT_SECONDS = 30
+
+# The bound on every server-initiated WebSocket close, and the library's close_timeout. The
+# library's own timeout only starts once the close frame has been written into the socket, which
+# never happens for a peer that stopped reading, so ws_server bounds each close itself and then
+# aborts the connection (T070; research/ws-prototype.md check 1). A client that reads again within
+# it gets the close code; one that doesn't sees 1006.
+WS_CLOSE_TIMEOUT_SECONDS = 2
+
 HTTP_SEND_TIMEOUT_SECONDS = 30
 
 # Minimum delivery rate for a streamed speech response (research.md R3). The send timeout only

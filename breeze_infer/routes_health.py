@@ -49,6 +49,12 @@ class Readiness:
         """The loaded runtime; None while loading and once unhealthy."""
         return None if self._unhealthy else self._runtime
 
+    @property
+    def unhealthy(self) -> bool:
+        """Whether the GPU stopped responding (`mark_unhealthy`): the WebSocket handshake
+        answers `503 gpu_unavailable` then, as `require_ready` does for HTTP."""
+        return self._unhealthy
+
     def mark_ready(self, runtime: Any) -> None:
         self._runtime = runtime
 

@@ -805,7 +805,7 @@ rules.
   - **SC-005**: 1,000 seeded random sequences of `text`, `flush`, `cancel`, `end`, `start` and
     `instruction`, asserting exactly one `done` per un-superseded `end`, exactly one `cancelled`
     per `cancel`, and no lost uncancelled piece.
-- [ ] T073 [P] [US4] Create `tests/test_ws_server.py` (a real server on ephemeral ports,
+- [X] T073 [P] [US4] Create `tests/test_ws_server.py` (a real server on ephemeral ports,
   `FakeRuntime`, the `websockets` client, and raw sockets for protocol probes):
   - `ready` first, with `sample_rate` from the runtime (`test_bc_33_*`);
   - every handshake response, accepted or refused, carries `X-Breeze-Version` (FR-037a);
@@ -849,7 +849,7 @@ rules.
   data-model.md "WebSocket Session" and R15. `apply(message) -> list[immediate events]`, plus the
   work-deque operations the worker consumes (`next_item`, `mark_piece_done(anchor)`,
   `is_stale(piece)`). No I/O, no GPU, no locks.
-- [ ] T077 [US4] *(Opus)* Create `breeze_infer/ws_server.py`:
+- [X] T077 [US4] *(Opus)* Create `breeze_infer/ws_server.py`:
   - `serve(settings, components, sock, registry)` using `websockets.asyncio.server.serve`, with
     `process_request` handling the Origin check via `cors.origin_allowed`, loading, shutdown and
     the connection cap, and a `process_response` hook that adds `X-Breeze-Version` to every

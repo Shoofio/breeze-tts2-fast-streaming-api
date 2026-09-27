@@ -444,7 +444,7 @@ async def _fall_back_to_codes(
     and on the codes path can still find no room after the `200` (data-model.md "Reference").
     """
     lookup.prefix_cache.evict_all(reason="oom", request_id=request_id)
-    await _gpu_call_under_lease(components.gpu, lease, release_cached_gpu_memory)
+    await gpu_call_under_lease(components.gpu, lease, release_cached_gpu_memory)
     codes_path = shape.codes_path()
     room = await components.cpu_tokenizer.run(
         _measure_first_piece, runtime, request, first_text, codes_path
@@ -463,7 +463,7 @@ async def _fall_back_to_codes(
     return codes_path, {"reference": "voice_codes"}
 
 
-async def _gpu_call_under_lease(gpu: GpuThread, lease: Any, fn: Callable[..., _T], *args: Any) -> _T:
+async def gpu_call_under_lease(gpu: GpuThread, lease: Any, fn: Callable[..., _T], *args: Any) -> _T:
     """`gpu.run(fn, *args)` from a step with no `gpu_task` slot in `_serve_speech`'s cleanup.
     If this request is cancelled while the call runs, the call keeps the gate
     (`GpuLease.hand_over`) until it has really finished, as a cancelled prefix build does
