@@ -73,8 +73,16 @@ hand, which the allowlist launch let in (confirmed by the user; `sillytavern-age
   concurrent sessions (one `queued`), streaming chunks, the trailing-comma drain, and instruction
   plus `cfg_scale`. The HTTP checks cover health, the voice list, unnamed uploads, the upload
   errors and deleting an unknown voice.
-- `sillytavern-agent` was asked to stay off the server during the gate. It is told that 2.0.0 is
-  live once the rollback rehearsal (T085) is done and 2.0.0 is running again.
+- `sillytavern-agent` was asked to stay off the server during the gate. After the rollback
+  rehearsal (T085), 2.0.0 was started as the live server on Windows (`start_breeze.ps1 -Cors
+  http://127.0.0.1:8000`, `/health` ok, `X-Breeze-Version: 2.0.0`), and `sillytavern-agent` was
+  told that 2.0.0 is live.
+
+## Merge
+
+With the user's confirmation, `main` was fast-forwarded to `enhanced-api` (no merge commit;
+`main` had no commits of its own) and tagged `v2.0.0`. This ends plan.md's Principle IX
+deviation: later work integrates to `main`. Nothing was pushed.
 
 ### Windows smoke check
 

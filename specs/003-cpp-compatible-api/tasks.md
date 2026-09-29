@@ -942,7 +942,7 @@ on the new server.
   happens before the final live gate (standing rule 8).
 - [X] T085 Rehearse rollback as in quickstart "Rollback": time it (it must take under 5 minutes),
   and record it in `research/live-phase5.md`.
-- [ ] T086 **Final live gate (full)**:
+- [X] T086 **Final live gate (full)**:
   - run `node tests/live/sillytavern/run.mjs full`, the extension's `npm run test:live`, and
     `python -m tests.live.cpp_examples`;
   - run the full `pytest` suite, the `pytest -m gpu` suite and `ruff`;
