@@ -926,7 +926,7 @@ on the new server.
   `specs/003-cpp-compatible-api/spec.md`, collect the test names under `tests/`, and assert that
   every BC-01 to BC-48 has at least one `test_bc_NN_*` whose docstring states the C++ behavior it
   rejects. Fill any gaps it reveals.
-- [ ] T082 Final benchmark (SC-007): `bench_api --api new` (`--warmup 3 --runs 10`), compared with the
+- [X] T082 Final benchmark (SC-007): `bench_api --api new` (`--warmup 3 --runs 10`), compared with the
   T002 baseline as described in "SC-007 method" below.
   Record it in `research/bench-final.md`. A regression over 10% blocks sign-off.
 - [X] T083 [P] Rewrite `README.md`'s API section (SC-008, FR-038):
