@@ -90,6 +90,34 @@ Run natively on Windows (`.venv-win`, the production launcher), with requests fr
 WSL reaches the Windows server on `127.0.0.1`, so the C++ examples were run against it too (the
 table above). The Windows CPU `pytest` suite was not run in this gate.
 
+## T085: rollback rehearsal (2026-09-29)
+
+Rehearsed as in quickstart "Rollback", taking the C++ route (the one SillyTavern keeps working
+on). The repo has no tags, so the "previous tag" route has no target yet; tagging `v2.0.0` at
+release gives future rollbacks one.
+
+- **Start state**: 2.0.0 serving on WSL (`scripts/start_breeze.sh --cors http://127.0.0.1:8000`,
+  warm, `/health` ok).
+- **Steps, all from one timed script**:
+  1. SIGTERM to the 2.0.0 server, then wait for ports 8080/8081 to be free.
+  2. Start the C++ server with `<Breeze-TTS-2.cpp checkout>/start_breeze.sh` (`breeze-server`
+     at `edb927c`, `breeze-tts-2-q4_k.gguf`, `--cors --host 0.0.0.0 --port 8080`, its own
+     `voices/` directory).
+  3. Poll `/health` until `ok`. The answer carried no `X-Breeze-Version`, so it came from the C++
+     server.
+  4. `node tests/live/sillytavern/run.mjs health --record rollback-cpp`: 7 of 7 passed
+     (`research/live-rollback-cpp.md`). The provider loaded, `breeze.health` and
+     `voices.refreshed` were logged, and there were no error toasts or CORS errors.
+- **Timeline (EDT)**: SIGTERM at 11:25:00; C++ launched at 11:25:03; SillyTavern checking against
+  it at 11:25:18.1; all checks passed at 11:25:18.75.
+- **Result: rollback takes about 19 s**, well under the 5-minute limit, with no code change. The
+  seconds are taken from the logs, because the script's own interval arithmetic failed
+  (`bc: command not found`).
+- **Voices**: neither server's voice files were touched. This server's `voices/` (`eric`,
+  `vale`) and the C++ server's `.breeze` files are separate directories.
+- **Not covered**: narration on the C++ server; Phase 0 (T011, `live-phase0.md`) already ran it.
+  The C++ server was stopped with SIGTERM afterwards.
+
 ## Review loop outcomes (Phase 9)
 
 - **T080/T081 (`9af5679`, `fd89358`), review pass 1 (Opus)** found the following, fixed in

@@ -940,7 +940,7 @@ on the new server.
 - [X] T084 Set `breeze_infer/__init__.py` to `__version__ = "2.0.0"`, and finalize `CHANGELOG.md`
   2.0.0 with the date, the full BC list, Known Differences and "old Python API removed". This
   happens before the final live gate (standing rule 8).
-- [ ] T085 Rehearse rollback as in quickstart "Rollback": time it (it must take under 5 minutes),
+- [X] T085 Rehearse rollback as in quickstart "Rollback": time it (it must take under 5 minutes),
   and record it in `research/live-phase5.md`.
 - [ ] T086 **Final live gate (full)**:
   - run `node tests/live/sillytavern/run.mjs full`, the extension's `npm run test:live`, and
