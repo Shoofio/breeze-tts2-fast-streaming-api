@@ -654,6 +654,9 @@ def test_voice_routes_answer_503_loading_before_the_scan_has_finished(tmp_path: 
 def test_bc_28_delete_removes_the_file_and_it_stays_gone_after_restart(
     start: Any, tmp_path: Path
 ) -> None:
+    """BC-28: `DELETE` removes the voice file and `file_kept` is always `false` -- the
+    C++ server kept the file (`file_kept: true`), so the voice came back on restart.
+    """
     voices_dir = tmp_path / "voices"
     server = start(voices_dir)
     assert server.post(audio=_wav(), name="alice").status_code == 200

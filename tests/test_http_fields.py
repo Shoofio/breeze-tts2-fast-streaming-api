@@ -887,12 +887,6 @@ def test_multipart_form_is_closed_after_reading(
 # expected to fail (mostly by getting 200 or the wrong error) until T048 lands.
 
 
-# BC-01: an unparseable number gets 400 invalid_field naming the field, never silently 0.
-# The grammar is ASCII-only -- Python's bare `\d` also matches non-ASCII decimal digits
-# (e.g. U+0661 ARABIC-INDIC DIGIT ONE), which the contract's grammar must reject the same
-# as any other non-numeral text.
-
-
 @pytest.mark.parametrize(
     ("field", "raw", "expected_message"),
     [
@@ -912,16 +906,21 @@ def test_multipart_form_is_closed_after_reading(
 def test_bc_01_unparseable_numbers_get_400(
     tmp_path: Path, field: str, raw: str, expected_message: str
 ) -> None:
+    """BC-01: an unparseable number gets `400 invalid_field` naming the field, never
+    silently 0. The grammar is ASCII-only -- Python's bare `\\d` also matches non-ASCII
+    decimal digits (e.g. U+0661 ARABIC-INDIC DIGIT ONE), which must be rejected the same
+    as any other non-numeral text.
+    """
     response = _client(tmp_path).post("/speech", data={"text": "hi", field: raw})
 
     assert response.status_code == 400
     assert response.json() == {"error": expected_message, "code": "invalid_field"}
 
 
-# BC-02: an empty value means the field is absent, for every field, not just text/instruction.
-
-
 def test_bc_02_empty_value_is_absent(tmp_path: Path) -> None:
+    """BC-02: an empty value (e.g. `seed=`) means the field is absent, for every field, not
+    just `text`/`instruction` -- the C++ server used the empty value literally (`""` or 0).
+    """
     response = _client(tmp_path).post(
         "/speech",
         data={
@@ -953,11 +952,6 @@ def test_bc_02_empty_value_is_absent(tmp_path: Path) -> None:
     assert body["reference"] == {"kind": "none"}
 
 
-# BC-03: negative, NaN or out-of-range sampling values get 400, never silently clamped,
-# defaulted or passed through. `0` is the one value that still means "use the model
-# default" (test_zero_means_default_for_sampling_fields above).
-
-
 @pytest.mark.parametrize(
     ("field", "raw"),
     [
@@ -977,18 +971,23 @@ def test_bc_02_empty_value_is_absent(tmp_path: Path) -> None:
 def test_bc_03_out_of_range_sampling_values_get_400(
     tmp_path: Path, field: str, raw: str
 ) -> None:
+    """BC-03: negative, NaN or out-of-range sampling values get `400`, never silently
+    clamped, defaulted or passed through -- `0` is the one value that still means "use the
+    model default" (see `test_zero_means_default_for_sampling_fields` above). The C++
+    server let these through unchecked or silently treated them as default.
+    """
     response = _client(tmp_path).post("/speech", data={"text": "hi", field: raw})
 
     assert response.status_code == 400
     assert response.json()["code"] == "invalid_field"
 
 
-# BC-04: max_new_tokens has a server ceiling (MAX_NEW_TOKENS_CEILING, 1,500), unlike the
-# C++ server which let it grow unbounded.
-
-
 @pytest.mark.parametrize("raw", [str(MAX_NEW_TOKENS_CEILING + 1), "999999"])
 def test_bc_04_max_new_tokens_over_ceiling_gets_400(tmp_path: Path, raw: str) -> None:
+    """BC-04: `max_new_tokens` above the server ceiling (`MAX_NEW_TOKENS_CEILING`, 1,500)
+    is `400 invalid_field` -- the C++ server let it grow unbounded, which could exhaust
+    memory and kill the process.
+    """
     response = _client(tmp_path).post(
         "/speech", data={"text": "hi", "max_new_tokens": raw}
     )
@@ -997,11 +996,11 @@ def test_bc_04_max_new_tokens_over_ceiling_gets_400(tmp_path: Path, raw: str) ->
     assert response.json()["code"] == "invalid_field"
 
 
-# BC-05: text and instruction are bounded (the C++ server let them grow unbounded); ref_text
-# shares instruction's limit and its own invalid_field wording, not text_too_long.
-
-
 def test_bc_05_text_or_instruction_too_long_gets_400(tmp_path: Path) -> None:
+    """BC-05: `text` and `instruction` are bounded (the C++ server let them grow
+    unbounded); `ref_text` shares `instruction`'s limit and its own `invalid_field`
+    wording, not `text_too_long`.
+    """
     text_response = _client(tmp_path).post(
         "/speech", data={"text": "a" * (MAX_TEXT_CHARS + 1)}
     )
@@ -1028,12 +1027,10 @@ def test_bc_05_text_or_instruction_too_long_gets_400(tmp_path: Path) -> None:
     }
 
 
-# BC-08: a field repeated within the form, within the query, or split across both, is
-# always 400 duplicate_field -- the C++ server resolved this silently (and this module's
-# own T037 precedence, review 1 finding #10, resolved it silently too).
-
-
 def test_bc_08_duplicate_field_in_body_query_or_both_gets_400(tmp_path: Path) -> None:
+    """BC-08: a field repeated within the form, within the query, or split across both, is
+    always `400 duplicate_field` -- the C++ server resolved this silently.
+    """
     # httpx's `data=` only form-urlencodes a Mapping -- a list of tuples (which would
     # otherwise be the natural way to send the same key twice) is instead treated as raw
     # streamed `content`, so the duplicate-within-the-form body is built by hand here, the
@@ -1068,12 +1065,11 @@ def test_bc_08_duplicate_field_in_body_query_or_both_gets_400(tmp_path: Path) ->
     }
 
 
-# BC-09: a blank (or absent) instruction uses the default -- the C++ server used the
-# literal empty string.
-
-
 @pytest.mark.parametrize("blank", ["", "   ", "\t", "\n"])
 def test_bc_09_blank_instruction_uses_default(tmp_path: Path, blank: str) -> None:
+    """BC-09: a blank (or absent) `instruction` uses the default -- the C++ server used
+    the literal empty string.
+    """
     response = _client(tmp_path).post(
         "/speech", data={"text": "hi", "instruction": blank}
     )
@@ -1082,11 +1078,9 @@ def test_bc_09_blank_instruction_uses_default(tmp_path: Path, blank: str) -> Non
     assert response.json()["instruction"] == DEFAULT_INSTRUCTION
 
 
-# BC-10: whitespace-only text is rejected -- the C++ server accepted it.
-
-
 @pytest.mark.parametrize("blank", ["   ", "\t\t", "\n\n", " \t\n "])
 def test_bc_10_whitespace_text_gets_400(tmp_path: Path, blank: str) -> None:
+    """BC-10: whitespace-only `text` is `400 text_required` -- the C++ server accepted it."""
     response = _client(tmp_path).post("/speech", data={"text": blank})
 
     assert response.status_code == 400
@@ -1103,6 +1097,10 @@ _ALLOWED_WHITESPACE_CONTROL_CHARS = ["\t", "\r", "\n"]
 
 @pytest.mark.parametrize("bad", _DISALLOWED_CONTROL_CHARS)
 def test_bc_46_control_characters_get_400(tmp_path: Path, bad: str) -> None:
+    """BC-46: a control character other than TAB, CR or LF in `text`, `instruction` or
+    `ref_text` is `400 invalid_field` -- the C++ server accepted every control character in
+    these fields (and treated NUL as sentence-closing punctuation).
+    """
     text_response = _client(tmp_path).post(
         "/speech", data={"text": f"hello{bad}there"}
     )
@@ -1134,6 +1132,10 @@ def test_bc_46_control_characters_get_400(tmp_path: Path, bad: str) -> None:
 
 @pytest.mark.parametrize("good", _ALLOWED_WHITESPACE_CONTROL_CHARS)
 def test_bc_46_tab_cr_lf_are_allowed_in_text(tmp_path: Path, good: str) -> None:
+    """BC-46: TAB, CR and LF are the control characters this contract still allows in
+    `text`, matching the C++ server's own tab/CR/LF handling while every other control
+    character is now rejected.
+    """
     response = _client(tmp_path).post("/speech", data={"text": f"hello{good}there"})
 
     assert response.status_code == 200

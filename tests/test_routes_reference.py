@@ -154,6 +154,9 @@ def test_bc_11_undecodable_or_empty_ref_audio_gets_400(ready_client: TestClient)
 
 
 def test_bc_12_ref_audio_without_ref_text_gets_400(ready_client: TestClient) -> None:
+    """BC-12: `ref_audio` without `ref_text` is `400 ref_text_required` -- the C++ server
+    ignored the upload silently instead.
+    """
     response = ready_client.post(
         SPEECH_PATH,
         data={"text": "hello there"},
@@ -167,6 +170,9 @@ def test_bc_12_ref_audio_without_ref_text_gets_400(ready_client: TestClient) -> 
 
 
 def test_bc_13_ref_text_without_reference_gets_400(ready_client: TestClient) -> None:
+    """BC-13: a stray `ref_text` with no `ref_audio`/`voice_id` is `400
+    reference_required` on HTTP -- the C++ server ignored it silently instead.
+    """
     response = ready_client.post(
         SPEECH_PATH, data={"text": "hello there", "ref_text": "a stray transcript"}
     )
@@ -178,6 +184,9 @@ def test_bc_13_ref_text_without_reference_gets_400(ready_client: TestClient) -> 
 
 
 def test_bc_14_voice_id_with_ref_audio_gets_400(ready_client: TestClient) -> None:
+    """BC-14: sending both `voice_id` and `ref_audio` is `400 reference_conflict`
+    (mutually exclusive) -- the C++ server silently ignored the upload instead.
+    """
     response = ready_client.post(
         SPEECH_PATH,
         data={"text": "hello there", "voice_id": "alice", "ref_text": "override text"},
@@ -226,6 +235,10 @@ def test_bc_15_pcm_and_float_wavs_now_decode(ready_client: TestClient, subtype: 
 
 
 def test_bc_16_too_long_or_too_short_reference_gets_400(ready_client: TestClient) -> None:
+    """BC-16: a reference clip over 30 seconds, or under one full codec frame (80 ms), is
+    `400` -- the C++ server allowed unlimited length and silently ignored a clip too short
+    for any frame.
+    """
     too_long = _post_with_reference(
         ready_client, ref_audio=_sine_wav(MAX_REF_SECONDS + 1, sample_rate=CODEC_SAMPLE_RATE)
     )

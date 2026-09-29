@@ -60,6 +60,10 @@ def _scanned(*voices: VoiceFile) -> list[tuple[VoiceFile, int]]:
 
 
 def test_bc_26_names_are_unique_ignoring_case_and_v_prefix_is_reserved():
+    """BC-26: a name starting with `v_` is rejected (it collides with generated ids), and
+    names differing only by case are rejected as duplicates -- the C++ server allowed both,
+    colliding with generated ids or on case-insensitive filesystems.
+    """
     registry = _registry()
     registry.register_saved(_saved_file("alice"), prefix_len=PREFIX_LEN)
 
@@ -90,6 +94,9 @@ def test_bc_26_names_are_unique_ignoring_case_and_v_prefix_is_reserved():
 
 
 def test_bc_48_cap_counts_only_unnamed_voices():
+    """BC-48: the 64-voice cap counts only unnamed voices -- the C++ server counted saved
+    voices too, so many saved voices left little room for unnamed ones.
+    """
     registry = _registry(cap=3)
     for i in range(10):
         registry.register_saved(_saved_file(f"saved-{i}"), prefix_len=PREFIX_LEN)
@@ -136,6 +143,9 @@ def test_an_identical_unnamed_registration_returns_the_existing_entry():
 
 
 def test_bc_25_list_order_is_saved_sorted_then_unnamed_by_registration():
+    """BC-25: voice listing order is deterministic (saved voices sorted by name, then
+    unnamed voices by registration order) -- the C++ server's list order was unspecified.
+    """
     registry = _registry()
     # Saved, registered out of alphabetical order.
     registry.register_saved(_saved_file("zeta"), prefix_len=PREFIX_LEN)

@@ -918,11 +918,11 @@ on the new server.
 
 **Purpose**: prove the success criteria, write the documentation, release 2.0.0.
 
-- [ ] T080 [P] Create `tests/live/cpp_examples.py` (SC-001): run every HTTP and WebSocket example
+- [X] T080 [P] Create `tests/live/cpp_examples.py` (SC-001): run every HTTP and WebSocket example
   from `<Breeze-TTS-2.cpp checkout>/docs/{server,voices,websocket}.md` against
   `--url`. Compare status, headers and body or event shape. Every difference must match an entry
   in an `EXPECTED_DIFFERENCES` table keyed by BC id. Exit non-zero on any unexplained difference.
-- [ ] T081 [P] Create `tests/test_bc_coverage.py` (SC-002): parse the BC ids from
+- [X] T081 [P] Create `tests/test_bc_coverage.py` (SC-002): parse the BC ids from
   `specs/003-cpp-compatible-api/spec.md`, collect the test names under `tests/`, and assert that
   every BC-01 to BC-48 has at least one `test_bc_NN_*` whose docstring states the C++ behavior it
   rejects. Fill any gaps it reveals.

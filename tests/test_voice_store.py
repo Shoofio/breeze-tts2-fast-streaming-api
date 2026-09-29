@@ -196,6 +196,9 @@ def test_scan_sweeps_leftover_tmp_and_del_files(tmp_path: Path):
 
 
 def test_bc_29_breeze_files_are_ignored_and_counted(tmp_path: Path):
+    """BC-29: `.breeze` files (the C++ server's own voice format) are ignored on scan, not
+    loaded -- voices must be registered again in this server's own versioned format.
+    """
     (tmp_path / "legacy.breeze").write_bytes(b"whatever the C++ server wrote")
     (tmp_path / "another.breeze").write_bytes(b"more")
     store = _store(tmp_path)
@@ -209,6 +212,9 @@ def test_bc_29_breeze_files_are_ignored_and_counted(tmp_path: Path):
 
 
 def test_bc_25_invalid_files_are_skipped_with_an_event(tmp_path: Path):
+    """BC-25: a voice file that fails to parse is skipped (with a `voice.skipped` event),
+    not loaded and left to break `GET /v1/voices` JSON as it did on the C++ server.
+    """
     (tmp_path / "broken.voice.json").write_text("not json")
     events = RecordingEvents()
     store = _store(tmp_path, events=events)

@@ -172,6 +172,10 @@ def test_bc_23_disallowed_origin_rejected_before_the_endpoint_runs_with_cors_off
 def test_bc_23_disallowed_origin_rejected_before_the_endpoint_runs_with_an_allowlist(
     method: str,
 ) -> None:
+    """BC-23: the C++ server let a cross-origin POST/DELETE run (and even write voice
+    files) regardless of the CORS setting; with an allowlist, a disallowed origin is
+    rejected the same way as with CORS off.
+    """
     client, calls = _counting_app(CorsPolicy((GOOD_ORIGIN,)))
     path = "/v1/voices" if method == "POST" else "/v1/voices/x"
 
@@ -250,6 +254,9 @@ def test_bc_20_vary_origin_on_a_plain_wrong_method_405() -> None:
 
 
 def test_bc_20_vary_origin_on_a_500(make_client: Callable[..., TestClient]) -> None:
+    """BC-20, continued: an unhandled-exception 500 must still carry `Vary: Origin` in
+    allowlist mode -- the C++ server only sent it on a response to a matching origin.
+    """
     client = make_client(["--cors", GOOD_ORIGIN], runtime=_ExplodingRuntime())
 
     response = client.get("/health", headers={"Origin": EVIL_ORIGIN})

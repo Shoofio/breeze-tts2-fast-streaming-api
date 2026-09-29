@@ -104,6 +104,9 @@ def test_head_health_is_supported_while_loading_and_when_ready(
 
 
 def test_bc_18_unknown_path_is_404_envelope(ready_client: TestClient) -> None:
+    """BC-18: an unknown path is `404` with a JSON error envelope -- the C++ server
+    returned an empty, non-JSON body.
+    """
     response = ready_client.get("/nope")
 
     assert response.status_code == 404
@@ -114,6 +117,10 @@ def test_bc_18_unknown_path_is_404_envelope(ready_client: TestClient) -> None:
 def test_bc_18_wrong_method_on_health_is_405_with_allow(
     ready_client: TestClient, method: str
 ) -> None:
+    """BC-18: a wrong method on `/health` is `405` with an `Allow` header naming the
+    routes that are registered -- the C++ server answered `400` or `404` and never sent
+    `Allow`.
+    """
     response = ready_client.request(method, "/health")
 
     assert response.status_code == 405
@@ -244,6 +251,9 @@ def test_bc_24_ws_bind_failure_reports_zero(readiness: Readiness) -> None:
 
 
 def test_bc_24_health_reports_the_bound_ws_port(readiness: Readiness) -> None:
+    """BC-24: when the WebSocket bound successfully, `/health` reports its real port --
+    the companion case to the zero-on-bind-failure test above.
+    """
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         free = probe.getsockname()[1]

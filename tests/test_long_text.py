@@ -413,6 +413,10 @@ def test_split_chars_zero_gives_one_piece(
 
 
 def test_bc_47_first_piece_without_room_gets_400_text_too_long(envs: list[Env]) -> None:
+    """BC-47: a first piece that cannot fit the model's context gets `400 text_too_long`
+    -- the C++ server had no fixed context limit, so a piece of any length could generate
+    (or exhaust the cache it sized per piece).
+    """
     runtime = _fake_runtime(config=FakeStreamingConfig(max_seq_len=1))
     env = _env(envs, runtime)
 

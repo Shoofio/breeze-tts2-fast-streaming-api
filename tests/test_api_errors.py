@@ -80,6 +80,9 @@ def test_bc_18_unhandled_exception_emits_request_failed_with_a_request_id() -> N
 
 
 def test_bc_18_api_error_carries_its_own_code() -> None:
+    """BC-18: every error response is a JSON envelope with its own machine `code` -- the
+    C++ server's error responses were empty, non-JSON bodies.
+    """
     response = _client().get("/api-error")
 
     assert response.status_code == 409
@@ -229,6 +232,9 @@ def test_starlette_multipart_missing_boundary_is_400_invalid_field() -> None:
 
 
 def test_bc_18_pydantic_validation_error_is_400_invalid_field() -> None:
+    """BC-18: a request validation failure is `400 invalid_field` in the JSON envelope --
+    the C++ server's error responses were empty, non-JSON bodies.
+    """
     app = _app()
 
     @app.get("/typed")
@@ -312,6 +318,9 @@ def test_api_error_response_accepts_headers() -> None:
 
 
 def test_bc_18_every_error_response_is_application_json() -> None:
+    """BC-18: unknown route, wrong method, and handler-error responses are all a JSON
+    error envelope -- the C++ server's error responses were empty, non-JSON bodies.
+    """
     for response in (
         _client().get("/boom"),
         _client().get("/this-route-does-not-exist"),

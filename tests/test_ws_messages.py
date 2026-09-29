@@ -474,6 +474,9 @@ def test_bc_46_control_characters_rejected(escape: str) -> None:
 
 @pytest.mark.parametrize("escape", ["\\t", "\\r", "\\n"])
 def test_bc_46_tab_cr_lf_are_allowed_in_text(escape: str) -> None:
+    """BC-46: TAB, CR and LF are still allowed in a `text` message, matching the C++
+    server's own tab/CR/LF handling while every other control character is now rejected.
+    """
     raw = _msg("text", text=f'"hello{escape}there"')
 
     result = parse(raw)
@@ -492,6 +495,9 @@ def test_bc_46_tab_cr_lf_are_allowed_in_text(escape: str) -> None:
 
 @pytest.mark.parametrize("escape", _DISALLOWED_CONTROL_ESCAPES)
 def test_bc_46_control_characters_rejected_in_start_instruction(escape: str) -> None:
+    """BC-46: `start`'s `instruction` field is rejected the same way as `text` for a
+    disallowed control character -- the C++ server accepted raw control characters here.
+    """
     raw = _start(instruction=f'"speak{escape}slowly"')
 
     _assert_error(raw, "invalid_field", request_type="start")
@@ -499,6 +505,9 @@ def test_bc_46_control_characters_rejected_in_start_instruction(escape: str) -> 
 
 @pytest.mark.parametrize("escape", _DISALLOWED_CONTROL_ESCAPES)
 def test_bc_46_control_characters_rejected_in_start_ref_text(escape: str) -> None:
+    """BC-46: `start`'s `ref_text` field is rejected the same way as `text` for a
+    disallowed control character -- the C++ server accepted raw control characters here.
+    """
     raw = _start(voice_id='"alice"', ref_text=f'"hello{escape}world"')
 
     _assert_error(raw, "invalid_field", request_type="start")
@@ -506,6 +515,9 @@ def test_bc_46_control_characters_rejected_in_start_ref_text(escape: str) -> Non
 
 @pytest.mark.parametrize("escape", _DISALLOWED_CONTROL_ESCAPES)
 def test_bc_46_control_characters_rejected_in_instruction_message(escape: str) -> None:
+    """BC-46: the `instruction` message is rejected the same way as `text` for a
+    disallowed control character -- the C++ server accepted raw control characters here.
+    """
     raw = _msg("instruction", instruction=f'"speak{escape}slowly"')
 
     _assert_error(raw, "invalid_field", request_type="instruction")
@@ -516,6 +528,10 @@ _JSON_ESCAPE_TO_CHAR = {"\\t": "\t", "\\r": "\r", "\\n": "\n"}
 
 @pytest.mark.parametrize("escape", ["\\t", "\\r", "\\n"])
 def test_bc_46_tab_cr_lf_are_allowed_in_start_instruction_and_ref_text(escape: str) -> None:
+    """BC-46: TAB, CR and LF are still allowed in `start`'s `instruction` and `ref_text`,
+    matching the C++ server's own tab/CR/LF handling while other control characters are
+    now rejected.
+    """
     char = _JSON_ESCAPE_TO_CHAR[escape]
 
     instruction_result = parse(_start(instruction=f'"speak{escape}slowly"'))

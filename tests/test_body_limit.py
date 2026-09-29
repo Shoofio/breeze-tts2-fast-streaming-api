@@ -92,6 +92,9 @@ def test_bc_06_chunked_body_over_the_limit_is_rejected_once_it_grows_past_it() -
 
 
 def test_bc_06_body_under_the_limit_passes_through() -> None:
+    """BC-06: a body under the upload limit is unaffected by the new cap -- this pins the
+    boundary against the two rejection tests above.
+    """
     body = b"z" * (_LIMIT - 1)
 
     response = _client().post("/upload", content=body)
@@ -101,6 +104,9 @@ def test_bc_06_body_under_the_limit_passes_through() -> None:
 
 
 def test_bc_06_body_exactly_at_the_limit_passes_through() -> None:
+    """BC-06: a body exactly at the upload limit passes through -- only strictly over the
+    limit (the C++ server's unbounded body) gets `413`.
+    """
     body = b"w" * _LIMIT
 
     response = _client().post("/upload", content=body)
