@@ -132,7 +132,8 @@ release gives future rollbacks one.
     docstring naming the C++ behavior);
   - docstrings that misstated the C++ behavior. BC-18 had wrongly called C++'s 400/409 errors
     non-JSON, and BC-15 and BC-27 never named the C++ behavior.
-- **Declined in pass 1**: correcting spec.md's "`type` on WebSocket error events" to
-  `request_type` (the contract's and server's name) was left for the user to decide.
+- **Spec wording**: spec.md's "`type` on WebSocket error events" (also in the README) is
+  corrected to `request_type`, the contract's and server's name, at the user's direction.
 - **Pass 2** on `16296e3` and T084's `7a88a17` was stopped by the user before it reported, so
-  these commits had one review pass.
+  these commits had one review pass. The user chose to merge without a review of the later
+  commits (records, the `verify_live` flag change and this wording fix).

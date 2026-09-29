@@ -525,7 +525,7 @@ by area, not listed in numeric order (BC-46 to BC-48 were added later).
 
 **Additive changes (not breaking)**: an `X-Breeze-Version` header on every HTTP response and
 WebSocket handshake (FR-037a); an error `code` field alongside `error` on HTTP and
-WebSocket errors; `type` on WebSocket error events; `top_p`, `repetition_penalty`,
+WebSocket errors; `request_type` on WebSocket error events; `top_p`, `repetition_penalty`,
 `max_new_tokens` on WebSocket `start`; any sample rate and channel count, 8/24-bit PCM and other
 common audio containers accepted as `ref_audio`.
 
