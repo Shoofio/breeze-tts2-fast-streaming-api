@@ -174,12 +174,19 @@ def test_report_names_the_bc_id_and_flags_unexplained():
     ])
     text = "\n".join(lines)
     assert "EXPLAINED cpp18" in text
-    assert "body.file_kept: C++ True, here False  -> BC-28, verify live" in text
+    assert "body.file_kept: C++ True, here False  -> BC-28: DELETE removes" in text
     assert "status: C++ 200, here 400  -> UNEXPLAINED" in text
     assert "error: TimeoutError: no done" in text
     assert "3 examples: 0 pass, 1 explained, 2 fail, 0 skipped" in text
     assert "not seen this run: BC-18, ADD-2, ADD-3" in text
     assert lines[-1].startswith("RESULT: FAIL")
+
+
+def test_report_flags_entries_not_yet_confirmed_live():
+    table = {"BC-28": ExpectedDifference("file_kept", (Match("cpp18", "body.file_kept", True, False),), verify_live=True)}
+    text = "\n".join(render_report([result("cpp18", diff("cpp18", "body.file_kept", True, False))], table))
+    assert "-> BC-28, verify live: file_kept" in text
+    assert "still marked verify live (confirm, then clear the flag): BC-28" in text
 
 
 def test_report_ok_line():
@@ -273,7 +280,6 @@ def test_additive_codes_are_explained_on_prefixed_event_paths():
 
 def test_bc18_explains_options_without_cors_being_405_not_404():
     assert explain(diff("cpp12", "status", 404, 405)) == "BC-18"
-    assert EXPECTED_DIFFERENCES["BC-18"].verify_live
 
 
 def test_bc18_does_not_explain_other_statuses_or_examples():

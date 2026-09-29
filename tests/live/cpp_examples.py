@@ -23,7 +23,8 @@ voices from an interrupted run are swept before and after the run. The reference
 upload content (by default the `eric` source recording, used under the throwaway names).
 
 `EXPECTED_DIFFERENCES` was derived from contracts/http-api.md and contracts/ws-api.md before any
-live run; entries marked `verify_live` are to be confirmed in the T086 live gate.
+live run, and every entry was then seen on the live 2.0.0 server in the T086 gate
+(research/live-phase5.md). A new entry is marked `verify_live` until a live run confirms it.
 """
 
 from __future__ import annotations
@@ -176,14 +177,12 @@ EXPECTED_DIFFERENCES: dict[str, ExpectedDifference] = {
     "BC-28": ExpectedDifference(
         summary="DELETE removes a saved voice's file, so file_kept is always false",
         matches=(Match("cpp18", "body.file_kept", cpp=True, actual=False),),
-        verify_live=True,
     ),
     # spec.md BC-18: "`OPTIONS` without CORS gets `404`" in C++, "`405` with `Allow`" here;
     # contracts/http-api.md CORS section: "every `OPTIONS` request gets `405 method_not_allowed`".
     "BC-18": ExpectedDifference(
         summary="OPTIONS without CORS is 405 with Allow, not the C++ server's 404",
         matches=(Match("cpp12", "status", cpp=404, actual=405),),
-        verify_live=True,
     ),
     # spec.md "Additive changes (not breaking)": "an error `code` field alongside `error` on
     # HTTP and WebSocket errors" (http-api.md Errors, ws-api.md error event).
@@ -193,7 +192,6 @@ EXPECTED_DIFFERENCES: dict[str, ExpectedDifference] = {
             Match("*", "body.code", cpp=MISSING, actual=STRING),
             Match("*", "*events.*.code", cpp=MISSING, actual=STRING),
         ),
-        verify_live=True,
     ),
     # spec.md "Additive changes": "`type` on WebSocket error events"; ws-api.md names the field
     # `request_type`: the client message type that caused the error, or null.
@@ -202,7 +200,6 @@ EXPECTED_DIFFERENCES: dict[str, ExpectedDifference] = {
         matches=(
             Match("*", "*events.*.request_type", cpp=MISSING, actual=Pred("a string or null", lambda v: v is None or isinstance(v, str))),
         ),
-        verify_live=True,
     ),
 }
 
