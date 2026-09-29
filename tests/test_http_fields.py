@@ -1133,8 +1133,8 @@ def test_bc_46_control_characters_get_400(tmp_path: Path, bad: str) -> None:
 @pytest.mark.parametrize("good", _ALLOWED_WHITESPACE_CONTROL_CHARS)
 def test_bc_46_tab_cr_lf_are_allowed_in_text(tmp_path: Path, good: str) -> None:
     """BC-46: TAB, CR and LF are the control characters this contract still allows in
-    `text`, matching the C++ server's own tab/CR/LF handling while every other control
-    character is now rejected.
+    `text`. The C++ server accepted them along with every other control character, so
+    only the rest change.
     """
     response = _client(tmp_path).post("/speech", data={"text": f"hello{good}there"})
 

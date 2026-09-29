@@ -474,8 +474,10 @@ def test_bc_46_control_characters_rejected(escape: str) -> None:
 
 @pytest.mark.parametrize("escape", ["\\t", "\\r", "\\n"])
 def test_bc_46_tab_cr_lf_are_allowed_in_text(escape: str) -> None:
-    """BC-46: TAB, CR and LF are still allowed in a `text` message, matching the C++
-    server's own tab/CR/LF handling while every other control character is now rejected.
+    """BC-46: TAB, CR and LF are still allowed in a `text` message. The C++
+    server accepted them along with every other control character, so only the rest
+    change (it did drop tabs and CRs from `speaking.text`, BC-44, which the new server
+    does not).
     """
     raw = _msg("text", text=f'"hello{escape}there"')
 

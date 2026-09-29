@@ -208,8 +208,8 @@ def test_bc_14_voice_id_with_ref_audio_gets_400(ready_client: TestClient) -> Non
 def test_bc_15_malformed_wavs_are_rejected_safely(
     ready_client: TestClient, name: str, blob: bytes, expected_codes: frozenset[str]
 ) -> None:
-    """Each of these used to be reachable by a hand-written parser that could over-read
-    memory or divide by zero (BC-15). Here they must produce an ordinary 400, and the
+    """BC-15: the C++ server's hand-written WAV parser could over-read memory or divide by
+    zero on each of these. Here they must produce an ordinary 400, and the
     server must still be answering /health afterwards -- proof the process itself was
     unaffected."""
     response = _post_with_reference(ready_client, ref_audio=blob)
@@ -223,8 +223,8 @@ def test_bc_15_malformed_wavs_are_rejected_safely(
 
 @pytest.mark.parametrize("subtype", ["PCM_U8", "PCM_24", "FLOAT"])
 def test_bc_15_pcm_and_float_wavs_now_decode(ready_client: TestClient, subtype: str) -> None:
-    """BC-15's other half: 8/24-bit PCM used to decode as silence; now they decode (and
-    reach a real 200), same as 16-bit."""
+    """BC-15's other half: the C++ server decoded 8/24-bit PCM as silence; now they decode
+    (and reach a real 200), same as 16-bit."""
     response = _post_with_reference(ready_client, ref_audio=_sine_wav(0.5, subtype=subtype))
 
     assert response.status_code == 200

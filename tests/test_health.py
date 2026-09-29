@@ -80,7 +80,8 @@ def test_health_when_ready_has_exactly_status_sample_rate_and_ws_port(
 
 
 def test_bc_24_ws_port_comes_from_the_provider(readiness: Readiness) -> None:
-    """BC-24: `ws_port` is whatever is actually listening; 0 when nothing is."""
+    """BC-24: `ws_port` is whatever is actually listening, `0` when nothing is; the C++
+    server reported its configured port even when the WebSocket failed to bind."""
     readiness.mark_ready(FakeRuntime())
     components = replace(_components(readiness), ws_port=lambda: 0)
     try:
@@ -118,7 +119,7 @@ def test_bc_18_wrong_method_on_health_is_405_with_allow(
     ready_client: TestClient, method: str
 ) -> None:
     """BC-18: a wrong method on `/health` is `405` with an `Allow` header naming the
-    routes that are registered -- the C++ server answered `400` or `404` and never sent
+    methods that route accepts -- the C++ server answered `400` or `404` and never sent
     `Allow`.
     """
     response = ready_client.request(method, "/health")
@@ -227,7 +228,7 @@ def test_unhealthy_wins_over_a_later_ready_and_over_loading(
 
 
 def test_bc_24_ws_bind_failure_reports_zero(readiness: Readiness) -> None:
-    """C++ reports its configured WebSocket port even when nothing listens there. Here a
+    """BC-24: C++ reports its configured WebSocket port even when nothing listens there. Here a
     WebSocket port that can't be bound is reported, the HTTP server carries on, and `/health`
     says `ws_port: 0`."""
     sink = io.StringIO()
@@ -251,8 +252,9 @@ def test_bc_24_ws_bind_failure_reports_zero(readiness: Readiness) -> None:
 
 
 def test_bc_24_health_reports_the_bound_ws_port(readiness: Readiness) -> None:
-    """BC-24: when the WebSocket bound successfully, `/health` reports its real port --
-    the companion case to the zero-on-bind-failure test above.
+    """BC-24: when the WebSocket bound successfully, `/health` reports its real port. The
+    C++ server reported the configured port either way, so only the zero-on-bind-failure
+    case above differs; this pins that the success case is unchanged.
     """
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))

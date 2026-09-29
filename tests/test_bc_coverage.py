@@ -3,8 +3,9 @@
 This parses the Breaking Changes table out of `specs/003-cpp-compatible-api/spec.md` (rather than
 hard-coding the id range) and the `test_bc_NN_*` functions out of every file under `tests/`
 (via `ast`, so nothing is imported or executed), then asserts each BC id has at least one such
-test whose docstring names the C++ behavior it rejects. A docstring is the machine-checkable proxy
-for that: a human still has to write real prose, but an empty or missing docstring can't pass.
+test whose docstring states the C++ behavior it rejects (T081). The machine-checkable proxy for
+that is the docstring containing "C++": a human still has to write accurate prose, but a test
+that never mentions the old behavior can't pass.
 """
 
 from __future__ import annotations
@@ -60,9 +61,14 @@ def _test_functions_by_bc_id() -> dict[str, list[tuple[Path, str, str | None]]]:
 
 
 def test_every_bc_id_has_a_documented_test() -> None:
-    """Each BC-01..BC-48 row in spec.md must have a test_bc_NN_* test with a non-empty docstring."""
+    """Each BC-01..BC-48 row in spec.md must have a test_bc_NN_* test whose docstring names "C++"."""
     bc_ids = _bc_ids_from_spec()
-    assert bc_ids, f"parsed no BC ids from {SPEC_PATH}; the table format may have changed"
+    expected = {f"BC-{n:02d}" for n in range(1, 49)}
+    # Exact set, so a malformed row can't silently drop an id from the check below.
+    assert set(bc_ids) == expected, (
+        f"spec.md Breaking Changes table parsed wrongly: missing {sorted(expected - set(bc_ids))}, "
+        f"unexpected {sorted(set(bc_ids) - expected)}"
+    )
 
     tests_by_bc = _test_functions_by_bc_id()
 
@@ -73,7 +79,7 @@ def test_every_bc_id_has_a_documented_test() -> None:
         if not candidates:
             missing_entirely.append(f"{bc_id} ({cpp_behavior})")
             continue
-        if not any(doc and doc.strip() for _, _, doc in candidates):
+        if not any(doc and "C++" in doc for _, _, doc in candidates):
             names = ", ".join(f"{p.relative_to(REPO_ROOT)}::{n}" for p, n, _ in candidates)
             missing_docstring.append(f"{bc_id}: {names}")
 
@@ -84,6 +90,6 @@ def test_every_bc_id_has_a_documented_test() -> None:
         )
     if missing_docstring:
         problems.append(
-            "test(s) exist but none has a docstring for: " + "; ".join(missing_docstring)
+            "test(s) exist but none has a docstring naming the C++ behavior (containing \"C++\") for: " + "; ".join(missing_docstring)
         )
     assert not problems, "\n".join(problems)

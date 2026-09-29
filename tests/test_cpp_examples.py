@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import httpx
 import pytest
 
 from tests.live import cpp_examples as cx
@@ -177,7 +178,7 @@ def test_report_names_the_bc_id_and_flags_unexplained():
     assert "status: C++ 200, here 400  -> UNEXPLAINED" in text
     assert "error: TimeoutError: no done" in text
     assert "3 examples: 0 pass, 1 explained, 2 fail, 0 skipped" in text
-    assert "not seen this run: ADD-2, ADD-3" in text
+    assert "not seen this run: BC-18, ADD-2, ADD-3" in text
     assert lines[-1].startswith("RESULT: FAIL")
 
 
@@ -222,3 +223,60 @@ def test_json_events_and_audio_ordering():
     assert not cx.audio_after_each_speaking([{"type": "speaking", "text": "a"}, {"type": "done"}])
     assert cx.collapse_audio(items[3:]) == [{"type": "speaking", "text": "a"}, cx.AUDIO, {"type": "done"}]
     assert STRING.test("") and not STRING.test(None)
+
+
+# ---- sweep warnings ---------------------------------------------------------------------------
+
+
+def sweep_ctx(handler) -> cx.Context:
+    http = httpx.Client(base_url="http://server.test", transport=httpx.MockTransport(handler))
+    return cx.Context(http=http, ref_wav=b"", ref_text="", cors=None, run_tag="t")
+
+
+def test_sweep_warns_when_the_voice_list_is_not_200(capsys):
+    ctx = sweep_ctx(lambda request: httpx.Response(503))
+    assert cx.sweep(ctx) == []
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "503" in err
+
+
+def test_sweep_deletes_throwaways_and_stays_quiet_on_200_and_404(capsys):
+    deleted = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[{"id": "st_live_tmp_cpp14"}, {"id": "st_live_tmp_cpp15"}, {"id": "eric"}])
+        deleted.append(request.url.path)
+        return httpx.Response(404 if request.url.path.endswith("15") else 200)
+
+    assert cx.sweep(sweep_ctx(handler)) == ["st_live_tmp_cpp14", "st_live_tmp_cpp15"]
+    assert deleted == ["/v1/voices/st_live_tmp_cpp14", "/v1/voices/st_live_tmp_cpp15"]
+    assert capsys.readouterr().err == ""
+
+
+def test_sweep_warns_naming_a_voice_whose_delete_fails(capsys):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[{"id": "st_live_tmp_cpp14"}])
+        return httpx.Response(500)
+
+    assert cx.sweep(sweep_ctx(handler)) == ["st_live_tmp_cpp14"]
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "st_live_tmp_cpp14" in err and "500" in err
+
+
+def test_additive_codes_are_explained_on_prefixed_event_paths():
+    # cpp23 checks `second.events`, so the path carries a prefix.
+    assert explain(diff("cpp23", "second.events.2.code", MISSING, "unknown_voice")) == "ADD-2"
+    assert explain(diff("cpp23", "second.events.2.request_type", MISSING, "start")) == "ADD-3"
+
+
+def test_bc18_explains_options_without_cors_being_405_not_404():
+    assert explain(diff("cpp12", "status", 404, 405)) == "BC-18"
+    assert EXPECTED_DIFFERENCES["BC-18"].verify_live
+
+
+def test_bc18_does_not_explain_other_statuses_or_examples():
+    assert explain(diff("cpp12", "status", 404, 500)) is None
+    assert explain(diff("cpp12", "status", 204, 405)) is None
+    assert explain(diff("cpp13", "status", 404, 405)) is None

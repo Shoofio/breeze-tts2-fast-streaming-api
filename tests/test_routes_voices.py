@@ -403,8 +403,9 @@ def test_a_duplicate_field_gets_400_duplicate_field(start: Any) -> None:
 
 @pytest.mark.parametrize("name", ["alice", "ALICE", "Alice"])
 def test_bc_27_existing_name_gets_409_voice_exists(start: Any, name: str) -> None:
-    """BC-27 (and BC-26's case rule): a name already saved, ignoring case, is refused before
-    anything is decoded, encoded or written -- even with bad audio and a busy GPU."""
+    """BC-27 (and BC-26's case rule): the C++ server silently overwrote an existing voice of
+    the same name; here a name already saved, ignoring case, is refused before anything is
+    decoded, encoded or written -- even with bad audio and a busy GPU."""
     server = start()
     assert server.post(audio=_wav(), name="alice", ref_text="first").status_code == 200
     before = (server.voices_dir / "alice.voice.json").read_bytes()

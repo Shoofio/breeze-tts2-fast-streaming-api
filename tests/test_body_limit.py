@@ -92,8 +92,8 @@ def test_bc_06_chunked_body_over_the_limit_is_rejected_once_it_grows_past_it() -
 
 
 def test_bc_06_body_under_the_limit_passes_through() -> None:
-    """BC-06: a body under the upload limit is unaffected by the new cap -- this pins the
-    boundary against the two rejection tests above.
+    """BC-06: the C++ server had no cap; a body under the new upload limit is still accepted,
+    which pins the boundary against the two rejection tests above.
     """
     body = b"z" * (_LIMIT - 1)
 

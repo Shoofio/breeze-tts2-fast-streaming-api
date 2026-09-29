@@ -178,13 +178,20 @@ EXPECTED_DIFFERENCES: dict[str, ExpectedDifference] = {
         matches=(Match("cpp18", "body.file_kept", cpp=True, actual=False),),
         verify_live=True,
     ),
+    # spec.md BC-18: "`OPTIONS` without CORS gets `404`" in C++, "`405` with `Allow`" here;
+    # contracts/http-api.md CORS section: "every `OPTIONS` request gets `405 method_not_allowed`".
+    "BC-18": ExpectedDifference(
+        summary="OPTIONS without CORS is 405 with Allow, not the C++ server's 404",
+        matches=(Match("cpp12", "status", cpp=404, actual=405),),
+        verify_live=True,
+    ),
     # spec.md "Additive changes (not breaking)": "an error `code` field alongside `error` on
     # HTTP and WebSocket errors" (http-api.md Errors, ws-api.md error event).
     "ADD-2": ExpectedDifference(
         summary="Additive: every error carries a machine-readable `code` next to its message",
         matches=(
             Match("*", "body.code", cpp=MISSING, actual=STRING),
-            Match("*", "events.*.code", cpp=MISSING, actual=STRING),
+            Match("*", "*events.*.code", cpp=MISSING, actual=STRING),
         ),
         verify_live=True,
     ),
@@ -193,7 +200,7 @@ EXPECTED_DIFFERENCES: dict[str, ExpectedDifference] = {
     "ADD-3": ExpectedDifference(
         summary="Additive: WebSocket error events carry `request_type`, the message that caused them",
         matches=(
-            Match("*", "events.*.request_type", cpp=MISSING, actual=Pred("a string or null", lambda v: v is None or isinstance(v, str))),
+            Match("*", "*events.*.request_type", cpp=MISSING, actual=Pred("a string or null", lambda v: v is None or isinstance(v, str))),
         ),
         verify_live=True,
     ),
@@ -443,10 +450,17 @@ def sweep(ctx: Context) -> list[str]:
     """Delete leftover `st_live_tmp_cpp*` voices and this run's unnamed ones."""
     response = ctx.http.get("/v1/voices")
     if response.status_code != 200:
+        # Say so: a silent skip would leave throwaway voices behind with no sign of it.
+        print(f"WARNING: sweep could not list voices (GET /v1/voices gave {response.status_code}); "
+              f"delete {TMP_PREFIX}* voices by hand", file=sys.stderr)
         return []
     ids = [v["id"] for v in response.json() if v["id"].startswith(TMP_PREFIX) or v["id"] in ctx.owned]
     for voice_id in ids:
-        delete_voice(ctx, voice_id)
+        status = delete_voice(ctx, voice_id).status_code
+        # 404 is fine: an example's own cleanup already removed it.
+        if status not in (200, 404):
+            print(f"WARNING: sweep could not delete {voice_id} (DELETE gave {status}); delete it by hand",
+                  file=sys.stderr)
     return ids
 
 
@@ -532,6 +546,8 @@ def audio_after_each_speaking(items: Sequence[object]) -> bool:
 
 @contextlib.asynccontextmanager
 async def ws_open(ctx: Context):
+    if not ctx.ws_url:
+        raise Skip("GET /health reported ws_port 0, so the WebSocket is disabled or failed to bind")
     # proxy=None: a local server must not be reached through an environment proxy.
     async with connect(ctx.ws_url, max_size=None, open_timeout=10, proxy=None) as ws:
         yield WsProbe(ws)
@@ -638,6 +654,9 @@ def error_busy(ctx: Context, run: Run) -> None:
             if first.status_code == 409:
                 time.sleep(BUSY_BACKOFF)
                 continue
+            if first.status_code != 200:
+                first.read()
+                raise RuntimeError(f"first request got {first.status_code}, not 200 or 409: {first.text[:200]}")
             run.check("first.status", 200, first.status_code)
             second = ctx.http.post("/v1/audio/speech", files=form({"text": "Hello there."}))
             run.check("status", 409, second.status_code)
@@ -681,13 +700,14 @@ def cors_headers(ctx: Context, run: Run) -> None:
 
 @example(12, "server.md", "Cross origin requests: preflight before DELETE /v1/voices/<id> is 204, cached a day")
 def cors_preflight(ctx: Context, run: Run) -> None:
-    if ctx.cors is None:
-        raise Skip("the doc describes preflights only with --cors; pass --cors to match the server")
     response = ctx.http.request("OPTIONS", f"/v1/voices/{run.tmp_name}", headers={
         "Origin": _cors_origin(ctx), "Access-Control-Request-Method": "DELETE",
     })
-    run.check("status", 204, response.status_code)
-    run.check("header.access-control-max-age", "86400", header(response, "access-control-max-age"))
+    # The doc describes the 204 only with --cors. Without it the C++ server answers OPTIONS 404
+    # (spec.md BC-18), so that is the C++ side to compare; this server's 405 is the BC-18 entry.
+    run.check("status", 204 if ctx.cors is not None else 404, response.status_code)
+    run.check("header.access-control-max-age", "86400" if ctx.cors is not None else MISSING,
+              header(response, "access-control-max-age"))
 
 
 @example(13, "server.md", "Cross origin requests: an origin not on the --cors list gets no CORS headers")
@@ -730,12 +750,14 @@ def cached_voice(ctx: Context, run: Run) -> None:
     run.check("body", voice_shape(STRING, False, ref_text), first_body)
     if first.status_code != 200:
         return
-    second = register_voice(ctx, None, ref_text)
-    run.check("second.status", 200, second.status_code)
-    second_body = body_json(second)
-    second_id = second_body.get("id", MISSING) if isinstance(second_body, dict) else MISSING
-    run.check("second.body.id", first_body["id"], second_id)
-    delete_voice(ctx, first_body["id"])
+    try:
+        second = register_voice(ctx, None, ref_text)
+        run.check("second.status", 200, second.status_code)
+        second_body = body_json(second)
+        second_id = second_body.get("id", MISSING) if isinstance(second_body, dict) else MISSING
+        run.check("second.body.id", first_body["id"], second_id)
+    finally:
+        delete_voice(ctx, first_body["id"])
 
 
 @example(17, "voices.md", "Listing and removing: GET /v1/voices")
@@ -912,7 +934,10 @@ def discover(ctx: Context, base_url: str) -> None:
     body = ctx.http.get("/health").json()
     ctx.sample_rate = body["sample_rate"]
     if body.get("ws_port"):
-        ctx.ws_url = f"ws://{httpx.URL(base_url).host}:{body['ws_port']}"
+        host = httpx.URL(base_url).host
+        if ":" in host:  # an IPv6 literal needs brackets in a URL
+            host = f"[{host}]"
+        ctx.ws_url = f"ws://{host}:{body['ws_port']}"
 
 
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -958,7 +983,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         finally:
             try:
                 sweep(ctx)
-            except httpx.HTTPError as error:
+            except Exception as error:  # noqa: BLE001 -- a bad body from the sweep must not lose the report
                 print(f"WARNING: the closing sweep failed ({error}); delete {TMP_PREFIX}* voices by hand",
                       file=sys.stderr)
     print()

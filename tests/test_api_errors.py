@@ -51,7 +51,10 @@ def _client(events: RecordingEvents | None = None) -> TestClient:
 
 
 def test_bc_18_unhandled_exception_returns_internal_error_envelope() -> None:
-    """BC-18: C++ crashes leave the client with no body at all to parse."""
+    """BC-18, FR-023: an unhandled failure is a `500` in the same JSON envelope as every other
+    error; the C++ server's unknown-route, wrong-method and oversize errors had empty,
+    non-JSON bodies.
+    """
     response = _client().get("/boom")
 
     assert response.status_code == 500
@@ -80,8 +83,9 @@ def test_bc_18_unhandled_exception_emits_request_failed_with_a_request_id() -> N
 
 
 def test_bc_18_api_error_carries_its_own_code() -> None:
-    """BC-18: every error response is a JSON envelope with its own machine `code` -- the
-    C++ server's error responses were empty, non-JSON bodies.
+    """Every error carries its own machine `code` next to `error`. The `code` field is
+    additive (spec "Additive changes"), not BC-18: the C++ server already sent JSON for
+    its `400`, `404` and `409` (server.md "Errors"), and `error` keeps that message.
     """
     response = _client().get("/api-error")
 
@@ -90,7 +94,7 @@ def test_bc_18_api_error_carries_its_own_code() -> None:
 
 
 def test_bc_18_unknown_route_is_404_with_a_json_envelope() -> None:
-    """BC-18: C++ returns an empty body for an unknown path; this always has JSON."""
+    """BC-18: C++ answered an unknown path with `404` and an empty, non-JSON body; this has JSON."""
     response = _client().get("/this-route-does-not-exist")
 
     assert response.status_code == 404
@@ -99,7 +103,7 @@ def test_bc_18_unknown_route_is_404_with_a_json_envelope() -> None:
 
 
 def test_bc_18_wrong_method_is_405_with_allow_header_and_json_envelope() -> None:
-    """BC-18: C++ returns 400 for a wrong method on some routes, 404 on others."""
+    """BC-18: C++ answered a wrong method with `400` or `404` and an empty, non-JSON body."""
     # DELETE isn't declared for /health (only GET is), so this exercises Starlette's
     # own 405 path, including the `Allow` header it attaches.
     response = _client().delete("/health")
@@ -143,7 +147,8 @@ def test_http_exception_with_unmapped_status_falls_back_to_a_500_internal_error(
 
 
 def test_bc_18_malformed_multipart_body_is_400_invalid_field() -> None:
-    """BC-18: C++'s multipart parser has no error path at all for this input."""
+    """BC-18, FR-023: a malformed multipart body is a `400 invalid_field` in the JSON envelope,
+    like every error here; the C++ docs list no such response."""
     app = _app()
 
     @app.post("/upload")
@@ -232,8 +237,8 @@ def test_starlette_multipart_missing_boundary_is_400_invalid_field() -> None:
 
 
 def test_bc_18_pydantic_validation_error_is_400_invalid_field() -> None:
-    """BC-18: a request validation failure is `400 invalid_field` in the JSON envelope --
-    the C++ server's error responses were empty, non-JSON bodies.
+    """A request validation failure is `400 invalid_field` in the JSON envelope. The C++
+    server already sent JSON for its `400` (server.md "Errors"); the `code` is additive.
     """
     app = _app()
 
@@ -318,8 +323,9 @@ def test_api_error_response_accepts_headers() -> None:
 
 
 def test_bc_18_every_error_response_is_application_json() -> None:
-    """BC-18: unknown route, wrong method, and handler-error responses are all a JSON
-    error envelope -- the C++ server's error responses were empty, non-JSON bodies.
+    """BC-18: unknown route, wrong method and handler-error responses are all a JSON
+    error envelope with `error` and `code`; the C++ server's unknown-route and
+    wrong-method responses were empty, non-JSON bodies (`code` is additive).
     """
     for response in (
         _client().get("/boom"),
