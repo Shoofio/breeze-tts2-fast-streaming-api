@@ -21,3 +21,6 @@ htmlcov/
 .env.*
 !.env.example
 
+
+voices/
+rver's voice store: user voices (eric, vale), never committed
