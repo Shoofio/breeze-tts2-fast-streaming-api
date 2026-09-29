@@ -4,11 +4,26 @@ All notable changes to this project are documented here. See
 `specs/003-cpp-compatible-api/spec.md` for the full breaking-changes list and rationale (IDs
 `BC-nn`).
 
-## Unreleased — 2.0.0
+## 2.0.0 — 2026-09-29
 
-The previous Python HTTP API (the pre-2.0 request/response shapes) is removed. The server now
-exposes a C++-server-compatible HTTP and WebSocket API; see the README and
-`specs/003-cpp-compatible-api/contracts/http-api.md` for the full contract.
+The server now exposes a C++-server-compatible HTTP and WebSocket API; see the README and
+`specs/003-cpp-compatible-api/contracts/` for the full contract.
+
+### Removed
+
+- **The old Python API is removed.** The pre-2.0 request and response shapes and the port 7860
+  default are gone; there is no compatibility mode. HTTP is on 8080 and the WebSocket on 8081.
+
+### Added
+
+These are additive and don't break C++ clients:
+
+- An `X-Breeze-Version` header on every HTTP response and WebSocket handshake.
+- A machine-readable `code` next to `error` on every HTTP and WebSocket error.
+- `request_type` on WebSocket `error` events: the client message type that caused the error.
+- `top_p`, `repetition_penalty` and `max_new_tokens` on WebSocket `start`.
+- `ref_audio` accepts any sample rate and channel count, 8- and 24-bit PCM, and other common
+  audio containers.
 
 ### Breaking changes
 
@@ -115,6 +130,16 @@ exposes a C++-server-compatible HTTP and WebSocket API; see the README and
   voice, the first piece anchors the later ones, unless the anchor would shorten a given piece,
   which is then spoken without it; a piece that doesn't fit the context gets `text_too_long` and
   the session continues.
+
+### Known differences outside the API contract
+
+- **Repetition penalty**: applied once per distinct generated token (the reference model
+  implementation's semantics); the C++ server compounds it once per occurrence. The field, its
+  range and its default are the same; only the resulting audio differs.
+- **First chunk size**: streams start at 1 codec frame (80 ms) and ramp to 25, where C++ starts
+  at 4. This lowers time to first audio; `--chunk-first`/`--chunk-max` set it back.
+- **Default length**: with `max_new_tokens` absent or `0`, a piece is capped at the model default
+  of 750 frames (60 s), as in C++. The old Python API used 1,500.
 
 ### Fixed
 

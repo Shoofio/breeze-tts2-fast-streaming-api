@@ -937,7 +937,7 @@ on the new server.
   - the development command table (Constitution X);
   - removal of old API examples and port 7860 references (`rg -n 7860` must come back clean
     outside `specs/` and the benchmark's `--api old`).
-- [ ] T084 Set `breeze_infer/__init__.py` to `__version__ = "2.0.0"`, and finalize `CHANGELOG.md`
+- [X] T084 Set `breeze_infer/__init__.py` to `__version__ = "2.0.0"`, and finalize `CHANGELOG.md`
   2.0.0 with the date, the full BC list, Known Differences and "old Python API removed". This
   happens before the final live gate (standing rule 8).
 - [ ] T085 Rehearse rollback as in quickstart "Rollback": time it (it must take under 5 minutes),
