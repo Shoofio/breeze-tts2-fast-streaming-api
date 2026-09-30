@@ -50,7 +50,7 @@ Don't add tests beyond those named in a task.
 
 ## Phase 1: Setup
 
-- [ ] T001 Bump `__version__` to `2.1.0.dev1` in `breeze_infer/__init__.py`. Add an
+- [X] T001 Bump `__version__` to `2.1.0.dev1` in `breeze_infer/__init__.py`. Add an
   `## Unreleased` section with an `### Added` subsection in `CHANGELOG.md`, containing one line for
   `GET /v1/audio/speech.wav`. This task and T002 go in one commit.
 
@@ -58,7 +58,7 @@ Don't add tests beyond those named in a task.
 
 ## Phase 2: Foundational (blocks every story)
 
-- [ ] T002 In `breeze_infer/streaming.py`, give `SpeechResponse.__init__` two new keyword
+- [X] T002 In `breeze_infer/streaming.py`, give `SpeechResponse.__init__` two new keyword
   parameters (research R4). Neither changes anything when left at its default.
   - **`media_type: str = "audio/pcm"`**: used for the contract `content-type` instead of the class
     attribute.
@@ -66,7 +66,7 @@ Don't add tests beyond those named in a task.
     outcome event (`speech.completed`/`aborted`/`failed`), by passing them through `_Outcome`.
 
   No new tests; the existing ones cover the defaults.
-- [ ] T003 [P] Add three constants to `breeze_infer/limits.py`, each with a one-line comment saying
+- [X] T003 [P] Add three constants to `breeze_infer/limits.py`, each with a one-line comment saying
   why (spec FR-004, FR-006, FR-016):
   - `WAV_GPU_WAIT_SECONDS = 60`
   - `WAV_SEND_TIMEOUT_SECONDS = 600`
