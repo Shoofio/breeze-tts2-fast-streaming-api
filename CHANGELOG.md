@@ -11,6 +11,14 @@ All notable changes to this project are documented here. See
 - `GET /v1/audio/speech.wav`: a progressive WAV stream of the same synthesis as
   `POST /v1/audio/speech`, playable by a browser `<audio>` element.
 
+### Changed
+
+- On Linux, `TCP_USER_TIMEOUT` on accepted connections is now 600 s, up from 30 s. The kernel
+  applies it to a peer that keeps a zero receive window as well as one that stopped
+  acknowledging. At 30 s it reset a browser that paused reading while far ahead of playback,
+  cutting WAV playback short. The option only frees the socket; the GPU is still released by
+  the application timeouts. Windows is unaffected, since it has no such option.
+
 ## 2.0.0 — 2026-09-29
 
 The server now exposes a C++-server-compatible HTTP and WebSocket API; see the README and

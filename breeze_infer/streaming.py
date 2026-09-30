@@ -39,7 +39,7 @@ Limits, both because ASGI gives no way to reach the transport:
   (`h11_impl.py:431-434`); no ASGI-level choice avoids it.
 
 In both cases the GPU is already released and the outcome already reported. The socket is
-evicted by the kernel through `TCP_USER_TIMEOUT` (30 s, set on the listening socket in
+evicted by the kernel through `TCP_USER_TIMEOUT` (600 s, set on the listening socket in
 `api.bind_http_sockets`), and at shutdown by uvicorn's bounded graceful timeout.
 
 Aborts the client caused (a disconnect, a send timeout, a reader below the delivery floor)

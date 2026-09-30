@@ -99,4 +99,11 @@ MAX_REQUEST_LINE_BYTES = 128 * 1024
 # the audio has to read.
 MIN_RATE_GRACE_SECONDS = 30.0
 MIN_RATE_REAL_TIME = 0.5
-TCP_USER_TIMEOUT_MS = 30_000
+
+# The kernel drops an accepted connection whose peer hasn't acknowledged data, or has kept a
+# zero receive window, for this long (api.bind_http_sockets, research.md R5; Linux only). It
+# frees only the socket: application timeouts already release the GPU. It must not be shorter
+# than the longest application send timeout. Otherwise a browser that stops reading while far
+# ahead of playback is reset before the WAV route's own 600 s limit (004 FR-016). It was 30 s
+# before 2.1.0.
+TCP_USER_TIMEOUT_MS = WAV_SEND_TIMEOUT_SECONDS * 1000

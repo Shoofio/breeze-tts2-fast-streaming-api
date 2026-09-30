@@ -108,3 +108,22 @@ the code.
   - The route is additive, so there is no feature flag.
 - **Rollback**: restart on the `v2.0.0` tag. The extension sees `X-Breeze-Version` `2.0.0` and
   falls back to the WebSocket.
+
+## R7. The kernel's TCP_USER_TIMEOUT must outlast the WAV send timeout (found in T007)
+
+- **Finding**: Linux applies `TCP_USER_TIMEOUT` to a peer that keeps a zero receive window, not
+  only to one that stopped acknowledging. With 003's 30 s (R5 there), a browser that stops reading
+  once it is far enough ahead is reset about 30 s after the socket buffers fill, long before
+  FR-016's 600 s. The T007 harness showed it at its 2 s setting as
+  `httpx.ReadError: [Errno 104] Connection reset by peer`.
+- **Decision (user, 2026-09-30)**: set `TCP_USER_TIMEOUT_MS = WAV_SEND_TIMEOUT_SECONDS * 1000`
+  (600 s) for every route.
+- **Rationale**:
+  - The option only frees a socket whose peer is gone. The GPU is released by application
+    timeouts: the POST route's 30 s send timeout, the WebSocket stall timer, and the WAV
+    producer.
+  - Windows production has no such option at all.
+  - The cost is that a vanished peer's socket lingers up to 10 minutes on Linux.
+- **Rejected alternatives**:
+  - Keeping 30 s and amending FR-016: this breaks the feature on WSL and in Docker.
+  - A per-connection timeout: ASGI doesn't expose the socket.
