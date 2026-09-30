@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 import httpx
+import pytest
 
 from breeze_infer.api import Components, create_app
 from breeze_infer.limits import TCP_USER_TIMEOUT_MS
@@ -128,6 +129,33 @@ def test_a_disconnect_mid_generation_stops_it_and_frees_the_gpu() -> None:
     assert fields["format"] == "wav"
     # Stopped, not finished: generation never reached its end.
     assert _named(events, "speech.generated", "speech.piece_done") == []
+
+
+def test_a_generation_failure_frees_the_gpu_before_the_client_reads_the_buffer() -> None:
+    # Phase 4 review, finding 1: the failure is queued behind every buffered chunk, so it must
+    # not wait there to release the GPU. Fail late, with most of the audio buffered and unread.
+    runtime = _fake_runtime(
+        chunks=CHUNKS, frames_per_chunk=FRAMES_PER_CHUNK, fail_after=CHUNKS - 10
+    )
+    with (
+        _serving(runtime) as (components, events, server, url),
+        httpx.Client(timeout=30) as client,
+        client.stream("GET", url, params=FIELDS) as response,
+    ):
+        assert response.status_code == 200
+        wait_until(lambda: _gate_free_on_server(components, server), timeout=10)
+
+        # The client still gets the audio generated before the failure, then a body cut short
+        # without its chunked terminator, as on the POST route.
+        with pytest.raises(httpx.RemoteProtocolError):
+            response.read()
+
+    wait_until(lambda: bool(_named(events, *OUTCOME_EVENTS)))
+    [(name, fields)] = _named(events, *OUTCOME_EVENTS)
+    assert name == "speech.failed"
+    assert fields["reason"] == "generation_error"
+    assert fields["format"] == "wav"
+    assert _named(events, "speech.generated") == []
 
 
 async def _loop_turns(count: int) -> None:

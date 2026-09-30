@@ -1002,21 +1002,22 @@ async def _buffered(
     at full speed into a buffer rather than one chunk per send, so the GPU is released when
     generation ends, not when the client has read everything. A browser that pauses, or
     plays slowly, must not hold the one GPU while it drains (FR-013, FR-014); it costs only
-    the buffer's memory, bounded by the route's send timeout.
+    the buffer's memory. That memory is not capped: a client that keeps reading, however
+    slowly, keeps it (a deliberate choice; spec Assumptions, research R4).
 
     A producer task, started on the first iteration (after the primed chunk is sent), steps
     the session into an unbounded queue:
     - a chunk is queued as it comes;
-    - a failure from `step()` is queued and re-raised here, so the stream ends as
-      `speech.failed`, exactly as on the POST route;
+    - a failure from `step()` closes the session, then is queued and re-raised here, so the
+      stream ends as `speech.failed`, as on the POST route;
     - at `DONE` it closes the session, which releases the gate, then emits
-      `speech.generated` and queues the end marker (`None`).
+      `speech.generated` and queues the end marker (`None`). A failed close is queued
+      instead, so the request is reported as failed.
 
     Closing here is safe although `SpeechResponse` closes the session again when the response
-    ends: `GpuSession.aclose()` is idempotent, and every call waits for the same close. So a
-    close failure suppressed here is raised again by that final close, which reports it as
-    the outcome. `primed_bytes` is the PCM already generated before the `200`, so
-    `audio_seconds` counts the whole request's audio.
+    ends: `GpuSession.aclose()` is idempotent, and every call waits for the same close.
+    `primed_bytes` is the PCM already generated before the `200`, so `audio_seconds` counts
+    the whole request's audio.
 
     However this generator ends, its `finally` cancels the producer: after a disconnect
     mid-generation that cancels the `session.step()` in flight, as cancelling
@@ -1031,22 +1032,27 @@ async def _buffered(
                 generated += len(chunk)
                 queue.put_nowait(chunk)
         except Exception as error:  # noqa: BLE001 -- re-raised by the body, below
+            # Close first: queued behind every buffered chunk, the error would otherwise keep
+            # the GPU held until the client had read them all (FR-014). The step's own error
+            # is the one to report, so a close failure here is left to the final close.
+            with contextlib.suppress(Exception):
+                await session.aclose()
             queue.put_nowait(error)
             return
-        closed = False
-        # A close failure is the response's to report: its final close raises it again.
-        with contextlib.suppress(Exception):
+        try:
             await session.aclose()
-            closed = True
-        if closed:
-            # Only after a clean close: after a close timeout the gate is poisoned, not
-            # released, so "generated and the GPU is free" would be untrue.
-            events.emit(
-                "speech.generated",
-                request_id=request_id,
-                audio_seconds=generated / _PCM_BYTES_PER_SAMPLE / sample_rate,
-                format="wav",
-            )
+        except Exception as error:  # noqa: BLE001 -- re-raised by the body, below
+            # Reported through the stream, not left to the response's final close: after a
+            # close timeout that close waits afresh and may succeed, so the request would be
+            # reported as completed on a poisoned gate.
+            queue.put_nowait(error)
+            return
+        events.emit(
+            "speech.generated",
+            request_id=request_id,
+            audio_seconds=generated / _PCM_BYTES_PER_SAMPLE / sample_rate,
+            format="wav",
+        )
         queue.put_nowait(None)
 
     producer = asyncio.create_task(produce())

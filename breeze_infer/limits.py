@@ -80,9 +80,10 @@ HTTP_SEND_TIMEOUT_SECONDS = 30
 # once. 60 s matches the SillyTavern extension's own queue timeout.
 WAV_GPU_WAIT_SECONDS = 60
 
-# The WAV route's send timeout. It delivers from a buffer after releasing the GPU, so a slow or
-# paused reader (browser read-ahead limits, playback speed down to 0x) costs only memory, never
-# the GPU. 10 minutes bounds that memory.
+# The WAV route's send timeout: one send blocked this long ends the stream. The route delivers
+# from a buffer after releasing the GPU, so a slow or paused reader (browser read-ahead limits,
+# playback speed down to 0x) costs only memory, never the GPU. It bounds a reader that stops,
+# not one that keeps reading slowly; the buffer's memory is deliberately uncapped (004 R4).
 WAV_SEND_TIMEOUT_SECONDS = 600
 
 # The HTTP request-line limit (h11's max incomplete event size). GET carries the text in the

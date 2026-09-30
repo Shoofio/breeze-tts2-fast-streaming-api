@@ -86,6 +86,13 @@ the code.
   samples, under 1 ms, and not worth a second send path.
 - **Memory**: an unbounded queue per stream. The sizes are in the spec's Assumptions (worst case
   about 100–115 MB for 10,000 CJK characters). No cap, as decided.
+  - The 600 s send timeout ends a reader that *stops*, not one that keeps reading slowly. A client
+    that reads a few bytes every 10 minutes can hold its buffer indefinitely (Phase 4 review,
+    finding 3).
+  - This is accepted with the no-cap decision. Only a deliberately trickling client does it, and
+    it spends memory, never the GPU.
+  - If it matters later, the cheapest bound is a total response deadline, e.g. a multiple of the
+    audio's duration.
 - **Alternative considered**: A new response class that owns its own buffer and timers. Rejected:
   it would duplicate `SpeechResponse`'s outcome bookkeeping, finalizer and cancellation shielding,
   the most carefully reviewed code in the server.
