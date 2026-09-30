@@ -41,8 +41,9 @@ from breeze_infer.origins import canonical_origin
 # Every method a disallowed cross-origin request is *not* blocked for: GET/HEAD can't write, and
 # OPTIONS is how a preflight itself arrives (review issue 6 -- every other method, not just
 # POST/DELETE, can have side effects, so all of them are blocked). One GET does spend GPU:
-# `GET /v1/audio/speech.wav` synthesizes, and stays open to every origin on purpose. An <audio>
-# element's request carries no Origin to check (specs/004-browser-wav-stream, Clarifications).
+# `GET /v1/audio/speech.wav` synthesizes. GET skips the origin check, so any page can trigger
+# synthesis there, with or without an Origin (a plain <audio> sends none). That is accepted on
+# purpose (specs/004-browser-wav-stream, Clarifications).
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _MAX_AGE = b"86400"
 _EXPOSE_HEADERS = b"X-Sample-Rate, X-Sample-Format, X-Breeze-Version"
