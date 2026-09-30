@@ -212,7 +212,8 @@ class SpeechResponse(StreamingResponse):
     - `media_type`: the `Content-Type` of the stream (`audio/pcm` unless the body carries a
       container, such as WAV).
     - `event_fields`: extra fields for the one outcome event. The outcome's own fields
-      (`audio_seconds_sent`, `reason`, `error`, `rtf`) win on a clash. Keys must not be
+      (`reason`, `error`, `rtf`) win when that outcome sets them; `audio_seconds_sent` is
+      always set. Keys must not be
       `request_id` or `level` (emit's own arguments), nor names `Events.emit` reserves
       (`event_schema`, `ts`, `event`): those raise and the outcome event is lost.
     - `clock` and `started_at`: a monotonic clock and its reading when generation started,
