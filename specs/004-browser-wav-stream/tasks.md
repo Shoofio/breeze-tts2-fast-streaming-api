@@ -85,13 +85,13 @@ route.
 contract's header, the headers are right, and the PCM after the header equals the POST route's
 body.
 
-- [ ] T004 [US1] Add a pure function `wav_header(sample_rate: int) -> bytes` to
+- [X] T004 [US1] Add a pure function `wav_header(sample_rate: int) -> bytes` to
   `breeze_infer/routes_speech.py` (research R5).
   - It returns the 44-byte layout in [contracts/http-wav-stream.md](contracts/http-wav-stream.md),
     built with `struct.pack("<4sI4s4sIHHIIHH4sI", ...)`.
   - Test it byte for byte against a hand-written expected value at 24,000 Hz, in the new file
     `tests/test_speech_wav.py`.
-- [ ] T005 *(Opus)* [US1] Serve the route by reusing `_serve_speech` in
+- [X] T005 *(Opus)* [US1] Serve the route by reusing `_serve_speech` in
   `breeze_infer/routes_speech.py` (research R1). Pieces:
   - **New parameter**: `_serve_speech` gains the keyword `wav: bool = False`. When true, it returns
     `SpeechResponse` with:
