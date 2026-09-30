@@ -136,7 +136,7 @@ generation. Delivery follows the client's pace, with a 600 s send timeout and no
 **Independent test**: with real uvicorn, a client that reads nothing still sees the gate freed and
 `speech.generated` emitted. It then reads the whole body.
 
-- [ ] T007 *(Opus)* [US2] Add the tests first, in the new file `tests/test_speech_wav_stream.py`,
+- [X] T007 *(Opus)* [US2] Add the tests first, in the new file `tests/test_speech_wav_stream.py`,
   using the real uvicorn and httpx harness pattern of `tests/test_speech_abort.py`. Serve the real
   app built as in `tests/test_routes_speech.py`, with a fake runtime whose generation yields enough
   chunks to outrun the socket buffers. Two tests:
@@ -153,7 +153,7 @@ generation. Delivery follows the client's pace, with a 600 s send timeout and no
      reason=client_disconnect` is emitted.
 
   Confirm test 1 fails before T008.
-- [ ] T008 *(Opus)* [US2] Implement buffered delivery in `breeze_infer/routes_speech.py`
+- [X] T008 *(Opus)* [US2] Implement buffered delivery in `breeze_infer/routes_speech.py`
   (research R4).
   - **The generator**: an async generator `_buffered(session, events, request_id)`. On its first
     iteration it starts a producer task that loops `session.step()` into an unbounded
