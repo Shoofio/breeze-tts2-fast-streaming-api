@@ -92,6 +92,8 @@ itself since no `SpeechResponse` is ever built for it.
 # which refers to the local `components`, when the route is defined (routes_health.py does the
 # same, for the same reason).
 import asyncio
+import contextlib
+import math
 import struct
 import threading
 import time
@@ -127,7 +129,11 @@ from breeze_infer.http_fields import (
     parse_speech,
     read_fields,
 )
-from breeze_infer.limits import ANCHOR_CHARS, ANCHOR_SIZING_TIMEOUT_SECONDS
+from breeze_infer.limits import (
+    ANCHOR_CHARS,
+    ANCHOR_SIZING_TIMEOUT_SECONDS,
+    WAV_SEND_TIMEOUT_SECONDS,
+)
 from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_voices import VoiceSlot
 from breeze_infer.settings import Settings
@@ -984,6 +990,78 @@ async def _rest_of_audio(session: GpuSession[bytes]) -> AsyncGenerator[bytes, No
         yield chunk
 
 
+async def _buffered(
+    session: GpuSession[bytes],
+    events: Emitter,
+    request_id: str,
+    *,
+    sample_rate: int,
+    primed_bytes: int,
+) -> AsyncGenerator[bytes, None]:
+    """The GET route's body (research R4): the same chunks as `_rest_of_audio`, but generated
+    at full speed into a buffer rather than one chunk per send, so the GPU is released when
+    generation ends, not when the client has read everything. A browser that pauses, or
+    plays slowly, must not hold the one GPU while it drains (FR-013, FR-014); it costs only
+    the buffer's memory, bounded by the route's send timeout.
+
+    A producer task, started on the first iteration (after the primed chunk is sent), steps
+    the session into an unbounded queue:
+    - a chunk is queued as it comes;
+    - a failure from `step()` is queued and re-raised here, so the stream ends as
+      `speech.failed`, exactly as on the POST route;
+    - at `DONE` it closes the session, which releases the gate, then emits
+      `speech.generated` and queues the end marker (`None`).
+
+    Closing here is safe although `SpeechResponse` closes the session again when the response
+    ends: `GpuSession.aclose()` is idempotent, and every call waits for the same close. So a
+    close failure suppressed here is raised again by that final close, which reports it as
+    the outcome. `primed_bytes` is the PCM already generated before the `200`, so
+    `audio_seconds` counts the whole request's audio.
+
+    However this generator ends, its `finally` cancels the producer: after a disconnect
+    mid-generation that cancels the `session.step()` in flight, as cancelling
+    `_rest_of_audio` does on the POST route, so the GPU is freed within one chunk (FR-015).
+    """
+    queue: asyncio.Queue[bytes | Exception | None] = asyncio.Queue()
+
+    async def produce() -> None:
+        generated = primed_bytes
+        try:
+            while (chunk := await session.step()) is not DONE:
+                generated += len(chunk)
+                queue.put_nowait(chunk)
+        except Exception as error:  # noqa: BLE001 -- re-raised by the body, below
+            queue.put_nowait(error)
+            return
+        closed = False
+        # A close failure is the response's to report: its final close raises it again.
+        with contextlib.suppress(Exception):
+            await session.aclose()
+            closed = True
+        if closed:
+            # Only after a clean close: after a close timeout the gate is poisoned, not
+            # released, so "generated and the GPU is free" would be untrue.
+            events.emit(
+                "speech.generated",
+                request_id=request_id,
+                audio_seconds=generated / _PCM_BYTES_PER_SAMPLE / sample_rate,
+                format="wav",
+            )
+        queue.put_nowait(None)
+
+    producer = asyncio.create_task(produce())
+    try:
+        while (item := await queue.get()) is not None:
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        producer.cancel()
+        # `wait`, not `await producer`: it neither raises the producer's own cancellation
+        # nor swallows one aimed at this task (a suppressed `await` would lose it).
+        await asyncio.wait([producer])
+
+
 def wav_header(sample_rate: int) -> bytes:
     """The 44-byte header of a mono s16le WAV stream (contracts/http-wav-stream.md).
 
@@ -1020,7 +1098,8 @@ async def _serve_speech(
 ) -> Response:
     """Everything `install_speech`'s routes do once they have the runtime and the request's id;
     separate so tests can drive (and cancel) it directly. `wav` selects the GET route's
-    response: the same PCM behind a WAV header, as `audio/wav`."""
+    response: the same PCM behind a WAV header, as `audio/wav`, delivered from a buffer
+    (`_buffered`)."""
     fields = await read_fields(http_request)
     request = parse_speech(fields, components.settings)
 
@@ -1211,6 +1290,13 @@ async def _serve_speech(
     sample_rate = int(runtime.sample_rate)
     wav_fields: dict[str, Any] = {}
     if wav:
+        body = _buffered(
+            session,
+            components.events,
+            request_id,
+            sample_rate=sample_rate,
+            primed_bytes=len(first_chunk),
+        )
         # The header rides in the first chunk, so its 44 bytes count toward
         # `audio_seconds_sent` (under 1 ms of audio; research R4 accepts that).
         first_chunk = wav_header(sample_rate) + first_chunk
@@ -1218,10 +1304,17 @@ async def _serve_speech(
             "headers": {"Accept-Ranges": "none"},
             "media_type": "audio/wav",
             "event_fields": {"format": "wav"},
+            # Delivery comes from `_buffered`'s buffer and no longer holds the GPU, so only
+            # a reader stalled for 10 minutes is cut off, and no minimum rate applies: an
+            # infinite grace keeps `_send_audio`'s budget infinite (FR-016).
+            "send_timeout": WAV_SEND_TIMEOUT_SECONDS,
+            "min_rate_grace": math.inf,
         }
+    else:
+        body = _rest_of_audio(session)
     return SpeechResponse(
         first_chunk=first_chunk,
-        body=_rest_of_audio(session),
+        body=body,
         session=session,
         events=components.events,
         request_id=request_id,
