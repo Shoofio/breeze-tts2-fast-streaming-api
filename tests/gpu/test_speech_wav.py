@@ -37,6 +37,9 @@ def test_get_wav_matches_post_pcm_within_frame_tolerance(gpu_env) -> None:
         client = TestClient(create_app(components))
 
         get_response = client.get(WAV_PATH, params=FIELDS)
+        # Checked first: a GET refused before the GPU emits no terminal event, and the wait
+        # below would hide its real status and error.
+        assert get_response.status_code == 200, get_response.text
         # The GET's outcome event is emitted after its body reaches the client; the POST would
         # get a 409 if the gate were still held.
         _wait_for_terminal_event(events)
@@ -48,7 +51,6 @@ def test_get_wav_matches_post_pcm_within_frame_tolerance(gpu_env) -> None:
         finally:
             shut_down_cpu_tokenizer(components)
 
-    assert get_response.status_code == 200, get_response.text
     assert get_response.headers["content-type"] == "audio/wav"
     sample_rate = int(get_response.headers["x-sample-rate"])
     header = wav_header(sample_rate)

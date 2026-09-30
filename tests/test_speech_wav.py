@@ -37,14 +37,20 @@ def test_wav_header_matches_the_contract_at_24000_hz() -> None:
     assert wav_header(24000) == expected
 
 
-def _first_response(send: Callable[[TestClient], httpx.Response]) -> httpx.Response:
-    """`send`'s response from a fresh app and runtime: `FakeRuntime`'s samples depend on how
-    many calls it has served, so only each one's first request is comparable to another's."""
+def _second_response(send: Callable[[TestClient], httpx.Response]) -> httpx.Response:
+    """`send`'s second response from a fresh app and runtime.
+
+    `FakeRuntime`'s samples are `call_index / 100`, so two runtimes are only comparable at the
+    same call count. The first call's samples are all zero, which would hide which audio a
+    route served, so the first response is a warm-up and the second is compared.
+    """
     readiness = Readiness()
     components = _build_components(readiness)
     try:
         readiness.mark_ready(_fake_runtime())
-        return send(_client_for(components))
+        client = _client_for(components)
+        assert send(client).status_code == 200
+        return send(client)
     finally:
         components.gpu.shutdown()
 
@@ -52,10 +58,10 @@ def _first_response(send: Callable[[TestClient], httpx.Response]) -> httpx.Respo
 def test_get_streams_the_post_body_behind_a_wav_header_and_ignores_range() -> None:
     fields = {"text": "hello there", "seed": "7"}
 
-    response = _first_response(
+    response = _second_response(
         lambda client: client.get(WAV_PATH, params=fields, headers={"Range": "bytes=0-"})
     )
-    pcm = _first_response(lambda client: client.post(SPEECH_PATH, data=fields))
+    pcm = _second_response(lambda client: client.post(SPEECH_PATH, data=fields))
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "audio/wav"
@@ -63,4 +69,5 @@ def test_get_streams_the_post_body_behind_a_wav_header_and_ignores_range() -> No
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["x-sample-rate"] == "24000"
     assert pcm.status_code == 200
+    assert pcm.content.strip(b"\x00"), "the compared audio must not be silence"
     assert response.content == wav_header(24000) + pcm.content
