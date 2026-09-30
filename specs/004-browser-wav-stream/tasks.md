@@ -37,8 +37,10 @@ Don't add tests beyond those named in a task.
    Add `BREEZE_MODEL=<model> .venv/bin/pytest -m gpu` where a task says so. Without
    `BREEZE_MODEL`, every GPU test skips and still exits 0, which proves nothing. Show the real output.
 4. **Commits**: one small commit per task. The message cites FR ids.
-5. **Review loop after each commit**: two `review-agent` passes, then fix the valid findings. Run
-   only one agent at a time, and no review while a subagent is still working.
+5. **Review loop at the end of each phase**, starting at the end of Phase 2 (Phases 1 and 2 are
+   reviewed together): `review-agent` reviews the phase's commits, the valid findings are fixed, a
+   second pass reviews the fixes, and anything left is fixed. There is no third pass. Run only one
+   agent at a time, and no review while a subagent is still working.
 6. **Two-strike rule**: when a fix attempt fails, stop. Explain why, list at least 3 different
    approaches, and propose one.
 7. **The POST route stays unchanged** (FR-017). Every existing test must keep passing unmodified. If
