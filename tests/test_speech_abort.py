@@ -44,7 +44,7 @@ TERMINATOR = b"0\r\n\r\n"
 REQUEST = b"POST /speech HTTP/1.1\r\nHost: test\r\nContent-Length: 0\r\n\r\n"
 TERMINAL_EVENTS = ("speech.completed", "speech.aborted", "speech.failed")
 # The kernel evicts a connection whose peer stops acknowledging after this long. Production
-# uses 30 s (limits.TCP_USER_TIMEOUT_MS); short here so eviction can be observed.
+# uses limits.TCP_USER_TIMEOUT_MS; short here so eviction can be observed.
 TEST_TCP_USER_TIMEOUT_MS = 2000
 
 
@@ -164,11 +164,11 @@ class Rig:
 class LiveServer:
     """uvicorn serving `app` on 127.0.0.1:<ephemeral> from its own thread and event loop."""
 
-    def __init__(self, app: FastAPI) -> None:
-        # Bound as production binds, then with a short TCP_USER_TIMEOUT (accepted sockets
-        # inherit it) so the kernel's eviction of a stalled connection shows up quickly.
+    def __init__(self, app: FastAPI, user_timeout_ms: int = TEST_TCP_USER_TIMEOUT_MS) -> None:
+        # Bound as production binds, then with a short TCP_USER_TIMEOUT by default (accepted
+        # sockets inherit it) so the kernel's eviction of a stalled connection shows up quickly.
         [sock] = bind_http_sockets("127.0.0.1", 0)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, TEST_TCP_USER_TIMEOUT_MS)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, user_timeout_ms)
         self.port = sock.getsockname()[1]
         self.url = f"http://127.0.0.1:{self.port}/speech"
         self.loop = asyncio.new_event_loop()
