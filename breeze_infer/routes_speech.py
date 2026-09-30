@@ -92,6 +92,7 @@ itself since no `SpeechResponse` is ever built for it.
 # which refers to the local `components`, when the route is defined (routes_health.py does the
 # same, for the same reason).
 import asyncio
+import struct
 import threading
 import time
 from collections.abc import AsyncGenerator, Callable, Iterator
@@ -983,6 +984,30 @@ async def _rest_of_audio(session: GpuSession[bytes]) -> AsyncGenerator[bytes, No
         yield chunk
 
 
+def wav_header(sample_rate: int) -> bytes:
+    """The 44-byte header of a mono s16le WAV stream (contracts/http-wav-stream.md).
+
+    The RIFF and `data` sizes are `0xFFFFFFFF`, the usual "unknown length" value: the header
+    goes out before the audio is generated, so the body's final size isn't known yet.
+    """
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF",
+        0xFFFFFFFF,
+        b"WAVE",
+        b"fmt ",
+        16,  # fmt chunk size
+        1,  # PCM
+        1,  # mono
+        sample_rate,
+        sample_rate * 2,  # byte rate
+        2,  # block align
+        16,  # bits per sample
+        b"data",
+        0xFFFFFFFF,
+    )
+
+
 async def _serve_speech(
     http_request: Request,
     runtime: Any,
@@ -991,9 +1016,11 @@ async def _serve_speech(
     request_id: str,
     received_at: float,
     clock: Callable[[], float],
+    wav: bool = False,
 ) -> Response:
-    """Everything `install_speech`'s route does once it has the runtime and the request's id;
-    separate so tests can drive (and cancel) it directly."""
+    """Everything `install_speech`'s routes do once they have the runtime and the request's id;
+    separate so tests can drive (and cancel) it directly. `wav` selects the GET route's
+    response: the same PCM behind a WAV header, as `audio/wav`."""
     fields = await read_fields(http_request)
     request = parse_speech(fields, components.settings)
 
@@ -1181,15 +1208,27 @@ async def _serve_speech(
         ttfa_ms=(clock() - received_at) * 1000,
     )
 
+    sample_rate = int(runtime.sample_rate)
+    wav_fields: dict[str, Any] = {}
+    if wav:
+        # The header rides in the first chunk, so its 44 bytes count toward
+        # `audio_seconds_sent` (under 1 ms of audio; research R4 accepts that).
+        first_chunk = wav_header(sample_rate) + first_chunk
+        wav_fields = {
+            "headers": {"Accept-Ranges": "none"},
+            "media_type": "audio/wav",
+            "event_fields": {"format": "wav"},
+        }
     return SpeechResponse(
         first_chunk=first_chunk,
         body=_rest_of_audio(session),
         session=session,
         events=components.events,
         request_id=request_id,
-        sample_rate=int(runtime.sample_rate),
+        sample_rate=sample_rate,
         clock=clock,
         started_at=started_at,
+        **wav_fields,
     )
 
 
@@ -1199,7 +1238,8 @@ def install_speech(
     *,
     clock: Callable[[], float],
 ) -> None:
-    """Register `POST /v1/audio/speech`.
+    """Register `POST /v1/audio/speech` (raw PCM) and `GET /v1/audio/speech.wav` (the same
+    fields in the query string, answered as a WAV stream). Both are served by `_serve_speech`.
 
     `clock` is injected (Constitution III): it times `ttfa_ms` and feeds `SpeechResponse`'s own
     `rtf` (module docstring: two different readings of the same clock, not the same reading
@@ -1217,4 +1257,19 @@ def install_speech(
             request_id=http_request.state.request_id,
             received_at=clock(),
             clock=clock,
+        )
+
+    @app.get("/v1/audio/speech.wav")
+    async def speech_wav(
+        http_request: Request,
+        runtime: Annotated[Any, Depends(components.readiness.require_ready)],
+    ) -> Response:
+        return await _serve_speech(
+            http_request,
+            runtime,
+            components,
+            request_id=http_request.state.request_id,
+            received_at=clock(),
+            clock=clock,
+            wav=True,
         )
