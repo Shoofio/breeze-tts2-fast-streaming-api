@@ -136,12 +136,14 @@ class _Outcome:
         sample_rate: int,
         clock: Callable[[], float],
         started_at: float,
+        event_fields: Mapping[str, str],
     ) -> None:
         self._events = events
         self._request_id = request_id
         self._sample_rate = sample_rate
         self._clock = clock
         self._started_at = started_at
+        self._event_fields = event_fields
         self._reported = False
         self.bytes_sent = 0
 
@@ -153,7 +155,11 @@ class _Outcome:
             return
         self._reported = True
         audio_seconds_sent = self.audio_seconds_sent()
-        extra: dict[str, Any] = {"audio_seconds_sent": audio_seconds_sent, **fields}
+        extra: dict[str, Any] = {
+            **self._event_fields,
+            "audio_seconds_sent": audio_seconds_sent,
+            **fields,
+        }
         if outcome == "speech.completed" and audio_seconds_sent > 0:
             extra["rtf"] = (self._clock() - self._started_at) / audio_seconds_sent
         level = "error" if outcome == "speech.failed" else "info"
@@ -203,6 +209,10 @@ class SpeechResponse(StreamingResponse):
     - `sample_rate`: sets the contract headers and turns bytes into audio seconds. `headers`
       adds to the contract headers (and `Content-Type`); it can't replace them, and must not
       carry `Content-Length` (the body is streamed).
+    - `media_type`: the `Content-Type` of the stream (`audio/pcm` unless the body carries a
+      container, such as WAV).
+    - `event_fields`: extra fields for the one outcome event; the outcome's own fields win on
+      a clash.
     - `clock` and `started_at`: a monotonic clock and its reading when generation started,
       for the real-time factor in `speech.completed`. The clock also times each audio send
       for the minimum delivery rate (`min_rate_grace`, `min_rate`; see `limits.py`).
@@ -212,8 +222,6 @@ class SpeechResponse(StreamingResponse):
     transport while the client was still connected, not audio the client is known to have
     received. Build the response on the event loop that will serve it.
     """
-
-    media_type = "audio/pcm"
 
     def __init__(
         self,
@@ -227,6 +235,8 @@ class SpeechResponse(StreamingResponse):
         clock: Callable[[], float],
         started_at: float,
         headers: Mapping[str, str] | None = None,
+        media_type: str = "audio/pcm",
+        event_fields: Mapping[str, str] | None = None,
         send_timeout: float = HTTP_SEND_TIMEOUT_SECONDS,
         min_rate_grace: float = MIN_RATE_GRACE_SECONDS,
         min_rate: float = MIN_RATE_REAL_TIME,
@@ -235,19 +245,21 @@ class SpeechResponse(StreamingResponse):
         if "content-length" in extra:
             raise ValueError("a streamed speech response can't carry Content-Length")
         contract = {
-            "content-type": self.media_type,
+            "content-type": media_type,
             "x-sample-rate": str(sample_rate),
             "x-sample-format": "s16le",
             "cache-control": "no-store",
         }
-        super().__init__(body, headers={**extra, **contract})
+        super().__init__(body, headers={**extra, **contract}, media_type=media_type)
         self._first_chunk = first_chunk
         self._body = body
         self._session = session
         self._send_timeout = send_timeout
         self._min_rate_grace = min_rate_grace
         self._min_rate = min_rate
-        self._outcome = _Outcome(events, request_id, sample_rate, clock, started_at)
+        self._outcome = _Outcome(
+            events, request_id, sample_rate, clock, started_at, event_fields or {}
+        )
         self._clock = clock
         self._send_blocked = 0.0  # seconds spent in audio sends; generation time not included
         self._disconnected = False

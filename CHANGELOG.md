@@ -4,6 +4,13 @@ All notable changes to this project are documented here. See
 `specs/003-cpp-compatible-api/spec.md` for the full breaking-changes list and rationale (IDs
 `BC-nn`).
 
+## Unreleased
+
+### Added
+
+- `GET /v1/audio/speech.wav`: a progressive WAV stream of the same synthesis as
+  `POST /v1/audio/speech`, playable by a browser `<audio>` element.
+
 ## 2.0.0 — 2026-09-29
 
 The server now exposes a C++-server-compatible HTTP and WebSocket API; see the README and
