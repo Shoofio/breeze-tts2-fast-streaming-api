@@ -75,6 +75,21 @@ WS_CLOSE_TIMEOUT_SECONDS = 2
 
 HTTP_SEND_TIMEOUT_SECONDS = 30
 
+# How long GET /v1/audio/speech.wav waits for a busy GPU before answering 503 busy_timeout. An
+# <audio> element can't retry, so this route waits where POST /v1/audio/speech answers 409 at
+# once. 60 s matches the SillyTavern extension's own queue timeout.
+WAV_GPU_WAIT_SECONDS = 60
+
+# The WAV route's send timeout. It delivers from a buffer after releasing the GPU, so a slow or
+# paused reader (browser read-ahead limits, playback speed down to 0x) costs only memory, never
+# the GPU. 10 minutes bounds that memory.
+WAV_SEND_TIMEOUT_SECONDS = 600
+
+# The HTTP request-line limit (h11's max incomplete event size). GET carries the text in the
+# query string: 10,000 CJK characters are about 90 KB percent-encoded, and h11's default is
+# 16 KiB.
+MAX_REQUEST_LINE_BYTES = 128 * 1024
+
 # Minimum delivery rate for a streamed speech response (research.md R3). The send timeout only
 # catches a client that stops reading entirely; one that trickles (a few bytes before each
 # timeout) could hold the single GPU for hours. So the total time spent blocked in send() may
