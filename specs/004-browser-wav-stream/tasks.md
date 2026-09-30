@@ -114,7 +114,7 @@ body.
          fields returns.
 
        The fake runtime is deterministic.
-- [ ] T006 [P] [US1] Add `tests/gpu/test_speech_wav.py` with one `@pytest.mark.gpu` test. On the
+- [X] T006 [P] [US1] Add `tests/gpu/test_speech_wav.py` with one `@pytest.mark.gpu` test. On the
   session's warmed runtime (`tests/gpu/conftest.py`), GET a short text with `seed=7` and POST the
   same fields. Check:
   - the header is valid;
