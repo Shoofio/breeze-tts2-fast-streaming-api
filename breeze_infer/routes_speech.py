@@ -34,7 +34,9 @@ enforcement already lives in `body_limit.py`'s ASGI middleware, outside this rou
    voice without an override is the out-of-memory fallback's, sized only when that fallback is
    needed (step 7);
 6. `gate.try_acquire()`, else `409 busy` -- or `GpuUnavailable` if the gate is poisoned,
-   which propagates past this route to `errors.py`'s own handler (`503 gpu_unavailable`);
+   which propagates past this route to `errors.py`'s own handler (`503 gpu_unavailable`). The
+   GET route waits in the gate's queue instead (`_wait_for_gpu`): `503 busy_timeout` after
+   `wav_gpu_wait`, or no response at all if the client disconnects first;
 6a. with no reference and more than one piece, every later piece's prompt length is queued
    on the CPU tokenizer's sizing worker right after the lease (`_start_anchor_sizing`), not before
    the busy check (review #2 on 2d9070a): it runs on the CPU while piece 0 itself prepares and
@@ -114,6 +116,7 @@ from breeze_infer.gpu import (
     DONE,
     GpuCloseTimeout,
     GpuGate,
+    GpuLease,
     GpuSession,
     GpuThread,
     GpuUnavailable,
@@ -132,6 +135,7 @@ from breeze_infer.http_fields import (
 from breeze_infer.limits import (
     ANCHOR_CHARS,
     ANCHOR_SIZING_TIMEOUT_SECONDS,
+    WAV_GPU_WAIT_SECONDS,
     WAV_SEND_TIMEOUT_SECONDS,
 )
 from breeze_infer.routes_health import Readiness
@@ -1070,6 +1074,98 @@ async def _buffered(
         await asyncio.wait([producer])
 
 
+async def _wait_for_gpu(
+    gate: GpuGate,
+    http_request: Request,
+    events: Emitter,
+    *,
+    timeout: float,
+    request_id: str,
+    clock: Callable[[], float],
+) -> GpuLease | None:
+    """The GET route's way into the gate (research R3): wait in the gate's FIFO queue for up to
+    `timeout` seconds, rather than `try_acquire`'s immediate `409 busy` (FR-006). `None` if the
+    client disconnected while waiting: it leaves the queue and never takes the GPU (FR-007).
+
+    The wait races a task listening for that disconnect, and the first to finish wins. A
+    disconnect wins even over a lease handed over in the same instant, which is passed on.
+    - Timed out: `speech.queued_timeout`, then `503 busy_timeout`.
+    - Disconnected: `speech.aborted` with `queued: true`.
+    - A poisoned gate, now or while waiting: `GpuUnavailable`, as from `try_acquire`.
+
+    No lease leaks on any path. The acquire runs as its own task, and whatever ends the race
+    without taking its lease -- a disconnect, the timeout, a failed `receive()`, or this
+    request's own cancellation -- gives it up (`_give_up_gate`): that cancels a pending
+    acquire, whose `GpuGate.acquire` passes on a lease handed to it as it is cancelled, or
+    releases one already won. A lease taken is released if this request is cancelled while
+    the losing task is still being awaited.
+    """
+    queued_at = clock()
+    acquiring = asyncio.ensure_future(gate.acquire())
+    disconnect = asyncio.ensure_future(_until_disconnect(http_request))
+    lease: GpuLease | None = None
+    client_gone = False
+    try:
+        # `asyncio.timeout` cancels only this wait, never the acquire, which is decided below.
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(timeout):
+                await asyncio.wait({acquiring, disconnect}, return_when=asyncio.FIRST_COMPLETED)
+        # No `await` from here to the end of this block, so neither task can change under it.
+        client_gone = disconnect.done()
+        if not client_gone and acquiring.done():
+            lease = acquiring.result()  # raises GpuUnavailable for a poisoned gate
+    finally:
+        # Every way out but a won lease gives the gate up, and only here, so exactly once: a
+        # second `release()` of a won lease would raise, or free a later holder's gate.
+        if lease is None:
+            _give_up_gate(acquiring)
+        disconnect.cancel()
+    try:
+        # Await the losers, so neither outlives the request.
+        await asyncio.wait({acquiring, disconnect})
+    except BaseException:
+        if lease is not None:
+            lease.release()
+        raise
+    if lease is not None:
+        return lease
+    if client_gone:
+        disconnect.result()  # re-raises a failed `receive()`; otherwise the client has gone
+        events.emit(
+            "speech.aborted",
+            request_id=request_id,
+            reason="client_disconnect",
+            queued=True,
+            format="wav",
+        )
+        return None
+    events.emit(
+        "speech.queued_timeout",
+        level="warning",
+        request_id=request_id,
+        waited_s=clock() - queued_at,
+    )
+    raise ApiError(503, "busy_timeout", "the GPU stayed busy")
+
+
+async def _until_disconnect(http_request: Request) -> None:
+    """Return once the client has disconnected. `read_fields` has already consumed the body, so
+    a disconnect is the only message left to come; anything else is skipped. Asking for it is
+    what makes uvicorn resume reading the socket, so it notices the connection closing."""
+    while (await http_request.receive())["type"] != "http.disconnect":
+        pass
+
+
+def _give_up_gate(acquiring: asyncio.Future[GpuLease]) -> None:
+    """Stop waiting for the gate: cancel a pending acquire (`GpuGate.acquire` passes on a lease
+    handed to it as it is cancelled), or release a lease it already won. Call it at most once:
+    a second release of a won lease raises."""
+    if not acquiring.done():
+        acquiring.cancel()
+    elif not acquiring.cancelled() and acquiring.exception() is None:
+        acquiring.result().release()
+
+
 def wav_header(sample_rate: int) -> bytes:
     """The 44-byte header of a mono s16le WAV stream (contracts/http-wav-stream.md).
 
@@ -1103,11 +1199,14 @@ async def _serve_speech(
     received_at: float,
     clock: Callable[[], float],
     wav: bool = False,
+    gpu_wait: float | None = None,
 ) -> Response:
     """Everything `install_speech`'s routes do once they have the runtime and the request's id;
     separate so tests can drive (and cancel) it directly. `wav` selects the GET route's
     response: the same PCM behind a WAV header, as `audio/wav`, delivered from a buffer
-    (`_buffered`)."""
+    (`_buffered`). `gpu_wait` is how long a busy GPU is waited for (`_wait_for_gpu`), after
+    every CPU-only check (FR-005); `None` answers it with `409 busy` at once, as the POST
+    route always has (FR-017)."""
     fields = await read_fields(http_request)
     request = parse_speech(fields, components.settings)
 
@@ -1148,11 +1247,30 @@ async def _serve_speech(
         None if voice_lookup is None else voice_lookup.voice,
     )
 
-    # None means busy (409); a poisoned gate raises GpuUnavailable instead (gpu.py), which
-    # propagates straight past this route to errors.py's own handler (503 gpu_unavailable).
-    lease = components.gate.try_acquire()
-    if lease is None:
-        raise ApiError(409, "busy", "busy")
+    # A poisoned gate raises GpuUnavailable on either path (gpu.py), which propagates straight
+    # past this route to errors.py's own handler (503 gpu_unavailable).
+    if gpu_wait is None:
+        lease = components.gate.try_acquire()  # None means busy (409)
+        if lease is None:
+            raise ApiError(409, "busy", "busy")
+    else:
+        lease = await _wait_for_gpu(
+            components.gate,
+            http_request,
+            components.events,
+            timeout=gpu_wait,
+            request_id=request_id,
+            clock=clock,
+        )
+        if lease is None:
+            # The client disconnected while queued. Returned rather than raised: an exception
+            # would reach errors.py's catch-all (`request.failed`, a 500) and uvicorn's
+            # "Exception in ASGI application" traceback, CancelledError included, for what is
+            # the client's doing. uvicorn drops every send once the client has gone, so this
+            # response is never written (499 is nginx's "client closed request", for anything
+            # in between that inspects it), and a handler that returns after a disconnect is
+            # not logged.
+            return Response(status_code=499)
 
     session: GpuSession[bytes] | None = None
     gpu_task: asyncio.Task[Any] | None = None
@@ -1338,9 +1456,12 @@ def install_speech(
     components: SpeechComponents,
     *,
     clock: Callable[[], float],
+    wav_gpu_wait: float = WAV_GPU_WAIT_SECONDS,
 ) -> None:
     """Register `POST /v1/audio/speech` (raw PCM) and `GET /v1/audio/speech.wav` (the same
     fields in the query string, answered as a WAV stream). Both are served by `_serve_speech`.
+    The GET route waits up to `wav_gpu_wait` seconds for a busy GPU (FR-006), injected so
+    tests can shorten it; the POST route answers `409 busy` at once.
 
     `clock` is injected (Constitution III): it times `ttfa_ms` and feeds `SpeechResponse`'s own
     `rtf` (module docstring: two different readings of the same clock, not the same reading
@@ -1373,4 +1494,5 @@ def install_speech(
             received_at=clock(),
             clock=clock,
             wav=True,
+            gpu_wait=wav_gpu_wait,
         )

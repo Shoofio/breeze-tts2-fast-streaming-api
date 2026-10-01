@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import httpx
@@ -20,6 +21,7 @@ import pytest
 from breeze_infer.api import Components, create_app
 from breeze_infer.limits import TCP_USER_TIMEOUT_MS
 from breeze_infer.routes_health import Readiness
+from breeze_infer.routes_speech import wav_header
 from tests.fakes import CODEC_SAMPLES_PER_FRAME, FakeRuntime, RecordingEvents
 from tests.test_routes_speech import _build_components, _fake_runtime, _gate_is_free
 from tests.test_speech_abort import LiveServer, wait_until
@@ -156,6 +158,31 @@ def test_a_generation_failure_frees_the_gpu_before_the_client_reads_the_buffer()
     assert fields["reason"] == "generation_error"
     assert fields["format"] == "wav"
     assert _named(events, "speech.generated") == []
+
+
+def test_a_get_queued_behind_a_busy_gpu_streams_once_it_is_released() -> None:
+    chunks = 3
+    runtime = _fake_runtime(chunks=chunks, frames_per_chunk=FRAMES_PER_CHUNK)
+    with _serving(runtime) as (components, events, server, url):
+        # Held and released on the server's loop: `GpuGate` is loop-bound (gpu.py), and the
+        # release resolves the queued request's future.
+        lease = server.call(components.gate.try_acquire)
+        assert lease is not None
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(httpx.get, url, params=FIELDS, timeout=10)
+            wait_until(lambda: server.call(lambda: bool(components.gate._waiters)))
+            server.call(lease.release)
+            response = pending.result(timeout=10)
+
+        wait_until(lambda: bool(_named(events, *OUTCOME_EVENTS)))
+
+    assert response.status_code == 200
+    assert response.content[:WAV_HEADER_BYTES] == wav_header(runtime.sample_rate)
+    pcm_bytes = chunks * FRAMES_PER_CHUNK * CODEC_SAMPLES_PER_FRAME * 2
+    assert len(response.content) == WAV_HEADER_BYTES + pcm_bytes
+    [(name, fields)] = _named(events, *OUTCOME_EVENTS)
+    assert name == "speech.completed"
+    assert fields["format"] == "wav"
 
 
 async def _loop_turns(count: int) -> None:
