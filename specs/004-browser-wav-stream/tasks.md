@@ -217,7 +217,7 @@ result is `503 busy_timeout`. With the gate released during the wait, the result
 **Independent test**: over real uvicorn, a GET whose URL carries about 90 KB of percent-encoded
 Chinese reaches the route.
 
-- [ ] T011 [US4] In `breeze_infer/api.py`'s `uvicorn.Config(...)`, add
+- [X] T011 [US4] In `breeze_infer/api.py`'s `uvicorn.Config(...)`, add
   `h11_max_incomplete_event_size=MAX_REQUEST_LINE_BYTES`, with a comment giving the reason: 10,000
   CJK characters come to about 90 KB percent-encoded, and h11's default is 16 KiB.
   - In `tests/test_speech_wav_stream.py`, pass the same constant in the test server's own
