@@ -28,13 +28,22 @@ the code.
 - **Decision**: Use no new parsing code. For a GET with no body, `read_fields` reads the query
   string alone. It already rejects `ref_audio` given in a query (`400 invalid_field`) and a field
   repeated in the query (`400 duplicate_field`).
-- **Request-line size**: set `h11_max_incomplete_event_size=128 * 1024` in `uvicorn.Config`
+- **Request-head size**: set `h11_max_incomplete_event_size=192 * 1024` in `uvicorn.Config`
   (`breeze_infer/api.py`), next to the existing `http="h11"`. The default is 16,384 bytes (checked:
-  h11 0.16.0, uvicorn 0.52.4). 10,000 CJK characters come to 90,000 bytes percent-encoded. Anything
-  larger is refused by h11 with `400` before the app runs.
+  h11 0.16.0, uvicorn 0.52.4). Anything larger is refused by h11 with `400` before the app runs.
+  - The limit covers the whole request head (request line plus headers), not only the request line.
+  - 10,000 common CJK characters come to 90,000 bytes percent-encoded.
+  - Characters outside the basic plane take 12 bytes each. A maximum text of them, plus the longest
+    instruction that still leaves piece 0 room (about 500 characters), is about 123 KB before any
+    header.
+  - 128 KiB (the first plan) left too little room for headers, so the Phase 6 review raised it to
+    192 KiB, a decision made by the user.
 - **Alternative considered**: Raise the limit only for this route. Rejected: h11 applies it per
-  connection, before routing, so it can't be per route. The cost of 128 KiB of buffered headers per
-  connection is negligible.
+  connection, before routing, so it can't be per route.
+- **Cost**: each connection whose head is still arriving can buffer up to 192 KiB. HTTP has no
+  connection cap and no head timeout, so a slowloris client is a memory exposure when bound to
+  `0.0.0.0` (as `start_breeze.sh` does). This exposure already existed at 16 KiB. It is accepted:
+  this is a LAN server with no authentication.
 
 ## R3. A bounded wait that notices a client disconnect
 

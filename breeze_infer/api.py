@@ -44,7 +44,7 @@ from breeze_infer.gpu import (
     report_close_failed,
 )
 from breeze_infer.limits import (
-    MAX_REQUEST_LINE_BYTES,
+    MAX_REQUEST_HEAD_BYTES,
     TCP_USER_TIMEOUT_MS,
     VOICE_PREFIX_CACHE_BYTES,
 )
@@ -497,9 +497,9 @@ async def serve(
             # h11 explicitly: research R2/R3 measured the abort-without-terminator and
             # disconnect behaviour on it.
             http="h11",
-            # The WAV route carries its text in the query string: 10,000 CJK characters are
-            # about 90 KB percent-encoded, past h11's 16 KiB default (004 FR-004).
-            h11_max_incomplete_event_size=MAX_REQUEST_LINE_BYTES,
+            # The WAV route carries its fields in the query string, far past h11's 16 KiB
+            # default for the largest valid request (004 FR-004; limits.py).
+            h11_max_incomplete_event_size=MAX_REQUEST_HEAD_BYTES,
             log_config=None,
             access_log=False,
             timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,

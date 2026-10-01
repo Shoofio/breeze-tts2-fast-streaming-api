@@ -70,7 +70,7 @@ Don't add tests beyond those named in a task.
   why (spec FR-004, FR-006, FR-016):
   - `WAV_GPU_WAIT_SECONDS = 60`
   - `WAV_SEND_TIMEOUT_SECONDS = 600`
-  - `MAX_REQUEST_LINE_BYTES = 128 * 1024`
+  - `MAX_REQUEST_HEAD_BYTES = 128 * 1024` (raised to 192 KiB in the Phase 6 review)
 
 **Checkpoint**: `pytest` is green, with no behaviour change.
 
@@ -212,13 +212,13 @@ result is `503 busy_timeout`. With the gate released during the wait, the result
 
 ## Phase 6: User Story 4 - Long and non-ASCII text works in a URL (Priority: P2)
 
-**Goal**: request lines of up to 128 KiB are accepted.
+**Goal**: request heads of up to 192 KiB are accepted (128 KiB as first planned).
 
 **Independent test**: over real uvicorn, a GET whose URL carries about 90 KB of percent-encoded
 Chinese reaches the route.
 
 - [X] T011 [US4] In `breeze_infer/api.py`'s `uvicorn.Config(...)`, add
-  `h11_max_incomplete_event_size=MAX_REQUEST_LINE_BYTES`, with a comment giving the reason: 10,000
+  `h11_max_incomplete_event_size=MAX_REQUEST_HEAD_BYTES`, with a comment giving the reason: 10,000
   CJK characters come to about 90 KB percent-encoded, and h11's default is 16 KiB.
   - In `tests/test_speech_wav_stream.py`, pass the same constant in the test server's own
     `uvicorn.Config`.
@@ -255,7 +255,7 @@ Chinese reaches the route.
   - **Kept behaviours**: the list says "no WAV"; amend it to note this route is the exception.
 - [ ] T014 [P] Finish the `CHANGELOG.md` Unreleased entries:
   - the route
-  - the 128 KiB request-line limit (it affects all routes)
+  - the 192 KiB request-head limit (it affects all routes)
   - the new error code `busy_timeout`
   - the new events `speech.generated` and `speech.queued_timeout`
 - [ ] T015 Run the GPU suite (`BREEZE_MODEL=... .venv/bin/pytest -m gpu`), and record the result.

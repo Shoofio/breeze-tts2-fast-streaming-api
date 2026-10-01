@@ -147,7 +147,7 @@ Both stream to completion.
 
 1. **Given** a 10,000-character Chinese text, percent-encoded (about 90 KB), **When** it is
    requested, **Then** it streams to completion.
-2. **Given** a request line longer than 128 KiB, **When** it arrives, **Then** it is rejected
+2. **Given** a request head longer than 192 KiB, **When** it arrives, **Then** it is rejected
    before any work is done.
 
 ---
@@ -210,7 +210,8 @@ and compare the status and body with the POST route.
   so it can't arrive in a query string; the existing check rejects it with `400 invalid_field`.
   `ref_text` follows the POST route's rules: with `voice_id` it overrides the stored transcript,
   and alone it is `400 reference_required`.
-- **FR-004**: The server MUST accept request lines of up to 128 KiB, so that 10,000 characters of
+- **FR-004**: The server MUST accept request heads (request line plus headers) of up to 192 KiB,
+  raised from 128 KiB in the Phase 6 review, so that 10,000 characters of
   any script fit percent-encoded, and MUST reject longer ones without doing any work.
 - **FR-005**: All validation that the POST route does before streaming MUST happen before this
   route sends a status line, so every rejection is a real non-2xx response.

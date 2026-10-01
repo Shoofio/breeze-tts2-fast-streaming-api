@@ -86,10 +86,13 @@ WAV_GPU_WAIT_SECONDS = 60
 # not one that keeps reading slowly; the buffer's memory is deliberately uncapped (004 R4).
 WAV_SEND_TIMEOUT_SECONDS = 600
 
-# The HTTP request-line limit (h11's max incomplete event size). GET carries the text in the
-# query string: 10,000 CJK characters are about 90 KB percent-encoded, and h11's default is
-# 16 KiB.
-MAX_REQUEST_LINE_BYTES = 128 * 1024
+# The HTTP request-head limit: h11's max incomplete event size, which covers the request line
+# and every header (and chunked framing lines). GET /v1/audio/speech.wav carries its fields in
+# the query string: 10,000 characters of text and up to 2,000 of instruction, at up to 12 bytes
+# each percent-encoded (characters outside the basic plane), so at most about 144 KB before
+# headers. h11's default is 16 KiB. Each connection can buffer up to this much
+# while its head is still arriving.
+MAX_REQUEST_HEAD_BYTES = 192 * 1024
 
 # Minimum delivery rate for a streamed speech response (research.md R3). The send timeout only
 # catches a client that stops reading entirely; one that trickles (a few bytes before each

@@ -13,7 +13,7 @@ route reuses the POST route's pipeline, which differs in only two places:
 - it delivers from a buffer, so the GPU is released as soon as generation ends and the browser
   reads at its own pace.
 
-The only other server change is raising the request-line limit to 128 KiB. Version 2.1.0.
+The only other server change is raising the request-head limit to 192 KiB. Version 2.1.0.
 
 **Scope guidance from the user**: keep it tight. Tests cover the new behaviour's main paths, not
 every corner. The live gate carries the browser questions.
@@ -78,9 +78,9 @@ specs/004-browser-wav-stream/
 ```text
 breeze_infer/
 ├── __init__.py        # __version__ → 2.1.0.devN, then 2.1.0
-├── api.py             # uvicorn.Config: h11_max_incomplete_event_size=MAX_REQUEST_LINE_BYTES
+├── api.py             # uvicorn.Config: h11_max_incomplete_event_size=MAX_REQUEST_HEAD_BYTES
 ├── limits.py          # + WAV_GPU_WAIT_SECONDS = 60, WAV_SEND_TIMEOUT_SECONDS = 600,
-│                      #   MAX_REQUEST_LINE_BYTES = 128 KiB
+│                      #   MAX_REQUEST_HEAD_BYTES = 192 KiB
 ├── streaming.py       # SpeechResponse: + media_type parameter (default audio/pcm)
 └── routes_speech.py   # _serve_speech: + gpu_wait / wav parameters; the GET route;
                        #   _wait_for_gpu (R3), _buffered (R4), wav_header (R5)

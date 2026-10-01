@@ -30,7 +30,7 @@ from breeze_infer.api import bind_http_sockets
 from breeze_infer.audio import pcm16
 from breeze_infer.errors import StreamAborted, install_error_handlers
 from breeze_infer.gpu import DONE, GpuGate, GpuSession, GpuThread
-from breeze_infer.limits import MAX_REQUEST_LINE_BYTES
+from breeze_infer.limits import MAX_REQUEST_HEAD_BYTES
 from breeze_infer.streaming import ClientAbortLogFilter, SendTimeout, SpeechResponse
 
 # FakeRuntime imports this lazily on the first step, i.e. on the GPU thread in the middle of a
@@ -178,7 +178,7 @@ class LiveServer:
                 app,
                 lifespan="off",
                 http="h11",
-                h11_max_incomplete_event_size=MAX_REQUEST_LINE_BYTES,  # as api.serve sets it
+                h11_max_incomplete_event_size=MAX_REQUEST_HEAD_BYTES,  # as api.serve sets it
                 log_config=None,
                 access_log=False,
                 timeout_graceful_shutdown=2,

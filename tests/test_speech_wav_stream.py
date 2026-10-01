@@ -213,12 +213,15 @@ def test_a_get_that_disconnects_while_queued_leaves_the_queue() -> None:
     assert runtime.calls == []
 
 
-def test_a_10000_character_cjk_text_fits_in_the_url() -> None:
-    # FR-004: about 90 KB percent-encoded, past h11's 16 KiB default request-line limit.
-    text = "今天天氣很好，我們一起去公園散步吧。" * 556  # 18 x 556 = 10,008 characters
-    text = text[:10_000]
-    query = urllib.parse.urlencode({"text": text})
-    assert len(query) > 64 * 1024
+def test_the_largest_valid_request_fits_in_the_url() -> None:
+    # FR-004: 10,000 characters of text, mostly outside the basic plane (12 bytes each
+    # percent-encoded), with as long an instruction as still leaves piece 0 room to generate
+    # (a longer one is `text_too_long` on either route): about 123 KB, far past h11's 16 KiB
+    # default and close to 128 KiB before any header.
+    rare = "\U00020000"  # 𠀀, CJK Extension B
+    text = (rare * 9 + "，") * 1_000
+    query = urllib.parse.urlencode({"text": text, "instruction": rare * 500})
+    assert len(query) > 120_000
     # A raw socket: httpx itself refuses a query over 64 KiB, which browsers don't (Chrome
     # allows 2 MB URLs).
     request = f"GET /v1/audio/speech.wav?{query} HTTP/1.1\r\nHost: test\r\n\r\n"
@@ -229,12 +232,18 @@ def test_a_10000_character_cjk_text_fits_in_the_url() -> None:
         client.sendall(request.encode("ascii"))
         head = b""
         while b"\r\n\r\n" not in head:
-            head += client.recv(4096)
+            chunk = client.recv(4096)
+            if not chunk:
+                raise AssertionError(f"connection closed before the response head: {head!r}")
+            head += chunk
+        # Checked before waiting for the outcome, so a refused request shows its real status.
+        status_line, *header_lines = head.split(b"\r\n\r\n")[0].split(b"\r\n")
+        assert status_line == b"HTTP/1.1 200 OK", head
+        assert b"content-type: audio/wav" in header_lines
         wait_until(lambda: bool(_named(events, *OUTCOME_EVENTS)))
 
-    status_line, *header_lines = head.split(b"\r\n\r\n")[0].split(b"\r\n")
-    assert status_line == b"HTTP/1.1 200 OK"
-    assert b"content-type: audio/wav" in header_lines
+    [(name, _)] = _named(events, *OUTCOME_EVENTS)
+    assert name == "speech.completed"
 
 
 async def _loop_turns(count: int) -> None:
