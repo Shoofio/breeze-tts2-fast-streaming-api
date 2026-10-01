@@ -10,6 +10,7 @@ blocks in `send()` once the socket buffers are full. The components and fake run
 from __future__ import annotations
 
 import asyncio
+import socket
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -183,6 +184,32 @@ def test_a_get_queued_behind_a_busy_gpu_streams_once_it_is_released() -> None:
     [(name, fields)] = _named(events, *OUTCOME_EVENTS)
     assert name == "speech.completed"
     assert fields["format"] == "wav"
+
+
+def test_a_get_that_disconnects_while_queued_leaves_the_queue() -> None:
+    # FR-007: it must give up its place without ever taking the GPU, and end quietly, with no
+    # `request.failed`.
+    runtime = _fake_runtime()
+    with _serving(runtime) as (components, events, server, _url):
+        lease = server.call(components.gate.try_acquire)
+        assert lease is not None
+        with socket.create_connection(("127.0.0.1", server.port), timeout=5) as client:
+            client.sendall(
+                b"GET /v1/audio/speech.wav?text=hello%20there HTTP/1.1\r\nHost: test\r\n\r\n"
+            )
+            wait_until(lambda: server.call(lambda: bool(components.gate._waiters)))
+        # Leaving the block closed the connection while the request was still queued.
+        wait_until(lambda: bool(_named(events, "speech.aborted")))
+        assert server.call(lambda: not components.gate._waiters)
+        server.call(lease.release)
+        assert _gate_free_on_server(components, server)
+        server.wait_for_handlers()
+
+    [(_, aborted)] = _named(events, "speech.aborted")
+    assert aborted["reason"] == "client_disconnect"
+    assert aborted["queued"] is True
+    assert _named(events, "request.failed", "speech.accepted") == []
+    assert runtime.calls == []
 
 
 async def _loop_turns(count: int) -> None:

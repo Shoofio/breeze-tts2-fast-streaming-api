@@ -1120,8 +1120,12 @@ async def _wait_for_gpu(
         if lease is None:
             _give_up_gate(acquiring)
         disconnect.cancel()
+        # On the exception paths below the losers are only cancelled, not awaited: retrieve
+        # whatever they end with, so a failed `receive()` isn't logged as never retrieved.
+        for task in (acquiring, disconnect):
+            task.add_done_callback(_retrieve)
     try:
-        # Await the losers, so neither outlives the request.
+        # Await the losers, so on the normal paths neither outlives the request.
         await asyncio.wait({acquiring, disconnect})
     except BaseException:
         if lease is not None:
@@ -1154,6 +1158,11 @@ async def _until_disconnect(http_request: Request) -> None:
     what makes uvicorn resume reading the socket, so it notices the connection closing."""
     while (await http_request.receive())["type"] != "http.disconnect":
         pass
+
+
+def _retrieve(task: asyncio.Future[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 def _give_up_gate(acquiring: asyncio.Future[GpuLease]) -> None:
