@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import socket
 import threading
+import urllib.parse
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -210,6 +211,30 @@ def test_a_get_that_disconnects_while_queued_leaves_the_queue() -> None:
     assert aborted["queued"] is True
     assert _named(events, "request.failed", "speech.accepted") == []
     assert runtime.calls == []
+
+
+def test_a_10000_character_cjk_text_fits_in_the_url() -> None:
+    # FR-004: about 90 KB percent-encoded, past h11's 16 KiB default request-line limit.
+    text = "今天天氣很好，我們一起去公園散步吧。" * 556  # 18 x 556 = 10,008 characters
+    text = text[:10_000]
+    query = urllib.parse.urlencode({"text": text})
+    assert len(query) > 64 * 1024
+    # A raw socket: httpx itself refuses a query over 64 KiB, which browsers don't (Chrome
+    # allows 2 MB URLs).
+    request = f"GET /v1/audio/speech.wav?{query} HTTP/1.1\r\nHost: test\r\n\r\n"
+    with (
+        _serving(_fake_runtime()) as (_components, events, server, _url),
+        socket.create_connection(("127.0.0.1", server.port), timeout=10) as client,
+    ):
+        client.sendall(request.encode("ascii"))
+        head = b""
+        while b"\r\n\r\n" not in head:
+            head += client.recv(4096)
+        wait_until(lambda: bool(_named(events, *OUTCOME_EVENTS)))
+
+    status_line, *header_lines = head.split(b"\r\n\r\n")[0].split(b"\r\n")
+    assert status_line == b"HTTP/1.1 200 OK"
+    assert b"content-type: audio/wav" in header_lines
 
 
 async def _loop_turns(count: int) -> None:
