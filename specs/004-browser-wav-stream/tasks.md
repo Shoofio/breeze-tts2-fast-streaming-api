@@ -181,7 +181,7 @@ and it leaves the queue on disconnect.
 **Independent test**: hold the gate and GET with a short wait. With the gate held throughout, the
 result is `503 busy_timeout`. With the gate released during the wait, the result is `200`.
 
-- [ ] T009 *(Opus)* [US3] Implement `_wait_for_gpu(gate, http_request, timeout)` in
+- [X] T009 *(Opus)* [US3] Implement `_wait_for_gpu(gate, http_request, timeout)` in
   `breeze_infer/routes_speech.py` (research R3):
   - **The race**: race `gate.acquire()` inside `asyncio.timeout(timeout)` against a task that awaits
     `http_request.receive()` until `http.disconnect`. Cancel the loser, and await it.
@@ -196,7 +196,7 @@ result is `503 busy_timeout`. With the gate released during the wait, the result
     - `install_speech` gains `wav_gpu_wait: float = WAV_GPU_WAIT_SECONDS`, which the GET route
       passes in.
     - A poisoned gate still raises `GpuUnavailable` (`503 gpu_unavailable`).
-- [ ] T010 [US3] Add two tests:
+- [X] T010 [US3] Add two tests:
   - **(a)** In `tests/test_speech_wav.py`: install the app with `wav_gpu_wait=0.2`, hold the gate
     with `try_acquire()` from the test thread, and check that a GET returns `503` with code
     `busy_timeout`. This is safe across threads because the waiter times out and leaves the queue
