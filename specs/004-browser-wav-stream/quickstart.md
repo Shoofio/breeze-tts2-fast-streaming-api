@@ -12,14 +12,14 @@ The live gate for 004 replaces the skipped browser spike. Results go in
   - Stop 2.0.0 first; 8080 must be free.
   - Keep its stdout, which is the JSON event log.
 - SillyTavern is on `http://127.0.0.1:8000`, with Chrome and Firefox available.
-- A saved voice, for example `eric`. Never delete `eric` or `vale`.
+- A saved voice, for example `Eric01`. Never delete `Eric01` or `Vale01` (the voices 003 calls `eric` and `vale`).
 - `BASE=http://127.0.0.1:8080`
 
 ## 1. Wire format (curl)
 
 ```bash
-curl -sN -D - "$BASE/v1/audio/speech.wav?voice_id=eric&seed=7&text=Hello%20there." -o /tmp/h.wav
-xxd -l 44 /tmp/h.wav
+curl -sN -D - "$BASE/v1/audio/speech.wav?voice_id=Eric01&seed=7&text=Hello%20there." -o /tmp/h.wav
+od -A d -t x1 -N 44 /tmp/h.wav   # xxd is not installed in WSL
 ```
 
 Expected:
@@ -32,8 +32,8 @@ Expected:
 medians. They must be within 10% of each other.
 
 ```bash
-for i in 1 2 3; do curl -s -o /dev/null -w '%{time_starttransfer}\n' "$BASE/v1/audio/speech.wav?voice_id=eric&seed=7&text=Hello%20there."; done
-for i in 1 2 3; do curl -s -o /dev/null -w '%{time_starttransfer}\n' -X POST "$BASE/v1/audio/speech" -d voice_id=eric -d seed=7 --data-urlencode 'text=Hello there.'; done
+for i in 1 2 3; do curl -s -o /dev/null -w '%{time_starttransfer}\n' "$BASE/v1/audio/speech.wav?voice_id=Eric01&seed=7&text=Hello%20there."; done
+for i in 1 2 3; do curl -s -o /dev/null -w '%{time_starttransfer}\n' -X POST "$BASE/v1/audio/speech" -d voice_id=Eric01 -d seed=7 --data-urlencode 'text=Hello there.'; done
 ```
 
 ## 2. Browser playback (SC-002, SC-003)
@@ -41,7 +41,7 @@ for i in 1 2 3; do curl -s -o /dev/null -w '%{time_starttransfer}\n' -X POST "$B
 In **Chrome**, then **Firefox**, open the SillyTavern page and run this in the devtools console:
 
 ```js
-a = new Audio(`http://127.0.0.1:8080/v1/audio/speech.wav?voice_id=eric&seed=7&text=${encodeURIComponent(LONG)}`);
+a = new Audio(`http://127.0.0.1:8080/v1/audio/speech.wav?voice_id=Eric01&seed=7&text=${encodeURIComponent(LONG)}`);
 a.playbackRate = 1; a.play();
 ```
 

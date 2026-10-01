@@ -259,7 +259,7 @@ Chinese reaches the route.
   - the new error code `busy_timeout`
   - the new events `speech.generated` and `speech.queued_timeout`
 - [X] T015 Run the GPU suite (`BREEZE_MODEL=... .venv/bin/pytest -m gpu`), and record the result.
-- [ ] T016 Live gate:
+- [X] T016 Live gate (ended early by the user; see research/live-004.md "Not run"):
   1. Bump to `2.1.0.devN` first.
   2. Start the server as in the quickstart.
   3. Run [quickstart.md](quickstart.md) §1–5 in Chrome and Firefox. SillyTavern safety rules apply:
