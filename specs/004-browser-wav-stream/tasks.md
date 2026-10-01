@@ -268,7 +268,7 @@ Chinese reaches the route.
      `0xFFFFFFFF` handling) in `specs/004-browser-wav-stream/research/live-004.md`.
 
   The user drives the browser steps that automation can't.
-- [ ] T017 Release, with explicit user confirmation before touching `main` or the tag:
+- [X] T017 Release, with explicit user confirmation before touching `main` or the tag:
   1. Set the version to `2.1.0`, and date the CHANGELOG section.
   2. Merge to `main` and tag `v2.1.0`. Nothing is pushed unless the user asks.
   3. Restart the live server on 2.1.0, and tell `st-agent` that 2.1.0 is live.
