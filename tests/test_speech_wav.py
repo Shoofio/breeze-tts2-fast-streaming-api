@@ -152,3 +152,30 @@ def test_a_get_that_waits_too_long_for_the_gpu_gets_503_busy_timeout(
     assert [name for name, _ in events.calls if name == "speech.queued_timeout"] == [
         "speech.queued_timeout"
     ]
+
+
+@pytest.mark.parametrize(
+    ("fields", "status", "code"),
+    [
+        ({"text": "hello there", "voice_id": "nobody"}, 404, "unknown_voice"),
+        ({"text": ""}, 400, "text_required"),
+        ({"text": "hello there", "seed": "-1"}, 400, "invalid_field"),
+        ({"text": "hello there", "ref_audio": "x"}, 400, "invalid_field"),  # not a file part
+    ],
+)
+def test_bad_input_gets_the_same_error_on_get_as_on_post(
+    fields: dict[str, str], status: int, code: str
+) -> None:
+    # SC-007: one parser and one set of checks serve both routes, before any audio is sent.
+    readiness = Readiness()
+    components = _build_components(readiness)
+    try:
+        readiness.mark_ready(_fake_runtime())
+        client = _client_for(components)
+        get = client.get(WAV_PATH, params=fields)
+        post = client.post(SPEECH_PATH, data=fields)
+    finally:
+        components.gpu.shutdown()
+
+    assert (get.status_code, get.json()["code"]) == (status, code)
+    assert (get.status_code, get.json()) == (post.status_code, post.json())
