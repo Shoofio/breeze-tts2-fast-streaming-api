@@ -258,7 +258,7 @@ Chinese reaches the route.
   - the 192 KiB request-head limit (it affects all routes)
   - the new error code `busy_timeout`
   - the new events `speech.generated` and `speech.queued_timeout`
-- [ ] T015 Run the GPU suite (`BREEZE_MODEL=... .venv/bin/pytest -m gpu`), and record the result.
+- [X] T015 Run the GPU suite (`BREEZE_MODEL=... .venv/bin/pytest -m gpu`), and record the result.
 - [ ] T016 Live gate:
   1. Bump to `2.1.0.devN` first.
   2. Start the server as in the quickstart.
