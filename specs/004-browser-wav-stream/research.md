@@ -62,10 +62,12 @@ the code.
      producer task that runs `session.step()` at full speed, appending each chunk to an unbounded
      `asyncio.Queue`.
      - If `step()` raises (a generation error, or `NoRoomError` on a later piece), the producer
-       puts the exception in the queue. The body generator re-raises it, so it ends the stream as
+       first closes the session, releasing the GPU at once rather than after the client has
+       drained the buffer (Phase 4 review), then puts the exception in the queue. The body generator re-raises it, so it ends the stream as
        `speech.failed`, exactly as the POST route does today.
      - At `DONE`, the producer calls `session.aclose()`. That closes the generator on the GPU thread
-       and releases the gate, and the producer then emits `speech.generated`.
+       and releases the gate, and the producer then emits `speech.generated`. If that close fails,
+       the producer queues the error instead (and emits no `speech.generated`).
      - The body generator yields chunks from the queue.
      - In its `finally`, it cancels and awaits the producer.
   2. **`send_timeout=600`** and **`min_rate_grace=math.inf`**. The minimum rate never trips, and a
@@ -77,8 +79,10 @@ the code.
   - `GpuSession.aclose()` is idempotent: "Repeated and concurrent calls all wait for the same
     close". So `SpeechResponse`'s own `finally` can still close the session and report exactly one
     outcome.
-  - A close failure during the producer's `aclose()` surfaces again at that final close, which
-    reports it as `speech.failed`.
+  - A close failure at `DONE` goes through the stream rather than being left to that final close.
+    After a close timeout, the final close waits afresh and may succeed, which would report a
+    success on a poisoned gate. The request ends as `speech.failed` with
+    `reason=gpu_close_timeout`, as on the POST route (Phase 4 review).
   - When the client disconnects mid-generation, cancelling the producer cancels a `session.step()`.
     That is exactly what happens on the POST route today, so "GPU freed within one chunk" holds by
     the same path.

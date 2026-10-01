@@ -7,17 +7,23 @@ GET route is exercised on exactly the setup the POST route's tests use.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
+from breeze_infer import routes_speech
+from breeze_infer.gpu import GpuCloseTimeout, GpuSession
 from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_speech import wav_header
+from tests.fakes import RecordingEvents
 from tests.test_routes_speech import (
     SPEECH_PATH,
     _build_components,
     _client_for,
     _fake_runtime,
+    _gate_is_free,
 )
 
 WAV_PATH = "/v1/audio/speech.wav"
@@ -71,3 +77,44 @@ def test_get_streams_the_post_body_behind_a_wav_header_and_ignores_range() -> No
     assert pcm.status_code == 200
     assert pcm.content.strip(b"\x00"), "the compared audio must not be silence"
     assert response.content == wav_header(24000) + pcm.content
+
+
+class _FirstCloseTimesOut(GpuSession[Any]):
+    """The first close times out, as a stuck GPU thread would; a later close succeeds,
+    because the stuck close has finished by the time the response closes again."""
+
+    _timed_out = False
+
+    async def aclose(self) -> None:
+        await super().aclose()
+        if not _FirstCloseTimesOut._timed_out:
+            _FirstCloseTimesOut._timed_out = True
+            raise GpuCloseTimeout("still closing")
+
+
+def test_a_close_timeout_at_the_end_of_generation_is_reported_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Phase 4 review: the producer's close at DONE timed out, the response's final close then
+    # succeeded, and the request was reported as completed on what would be a poisoned gate.
+    monkeypatch.setattr(routes_speech, "GpuSession", _FirstCloseTimesOut)
+    monkeypatch.setattr(_FirstCloseTimesOut, "_timed_out", False)
+    readiness = Readiness()
+    events = RecordingEvents()
+    components = _build_components(readiness, events=events)
+    try:
+        readiness.mark_ready(_fake_runtime())
+        # The headers went out before the failure, so the status is still 200; TestClient
+        # returns the body cut short rather than raising, unlike a real connection.
+        response = _client_for(components).get(WAV_PATH, params={"text": "hello there"})
+        assert response.status_code == 200
+        assert _gate_is_free(components)
+    finally:
+        components.gpu.shutdown()
+
+    names = [name for name, _ in events.calls]
+    assert "speech.completed" not in names
+    assert "speech.generated" not in names
+    [failed] = [fields for name, fields in events.calls if name == "speech.failed"]
+    assert failed["reason"] == "gpu_close_timeout"
+    assert failed["format"] == "wav"

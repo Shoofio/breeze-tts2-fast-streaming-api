@@ -1033,8 +1033,10 @@ async def _buffered(
                 queue.put_nowait(chunk)
         except Exception as error:  # noqa: BLE001 -- re-raised by the body, below
             # Close first: queued behind every buffered chunk, the error would otherwise keep
-            # the GPU held until the client had read them all (FR-014). The step's own error
-            # is the one to report, so a close failure here is left to the final close.
+            # the GPU held until the client had read them all (FR-014). A close failure here is
+            # suppressed: the response's final close raises it again and reports it, as on the
+            # POST route. Once step() has raised, the generator is finished, so this close has
+            # nothing left to do and is not expected to fail.
             with contextlib.suppress(Exception):
                 await session.aclose()
             queue.put_nowait(error)

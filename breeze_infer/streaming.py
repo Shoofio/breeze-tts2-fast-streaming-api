@@ -354,8 +354,11 @@ class SpeechResponse(StreamingResponse):
             raise StreamAborted("client_disconnect") from error
         except Exception as error:
             event = "speech.failed"
-            fields = {"reason": "generation_error", "error": repr(error)}
-            raise StreamAborted("generation_error") from error
+            # A body that closes its own session (the WAV route's `_buffered`) raises a close
+            # timeout through the stream: report it as `_close_and_report` would.
+            reason = "gpu_close_timeout" if isinstance(error, GpuCloseTimeout) else "generation_error"
+            fields = {"reason": reason, "error": repr(error)}
+            raise StreamAborted(reason) from error
         finally:
             # In its own task, so a cancellation of this one can't interrupt it: the gate must
             # be released, and the event emitted, however the request ended.
