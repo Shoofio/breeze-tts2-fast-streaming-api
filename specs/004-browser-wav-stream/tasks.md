@@ -246,14 +246,14 @@ Chinese reaches the route.
 
 ## Phase 8: Polish and release
 
-- [ ] T013 [P] Update `README.md`:
+- [X] T013 [P] Update `README.md`:
   - **API section**: a `GET /v1/audio/speech.wav` subsection covering fields, headers, the WAV
     header, queueing (60 s, then `503 busy_timeout`), buffered delivery and the 600 s send timeout.
     Link the contract addendum.
   - **Security**: a note next to "no authentication": any web page can trigger synthesis through
     this route (spec FR-020).
   - **Kept behaviours**: the list says "no WAV"; amend it to note this route is the exception.
-- [ ] T014 [P] Finish the `CHANGELOG.md` Unreleased entries:
+- [X] T014 [P] Finish the `CHANGELOG.md` Unreleased entries:
   - the route
   - the 192 KiB request-head limit (it affects all routes)
   - the new error code `busy_timeout`
