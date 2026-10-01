@@ -4,7 +4,7 @@ All notable changes to this project are documented here. See
 `specs/003-cpp-compatible-api/spec.md` for the full breaking-changes list and rationale (IDs
 `BC-nn`).
 
-## Unreleased
+## 2.1.0 — 2026-10-01
 
 ### Added
 
