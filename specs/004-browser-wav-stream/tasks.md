@@ -233,7 +233,7 @@ Chinese reaches the route.
 
 **Independent test**: the same invalid fields get the same status and body on both routes.
 
-- [ ] T012 [US5] Add one parametrized test to `tests/test_speech_wav.py`. For four inputs, the GET
+- [X] T012 [US5] Add one parametrized test to `tests/test_speech_wav.py`. For four inputs, the GET
   and the POST (same fields as a form) return an identical status and JSON body. The four inputs are:
   - unknown `voice_id`
   - empty `text`
