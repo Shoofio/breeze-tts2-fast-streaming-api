@@ -21,7 +21,7 @@ import httpx
 import pytest
 
 from breeze_infer.api import Components, create_app
-from breeze_infer.limits import TCP_USER_TIMEOUT_MS
+from breeze_infer.limits import MAX_REQUEST_HEAD_BYTES, TCP_USER_TIMEOUT_MS
 from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_speech import wav_header
 from tests.fakes import CODEC_SAMPLES_PER_FRAME, FakeRuntime, RecordingEvents
@@ -213,18 +213,19 @@ def test_a_get_that_disconnects_while_queued_leaves_the_queue() -> None:
     assert runtime.calls == []
 
 
-def test_the_largest_valid_request_fits_in_the_url() -> None:
-    # FR-004: 10,000 characters of text, mostly outside the basic plane (12 bytes each
-    # percent-encoded), with as long an instruction as still leaves piece 0 room to generate
-    # (a longer one is `text_too_long` on either route): about 123 KB, far past h11's 16 KiB
-    # default and close to 128 KiB before any header.
-    rare = "\U00020000"  # 𠀀, CJK Extension B
-    text = (rare * 9 + "，") * 1_000
-    query = urllib.parse.urlencode({"text": text, "instruction": rare * 500})
-    assert len(query) > 120_000
+def test_a_request_head_between_128_and_192_kib_reaches_the_route() -> None:
+    # FR-004: 10,000 characters outside the basic plane (12 bytes each percent-encoded) are about
+    # 120 KB of query string. A padding header takes the whole head past 128 KiB, the first plan's
+    # limit, so this fails if the limit ever drops back to it. Headers count toward the limit.
+    text = "\U00020000" * 10_000  # 𠀀, CJK Extension B
+    query = urllib.parse.urlencode({"text": text})
+    padding = "a" * (24 * 1024)
+    request = (
+        f"GET /v1/audio/speech.wav?{query} HTTP/1.1\r\nHost: test\r\nX-Pad: {padding}\r\n\r\n"
+    )
+    assert 128 * 1024 < len(request) < MAX_REQUEST_HEAD_BYTES
     # A raw socket: httpx itself refuses a query over 64 KiB, which browsers don't (Chrome
     # allows 2 MB URLs).
-    request = f"GET /v1/audio/speech.wav?{query} HTTP/1.1\r\nHost: test\r\n\r\n"
     with (
         _serving(_fake_runtime()) as (_components, events, server, _url),
         socket.create_connection(("127.0.0.1", server.port), timeout=10) as client,

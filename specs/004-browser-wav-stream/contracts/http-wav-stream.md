@@ -15,7 +15,9 @@ GET /v1/audio/speech.wav?text=<pct-encoded>&voice_id=<id>&seed=<n>&...
   `text`, `voice_id`, `ref_text`, `instruction`, `cfg_scale`, `seed`, `temperature`, `top_k`,
   `top_p`, `repetition_penalty`, `max_new_tokens`, `split_chars`.
 - **Reference**: a saved `voice_id`, or none. `ref_audio` in a query gets `400 invalid_field`.
-- **Request head** (request line plus headers): up to 192 KiB. A longer one gets uvicorn's plain-text `400`, before the app runs.
+- **Request head** (request line plus headers): up to 192 KiB is always accepted. Past that, a head
+  still incomplete when 192 KiB has been buffered gets uvicorn's plain-text `400`, before the app
+  runs. h11 checks only an incomplete head, so a longer head that arrives in one read can pass.
 - **Ignored**: `Range` and other conditional headers. There is no CORS requirement; an `<audio>`
   element fetches it as a no-cors request.
 

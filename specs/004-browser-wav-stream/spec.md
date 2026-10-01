@@ -138,7 +138,7 @@ The GET streams after the release. If the GPU is held beyond the bound, the GET 
 A message of up to the 10,000-character text limit, in any script, fits in the request URL.
 
 **Why this priority**: Chinese text grows about 9× when percent-encoded. The server's default
-request-line limit (16 KiB) would reject it.
+request-head limit (16 KiB) would reject it.
 
 **Independent Test**: GET a 10,000-character Chinese text and a 10,000-character English text.
 Both stream to completion.
@@ -147,8 +147,9 @@ Both stream to completion.
 
 1. **Given** a 10,000-character Chinese text, percent-encoded (about 90 KB), **When** it is
    requested, **Then** it streams to completion.
-2. **Given** a request head longer than 192 KiB, **When** it arrives, **Then** it is rejected
-   before any work is done.
+2. **Given** a request head longer than 192 KiB that is still incomplete once that much has
+   arrived, **When** it arrives, **Then** it is rejected before any work is done. h11 checks only
+   an incomplete head, so a longer head that arrives in one socket read can still pass.
 
 ---
 

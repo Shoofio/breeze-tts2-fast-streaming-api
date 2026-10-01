@@ -33,9 +33,11 @@ the code.
   h11 0.16.0, uvicorn 0.52.4). Anything larger is refused by h11 with `400` before the app runs.
   - The limit covers the whole request head (request line plus headers), not only the request line.
   - 10,000 common CJK characters come to 90,000 bytes percent-encoded.
-  - Characters outside the basic plane take 12 bytes each. A maximum text of them, plus the longest
-    instruction that still leaves piece 0 room (about 500 characters), is about 123 KB before any
-    header.
+  - Characters outside the basic plane take 12 bytes each, so a maximum text of them is about
+    120 KB.
+  - `instruction` and `ref_text` share the 2,048-token context with piece 0, at up to about 12
+    bytes per token, so about 24 KB more. The largest valid request is about 140-145 KB before
+    headers (Phase 6 review, measured with the real tokenizer).
   - 128 KiB (the first plan) left too little room for headers, so the Phase 6 review raised it to
     192 KiB, a decision made by the user.
 - **Alternative considered**: Raise the limit only for this route. Rejected: h11 applies it per

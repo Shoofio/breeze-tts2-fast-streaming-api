@@ -8,6 +8,7 @@ tests send the process real signals.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import os
@@ -39,7 +40,11 @@ from breeze_infer.gpu import (
     GpuUnavailable,
     report_close_failed,
 )
-from breeze_infer.limits import MAX_BODY_BYTES, TCP_USER_TIMEOUT_MS
+from breeze_infer.limits import (
+    MAX_BODY_BYTES,
+    MAX_REQUEST_HEAD_BYTES,
+    TCP_USER_TIMEOUT_MS,
+)
 from breeze_infer.model_loading import LoadedModel
 from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_speech import CpuTokenizer
@@ -466,6 +471,44 @@ def test_serve_answers_loading_while_the_model_loads() -> None:
         {"status": "loading", "error": "model is loading", "code": "loading"},
     )
     assert outcome == ServeOutcome(1)
+
+
+def test_serve_accepts_a_request_head_up_to_the_wav_routes_limit() -> None:
+    """004 FR-004: the GET route's fields travel in the query string, so `serve` must raise h11's
+    16 KiB request-head limit. Checked on the production server, not a test harness.
+
+    Only acceptance is checked. h11 enforces the limit while a head is still incomplete, so a
+    longer head that happens to arrive in one socket read is not reliably refused."""
+    components = _components(io.StringIO())
+
+    async def status(port: int, padding: int) -> int:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(b"GET /health HTTP/1.1\r\nHost: t\r\nX-Pad: " + b"a" * padding)
+            writer.write(b"\r\n\r\n")
+            with contextlib.suppress(ConnectionError):  # refused before it was all read
+                await writer.drain()
+            return int((await reader.readline()).split()[1])
+        finally:
+            writer.close()
+
+    async def scenario() -> int:
+        unblock = asyncio.get_running_loop().create_future()
+        loop = asyncio.get_running_loop()
+
+        def load() -> LoadedModel:
+            asyncio.run_coroutine_threadsafe(asyncio.wait_for(unblock, 10), loop).result()
+            raise RuntimeError("stop here")
+
+        serving, port = _serving(components, load)
+        # Past 128 KiB, the first plan's limit, and under MAX_REQUEST_HEAD_BYTES.
+        within = await status(port, 150 * 1024)
+        unblock.set_result(None)
+        await asyncio.wait_for(serving, 10)
+        return within
+
+    assert 150 * 1024 < MAX_REQUEST_HEAD_BYTES
+    assert asyncio.run(scenario()) == 503  # reached the app, which is still loading
 
 
 def test_a_failed_load_is_reported_and_the_server_exits_non_zero() -> None:

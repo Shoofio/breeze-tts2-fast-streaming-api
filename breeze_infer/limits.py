@@ -88,9 +88,10 @@ WAV_SEND_TIMEOUT_SECONDS = 600
 
 # The HTTP request-head limit: h11's max incomplete event size, which covers the request line
 # and every header (and chunked framing lines). GET /v1/audio/speech.wav carries its fields in
-# the query string: 10,000 characters of text and up to 2,000 of instruction, at up to 12 bytes
-# each percent-encoded (characters outside the basic plane), so at most about 144 KB before
-# headers. h11's default is 16 KiB. Each connection can buffer up to this much
+# the query string. 10,000 characters of text outside the basic plane are about 120 KB
+# percent-encoded (12 bytes each). `instruction` and `ref_text` share the model's 2,048-token
+# context with piece 0, at no more than about 12 bytes per token: about 24 KB more. So the
+# largest valid request is about 140-145 KB before headers. h11's default is 16 KiB. Each connection can buffer up to this much
 # while its head is still arriving.
 MAX_REQUEST_HEAD_BYTES = 192 * 1024
 
