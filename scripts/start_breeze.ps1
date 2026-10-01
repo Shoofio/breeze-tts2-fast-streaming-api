@@ -26,12 +26,11 @@
     Port to listen on. Defaults to 8080.
 
 .PARAMETER Cors
-    CORS mode for browser clients (e.g. SillyTavern). Empty (the default)
-    leaves CORS off, so no browser origin is allowed. Pass '*' to allow every
-    origin -- this is how to send the API's bare `--cors` flag from
-    PowerShell, since a string parameter can't be given with no value -- or
-    an allowlist. This is a string array, so an unquoted comma-separated list
-    works directly, e.g.
+    CORS mode for browser clients (e.g. SillyTavern). Defaults to '*', every
+    origin, so browser clients work without extra flags. That also turns off
+    the server's cross-site 403 guard: any web page can upload or delete
+    voices and run synthesis. Pass an allowlist to narrow it. This is a
+    string array, so an unquoted comma-separated list works directly, e.g.
     -Cors http://127.0.0.1:8000,http://localhost:8000
     (PowerShell splits that on the commas itself); a single quoted string
     with commas also works.
@@ -75,7 +74,7 @@
 param(
     [string]$BindHost = '0.0.0.0',
     [int]$Port = 8080,
-    [string[]]$Cors,
+    [string[]]$Cors = @('*'),
     [ValidatePattern('^(\d+|disabled)\z')]
     [string]$WsPort,
     [string]$ModelPath,

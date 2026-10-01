@@ -4,6 +4,16 @@ All notable changes to this project are documented here. See
 `specs/003-cpp-compatible-api/spec.md` for the full breaking-changes list and rationale (IDs
 `BC-nn`).
 
+## Unreleased
+
+### Changed
+
+- `scripts/start_breeze.sh` and `scripts/start_breeze.ps1` now enable CORS for every origin (`*`)
+  by default; before, CORS was off unless asked for. This also turns off the cross-site `403`
+  guard for these launches, so any web page can upload or delete voices and run synthesis. Pass
+  `--cors=<allowlist>` (`-Cors <list>` on Windows) to narrow it. The server's own default, with
+  no flag, is unchanged: CORS off.
+
 ## 2.1.0 — 2026-10-01
 
 ### Added

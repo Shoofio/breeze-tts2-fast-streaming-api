@@ -41,6 +41,11 @@ fi
 # from systemd or `docker stop`) reaches Python directly instead of being
 # absorbed by an intermediate shell that never forwards it.
 # Extra arguments pass straight through, e.g. --attn-implementation sdpa.
+#
+# CORS is on for every origin by default, so browser clients such as
+# SillyTavern work without extra flags. That also turns off the server's
+# cross-site 403 guard: any web page can upload or delete voices and run
+# synthesis. A later --cors wins, so --cors=http://127.0.0.1:8000 narrows it.
 exec uv run python -m breeze_infer.api "$MODEL" \
-    --host 0.0.0.0 --port 8080 --fast-all \
+    --host 0.0.0.0 --port 8080 --fast-all --cors '*' \
     "$@"
