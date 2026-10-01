@@ -9,7 +9,14 @@ All notable changes to this project are documented here. See
 ### Added
 
 - `GET /v1/audio/speech.wav`: a progressive WAV stream of the same synthesis as
-  `POST /v1/audio/speech`, playable by a browser `<audio>` element.
+  `POST /v1/audio/speech`, playable by a browser `<audio>` element. The body is a 44-byte WAV
+  header (RIFF and `data` sizes `0xFFFFFFFF`) then PCM. A request made while the GPU is busy
+  waits up to 60 s, then gets `503 busy_timeout`; it never gets `409`. Delivery is buffered: the
+  GPU is released when generation ends, and a send blocked for 600 s aborts the stream. See
+  `specs/004-browser-wav-stream/contracts/http-wav-stream.md`.
+- New HTTP error code `busy_timeout` (`503`).
+- New events `speech.generated` and `speech.queued_timeout`, and a `format` field on the speech
+  outcome events.
 
 ### Changed
 
@@ -18,6 +25,8 @@ All notable changes to this project are documented here. See
   acknowledging. At 30 s it reset a browser that paused reading while far ahead of playback,
   cutting WAV playback short. The option only frees the socket; the GPU is still released by
   the application timeouts. Windows is unaffected, since it has no such option.
+- Request heads (request line plus headers) up to 192 KiB are accepted, up from h11's default of
+  16 KiB. This affects all routes; the WAV route's query string can be long.
 
 ## 2.0.0 — 2026-09-29
 

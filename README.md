@@ -142,8 +142,9 @@ python infer.py ../breeze-tts-2 \
 The server exposes an HTTP API and a WebSocket session endpoint compatible with the
 [HoppouAI/Breeze-TTS-2.cpp](https://github.com/HoppouAI/Breeze-TTS-2.cpp) reference server's
 contract, except where listed under [Breaking Changes](#breaking-changes-from-the-c-server) below.
-Contract version `2.0.0`. This section is the user-facing reference; the machine-readable source
-is `specs/003-cpp-compatible-api/contracts/http-api.md` and `contracts/ws-api.md`.
+Contract version `2.1.0`. This section is the user-facing reference; the machine-readable source
+is `specs/003-cpp-compatible-api/contracts/http-api.md` and `contracts/ws-api.md`, plus the 2.1.0
+addendum `specs/004-browser-wav-stream/contracts/http-wav-stream.md`.
 
 Start it the same way as the CLI, pointing at the checkpoint directory:
 
@@ -192,8 +193,8 @@ Fields may also come from the query string. A field present more than once, anyw
 26 MiB gets `413 payload_too_large`, whether or not `Content-Length` is set.
 
 **Version header**: every response — including errors, preflights and streamed speech — carries
-`X-Breeze-Version: 2.0.0` (the running server's version; a development build reports
-`2.0.0.devN`, plus a `+M` local label on a within-phase re-deploy), so clients can pin the
+`X-Breeze-Version: 2.1.0` (the running server's version; a development build reports
+`2.1.0.devN`, plus a `+M` local label on a within-phase re-deploy), so clients can pin the
 contract version.
 
 **Errors**: every error has body `{"error": "<message>", "code": "<code>"}` and
@@ -210,7 +211,13 @@ WebSocket piece is running or queued. Until the model is ready, every route retu
 `503 {"status":"loading","error":"model is loading","code":"loading"}`. Once the GPU has stopped
 responding (a generation's cleanup ran past 30 s), every route returns
 `503 {"status":"error","error":"gpu is not responding","code":"gpu_unavailable"}` until the server
-is restarted.
+is restarted. The one exception to "HTTP never waits" is `GET /v1/audio/speech.wav`, which queues
+(see its section).
+
+**Request head**: the request line plus headers may be up to 192 KiB on every route (h11's default
+is 16 KiB). A head still incomplete after 192 KiB gets uvicorn's plain-text `400` before the app
+runs; a longer head that arrives in a single read can pass, because h11 checks only an incomplete
+head.
 
 #### CORS
 
@@ -325,6 +332,47 @@ curl -X POST http://127.0.0.1:8080/v1/audio/speech \
 
 The response is streaming mono 24 kHz signed 16-bit little-endian PCM.
 
+#### `GET /v1/audio/speech.wav`
+
+Streams the same synthesis as `POST /v1/audio/speech` as a WAV, so a browser `<audio>` element can
+play it (for example SillyTavern's TTS provider). Clients detect it by `X-Breeze-Version` >= 2.1.0.
+The full contract is in
+[`specs/004-browser-wav-stream/contracts/http-wav-stream.md`](specs/004-browser-wav-stream/contracts/http-wav-stream.md).
+
+**Fields**: the same names, defaults, limits and validation as `POST /v1/audio/speech`, sent in the
+query string (percent-encode `text`). The reference is a saved `voice_id` or none; `ref_audio` can't
+be sent in a query and gets `400 invalid_field`. Errors use the same envelope, statuses and order as
+the POST route, except that this route never answers `409 busy`.
+
+**`200` response**: headers `Content-Type: audio/wav`, `Transfer-Encoding: chunked`,
+`Cache-Control: no-store`, `Accept-Ranges: none`, `X-Sample-Rate: 24000`, `X-Sample-Format: s16le`,
+`X-Breeze-Version` and `X-Request-Id`. The body is a 44-byte WAV header followed by the POST route's
+mono s16le PCM, flushed chunk by chunk. The stream length is unknown, so the RIFF and `data` size
+fields are both `0xFFFFFFFF`. `Range` and other conditional headers are ignored.
+
+**Queueing**: a request made while the GPU is busy waits up to 60 s in first-in, first-out order,
+holding its status line until the first audio chunk exists. If the GPU is still busy after 60 s it
+gets `503 busy_timeout`. A client that disconnects while waiting leaves the queue.
+
+**Delivery**: generation runs at full speed and releases the GPU when it ends; the client may read
+the buffered remainder at any pace, with no minimum read rate. A single send blocked for 600 s
+aborts the stream. A client that disconnects during generation frees the GPU within one chunk.
+
+**Failure after streaming starts**: as on the POST route, the body ends early without the chunked
+terminator. Every other error is sent before any audio, as a real non-2xx response.
+
+```bash
+curl -G http://127.0.0.1:8080/v1/audio/speech.wav \
+  --data-urlencode "text=Hello from the browser." \
+  --data-urlencode "voice_id=alice" \
+  --output hello.wav
+```
+
+**Security**: the route accepts any origin. An `<audio>` request carries no `Origin` header and `GET`
+skips the origin check, so any web page you visit can make the server synthesize speech. This is
+accepted, like the lack of authentication (see
+[Intentionally Kept C++ Behaviors](#intentionally-kept-c-behaviors)).
+
 #### `POST /v1/voices`
 
 | Field | Type | Valid |
@@ -398,7 +446,7 @@ never checks busy.
 `invalid_field`, `duplicate_field`, `text_required`, `text_too_long`, `reference_conflict`,
 `ref_text_required`, `reference_required`, `invalid_audio`, `audio_too_long`, `audio_too_short`,
 `voice_fields_required`, `invalid_name`, `voice_too_long`, `unknown_voice`, `voice_exists`, `busy`,
-`loading`, `gpu_unavailable`, `gpu_out_of_memory`, `not_found`, `method_not_allowed`,
+`busy_timeout`, `loading`, `gpu_unavailable`, `gpu_out_of_memory`, `not_found`, `method_not_allowed`,
 `payload_too_large`, `origin_not_allowed`, `voice_write_failed`, `voice_delete_failed`,
 `internal_error`. Codes are stable identifiers; messages may change, except where they match the
 C++ server's strings.
@@ -635,7 +683,8 @@ These C++ choices are unconventional but are kept for compatibility, not fixed:
   more conventional).
 - `200` rather than `201` on voice creation.
 - `{"error": "<string>"}` as the error body key (a `code` is added alongside).
-- `Content-Type: audio/pcm` with rate and format in headers; no WAV or `response_format` option.
+- `Content-Type: audio/pcm` with rate and format in headers; no `response_format` option. `POST`
+  never returns WAV; `GET /v1/audio/speech.wav` is the one WAV route.
 - Fields accepted from the query string.
 - `0` meaning "model default" for sampling fields and `max_new_tokens` (greedy decoding cannot be
   requested).
