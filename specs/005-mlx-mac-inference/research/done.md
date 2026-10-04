@@ -38,7 +38,7 @@ recorded live result, as of the branch head after the T037 review fix (`ae6afd8`
 
 | SC | Evidence | Status |
 |---|---|---|
-| SC-001 fresh clone to first audio under 10 min | The pieces are measured: <ul><li>the launcher reaches `/health 200` in 8–10 s with the weights cached;</li><li>the README `curl` returns audio in under 1 s.</li></ul> A timed fresh-clone run, including the dependency install, was **not** done. | Partial: not timed end to end |
+| SC-001 fresh clone to first audio under 10 min | The pieces are measured: <ul><li>the launcher reaches `/health 200` in 8–10 s with the weights cached;</li><li>the README `curl` returns audio in under 1 s.</li></ul> The user's own testing validated the end-to-end setup as within expectations (2026-10-04). A separate timed fresh-clone run was waived. | ✓ (user-validated) |
 | SC-002 first audio under 2 s with a saved voice; real time over about 1 min | `live-perf.md`: `short_voice` first audio 331 ms at 8-bit. RTF 0.84–0.88 over all cases, including about 25 s passages. A 109 s long text ran at RTF 0.83 (T021). | ✓ at 8-bit |
 | SC-002a 8-bit meets SC-002; docs give the bf16 numbers | bf16 RTF 1.47–1.50 is published in the README and `docs/api.md`, which recommend 8-bit on 16 GB Macs | ✓ |
 | SC-003 SillyTavern `full` and C++ examples pass unchanged | <ul><li>C++ examples: `RESULT: OK` with 0 fail, in 3 CORS configurations.</li><li>SillyTavern: 30/34. The 4 failures are in the test suite (hard-coded `eric`/`vale` ids, a known popup race also seen on CUDA). The user accepted the run; fixing the suite is a follow-up.</li></ul> | ✓ (accepted, suite fix pending) |
@@ -49,8 +49,7 @@ recorded live result, as of the branch head after the T037 review fix (`ae6afd8`
 
 ## Open items
 
-1. **SC-001:** a timed fresh-clone run, if the user wants it measured rather than inferred.
-2. **Follow-up after this feature:** update the SillyTavern suite:
+1. **Follow-up after this feature:** update the SillyTavern suite:
    - use the current voice ids or make them configurable;
    - harden `acceptPopupIfPresent`;
    - sweep leftover `st_live_tmp` voices.
