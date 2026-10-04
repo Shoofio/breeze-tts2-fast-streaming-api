@@ -117,7 +117,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
     `gpu` rule byte-for-byte.
   - Add a session fixture `mlx_model() -> Path` mirroring `breeze_model`. Add a session fixture
     `official_model() -> Path | None` that reads `BREEZE_MODEL` and returns `None` when unset.
-- [ ] T005 Create `tests/mlx/__init__.py` (empty) and `tests/mlx/conftest.py`. In the conftest,
+- [X] T005 Create `tests/mlx/__init__.py` (empty) and `tests/mlx/conftest.py`. In the conftest,
   add a session-scoped fixture `mlx_runtime` that, given `mlx_model`, will load the runtime (T014
   provides `load_mlx_runtime`). Until T014 lands, the fixture body calls `pytest.skip("T014")`.
 
