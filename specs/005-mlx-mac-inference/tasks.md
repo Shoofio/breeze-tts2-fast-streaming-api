@@ -153,7 +153,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
 
 ### Backend selection and refusals (research R5, contracts/launch-and-events.md)
 
-- [ ] T010 Write the tests first, in `tests/test_settings.py` (new cases only) and the new
+- [x] T010 Write the tests first, in `tests/test_settings.py` (new cases only) and the new
   `tests/test_checkpoint_kind.py`. They must fail before T011.
   - **Default and platform:**
     - `settings_from_args([...])` with no `platform` argument gives `backend == "cuda"` for an
