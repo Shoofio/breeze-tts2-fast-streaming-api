@@ -212,7 +212,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
 
 ### The MLX runtime (research R1, R4, R6; contracts/runtime-seam.md)
 
-- [ ] T013 Write `tests/test_mlx_room.py`. It runs everywhere, with no mlx and no model.
+- [x] T013 Write `tests/test_mlx_room.py`. It runs everywhere, with no mlx and no model.
   - Build `MlxBreezeStreamingRuntime`'s room logic from a small config view (`max_seq_len=2048`,
     the default `max_new_tokens` 750, ceiling `limits.MAX_NEW_TOKENS_CEILING`), without loading
     weights. Expose this as a classmethod or a constructor path that takes a config view, decided
