@@ -20,12 +20,34 @@ gate, with its transcript beside it as `reference.txt`.
   cancel, a queued second session, the error shape, and the client sketch.
 - **The allowlist run also confirms that a later `--cors` overrides the launcher's `*`.**
 
-## SillyTavern (`node tests/live/sillytavern/run.mjs full`)
+## SillyTavern (`node tests/live/sillytavern/run.mjs full --record mac-full`)
 
-**Not run yet.** The suite drives a running SillyTavern (`ST_URL`, default
-`http://127.0.0.1:8000`) through Playwright's Chromium, using the reference voices in
-`REFERENCE_VOICES_DIR`. None of these are installed on this Mac. Its defaults are Linux paths
-(`chrome-linux64`).
+**Run 1, 2026-10-04 19:40 UTC: 30/34 steps passed.** The run was made by the user from the Linux
+machine's SillyTavern, with `BREEZE_HTTP_URL=http://<mac>:8080` and
+`BREEZE_WS_URL=ws://<mac>:8081`, against the Mac launcher at 8-bit. The Mac had the user's saved
+voices `Eric01` and `Vale01`.
+
+**What passed:**
+- **Health:** the provider loaded, `/health` reported `version 2.2.0` and `wavStream: true`, the
+  voice list refreshed, and there were no CORS errors.
+- **Narration:** streamed in the "Breeze validation" chat, 42 frames delivered.
+- **Stop:** cancelled an active session (`synth.cancelled`).
+- **Guidance:** `cfg_scale` 4, 7.5 and 1 each reached the request and completed.
+- **Settings:** restored and verified.
+
+**The four failures all come from the test suite or its setup, not from the MLX backend.** The
+`breezetts-linux` session confirmed each one against the CUDA history:
+
+| Step | Cause |
+|---|---|
+| voices phase aborted (`page.click … dialog[open] .popup-button-ok … element was detached from the DOM`) | A timing race in `acceptPopupIfPresent` (`tests/live/sillytavern/lib.mjs:229-235`). The same message, word for word, appeared against CUDA in `live-full.md` (2026-09-27, 35/36), and the voices phase alone passed 20/20 a minute later. The aborted phase left an `st_live_tmp` voice behind, and the ST suite has no cleanup for it. |
+| voice preview for `eric` timed out | The suite hard-codes `eric` (`phases/full.mjs:194`). The voices on both machines were renamed to `Eric01`/`Vale01` on 2026-09-29, after the last full CUDA pass (`live-phase5-full.md`, 48/48). A CUDA run would fail this step today too. |
+| Node WS client: `unknown voice_id` | The same cause, with `vale` (`phases/full.mjs:205`). |
+| queued narration after the GPU frees | Skipped, because the previous step failed. |
+
+**Next:** delete `st_live_tmp` on the Mac, add the voices under the names the suite expects
+(`eric`, `vale`), and run it again. The suite itself is unchanged, since T028 requires running
+the checks without edits.
 
 ## Automated coverage
 
