@@ -109,7 +109,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - Confirm with `.venv/bin/python -c "import mlx.core as mx, transformers; from mlx_audio.tts.models.breeze_tts.breeze_tts import Model; print(transformers.__version__, mx.default_device())"`,
     which should print `4.57.3 Device(gpu, 0)`.
   - Run the model-free suite and confirm the same 17 failures as R10, no more.
-- [ ] T004 Register the `mlx` marker in `pyproject.toml` (`[tool.pytest.ini_options]` `markers`):
+- [X] T004 Register the `mlx` marker in `pyproject.toml` (`[tool.pytest.ini_options]` `markers`):
   `"mlx: loads the MLX checkpoint on Apple Silicon; skipped unless BREEZE_MLX_MODEL is set"`.
   - In `tests/conftest.py`, add `MLX_ENV = "BREEZE_MLX_MODEL"`. Extend
     `pytest_collection_modifyitems` so that `mlx`-marked items skip unless that variable is set

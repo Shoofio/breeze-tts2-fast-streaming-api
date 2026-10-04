@@ -2,4 +2,5 @@
 testpaths = ["tests"]
 markers = [
     "gpu: loads the Breeze checkpoint on a CUDA device; skipped unless BREEZE_MODEL is set",
+    "mlx: loads the MLX checkpoint on Apple Silicon; skipped unless BREEZE_MLX_MODEL is set",
 ]
