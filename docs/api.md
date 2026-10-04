@@ -78,9 +78,11 @@ differs:
   32-token buckets. It accepts the same text lengths as the CUDA backend without `--fast-all`,
   which is up to 31 more frames than `--fast-all` accepts for the same prompt before
   `400 text_too_long`.
-- **Saved voices don't move between backends.** Each backend saves voices with its own codec
-  fingerprint and skips, at startup, voices saved with a different one. The file format is
-  unchanged.
+- **Saved voices are not guaranteed to move between backends.** The file format is unchanged, and
+  a voice loads only when its codec fingerprint matches the running codec; otherwise it is skipped
+  at startup. Today the MLX codec files are the official ones, so the fingerprints match and voices
+  do load on either backend, but each backend encodes reference audio slightly differently, so a
+  voice saved on one may sound slightly different on the other.
 - **`model.loaded` has two more fields, and some are null.** The startup log event gains
   `backend` (`"cuda"` or `"mlx"`) and `weights` (`"bf16"` or `"8bit"`; always `"bf16"` on CUDA).
   On the MLX backend `device` is `"mlx:gpu"`, and `compile_cache_dir`, `torch_key`,
