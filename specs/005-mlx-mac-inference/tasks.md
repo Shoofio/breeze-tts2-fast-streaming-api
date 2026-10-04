@@ -321,7 +321,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
     audio, and the inputs from `templates.prepare_inputs` carry no `cfg_negative_*` keys. Assert
     on the template output, the observable fact. Don't add a test-only attribute to the
     runtime.
-- [ ] T018 *(Opus)* `models/mlx_streaming.py`, part 5: reference prefixes.
+- [X] T018 *(Opus)* `models/mlx_streaming.py`, part 5: reference prefixes.
   - `build_reference_prefix(prefix_inputs) -> MlxReferencePrefix(prefix_len: int, kv)`. It runs
     the batch-1 backbone prefill over the prefix and keeps a per-layer KV snapshot. It raises
     `ValueError` when `prefix_len > max_reference_prefix_len(2048)`, with the same message as

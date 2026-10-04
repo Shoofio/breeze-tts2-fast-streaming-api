@@ -31,11 +31,13 @@ from .cudagraph.sampling import (
 )
 from .fast_streaming import (
     _POSITIVE_INTEGER_RULE,
+    MIN_SUFFIX_FRAMES,
     FastStreamingChunk,
     FastStreamingConfig,
     NoRoomError,
     PromptLength,
     _require_valid_overrides,
+    max_reference_prefix_len,
     prompt_length,
     select_fast_cfg,
 )
@@ -165,6 +167,20 @@ class _MlxPrompt:
     source: Any
 
 
+@dataclass(frozen=True)
+class MlxReferencePrefix:
+    """A reference prefix's backbone KV at positions `0..prefix_len-1` (data-model.md,
+    "Reference prefix"). The server reads only `prefix_len`.
+
+    `kv` holds one `(keys, values)` pair per layer, each `[1, kv_heads, prefix_len, head_dim]`
+    bf16. Requests copy it into their own cache and never write to it, so one prefix serves
+    any number of requests.
+    """
+
+    prefix_len: int
+    kv: tuple[tuple[Any, Any], ...]
+
+
 def _to_mlx_prompt(inputs: Mapping[str, Any], keys: _PromptKeys, config: Any) -> _MlxPrompt:
     """Convert one row of the template dict to MLX (research R4).
 
@@ -272,17 +288,25 @@ class _BackboneCache:
     """The request's backbone KV cache: one buffer per layer, `[rows, kv_heads, capacity, head_dim]`.
 
     The rows (the prompt, and under CFG the negative prompt) can differ in length. Each row is
-    left-padded to the longest, the pad slots are masked out, and each row keeps its own RoPE
+    padded to the longest, the pad slots are masked out, and each row keeps its own RoPE
     position: the same attention as CUDA's left-padded batch with
     `position_ids = attention_mask.cumsum(-1) - 1` (fast_streaming.py `_run_prefill`).
+
+    A row's slots are `[reference prefix | pad | its own prompt | frames]`. Without a prefix
+    the pad comes first (left padding). With one, every row shares the prefix in slots
+    `[0, prefix_len)` and the pad follows it, as CUDA's `continuation_allowed_keys` lays out
+    a continuation.
     """
 
-    def __init__(self, prefills: list[list[Any]], frames: int) -> None:
+    def __init__(self, prefills: list[list[Any]], frames: int, prefix_len: int) -> None:
         import mlx.core as mx
 
+        # Each row's length so far, the prefix included.
         lengths = [cache[0].offset for cache in prefills]
         # The next slot to write, shared by every row.
         self.length = max(lengths)
+        self.prefix_len = prefix_len
+        # Each row's pad slots, starting at `prefix_len`.
         self.pad = mx.array([self.length - n for n in lengths])
         # Each row's RoPE position for the next token.
         self.positions = mx.array(lengths)
@@ -291,13 +315,12 @@ class _BackboneCache:
         self.values: list[Any] = []
         for layer in range(len(prefills[0])):
             for name, buffers in (("keys", self.keys), ("values", self.values)):
-                rows = [
-                    mx.pad(
-                        getattr(cache[layer], name)[..., :n, :],
-                        [(0, 0), (0, 0), (self.length - n, capacity - self.length), (0, 0)],
-                    )
-                    for cache, n in zip(prefills, lengths)
-                ]
+                rows = []
+                for cache, n in zip(prefills, lengths):
+                    kv = getattr(cache[layer], name)
+                    pad = [(0, 0), (0, 0), (self.length - n, capacity - self.length), (0, 0)]
+                    own = mx.pad(kv[..., prefix_len:n, :], pad)
+                    rows.append(mx.concatenate([kv[..., :prefix_len, :], own], axis=2))
                 buffers.append(mx.concatenate(rows, axis=0))
 
 
@@ -313,7 +336,9 @@ def _backbone_step(backbone: Any, cache: _BackboneCache, codes: Any) -> Any:
     rows = cache.pad.shape[0]
     x = backbone.embed_tokens(mx.broadcast_to(codes[None, None, :], (rows, 1, codes.shape[0])))
     slot = cache.length
-    visible = mx.arange(slot + 1)[None, :] >= cache.pad[:, None]
+    # Every slot but each row's pad window, which starts after the prefix.
+    slots = mx.arange(slot + 1)[None, :]
+    visible = (slots < cache.prefix_len) | (slots >= cache.prefix_len + cache.pad[:, None])
     mask = visible[:, None, None, :]
     for index, layer in enumerate(backbone.layers):
         attn = layer.self_attn
@@ -364,6 +389,7 @@ class _Generation:
         depth_sampling: Sampling,
         repetition_penalty: float,
         seed: int | None,
+        prefix: MlxReferencePrefix | None = None,
     ) -> None:
         import mlx.core as mx
 
@@ -375,19 +401,30 @@ class _Generation:
         # One key per request, split for every draw: the seed alone decides the random
         # stream, and mlx's global random state is never read or written.
         self._key = mx.random.key(0 if seed is None else seed)
-        # Ids the backbone has sampled so far. A flag per id penalises each distinct token
+        # Ids the backbone has produced so far. A flag per id penalises each distinct token
         # once, as CUDA's `apply_repetition_penalty` does over the request's whole history.
         self._seen = mx.zeros((model.vocab_size + 1,), dtype=mx.bool_)
 
         # Each row is prefilled on its own at its exact length, then padded into one cache.
+        # With a prefix, each row's cache starts from it, so the prompt continues it at
+        # position `prefix_len` and attends to it causally (mlx's "causal" mask is aligned to
+        # the end of the keys).
+        prefix_len = 0 if prefix is None else prefix.prefix_len
         prefills, hidden = [], []
         for prompt in prompts:
             cache = model.backbone_model.make_cache()
+            if prefix is not None:
+                for layer_cache, (keys, values) in zip(cache, prefix.kv):
+                    # A slice is a new array object. KVCache writes by item assignment, which
+                    # changes only the object it holds, so the shared prefix never changes.
+                    layer_cache.keys = keys[..., :prefix_len, :]
+                    layer_cache.values = values[..., :prefix_len, :]
+                    layer_cache.offset = prefix_len
             embeddings = _prompt_embeddings(model, prompt)
             hidden.append(model.backbone_model(input_embeddings=embeddings, cache=cache)[:, -1, :])
             prefills.append(cache)
         self._hidden = mx.concatenate(hidden, axis=0)
-        self._cache = _BackboneCache(prefills, frames)
+        self._cache = _BackboneCache(prefills, frames, prefix_len)
         mx.eval(self._hidden, self._cache.keys, self._cache.values)
 
     def _next_key(self) -> Any:
@@ -407,11 +444,10 @@ class _Generation:
         cond, uncond = logits[:1], logits[1:]
         return uncond + self._guidance * (cond - uncond)
 
-    def frame(self) -> Any:
-        """The next frame, `[num_codebooks + 1]` int32: its codes (the backbone's token, EOS
-        when it equals `vocab_size`, then the depth decoder's), then its guard flags
-        (`_BACKBONE_NONFINITE`, `_DEPTH_NONFINITE`). The flags ride in the same array so the
-        frame loop's one host read covers them."""
+    def backbone_logits(self) -> Any:
+        """What the backbone sampler takes for the next frame, `[1, vocab_size + 1]` float32:
+        the guided logits, then the repetition penalty, then the reserved codec ids masked, in
+        CUDA's order. EOS stays sampleable."""
         import mlx.core as mx
 
         model = self._model
@@ -420,11 +456,22 @@ class _Generation:
             penalty = self._repetition_penalty
             penalised = mx.where(logits > 0, logits / penalty, logits * penalty)
             logits = mx.where(self._seen, penalised, logits)
-        # The reserved codec ids are masked after the penalty, as on CUDA. EOS stays sampleable.
+        return model._mask_reserved_codec_logits(logits)
+
+    def depth_steps(self, first: Any) -> _DepthSteps:
+        """The depth decoder's run for the next frame, given its codebook-0 code `first`."""
+        return _DepthSteps(self._model, self._hidden, self._guided, first)
+
+    def frame(self) -> Any:
+        """The next frame, `[num_codebooks + 1]` int32: its codes (the backbone's token, EOS
+        when it equals `vocab_size`, then the depth decoder's), then its guard flags
+        (`_BACKBONE_NONFINITE`, `_DEPTH_NONFINITE`). The flags ride in the same array so the
+        frame loop's one host read covers them."""
+        import mlx.core as mx
+
         first, backbone_ok = _sample(
-            model._mask_reserved_codec_logits(logits), self._next_key(), self._backbone_sampling
+            self.backbone_logits(), self._next_key(), self._backbone_sampling
         )
-        self._seen = self._seen | (mx.arange(self._seen.shape[0]) == first)
         depth, depth_ok = self._depth_codes(first)
         flags = mx.where(mx.all(backbone_ok), 0, _BACKBONE_NONFINITE) + mx.where(
             mx.all(depth_ok), 0, _DEPTH_NONFINITE
@@ -432,55 +479,77 @@ class _Generation:
         return mx.concatenate([first, *depth, flags[None]]).astype(mx.int32)
 
     def _depth_codes(self, first: Any) -> tuple[list[Any], Any]:
-        """Codebooks 1 to `num_codebooks - 1` from the depth decoder, with its own KV cache.
-
-        Step 0 feeds `[backbone state, codebook 0]` and each later step one code: the same
-        positions and causal mask as CUDA's `DepthDecoderGraph` and mlx-audio's full re-run
-        (`Model._depth_tokens`). Under CFG both rows run as one batch of 2. Also returns
-        whether every step's logits could be sampled.
-        """
+        """Codebooks 1 to `num_codebooks - 1`, sampled step by step, and whether every step's
+        logits could be sampled."""
         import mlx.core as mx
-        from mlx_audio.lm.models.cache import KVCache
 
-        depth = self._model.depth_decoder
-        decoder = depth.model
-        rows = self._hidden.shape[0]
-        hidden = self._hidden
-        if decoder.backbone_hidden_state_projector is not None:
-            hidden = decoder.backbone_hidden_state_projector(hidden)
-
-        def embed(code: Any, codebook: int) -> Any:
-            embedded = decoder.embed_tokens(code + codebook * decoder.vocab_size)
-            return mx.broadcast_to(embedded[None], (rows, 1, embedded.shape[-1]))
-
-        x = decoder.inputs_embeds_projector(
-            mx.concatenate([hidden[:, None, :], embed(first, 0)], axis=1)
-        )
-        caches = [KVCache() for _ in decoder.layers]
-        mask = "causal"
+        steps = self.depth_steps(first)
         codes = []
         sampleable = []
         last = self._model.num_codebooks - 1
         for codebook in range(1, last + 1):
-            for layer, cache in zip(decoder.layers, caches):
-                x = layer(x, mask, cache)
-            head = depth.codebooks_head.weight[codebook - 1]
-            logits = self._guided(decoder.norm(x)[:, -1, :] @ head)
-            code, ok = _sample(
-                self._model._mask_reserved_codec_logits(logits),
-                self._next_key(),
-                self._depth_sampling,
-            )
+            code, ok = _sample(steps.logits(codebook), self._next_key(), self._depth_sampling)
             codes.append(code)
             sampleable.append(ok)
             if codebook < last:
-                x = decoder.inputs_embeds_projector(embed(code, codebook))
-                mask = None
+                steps.feed(code, codebook)
         return codes, mx.concatenate(sampleable)
 
     def advance(self, codes: Any) -> None:
-        """Run the backbone on `codes`, the frame just made, for the next frame."""
+        """Run the backbone on `codes`, the frame just made, for the next frame, and add its
+        codebook-0 token to the repetition-penalty history."""
+        import mlx.core as mx
+
+        self._seen = self._seen | (mx.arange(self._seen.shape[0]) == codes[0])
         self._hidden = _backbone_step(self._model.backbone_model, self._cache, codes)
+
+
+class _DepthSteps:
+    """One frame's depth decoder, with its own KV cache: codebooks 1 to `num_codebooks - 1`.
+
+    Call `logits(1)`, then `feed` that step's code and call `logits(2)`, and so on. Step 0
+    feeds `[backbone state, codebook 0]` and each later step one code: the same positions and
+    causal mask as CUDA's `DepthDecoderGraph` and mlx-audio's full re-run
+    (`Model._depth_tokens`). Under CFG both rows run as one batch of 2.
+    """
+
+    def __init__(self, model: Any, hidden: Any, guided: Callable[[Any], Any], first: Any) -> None:
+        import mlx.core as mx
+        from mlx_audio.lm.models.cache import KVCache
+
+        self._model = model
+        self._guided = guided
+        decoder = model.depth_decoder.model
+        self._decoder = decoder
+        self._rows = hidden.shape[0]
+        if decoder.backbone_hidden_state_projector is not None:
+            hidden = decoder.backbone_hidden_state_projector(hidden)
+        self._x = decoder.inputs_embeds_projector(
+            mx.concatenate([hidden[:, None, :], self._embed(first, 0)], axis=1)
+        )
+        self._caches = [KVCache() for _ in decoder.layers]
+        self._mask: str | None = "causal"
+
+    def _embed(self, code: Any, codebook: int) -> Any:
+        import mlx.core as mx
+
+        decoder = self._decoder
+        embedded = decoder.embed_tokens(code + codebook * decoder.vocab_size)
+        return mx.broadcast_to(embedded[None], (self._rows, 1, embedded.shape[-1]))
+
+    def logits(self, codebook: int) -> Any:
+        """What the depth sampler takes for `codebook`, `[1, codec_vocab]` float32: the guided
+        logits with the reserved codec ids masked."""
+        for layer, cache in zip(self._decoder.layers, self._caches):
+            self._x = layer(self._x, self._mask, cache)
+        head = self._model.depth_decoder.codebooks_head.weight[codebook - 1]
+        logits = self._guided(self._decoder.norm(self._x)[:, -1, :] @ head)
+        return self._model._mask_reserved_codec_logits(logits)
+
+    def feed(self, code: Any, codebook: int) -> None:
+        """Give the step its codebook-`codebook` code `[1]`, for `logits(codebook + 1)`."""
+        self._x = self._decoder.inputs_embeds_projector(self._embed(code, codebook))
+        self._mask = None
 
 
 class MlxBreezeStreamingRuntime:
@@ -561,6 +630,38 @@ class MlxBreezeStreamingRuntime:
         prefill_len = prefix_len + length.seq_len
         return min(self.frame_cap(requested), self.config.max_seq_len - prefill_len - 1)
 
+    def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> MlxReferencePrefix:
+        """Run a voice's reference prefix (`templates.prepare_prefix_inputs`) through the
+        backbone alone, batch 1, and keep its KV (contracts/runtime-seam.md). Refused with
+        CUDA's `ValueError`s when it is not one unpadded row, or leaves no room to generate."""
+        import mlx.core as mx
+
+        mask = prefix_inputs["attention_mask"]
+        prefix_len = int(mask.shape[1])
+        if mask.shape[0] != 1 or int(mask.sum()) != prefix_len:
+            raise ValueError("reference prefix must be a single unpadded row")
+        if prefix_len > max_reference_prefix_len(self.config.max_seq_len):
+            raise ValueError(
+                f"reference prefix of {prefix_len} tokens leaves no room to generate "
+                f"{MIN_SUFFIX_FRAMES} frames after the shortest default-instruction "
+                f"suffix in the {self.config.max_seq_len}-token context"
+            )
+        model = self._mlx_model
+        cache = model.backbone_model.make_cache()
+        prompt = _to_mlx_prompt(prefix_inputs, _CONDITIONAL, model.config)
+        model.backbone_model(input_embeddings=_prompt_embeddings(model, prompt), cache=cache)
+        # KVCache grows in 256-slot steps; a contiguous copy keeps exactly `prefix_len` slots,
+        # which is what the voice prefix cache's byte estimate counts.
+        kv = tuple(
+            (
+                mx.contiguous(layer.keys[..., :prefix_len, :]),
+                mx.contiguous(layer.values[..., :prefix_len, :]),
+            )
+            for layer in cache
+        )
+        mx.eval(kv)
+        return MlxReferencePrefix(prefix_len=prefix_len, kv=kv)
+
     def iter_audio_chunks(
         self,
         inputs: dict[str, Any],
@@ -568,7 +669,7 @@ class MlxBreezeStreamingRuntime:
         request_id: str | None = None,
         seed: int | None = None,
         token_observer: Callable[[torch.Tensor], None] | None = None,
-        prefix: Any | None = None,
+        prefix: MlxReferencePrefix | None = None,
         temperature: float | None = None,
         top_k: int | None = None,
         top_p: float | None = None,
@@ -581,9 +682,11 @@ class MlxBreezeStreamingRuntime:
         and a prompt with no room raises `NoRoomError`. The sampling overrides apply to the
         backbone only; the depth decoder keeps the model defaults, as on CUDA. Under CFG
         (`cfg_scale` with the `cfg_negative_*` keys) the guidance applies to the backbone and
-        to every depth step, as on CUDA. Generation stops at EOS or after
-        `max_new_tokens_room` frames. `request_id` is part of the seam and unused here: the
-        MLX codec serves one request at a time.
+        to every depth step, as on CUDA. With `prefix` (from `build_reference_prefix`),
+        `inputs` is the text that follows it (`templates.prepare_suffix_inputs`), and every
+        row continues the prefix. Generation stops at EOS or after `max_new_tokens_room`
+        frames. `request_id` is part of the seam and unused here: the MLX codec serves one
+        request at a time.
         """
         _require_valid_overrides(
             temperature=temperature,
@@ -592,8 +695,6 @@ class MlxBreezeStreamingRuntime:
             repetition_penalty=repetition_penalty,
             max_new_tokens=max_new_tokens,
         )
-        if prefix is not None:
-            raise NotImplementedError("the MLX runtime does not take reference prefixes yet")
         # Rejects dual-CFG keys and an invalid cfg_scale, as on CUDA.
         cfg = select_fast_cfg(inputs)
         if cfg.use_negative_as_main:
@@ -604,7 +705,9 @@ class MlxBreezeStreamingRuntime:
             rows = [_CONDITIONAL, _NEGATIVE]
         else:
             rows = [_CONDITIONAL]
-        frames = self.max_new_tokens_room(max_new_tokens, inputs)
+        frames = self.max_new_tokens_room(
+            max_new_tokens, inputs, prefix_len=0 if prefix is None else prefix.prefix_len
+        )
         if frames <= 0:
             raise NoRoomError(
                 f"prompt leaves no room to generate in the {self.config.max_seq_len}-token context"
@@ -632,6 +735,7 @@ class MlxBreezeStreamingRuntime:
                 depth_sampling=self._depth_sampling,
                 repetition_penalty=penalty,
                 seed=seed,
+                prefix=prefix,
             )
             yield from self._stream(generation, frames, token_observer)
         finally:
