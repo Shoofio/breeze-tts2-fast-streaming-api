@@ -54,7 +54,7 @@ from breeze_infer.routes_health import Readiness, install_health
 from breeze_infer.routes_speech import CpuTokenizer, install_speech
 from breeze_infer.routes_voices import VoiceServices, VoiceSlot, install_voices
 from breeze_infer.runtime import get_dist_info
-from breeze_infer.settings import Settings, settings_from_args
+from breeze_infer.settings import Platform, Settings, settings_from_args
 from breeze_infer.streaming import ClientAbortLogFilter
 from breeze_infer.synthesis import measure_voice_prefix
 from breeze_infer.version_header import VersionHeaderMiddleware
@@ -832,8 +832,21 @@ def _select_no_device(_: str) -> None:
     """`set_device` stand-in without CUDA; the load then fails with a clear runtime error."""
 
 
+def choose_device(
+    settings: Settings, environ: Mapping[str, str]
+) -> tuple[str, Callable[[str], None]]:
+    """The device name for the GPU thread, and the `set_device` that selects it.
+
+    MLX has one GPU and no per-thread device to select, so it gets the no-op.
+    """
+    if settings.backend == "mlx":
+        return "mlx:gpu", _select_no_device
+    device = _cuda_device(environ)
+    return device, torch.cuda.set_device if device.startswith("cuda") else _select_no_device
+
+
 def main(argv: Sequence[str] | None = None) -> None:
-    settings = settings_from_args(argv)
+    settings = settings_from_args(argv, platform=Platform.detect())
     events = Emitter(sys.stdout, time.time)
 
     try:
@@ -857,8 +870,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     # The one read of the process environment (Constitution III): the device choice, and the
     # mapping the compile-cache setup exports TORCHINDUCTOR_CACHE_DIR into.
     environ = os.environ
-    device = _cuda_device(environ)
-    set_device = torch.cuda.set_device if device.startswith("cuda") else _select_no_device
+    device, set_device = choose_device(settings, environ)
     readiness = Readiness()
     components = Components(
         settings=settings,
