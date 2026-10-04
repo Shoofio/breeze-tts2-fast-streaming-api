@@ -13,7 +13,7 @@
 
 ## 📰 News
 
-- **[2026.08.25]** 🎉 We open-source [Breeze TTS 2](https://huggingface.co/BreezeBlue/breeze-tts-2) model weights and the [PyTorch inference code](https://github.com/breezeblue-ai/breeze-tts).
+- **[2026.08.25]** 🎉 We release [Breeze TTS 2](https://huggingface.co/BreezeBlue/breeze-tts-2) model weights and the [PyTorch inference code](https://github.com/breezeblue-ai/breeze-tts).
 - **[2026.08.07]** 🔥 We release the TTS benchmark suite for [voice design](https://github.com/breezeblue-ai/tts-voice-design-benchmark), [voice direction](https://github.com/breezeblue-ai/TTS-Voice-Direction-Benchmark), and [latency evaluation](https://github.com/breezeblue-ai/TTS-Latency-Benchmark).
 
 ## 📖 Introduction
@@ -97,7 +97,10 @@ python infer.py ../breeze-tts-2 \
   --output outputs/voice_clone_zh.wav
 ```
 
-Reference audio should contain clean speech with minimal background noise.
+Reference audio should contain clean, non-looping speech with minimal background
+noise. `--ref-text` should match the complete spoken content of the reference
+audio; if speech is repeated in the audio, include those repetitions in the
+transcript.
 
 ### 🎨 Voice Design
 
