@@ -1,4 +1,4 @@
-"""The real server with the real MLX runtime, over real HTTP (tasks.md T021, T024, T025; FR-001, FR-005, FR-009, FR-010).
+"""The real server with the real MLX runtime, over real HTTP (tasks.md T021, T024, T025, T027; FR-001, FR-005, FR-009, FR-010).
 
 One server process serves the whole module: loading the weights takes seconds and a 16 GB Mac has
 no room for two models. It runs as a subprocess (`python -m breeze_infer.api`), so these tests
@@ -27,6 +27,7 @@ from urllib.parse import urlencode
 import pytest
 
 from breeze_infer.settings import DEFAULT_SPLIT_CHARS
+from tests.ws_helpers import RawWs
 
 pytestmark = pytest.mark.mlx
 
@@ -176,7 +177,10 @@ def running_server(mlx_model: Path, *extra_args: str) -> Iterator[Server]:
 
 @pytest.fixture(scope="module")
 def server(mlx_model: Path) -> Iterator[Server]:
-    with running_server(mlx_model) as running:
+    # The WebSocket listener is on for the shared server: the session test needs it, and a
+    # second model load would cost seconds and memory a 16 GB Mac does not have to spare. The
+    # later `--ws-port disabled` in `running_server` is overridden by this one (the last wins).
+    with running_server(mlx_model, "--ws-port", str(_free_port())) as running:
         yield running
 
 
@@ -384,6 +388,49 @@ def test_voice_clone_design_and_direction_return_audio(server: Server) -> None:
 
     assert min(clone, design, direction) > MIN_AUDIO_S
     print(f"\nclone {clone:.2f} s, design {design:.2f} s, direction {direction:.2f} s")
+
+
+# --- WebSocket (T027) ------------------------------------------------------------------------
+
+
+def test_websocket_session_streams_audio_then_done(server: Server) -> None:
+    """The documented order (docs/api.md, WebSocket API): ready, started, speaking, binary PCM
+    frames, then done, which comes after every frame of the piece."""
+    status, health = server.health()
+    assert status == 200
+    ws_port = health["ws_port"]
+    assert ws_port > 0, "the module server was started with the WebSocket listener on"
+
+    client = RawWs(ws_port)
+    try:
+        ready = client.open()
+        assert (ready["sample_rate"], ready["format"]) == (SAMPLE_RATE, "s16le")
+
+        client.send_json({"type": "start", "seed": 1234})
+        started = client.recv_frame().event
+        assert started == {"type": "started", "voice_id": ""}
+
+        client.send_json({"type": "end", "text": SHORT_TEXT})
+        frames = client.frames_until_event("done")
+    finally:
+        client.close()
+
+    events = [f.event["type"] for f in frames if f.event is not None]
+    assert events == ["speaking", "done"]  # no `queued`, `error` or `cancelled` on the way
+    speaking = next(f.event for f in frames if f.event is not None)
+    assert speaking["text"] == SHORT_TEXT
+
+    audio_indexes = [i for i, f in enumerate(frames) if f.opcode == 0x2]
+    assert audio_indexes, "no binary audio frames arrived"
+    # The piece's audio sits between `speaking` and `done`, with nothing else mixed in.
+    assert audio_indexes == list(range(1, len(frames) - 1))
+    pcm = b"".join(frames[i].payload for i in audio_indexes)
+    assert len(pcm) % 2 == 0  # whole s16le samples
+    assert len(pcm) / 2 / SAMPLE_RATE > MIN_AUDIO_S
+    print(
+        f"\nws sequence: ready, started, speaking, {len(audio_indexes)} audio frames, done; "
+        f"{len(pcm) / 2 / SAMPLE_RATE:.2f} s of audio"
+    )
 
 
 def test_saved_voices_survive_a_restart_and_a_foreign_fingerprint_is_skipped(

@@ -440,7 +440,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
 
 **Independent Test**: quickstart step 4.
 
-- [ ] T027 [US3] Extend `tests/mlx/test_mlx_server.py` with one real-server WebSocket session.
+- [x] T027 [US3] Extend `tests/mlx/test_mlx_server.py` with one real-server WebSocket session.
   Use the message sequence from `tests/ws_helpers.py`: open, send text, receive audio frames, then
   the completion message in the documented order.
 - [ ] T028 [US3] *(main)* Live gate, quickstart step 4, against the Mac server started by the
