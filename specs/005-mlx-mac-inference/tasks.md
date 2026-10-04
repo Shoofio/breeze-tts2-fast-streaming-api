@@ -502,7 +502,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
   and 1 plain, on CUDA and on the Mac at both precisions. The main session generates the files
   and a comparison table in `specs/005-mlx-mac-inference/research/live-listening.md`; the user
   fills in the judgements.
-- [ ] T034 [P] Update `README.md`:
+- [x] T034 [P] Update `README.md`:
   - a "Quick start (macOS, Apple Silicon)" section: requirements (M1+, 16 GB, macOS), the two
     `hf download` commands with revisions, and `scripts/start_breeze_mac.sh [--precision 8bit]`;
   - the Requirements section lists macOS;
