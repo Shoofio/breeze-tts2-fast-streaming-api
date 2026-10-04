@@ -72,3 +72,32 @@ machine. The remote research cites about 2.4× on an M3 Max, from vanch007's for
 bug still in. Applied to 2.61, that would give about 1.09: still short of RTF 1.0 with CFG.
 Without CFG (1.44), it would clear 1.0 if the depth decoder is most of the per-frame cost, which
 is unmeasured. The decision on how to proceed goes back to the user.
+
+## Re-gate with a prototype frame loop (2026-10-04)
+
+A throwaway prototype frame loop (session scratchpad, not repo code) applied research R6's changes
+on top of mlx-audio's model classes. The full write-up is in
+[proto-2026-10-04.md](proto-2026-10-04.md). The changes, cumulatively:
+- (a) a depth-decoder KV cache;
+- (b) CFG as batch 2;
+- (c) no per-token host syncs;
+- (d) `mx.compile` with a fixed KV buffer;
+- (e) the codec on a second GPU stream.
+
+Benchmark passage: 444 chars, about 30 s, ending on EOS. The Phase-0 passage hit the 750-frame
+cap. The main session re-ran stock against level e independently:
+
+| 8-bit, passage | Prototype agent | Main-session re-run |
+|---|---|---|
+| stock, no CFG | 114.0 ms/frame, RTF 1.424 | 113.9 ms/frame, RTF 1.424 |
+| level e, no CFG | 64.5 ms/frame, RTF 0.806 | 64.5 ms/frame, RTF 0.807 |
+| stock, CFG | 207.4 ms/frame, RTF 2.592 | 208.1 ms/frame, RTF 2.601 |
+| level e, CFG | 66.3 ms/frame, RTF 0.829 | 66.4 ms/frame, RTF 0.830 |
+
+First audio stays under 0.5 s, and peak MLX memory is 5.2–5.5 GB. bf16 at level e: RTF 1.45
+(no CFG) and 1.44 (CFG), so not real time on this machine.
+
+**Revised verdict: GO for 8-bit.** 8-bit with CFG reaches RTF 0.83, under the 1.0 that SC-002
+needs. bf16 doesn't reach real time on the 16 GB M5, so SC-002a's fallback applies: the docs
+recommend 8-bit for 16 GB Macs. Nearly all of the gain comes from (a) and (b). (c) saves about
+4–5 ms, and (d) and (e) about 1 ms each, which is near noise.
