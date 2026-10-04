@@ -298,9 +298,10 @@ research R9 and R10. Don't add tests beyond those named in a task.
     decoder's two branches batched in its KV cache.
   - Reject dual-CFG keys exactly as `select_fast_cfg` does: reuse it by import.
   - `cfg_scale == 0` means the negative prompt alone, as on CUDA.
-  - **mlx tests:** an instruction with `cfg_scale=4` produces audio; `cfg_scale=1.0` takes the
-    no-CFG path (assert by timing or by a branch-count attribute, whichever is simpler and not a
-    mock).
+  - **mlx tests:** an instruction with `cfg_scale=4` produces audio. `cfg_scale=1.0` produces
+    audio, and the inputs from `templates.prepare_inputs` carry no `cfg_negative_*` keys. Assert
+    on the template output, the observable fact. Don't add a test-only attribute to the
+    runtime.
 - [ ] T018 *(Opus)* `models/mlx_streaming.py`, part 5: reference prefixes.
   - `build_reference_prefix(prefix_inputs) -> MlxReferencePrefix(prefix_len: int, kv)`. It runs
     the batch-1 backbone prefill over the prefix and keeps a per-layer KV snapshot. It raises
@@ -309,10 +310,9 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - `iter_audio_chunks(prefix=…)` seeds a **copy** of the snapshot into the request's cache and
     never mutates the cached arrays. Room uses `prefix_len`.
   - **mlx tests:**
-    - With a fixed seed, a request using a built prefix produces the same frames as the same
-      request with the reference inline. If exact equality fails because of numerics, the
-      fallback is: the first 10 frames are equal and the total length is within ±10%. Record
-      which assertion holds.
+    - With a fixed seed, a request using a built prefix produces **exactly** the same frames as
+      the same request with the reference inline. If it doesn't, that is a bug in prefix
+      seeding: apply the two-strike rule. Don't loosen the assertion.
     - Two requests sharing one prefix both succeed, and the prefix's arrays are unchanged.
 - [ ] T019 `models/mlx_streaming.py`, part 6: `warmup() -> float`. It runs one short synthetic
   generation without CFG and one with CFG (`cfg_scale=4`), each about 12 frames long, drains them,
@@ -346,6 +346,10 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - `GET /v1/audio/speech.wav` starts with a 44-byte RIFF header with sizes `0xFFFFFFFF`.
   - A second POST during the first gets `409` with code `busy`.
   - Closing the client mid-stream frees the gate: the next POST succeeds within 5 s.
+  - A text long enough to be split into at least 3 pieces (longer than 3× the default
+    `--split-chars`) streams every piece in order with no error. This exercises the anchor-codes
+    path: piece 0's frames go through `token_observer` and come back as `input_values` for the
+    later pieces.
   - Run with `pytest -m mlx`, at bf16, and once at 8-bit (`BREEZE_MLX_MODEL=<8bit>`).
 - [ ] T022 [US1] Create `scripts/start_breeze_mac.sh` (POSIX `sh`, executable), modelled on
   `scripts/start_breeze.sh`, per research R8 and contracts/launch-and-events.md.
@@ -365,7 +369,10 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - the launcher at both precisions;
   - the README `curl` examples;
   - the `.wav` URL in Chrome and in Firefox;
-  - the four refusals.
+  - the four refusals;
+  - suspend the server mid-request (`kill -STOP <pid>`, wait 10 s, `kill -CONT <pid>`). The
+    request must either complete or end with the existing error, and the next request must
+    succeed (spec Edge Cases, "The Mac sleeps or the process is suspended").
   Record the results in `specs/005-mlx-mac-inference/research/live-us1.md`.
 
 **Checkpoint**: MVP. A Mac user can stream speech over HTTP.
@@ -434,22 +441,36 @@ research R9 and R10. Don't add tests beyond those named in a task.
   Compare against `specs/003-cpp-compatible-api/research/bench-final.md`: time to first audio and
   throughput must be within 5%. Paste the outputs. The main session records them in
   `specs/005-mlx-mac-inference/research/live-us4-cuda.md`.
+  Also:
+  - `bash docker/build.sh`, then the image's `docker/smoke_check.py`. The pip log must show
+    `Ignoring mlx-audio: markers … don't match`, and the pins must match.
+  - On Windows, if available: `.\scripts\start_breeze.ps1 -Reinstall`. mlx-audio must not
+    install, and the server must reach `/health 200`.
+- [ ] T031 [US4] *(user)* Rollback drill (Constitution VII). On the CUDA machine, with 2.2.0
+  running from `scripts/start_breeze.sh`:
+  1. Stop it, `git checkout v2.1.0`, `uv pip install -r requirements.txt`, and start
+     `scripts/start_breeze.sh` again.
+  2. Time it from stop to `/health` returning `200`; it must be under 5 minutes.
+  3. Run the README `curl` POST and `.wav` examples, and confirm `X-Breeze-Version: 2.1.0`.
+  4. Return to the branch and confirm 2.2.0 comes back the same way.
+  Paste the timings and outputs. The main session records them in
+  `specs/005-mlx-mac-inference/research/live-rollback.md`.
 
 ---
 
 ## Phase 7: Polish & cross-cutting
 
-- [ ] T031 *(main)* Speed and memory gate, quickstart step 5:
+- [ ] T032 *(main)* Speed and memory gate, quickstart step 5:
   - `bench_api` on the Mac at bf16 and at 8-bit, with a browser and an editor open;
   - `sysctl vm.swapusage` before and after.
   Check SC-002 and SC-002a, and set SC-006's number from the measured peak. If bf16 misses
   SC-002, the README recommends 8-bit for 16 GB Macs, with the numbers. Record the results in
   `specs/005-mlx-mac-inference/research/live-perf.md`.
-- [ ] T032 *(user)* Listening test, quickstart step 6. Prompts: 3 clone, 3 design, 3 direction
+- [ ] T033 *(user)* Listening test, quickstart step 6. Prompts: 3 clone, 3 design, 3 direction
   and 1 plain, on CUDA and on the Mac at both precisions. The main session generates the files
   and a comparison table in `specs/005-mlx-mac-inference/research/live-listening.md`; the user
   fills in the judgements.
-- [ ] T033 [P] Update `README.md`:
+- [ ] T034 [P] Update `README.md`:
   - a "Quick start (macOS, Apple Silicon)" section: requirements (M1+, 16 GB, macOS), the two
     `hf download` commands with revisions, and `scripts/start_breeze_mac.sh [--precision 8bit]`;
   - the Requirements section lists macOS;
@@ -460,18 +481,18 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - a note that `infer.py` stays CUDA-only (FR-005a);
   - a note that the MLX weights are an unofficial community conversion and still under the
     BreezeBlue non-commercial licence (FR-011).
-- [ ] T034 [P] Update `docs/api.md` launch options with `--backend` and the CUDA-only options.
+- [ ] T035 [P] Update `docs/api.md` launch options with `--backend` and the CUDA-only options.
   Add a "Differences on the MLX backend" subsection:
   - CUDA-only options are refused;
   - no kernel eviction of stalled readers (R10);
   - the room limit equals CUDA's exact-length mode (R4);
   - the `model.loaded` fields;
-  - measured speed from T031.
-- [ ] T035 Set `__version__ = "2.2.0"` in `breeze_infer/__init__.py`, and rename `## Unreleased`
+  - measured speed from T032.
+- [ ] T036 Set `__version__ = "2.2.0"` in `breeze_infer/__init__.py`, and rename `## Unreleased`
   to `## 2.2.0 — <date>` in `CHANGELOG.md`, with Added, Changed (the test fixes, the
   `--attn-implementation`/`--fast-*` sentinel defaults with unchanged behaviour) and
   Documentation entries. Do this before any tag or deploy (CLAUDE.md).
-- [ ] T036 *(main)* Final review loop over the whole branch (standing rule 5). Confirm every FR
+- [ ] T037 *(main)* Final review loop over the whole branch (standing rule 5). Confirm every FR
   and SC in spec.md maps to a passing test or a recorded live result, and list the mapping in
   `specs/005-mlx-mac-inference/research/done.md` (Constitution IX "Done means").
 
@@ -489,8 +510,8 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - The baseline track (T006–T009) and the settings track (T010–T012) can run beside the runtime
     track, since they touch different files.
 - Phase 3 (US1) needs all of Phase 2. US2, US3 and US4 each need US1's T020 and T021. After that,
-  US2 (T024–T026), US3 (T027–T028) and US4 (T029–T030) are independent.
-- Phase 7 needs the stories it documents. T035 comes after T033 and T034, and T036 comes last.
+  US2 (T024–T026), US3 (T027–T028) and US4 (T029–T031) are independent.
+- Phase 7 needs the stories it documents. T036 comes after T034 and T035, and T037 comes last.
 
 ## Parallel examples
 
@@ -499,7 +520,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
 - **After US1:** T024–T025 (US2), T027 (US3) and T029 (US4) touch different code. T024, T025 and
   T027 all append to `tests/mlx/test_mlx_server.py`, so run them one after another, or give each
   agent its own section and merge them by hand.
-- **Polish:** T033 and T034 together.
+- **Polish:** T034 and T035 together.
 
 ## Implementation strategy
 

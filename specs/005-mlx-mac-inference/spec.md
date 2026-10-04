@@ -192,7 +192,10 @@ the results with the 2.1.0 baseline.
 - **FR-005**: The Mac backend MUST serve the HTTP and WebSocket API documented in `docs/api.md`
   unchanged: the same routes, request fields, validation, error codes and bodies, audio format
   (24 kHz mono s16le PCM; progressive WAV on the `.wav` route), and `X-Breeze-Version` header.
-  The first release MUST cover all of it (User Stories 1–3).
+  The first release MUST cover all of it (User Stories 1–3). The limit on how much text fits in
+  one request ("room") follows CUDA's exact-length rule. With the CUDA launcher's `--fast-all`,
+  CUDA pads prompts to 32-token buckets, so the Mac backend can accept up to 31 more frames
+  before returning `400 text_too_long` (research R4).
 - **FR-005a**: `infer.py` is out of scope for this release. Its behavior and options MUST NOT
   change on any platform, and the README MUST say that the Mac backend is available through the
   server only.
@@ -223,8 +226,11 @@ the results with the 2.1.0 baseline.
 - **FR-012**: The Mac backend MUST support bf16 and 8-bit weights, chosen at launch, with bf16
   as the default. 4-bit weights are out of scope. Choosing them MUST stop startup with a message
   that names the supported precisions.
-- **FR-013**: When the weights are missing, the server MUST refuse to start and print the exact
-  command that downloads them.
+- **FR-013**: When the weights are missing, the macOS launcher MUST refuse to start and print the
+  exact command that downloads them. When the server is started directly with a checkpoint
+  directory of the wrong format, it MUST refuse with the download command (contracts:
+  launch-and-events). A missing directory keeps the existing "must be an existing directory"
+  error.
 
 **Observability and operation**
 
@@ -240,8 +246,10 @@ the results with the 2.1.0 baseline.
 **No regression on CUDA**
 
 - **FR-017**: On Linux, WSL and Windows, launch options, defaults and documented behavior MUST be
-  unchanged. The existing CPU test suite and GPU test suite MUST pass with no change to their
-  assertions.
+  unchanged. The existing CPU test suite and GPU test suite MUST pass. Existing tests may change
+  only to correct assumptions that are true on Linux but not on macOS (research R10). Each such
+  test MUST still prove the same thing on Linux, and no assertion about CUDA behaviour may be
+  relaxed.
 - **FR-018**: The Mac backend MUST have its own test marker, analogous to `gpu`. It runs the
   model-backed tests on a Mac and skips them elsewhere. The model-free tests (`.venv/bin/pytest`)
   MUST pass on macOS.
@@ -274,8 +282,9 @@ the results with the 2.1.0 baseline.
 - **SC-002**: On the reference Mac, a one-sentence request with a saved voice produces its first
   audio in under 2 seconds. Over a passage of about one minute, the server produces audio at
   least as fast as it plays (no underrun at 1× playback).
-- **SC-002a**: 8-bit meets SC-002 on the reference Mac. bf16 must also meet it, unless
-  measurement in the plan phase shows the 16 GB reference Mac can't. In that case the docs
+- **SC-002a**: 8-bit meets SC-002 on the reference Mac. bf16 must also meet it, unless the
+  measurements in the Phase-0 gate and the performance gate show the 16 GB reference Mac
+  can't. In that case the docs
   recommend 8-bit for 16 GB Macs and give the measured bf16 numbers.
 - **SC-003**: The existing live acceptance checks (the SillyTavern `full` run and the C++ docs
   example check, both of which exercise the WebSocket API too) pass against the Mac server with
@@ -286,8 +295,8 @@ the results with the 2.1.0 baseline.
   Mac output intelligible, free of artifacts, and matching the CUDA output's speaker identity or
   described voice in all 10. This holds at both bf16 and 8-bit.
 - **SC-006**: On the reference Mac (16 GB), the server's peak memory during sustained use stays
-  low enough that the system does not swap with a browser and editor open. The plan phase sets
-  the number from measurement.
+  low enough that the system does not swap with a browser and editor open. The performance gate
+  sets the number from measurement.
 - **SC-007**: Every unsupported-platform and unsupported-option case in Edge Cases ends in a
   startup refusal whose message names the cause. None of them produces a crash trace or a
   silent fallback.
