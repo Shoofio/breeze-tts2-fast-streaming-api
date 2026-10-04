@@ -302,8 +302,9 @@ the results with the 2.1.0 baseline.
   Mac output intelligible, free of artifacts, and matching the CUDA output's speaker identity or
   described voice in all 10. This holds at both bf16 and 8-bit.
 - **SC-006**: On the reference Mac (16 GB), the server's peak memory during sustained use stays
-  low enough that the system does not swap with a browser and editor open. The performance gate
-  sets the number from measurement.
+  low enough that the system does not swap with a browser and editor open. Set by the
+  performance gate (research/live-perf.md): at 8-bit, the default, the server's peak physical
+  footprint is at most 7.5 GB (measured 7.0 GB, with no swap growth).
 - **SC-007**: Every unsupported-platform and unsupported-option case in Edge Cases ends in a
   startup refusal whose message names the cause. None of them produces a crash trace or a
   silent fallback.

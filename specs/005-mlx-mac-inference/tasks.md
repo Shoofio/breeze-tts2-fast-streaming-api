@@ -492,7 +492,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
 
 ## Phase 7: Polish & cross-cutting
 
-- [ ] T032 *(main)* Speed and memory gate, quickstart step 5:
+- [X] T032 *(main)* Speed and memory gate, quickstart step 5:
   - `bench_api` on the Mac at bf16 and at 8-bit, with a browser and an editor open;
   - `sysctl vm.swapusage` before and after.
   Check SC-002 and SC-002a, and set SC-006's number from the measured peak. If bf16 misses
