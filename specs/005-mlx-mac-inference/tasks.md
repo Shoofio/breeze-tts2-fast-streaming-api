@@ -127,7 +127,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
 
 ### macOS green baseline (research R10)
 
-- [ ] T006 [P] In `tests/test_speech_abort.py`, make the `LiveServer` harness set
+- [X] T006 [P] In `tests/test_speech_abort.py`, make the `LiveServer` harness set
   `TCP_USER_TIMEOUT` only when `hasattr(socket, "TCP_USER_TIMEOUT")` (line 172).
   - Tests that **observe kernel eviction** get
     `@pytest.mark.skipif(not hasattr(socket, "TCP_USER_TIMEOUT"), reason="kernel eviction needs Linux TCP_USER_TIMEOUT")`.
