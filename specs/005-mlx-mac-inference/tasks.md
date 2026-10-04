@@ -270,7 +270,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - **mlx test:** for synthetic mono inputs of 0.5 s, 1 s, 3.7 s and 10 s, at 24 kHz and at
     44.1 kHz, the frame count equals `reference_audio.predicted_frames`, and every code is in
     `[0, codebook_size)`.
-- [ ] T016 *(Opus)* `models/mlx_streaming.py`, part 3: `iter_audio_chunks` with no CFG and no
+- [x] T016 *(Opus)* `models/mlx_streaming.py`, part 3: `iter_audio_chunks` with no CFG and no
   prefix. Follow research R6 and the `iter_audio_chunks` section of
   contracts/runtime-seam.md exactly.
   - **Before the first `next()`:** nothing runs. Then validate the overrides with
