@@ -379,7 +379,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
     path: piece 0's frames go through `token_observer` and come back as `input_values` for the
     later pieces.
   - Run with `pytest -m mlx`, at 8-bit, and once at bf16 (`BREEZE_MLX_MODEL=<bf16>`).
-- [ ] T022 [US1] Create `scripts/start_breeze_mac.sh` (POSIX `sh`, executable), modelled on
+- [X] T022 [US1] Create `scripts/start_breeze_mac.sh` (POSIX `sh`, executable), modelled on
   `scripts/start_breeze.sh`, per research R8 and contracts/launch-and-events.md.
   - Refuse unless `uname -s` is `Darwin` and `uname -m` is `arm64`.
   - Parse and strip a leading `--precision 8bit|bf16` (default `8bit`, spec FR-012); anything
