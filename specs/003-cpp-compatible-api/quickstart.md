@@ -8,7 +8,7 @@ covers. Exact fields and codes live in the contracts; they are not repeated here
 
 ## Prerequisites
 
-- **Environment:** repo at `<repo>` on `enhanced-api`, with the venv at `.venv`
+- **Environment:** repo on `enhanced-api`, with the venv at `.venv`
   and dependencies installed by `uv pip install -r requirements.txt` (`uv sync` doesn't read
   `requirements.txt`: `pyproject.toml` has no `[project]` table).
 - **GPU and model:**

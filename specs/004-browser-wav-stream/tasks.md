@@ -22,7 +22,7 @@ Don't add tests beyond those named in a task.
 
 - **[P]**: can run in parallel (a different file, and no dependency on an incomplete task).
 - **[Story]**: US1–US5 from spec.md.
-- Paths are relative to the repo root `<repo>`.
+- Paths are relative to the repo root.
 
 ## Standing rules (apply to every task)
 

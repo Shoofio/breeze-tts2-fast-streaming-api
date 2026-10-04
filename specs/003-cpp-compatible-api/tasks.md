@@ -30,7 +30,7 @@ phases as follows:
 
 - **[P]**: can run in parallel (a different file, and no dependency on an incomplete task).
 - **[Story]**: US1–US5 from spec.md.
-- Paths are relative to the repo root `<repo>`.
+- Paths are relative to the repo root.
 - `A:` means `git show api-alignment:<path>`, the source to port from. Read it with `git show`;
   **never check out that branch**.
 
