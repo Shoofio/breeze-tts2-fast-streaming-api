@@ -45,9 +45,13 @@ voices `Eric01` and `Vale01`.
 | Node WS client: `unknown voice_id` | The same cause, with `vale` (`phases/full.mjs:205`). |
 | queued narration after the GPU frees | Skipped, because the previous step failed. |
 
-**Next:** delete `st_live_tmp` on the Mac, add the voices under the names the suite expects
-(`eric`, `vale`), and run it again. The suite itself is unchanged, since T028 requires running
-the checks without edits.
+**Accepted by the user, 2026-10-04.** Every step that exercises the server passed, and the
+failures belong to the test suite. Fixing the suite is a follow-up after this feature:
+- use the current voice ids or make them configurable;
+- harden `acceptPopupIfPresent`;
+- sweep leftover `st_live_tmp` voices.
+
+The leftover `st_live_tmp` voice is still on the Mac server.
 
 ## Automated coverage
 
