@@ -308,7 +308,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
     - `max_new_tokens=24` stops at 24 frames or fewer;
     - `token_observer` is called once per frame, with `1 + num_codebooks` codes.
   - Use `templates.prepare_inputs` to build inputs, exactly as `synthesis.prepare_piece` does.
-- [ ] T017 *(Opus)* `models/mlx_streaming.py`, part 4: CFG.
+- [x] T017 *(Opus)* `models/mlx_streaming.py`, part 4: CFG.
   - When the inputs carry `cfg_scale` and `cfg_negative_*`, run the conditional and
     unconditional backbone branches **batched** (batch 2) and combine them as
     `uncond + g·(cond − uncond)`, as `fast_streaming.py:1374-1383` does.

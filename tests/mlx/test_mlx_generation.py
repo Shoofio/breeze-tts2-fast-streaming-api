@@ -94,3 +94,30 @@ def test_token_observer_sees_every_frame(mlx_runtime) -> None:
     assert len(observed) == sum(chunk.codec_frames for chunk in chunks)
     codes = torch.stack(observed)
     assert 0 <= int(codes.min()) and int(codes.max()) < mlx_runtime.model.config.codec_config.codebook_size
+
+
+def test_cfg_with_an_instruction_produces_audio(mlx_runtime) -> None:
+    inputs = inputs_for(mlx_runtime, SENTENCE, instruction="A calm, warm voice.", cfg_scale=4.0)
+    assert inputs["cfg_scale"] == 4.0 and "cfg_negative_prompt_ids" in inputs
+    chunks = list(mlx_runtime.iter_audio_chunks(inputs, seed=2, max_new_tokens=SHORT))
+    assert audio_of(chunks).size > 0
+
+
+def test_cfg_scale_one_runs_without_a_negative_prompt(mlx_runtime) -> None:
+    inputs = inputs_for(mlx_runtime, SENTENCE, cfg_scale=1.0)
+    assert not [key for key in inputs if key.startswith("cfg_negative_")]
+    chunks = list(mlx_runtime.iter_audio_chunks(inputs, seed=2, max_new_tokens=SHORT))
+    assert audio_of(chunks).size > 0
+
+
+def test_cfg_scale_zero_runs_the_negative_prompt_alone(mlx_runtime) -> None:
+    inputs = inputs_for(mlx_runtime, SENTENCE, cfg_scale=0.0)
+    chunks = list(mlx_runtime.iter_audio_chunks(inputs, seed=2, max_new_tokens=SHORT))
+    assert audio_of(chunks).size > 0
+
+
+def test_dual_cfg_is_rejected_on_the_first_next(mlx_runtime) -> None:
+    inputs = {**inputs_for(mlx_runtime, SENTENCE), "cfg_scale_ref": 2.0}
+    chunks = mlx_runtime.iter_audio_chunks(inputs)
+    with pytest.raises(ValueError, match="dual CFG"):
+        next(chunks)

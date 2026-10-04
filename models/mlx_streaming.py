@@ -60,6 +60,12 @@ class _PromptKeys(NamedTuple):
 
 
 _CONDITIONAL = _PromptKeys("input_ids", "text_ids_mask", "text_ids_len", "input_values")
+_NEGATIVE = _PromptKeys(
+    "cfg_negative_prompt_ids",
+    "cfg_negative_text_ids_mask",
+    "cfg_negative_text_ids_len",
+    "cfg_negative_input_values",
+)
 
 
 @dataclass(frozen=True)
@@ -542,9 +548,11 @@ class MlxBreezeStreamingRuntime:
 
         Nothing runs until the first `next()`. Invalid overrides raise `ValueError` there,
         and a prompt with no room raises `NoRoomError`. The sampling overrides apply to the
-        backbone only; the depth decoder keeps the model defaults, as on CUDA. Generation
-        stops at EOS or after `max_new_tokens_room` frames. `request_id` is part of the seam
-        and unused here: the MLX codec serves one request at a time.
+        backbone only; the depth decoder keeps the model defaults, as on CUDA. Under CFG
+        (`cfg_scale` with the `cfg_negative_*` keys) the guidance applies to the backbone and
+        to every depth step, as on CUDA. Generation stops at EOS or after
+        `max_new_tokens_room` frames. `request_id` is part of the seam and unused here: the
+        MLX codec serves one request at a time.
         """
         _require_valid_overrides(
             temperature=temperature,
@@ -555,9 +563,16 @@ class MlxBreezeStreamingRuntime:
         )
         if prefix is not None:
             raise NotImplementedError("the MLX runtime does not take reference prefixes yet")
+        # Rejects dual-CFG keys and an invalid cfg_scale, as on CUDA.
         cfg = select_fast_cfg(inputs)
-        if cfg.mode != "no_cfg" or cfg.use_negative_as_main:
-            raise NotImplementedError("the MLX runtime does not run CFG yet")
+        if cfg.use_negative_as_main:
+            # cfg_scale 0: the negative prompt alone.
+            rows = [_NEGATIVE]
+        elif cfg.mode == "single_cfg":
+            # The conditional and unconditional rows run as one batch of 2.
+            rows = [_CONDITIONAL, _NEGATIVE]
+        else:
+            rows = [_CONDITIONAL]
         frames = self.max_new_tokens_room(max_new_tokens, inputs)
         if frames <= 0:
             raise NoRoomError(
@@ -579,7 +594,7 @@ class MlxBreezeStreamingRuntime:
         try:
             generation = _Generation(
                 model,
-                [_to_mlx_prompt(inputs, _CONDITIONAL, model.config)],
+                [_to_mlx_prompt(inputs, keys, model.config) for keys in rows],
                 frames=frames,
                 guidance=cfg.guidance_scale,
                 backbone_sampling=backbone_sampling,
