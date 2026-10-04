@@ -672,8 +672,8 @@ MAC = Platform("darwin", "arm64", 16 * GIB)
 LINUX = Platform("linux", "x86_64", 64 * GIB)
 
 PYTORCH_DOWNLOAD = (
-    "uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx "
-    "--revision 3c8829fb7fd335818f085cd2ef49b4100c0e46c8"
+    "uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx-8bit "
+    "--revision c6e4a2ff6ab9afba68b7853de802273ffe23fb49"
 )
 
 
@@ -834,3 +834,11 @@ def test_cuda_tolerates_a_missing_or_unreadable_config(tmp_path: Path) -> None:
     assert settings_from_args([str(tmp_path)], platform=LINUX).backend == "cuda"
     (tmp_path / "config.json").write_text("{not json")
     assert settings_from_args([str(tmp_path)], platform=LINUX).backend == "cuda"
+
+
+def test_platform_detect_works_without_sysconf(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Windows has no os.sysconf, and api.main calls detect() on every launch.
+    monkeypatch.setattr("breeze_infer.settings.sys.platform", "win32")
+    monkeypatch.delattr("breeze_infer.settings.os.sysconf", raising=False)
+    detected = Platform.detect()
+    assert (detected.system, detected.memory_bytes) == ("win32", 0)

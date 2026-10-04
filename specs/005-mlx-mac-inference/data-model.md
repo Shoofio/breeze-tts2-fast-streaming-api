@@ -18,10 +18,11 @@ Lives on the frozen `Settings` (`breeze_infer/settings.py`). Validation runs in
 |---|---|---|
 | `system` | `str` | `sys.platform` |
 | `machine` | `str` | `platform.machine()` |
-| `memory_bytes` | `int` | `os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")` |
+| `memory_bytes` | `int` | `os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")` on macOS; `0` elsewhere |
 
 It is a frozen dataclass in `breeze_infer/settings.py`. `Platform.detect()` reads the three facts
-(memory via `os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")`), and only `api.main` calls
+(memory via `os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")` on macOS only, because
+Windows has no `os.sysconf` and memory matters only for MLX), and only `api.main` calls
 it. The result is passed to `settings_from_args(argv, platform=...)` (Constitution III). When
 `platform` is `None`, as in every existing test call, the backend defaults to `cuda`, and an
 explicit `--backend mlx` is refused as "not an Apple Silicon Mac". Existing tests keep today's

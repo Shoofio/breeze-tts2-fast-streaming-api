@@ -87,8 +87,9 @@ No NEEDS CLARIFICATION items remain. [research.md](research.md) R1–R9 records 
 1. ~~Room arithmetic extraction~~: **dropped**. It was approved, but it turned out to be
    unnecessary (R4): the MLX backend uses CUDA's exact-length rule, and
    `FastBreezeStreamingRuntime` is untouched.
-2. **`--attn-implementation` default.** It becomes `None`, resolved to `eager` for CUDA, so that
-   an explicit use can be detected. A settings test pins the CUDA result.
+2. ~~`--attn-implementation` default~~: **not needed** (decided 2026-10-04 during T011). The
+   CUDA-only options record that they were typed through a small argparse action instead, so
+   their defaults and `--help` text are unchanged (R5).
 3. **Existing tests.** 17 tests fail on macOS today because they assume Linux (R10). They get
    platform-correct assertions, and the harness guards `TCP_USER_TIMEOUT`. They must keep passing
    on Linux.

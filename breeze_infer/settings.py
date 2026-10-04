@@ -34,9 +34,10 @@ DEFAULT_ATTN_IMPLEMENTATION = "eager"
 MLX_MIN_MEMORY_BYTES = 16 * 1024**3
 
 # Where to get each backend's weights; named in the checkpoint/backend mismatch refusals.
+# The MLX command names the 8-bit repo because 8-bit is the Mac default (spec FR-012).
 MLX_DOWNLOAD_COMMAND = (
-    "uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx "
-    "--revision 3c8829fb7fd335818f085cd2ef49b4100c0e46c8"
+    "uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx-8bit "
+    "--revision c6e4a2ff6ab9afba68b7853de802273ffe23fb49"
 )
 PYTORCH_DOWNLOAD_COMMAND = "uvx --from huggingface_hub hf download BreezeBlue/Breeze-TTS-2"
 
@@ -62,11 +63,12 @@ class Platform:
 
     @classmethod
     def detect(cls) -> Platform:
-        return cls(
-            system=sys.platform,
-            machine=platform_module.machine(),
-            memory_bytes=os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"),
-        )
+        # Memory only matters for the MLX backend, which only runs on macOS. os.sysconf doesn't
+        # exist on Windows, and every launch calls this, so elsewhere memory is left at 0.
+        memory_bytes = 0
+        if sys.platform == "darwin":
+            memory_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        return cls(system=sys.platform, machine=platform_module.machine(), memory_bytes=memory_bytes)
 
     @property
     def is_macos(self) -> bool:

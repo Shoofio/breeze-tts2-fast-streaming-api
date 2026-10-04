@@ -218,7 +218,9 @@ synthesis, voice prefix cache and WebSocket code do not change.
 
 **Decision:**
 - **The flag.** A new launch option `--backend {cuda,mlx}`, read once in `settings.py`. If it
-  isn't given, the default is `mlx` on macOS arm64 and `cuda` everywhere else. The platform
+  isn't given, the default is `mlx` on macOS and `cuda` everywhere else. An Intel Mac therefore
+  gets the accurate "needs an Apple Silicon Mac" refusal rather than a CUDA one (decided
+  2026-10-04). The platform
   facts (`sys.platform`, `platform.machine()`, physical memory) are read once in `api.main` and
   passed into `settings_from_args` (Constitution III).
 - **Refusals before any weights load.** Each one goes through `parser.error` (usage line, then
@@ -232,9 +234,10 @@ synthesis, voice prefix cache and WebSocket code do not change.
   - a checkpoint whose `model_type` doesn't match the backend. The message includes the exact
     `hf download` command (FR-013);
   - an MLX checkpoint whose quantization isn't bf16 or mxfp8 8-bit.
-- **Detecting explicit flags.** `--attn-implementation` currently defaults to `eager`. To tell an
-  explicit use apart from the default, its argparse default becomes `None`, which `settings`
-  resolves to `eager` for CUDA. The CUDA behaviour is unchanged, and a settings test pins it.
+- **Detecting explicit flags.** Each CUDA-only option uses a small argparse action that records
+  the option string as typed. That keeps argv order for the refusal message and catches
+  `--no-fast-*`, which a `None` default can't. Defaults and `--help` are unchanged (decided
+  2026-10-04; this replaces the planned `None` sentinel defaults).
 
 **Rationale:** fail-loud refusals are what Constitution X requires (no silent fallbacks). The
 16 GB minimum is the reference machine, and the smallest Apple Silicon Mac with room for bf16

@@ -183,7 +183,8 @@ research R9 and R10. Don't add tests beyond those named in a task.
 - [x] T011 Implement in `breeze_infer/settings.py` until T010 passes.
   - **`Platform`:** a frozen dataclass with `system: str`, `machine: str`, `memory_bytes: int`,
     and a `Platform.detect()` classmethod using `sys.platform`, `platform.machine()` and
-    `os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")`.
+    `os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")` (macOS only; `0` elsewhere,
+    because Windows has no `os.sysconf`).
   - **`CheckpointKind`:** a frozen dataclass with `format: Literal["pytorch","mlx"]` and
     `weights: Literal["bf16","8bit"]`, plus `checkpoint_kind(config: dict) -> CheckpointKind`.
     Rules quoted from data-model.md:
@@ -191,18 +192,16 @@ research R9 and R10. Don't add tests beyond those named in a task.
     - "No `quantization` → bf16; `{bits: 8, mode: "mxfp8"}` → 8bit; anything else is refused.
       PyTorch → `"bf16"`".
   - **`Settings` fields:** add `backend: Literal["cuda","mlx"]` and `weights: str`.
-  - **Parser:** add `--backend` with `choices=("cuda","mlx")` and `default=None`. Change
-    `--attn-implementation` to `default=None`, resolved to `DEFAULT_ATTN_IMPLEMENTATION` for
-    CUDA.
+  - **Parser:** add `--backend` with `choices=("cuda","mlx")` and `default=None`.
   - **`settings_from_args`:** gains `platform: Platform | None = None`.
     - `None` means "not an Apple Silicon Mac".
-    - Detect explicit CUDA-only options with `default=None` sentinels. `--fast-all` already
-      defaults to `None`. The other `--fast-*` default to `False`, so switch them to `None` and
-      resolve them to `False` for CUDA. CUDA `Settings` values must stay identical.
+    - Detect explicit CUDA-only options with an argparse action that records each option
+      string as typed (decided 2026-10-04, replacing `None` sentinel defaults). Defaults and
+      CUDA `Settings` values stay identical.
     - Read `<model_path>/config.json` after the existing directory check.
     - Every refusal goes through `parser.error` with the contract's exact message.
   - Don't change any existing message or default as seen by a CUDA user.
-- [ ] T012 In `breeze_infer/api.py` `main`, call `Platform.detect()` once and pass it to
+- [x] T012 In `breeze_infer/api.py` `main`, call `Platform.detect()` once and pass it to
   `settings_from_args(argv, platform=...)`.
   - When `settings.backend == "mlx"`, use `device = "mlx:gpu"` and
     `set_device = _select_no_device`.
@@ -519,8 +518,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - the `model.loaded` fields;
   - measured speed from T032.
 - [ ] T036 Set `__version__ = "2.2.0"` in `breeze_infer/__init__.py`, and rename `## Unreleased`
-  to `## 2.2.0 — <date>` in `CHANGELOG.md`, with Added, Changed (the test fixes, the
-  `--attn-implementation`/`--fast-*` sentinel defaults with unchanged behaviour) and
+  to `## 2.2.0 — <date>` in `CHANGELOG.md`, with Added, Changed (the macOS test fixes) and
   Documentation entries. Do this before any tag or deploy (CLAUDE.md).
 - [ ] T037 *(main)* Final review loop over the whole branch (standing rule 5). Confirm every FR
   and SC in spec.md maps to a passing test or a recorded live result, and list the mapping in

@@ -14,7 +14,7 @@ python -m breeze_infer.api <checkpoint dir> [--backend {cuda,mlx}] [existing opt
 
 | Platform | Default `--backend` |
 |---|---|
-| macOS, arm64 | `mlx` |
+| macOS (an Intel Mac is then refused: it needs Apple Silicon) | `mlx` |
 | everything else | `cuda` (today's behaviour) |
 
 `<checkpoint dir>` keeps its meaning: the snapshot directory to load. The MLX backend reads the
@@ -33,7 +33,9 @@ below are the `<message>` part.
 | `cuda` on macOS | `--backend cuda is not available on macOS; use --backend mlx (the default here)` |
 | `mlx` with < 16 GB memory | `--backend mlx needs at least 16 GB of memory (this machine: {n} GB)` |
 | `mlx` with CUDA-only options | `{option[, option…]} only apply to --backend cuda; remove them` |
-| checkpoint is CUDA-format, backend is `mlx` | `{dir} is the PyTorch checkpoint; --backend mlx needs the MLX weights: uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx --revision 3c8829fb7fd335818f085cd2ef49b4100c0e46c8` |
+| checkpoint is CUDA-format, backend is `mlx` | `{dir} is the PyTorch checkpoint; --backend mlx needs the MLX weights: uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx-8bit --revision c6e4a2ff6ab9afba68b7853de802273ffe23fb49` |
+| backend is `mlx`, and `{dir}/config.json` is missing or not a JSON object | `{dir} has no readable config.json; --backend mlx needs the MLX weights: uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx-8bit --revision c6e4a2ff6ab9afba68b7853de802273ffe23fb49` |
+| backend is `mlx`, and `model_type` is neither `breeze` nor `breeze_tts` | `{dir} has model_type {value!r}; expected 'breeze' (PyTorch) or 'breeze_tts' (MLX)` |
 | checkpoint is MLX-format, backend is `cuda` | `{dir} holds MLX weights; --backend cuda needs: uvx --from huggingface_hub hf download BreezeBlue/Breeze-TTS-2` |
 | MLX checkpoint with unsupported quantization | `{dir} is {bits}-bit {mode}; the MLX backend supports bf16 and 8-bit (mxfp8)` |
 
@@ -41,7 +43,9 @@ CUDA-only options: `--fast-all`, `--no-fast-all`, `--fast-text-encoder`,
 `--fast-backbone-prefill`, `--fast-backbone-decode`, `--fast-depth-decoder`, `--fast-codec`
 (and their `--no-` forms), `--attn-implementation`, `--compile-cache-dir`.
 
-The CUDA backend's options, defaults and refusals are unchanged.
+The CUDA backend's options, defaults and refusals are unchanged. With `--backend cuda`, a
+missing or unreadable `config.json` is ignored, as today; only one that says `breeze_tts` is
+refused.
 
 ## macOS launcher (new)
 
