@@ -19,6 +19,11 @@ All notable changes to this project are documented here. See
   `REFERENCE_VOICES_DIR` (and `BREEZE_CPP_ROOT` for the C++ tools) with no machine-specific
   fallback; without them the reference-voice GPU tests skip.
 
+### Documentation
+
+- README rewritten as an overview with Linux/Windows quick starts and an explicit
+  derivative/licence notice; the API reference moved unchanged to `docs/api.md`.
+
 ## 2.1.0 — 2026-10-01
 
 ### Added
