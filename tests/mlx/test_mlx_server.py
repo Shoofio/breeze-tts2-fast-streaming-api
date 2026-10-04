@@ -370,9 +370,15 @@ def test_voice_clone_design_and_direction_return_audio(server: Server) -> None:
     design = _speech_seconds(
         server, {"instruction": "A deep, calm older male voice.", "cfg_scale": "4"}
     )
+    # cfg_scale 4 as in the docs/api.md direction example: the guidance branch then carries the
+    # reference too (cfg_negative_input_values), a path neither clone nor design takes.
     direction = _speech_seconds(
         server,
-        {"ref_text": REF_TEXT, "instruction": "Speak slowly with a restrained, serious tone."},
+        {
+            "ref_text": REF_TEXT,
+            "instruction": "Speak slowly with a restrained, serious tone.",
+            "cfg_scale": "4",
+        },
         reference,
     )
 
