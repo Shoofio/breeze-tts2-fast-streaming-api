@@ -227,7 +227,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
     - equality with `tests.fakes.FakeRuntime`'s `room_for_length` for the same inputs, with
       `fast_backbone_prefill=False`.
   - The test must fail until T014.
-- [ ] T014 *(Opus)* Create `models/mlx_streaming.py`, part 1: loading and attributes.
+- [x] T014 *(Opus)* Create `models/mlx_streaming.py`, part 1: loading and attributes.
   - **`load_mlx_runtime(path: Path) -> MlxBreezeStreamingRuntime`:** load weights with
     mlx-audio's loader for `breeze_tts`, and the codec from `path / "audio_tokenizer"`.
   - **The tokenizer:** use `transformers.AutoTokenizer.from_pretrained(path, fix_mistral_regex=False)`.

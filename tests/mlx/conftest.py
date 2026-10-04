@@ -7,9 +7,8 @@ import pytest
 
 @pytest.fixture(scope="session")
 def mlx_runtime(mlx_model: Path):
-    """Load the MLX runtime once per session.
+    """Load the MLX runtime once per session: one model per process, since a 16 GB Mac has
+    no room for two."""
+    from models.mlx_streaming import load_mlx_runtime
 
-    The loader arrives with the runtime module, so until then tests that need
-    the runtime skip instead of failing.
-    """
-    pytest.skip("T014")
+    return load_mlx_runtime(mlx_model)
