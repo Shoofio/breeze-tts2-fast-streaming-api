@@ -98,7 +98,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
     verdict to `specs/005-mlx-mac-inference/research/live-phase0.md`.
   - **Go** if 8-bit with CFG has RTF ≤ 1.3 on the passage. Otherwise **stop and report to the
     user** with the numbers. Don't start T003.
-- [ ] T003 Add this line at the end of `requirements.txt`, under a comment
+- [X] T003 Add this line at the end of `requirements.txt`, under a comment
   `# Apple Silicon only: the MLX backend (specs/005-mlx-mac-inference research R1, R2).`:
   `mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@e1b19b9054bf163f5d812221a54fcc346f1890e9; sys_platform == "darwin" and platform_machine == "arm64"`.
   - Create `requirements-mac-overrides.txt` with exactly `transformers==4.57.3` and
