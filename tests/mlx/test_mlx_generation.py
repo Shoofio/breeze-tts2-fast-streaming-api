@@ -11,6 +11,7 @@ import torch
 
 from breeze_infer.http_fields import DEFAULT_INSTRUCTION
 from breeze_infer.synthesis import NoRef, prepare_piece
+from models.cudagraph.sampling import NonFiniteLogitsError
 
 pytestmark = pytest.mark.mlx
 
@@ -121,3 +122,28 @@ def test_dual_cfg_is_rejected_on_the_first_next(mlx_runtime) -> None:
     chunks = mlx_runtime.iter_audio_chunks(inputs)
     with pytest.raises(ValueError, match="dual CFG"):
         next(chunks)
+
+
+@pytest.mark.parametrize(
+    ("part", "message"),
+    [
+        ("backbone", "backbone logits contain NaN or +inf, or no finite value; cannot sample"),
+        ("depth", "depth decoder logits contain NaN or +inf, or no finite value; cannot sample"),
+    ],
+)
+def test_nonfinite_logits_fail_before_the_frame_is_observed(mlx_runtime, monkeypatch, part, message) -> None:
+    """A NaN norm weight (mlx-audio's module, restored after the test) makes that part's logits
+    NaN; the request fails with CUDA's error before anything sees the frame."""
+    import mlx.core as mx
+
+    model = mlx_runtime._mlx_model
+    norm = model.backbone_model.norm if part == "backbone" else model.depth_decoder.model.norm
+    monkeypatch.setitem(norm, "weight", mx.full(norm.weight.shape, mx.nan, norm.weight.dtype))
+    observed: list[torch.Tensor] = []
+    chunks = mlx_runtime.iter_audio_chunks(
+        inputs_for(mlx_runtime, SENTENCE), seed=4, max_new_tokens=SHORT, token_observer=observed.append
+    )
+    with pytest.raises(NonFiniteLogitsError) as raised:
+        next(chunks)
+    assert str(raised.value) == message
+    assert observed == []

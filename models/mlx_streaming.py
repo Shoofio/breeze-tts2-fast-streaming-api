@@ -23,7 +23,12 @@ import torch
 from breeze_infer.limits import MAX_NEW_TOKENS_CEILING
 from breeze_infer.reference_audio import predicted_frames
 
-from .cudagraph.sampling import MIN_TEMPERATURE, require_number
+from .cudagraph.sampling import (
+    _NONFINITE_MESSAGE,
+    MIN_TEMPERATURE,
+    NonFiniteLogitsError,
+    require_number,
+)
 from .fast_streaming import (
     _POSITIVE_INTEGER_RULE,
     FastStreamingChunk,
@@ -227,24 +232,32 @@ def _prompt_embeddings(model: Any, prompt: _MlxPrompt) -> Any:
     return table[prompt.source][None]
 
 
-def _sample(logits: Any, key: Any, sampling: Sampling) -> Any:
-    """One token per row of float32 `logits`, on the GPU.
+def _sample(logits: Any, key: Any, sampling: Sampling) -> tuple[Any, Any]:
+    """One token per row of float32 `logits`, on the GPU, and whether each row could be sampled.
 
     The same steps, in the same order, as CUDA's `_sample_logits_or_sentinel` and `_draw`
     (models/cudagraph/sampling.py): temperature (floored at `MIN_TEMPERATURE`), top-k, then
     top-p with Hugging Face's shift, then a draw; `do_sample=False` is argmax.
+
+    The second result is CUDA's guard, on the same values: after the temperature for a sampled
+    row, the raw logits for a greedy one. A row with NaN or +inf, or with no finite value,
+    cannot be trusted, and one reduction finds all three (the max is NaN if any value is, +inf
+    if any is, -inf if none is finite). It stays on the GPU; the frame loop reads it with the
+    frame. Unlike CUDA, the bad row is not replaced with zeros: MLX's argmax and categorical
+    always return an id in range, and the frame is refused before anything uses it.
     """
     import mlx.core as mx
 
     if not sampling.do_sample:
-        return mx.argmax(logits, axis=-1)
+        return mx.argmax(logits, axis=-1), mx.isfinite(mx.max(logits, axis=-1))
     logits = logits / max(sampling.temperature, MIN_TEMPERATURE)
+    sampleable = mx.isfinite(mx.max(logits, axis=-1))
     if sampling.top_k > 0:
         k = min(sampling.top_k, logits.shape[-1])
         kth = mx.min(mx.topk(logits, k, axis=-1), axis=-1, keepdims=True)
         logits = mx.where(logits < kth, -mx.inf, logits)
     if sampling.top_p >= 1.0:
-        return mx.random.categorical(logits, key=key)
+        return mx.random.categorical(logits, key=key), sampleable
     order = mx.argsort(-logits, axis=-1)
     ranked = mx.take_along_axis(logits, order, axis=-1)
     cumulative = mx.cumsum(mx.softmax(ranked, axis=-1), axis=-1)
@@ -252,7 +265,7 @@ def _sample(logits: Any, key: Any, sampling: Sampling) -> Any:
     keep_first = mx.zeros(cumulative[..., :1].shape, dtype=mx.bool_)
     remove = mx.concatenate([keep_first, cumulative[..., :-1] > sampling.top_p], axis=-1)
     choice = mx.random.categorical(mx.where(remove, -mx.inf, ranked), key=key)
-    return mx.take_along_axis(order, choice[:, None], axis=-1)[:, 0]
+    return mx.take_along_axis(order, choice[:, None], axis=-1)[:, 0], sampleable
 
 
 class _BackboneCache:
@@ -326,6 +339,13 @@ def _backbone_step(backbone: Any, cache: _BackboneCache, codes: Any) -> Any:
     return backbone.norm(x)[:, -1, :]
 
 
+# The guard flags in the last element of `_Generation.frame()`: logits that could not be
+# sampled (NaN, +inf, or no finite value), as CUDA's sentinel token and
+# `DepthDecoderGraph.nonfinite_logits` report them.
+_BACKBONE_NONFINITE = 1
+_DEPTH_NONFINITE = 2
+
+
 class _Generation:
     """One request's generation state (data-model.md, "Request generation state").
 
@@ -388,8 +408,10 @@ class _Generation:
         return uncond + self._guidance * (cond - uncond)
 
     def frame(self) -> Any:
-        """The next frame's codes, `[num_codebooks]` int32: the backbone's token (EOS when it
-        equals `vocab_size`), then the depth decoder's."""
+        """The next frame, `[num_codebooks + 1]` int32: its codes (the backbone's token, EOS
+        when it equals `vocab_size`, then the depth decoder's), then its guard flags
+        (`_BACKBONE_NONFINITE`, `_DEPTH_NONFINITE`). The flags ride in the same array so the
+        frame loop's one host read covers them."""
         import mlx.core as mx
 
         model = self._model
@@ -399,18 +421,23 @@ class _Generation:
             penalised = mx.where(logits > 0, logits / penalty, logits * penalty)
             logits = mx.where(self._seen, penalised, logits)
         # The reserved codec ids are masked after the penalty, as on CUDA. EOS stays sampleable.
-        first = _sample(
+        first, backbone_ok = _sample(
             model._mask_reserved_codec_logits(logits), self._next_key(), self._backbone_sampling
         )
         self._seen = self._seen | (mx.arange(self._seen.shape[0]) == first)
-        return mx.concatenate([first, *self._depth_codes(first)]).astype(mx.int32)
+        depth, depth_ok = self._depth_codes(first)
+        flags = mx.where(mx.all(backbone_ok), 0, _BACKBONE_NONFINITE) + mx.where(
+            mx.all(depth_ok), 0, _DEPTH_NONFINITE
+        )
+        return mx.concatenate([first, *depth, flags[None]]).astype(mx.int32)
 
-    def _depth_codes(self, first: Any) -> list[Any]:
+    def _depth_codes(self, first: Any) -> tuple[list[Any], Any]:
         """Codebooks 1 to `num_codebooks - 1` from the depth decoder, with its own KV cache.
 
         Step 0 feeds `[backbone state, codebook 0]` and each later step one code: the same
         positions and causal mask as CUDA's `DepthDecoderGraph` and mlx-audio's full re-run
-        (`Model._depth_tokens`). Under CFG both rows run as one batch of 2.
+        (`Model._depth_tokens`). Under CFG both rows run as one batch of 2. Also returns
+        whether every step's logits could be sampled.
         """
         import mlx.core as mx
         from mlx_audio.lm.models.cache import KVCache
@@ -432,22 +459,24 @@ class _Generation:
         caches = [KVCache() for _ in decoder.layers]
         mask = "causal"
         codes = []
+        sampleable = []
         last = self._model.num_codebooks - 1
         for codebook in range(1, last + 1):
             for layer, cache in zip(decoder.layers, caches):
                 x = layer(x, mask, cache)
             head = depth.codebooks_head.weight[codebook - 1]
             logits = self._guided(decoder.norm(x)[:, -1, :] @ head)
-            code = _sample(
+            code, ok = _sample(
                 self._model._mask_reserved_codec_logits(logits),
                 self._next_key(),
                 self._depth_sampling,
             )
             codes.append(code)
+            sampleable.append(ok)
             if codebook < last:
                 x = decoder.inputs_embeds_projector(embed(code, codebook))
                 mask = None
-        return codes
+        return codes, mx.concatenate(sampleable)
 
     def advance(self, codes: Any) -> None:
         """Run the backbone on `codes`, the frame just made, for the next frame."""
@@ -457,9 +486,10 @@ class _Generation:
 class MlxBreezeStreamingRuntime:
     """The runtime seam (contracts/runtime-seam.md) on MLX.
 
-    `load_mlx_runtime` builds it with the loaded mlx-audio model, its codec and the tokenizer.
-    The room rules read only `config` and `generation_config`'s `max_new_tokens`, so the
-    model-free tests build it with `None` for the loaded parts and no sampling defaults.
+    `load_mlx_runtime` builds it with the loaded mlx-audio model, its codec, the tokenizer
+    and the backbone's generation config (as a mapping). The room rules read only `config` and
+    `generation_config`'s `max_new_tokens`, so the model-free tests build it with `None` for
+    the loaded parts and no sampling defaults.
     """
 
     # The KV cache is bf16 at both precisions (mxfp8 quantizes weights, not activations), so
@@ -505,7 +535,8 @@ class MlxBreezeStreamingRuntime:
 
     def frame_cap(self, requested: int | None) -> int:
         """Frames a request may generate, before any context limit: `requested`, or the
-        checkpoint's default when it is `None`, clamped to the ceiling. The same rule as
+        generation config's `max_new_tokens` when it is `None` (750, from
+        `update_generation_config_for_breeze`), clamped to the ceiling. The same rule as
         `FastBreezeStreamingRuntime.frame_cap`."""
         if requested is None:
             requested = self._default_max_new_tokens or self.config.max_new_tokens
@@ -627,18 +658,28 @@ class MlxBreezeStreamingRuntime:
         pad = self.model.config.codebook_pad_token_id
         pending: list[Any] = []
         queued: tuple[Any, int] | None = None
-        codes = generation.frame()
-        mx.async_eval(codes)
+        frame = generation.frame()
+        mx.async_eval(frame)
         for step in range(frames):
             last = step == frames - 1
+            codes = frame[:-1]
             if not last:
                 generation.advance(codes)
-                next_codes = generation.frame()
-                mx.async_eval(next_codes)
-            # The frame's one host read: the EOS check, the observer and the pad check use it.
-            host = np.array(codes)
+                next_frame = generation.frame()
+                mx.async_eval(next_frame)
+            # The frame's one host read: the guard, the EOS check, the observer and the pad
+            # check all use it.
+            host = np.array(frame)
+            flags, host = int(host[-1]), host[:-1]
+            # In CUDA's order: a backbone token that could not be sampled fails before the EOS
+            # check, and the depth decoder's guard after it, before the frame is observed or
+            # decoded. The messages are CUDA's.
+            if flags & _BACKBONE_NONFINITE:
+                raise NonFiniteLogitsError(f"backbone {_NONFINITE_MESSAGE}")
             if int(host[0]) == eos:
                 break
+            if flags & _DEPTH_NONFINITE:
+                raise NonFiniteLogitsError(f"depth decoder {_NONFINITE_MESSAGE}")
             if queued is not None:
                 yield self._chunk(*queued, is_final=False)
                 queued = None
@@ -651,7 +692,7 @@ class MlxBreezeStreamingRuntime:
                 queued = self._decode(pending)
                 pending = []
             if not last:
-                codes = next_codes
+                frame = next_frame
         if pending:
             queued = self._decode(pending)
         if queued is not None:
@@ -695,15 +736,16 @@ def _sampling(generation_config: Any) -> Sampling:
     )
 
 
-def _load_sampling_defaults(path: Path) -> tuple[Sampling, Sampling]:
-    """The backbone's and the depth decoder's default sampling, sourced as on CUDA.
+def _load_generation_configs(path: Path) -> tuple[Any, Any]:
+    """The backbone's and the depth decoder's `GenerationConfig`, sourced as on CUDA.
 
     On CUDA the model's `generation_config` comes from the checkpoint's
     `generation_config.json`, the depth decoder's starts from transformers' defaults, and
     `model_loading.load_model` then applies `update_generation_config_for_breeze`
     (breeze_infer/model_loading.py:111, breeze_infer/runtime.py:45-70). That call's built-in
-    values override the file for every sampling setting of both. The same function is applied
-    here to the same starting configs, so the two backends cannot drift apart.
+    values override the file for every sampling setting of both, and for the backbone's
+    `max_new_tokens`. The same function is applied here to the same starting configs, so the
+    two backends cannot drift apart.
     """
     from transformers import GenerationConfig
 
@@ -714,7 +756,7 @@ def _load_sampling_defaults(path: Path) -> tuple[Sampling, Sampling]:
         depth_decoder=SimpleNamespace(generation_config=GenerationConfig()),
     )
     update_generation_config_for_breeze(model)
-    return _sampling(model.generation_config), _sampling(model.depth_decoder.generation_config)
+    return model.generation_config, model.depth_decoder.generation_config
 
 
 def load_mlx_runtime(path: Path) -> MlxBreezeStreamingRuntime:
@@ -732,14 +774,13 @@ def load_mlx_runtime(path: Path) -> MlxBreezeStreamingRuntime:
     # `mlx_model.tokenizer` is not used.
     tokenizer = AutoTokenizer.from_pretrained(path, fix_mistral_regex=False)
     config = json.loads((path / "config.json").read_text(encoding="utf-8"))
-    generation_config = json.loads((path / "generation_config.json").read_text(encoding="utf-8"))
-    backbone_sampling, depth_sampling = _load_sampling_defaults(path)
+    backbone, depth = _load_generation_configs(path)
     return MlxBreezeStreamingRuntime(
         mlx_model=mlx_model,
         codec=mlx_model.audio_tokenizer,
         tokenizer=tokenizer,
         model_config=MlxModelConfig.from_config_json(config),
-        generation_config=generation_config,
-        backbone_sampling=backbone_sampling,
-        depth_sampling=depth_sampling,
+        generation_config=backbone.to_dict(),
+        backbone_sampling=_sampling(backbone),
+        depth_sampling=_sampling(depth),
     )
