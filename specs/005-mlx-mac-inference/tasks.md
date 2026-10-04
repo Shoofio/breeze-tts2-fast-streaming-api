@@ -500,7 +500,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
   Check SC-002 and SC-002a, and set SC-006's number from the measured peak. If bf16 misses
   SC-002, the README recommends 8-bit for 16 GB Macs, with the numbers. Record the results in
   `specs/005-mlx-mac-inference/research/live-perf.md`.
-- [ ] T033 *(user)* Listening test, quickstart step 6. Prompts: 3 clone, 3 design, 3 direction
+- [X] T033 *(user)* Listening test, quickstart step 6. Prompts: 3 clone, 3 design, 3 direction
   and 1 plain, on CUDA and on the Mac at both precisions. The main session generates the files
   and a comparison table in `specs/005-mlx-mac-inference/research/live-listening.md`; the user
   fills in the judgements.

@@ -31,16 +31,16 @@ matching the CUDA speaker or description.
 
 | Prompt | Kind | Voice / description | CUDA | Mac 8-bit | Mac bf16 | 8-bit ✓? | bf16 ✓? | Notes |
 |---|---|---|---|---|---|---|---|---|
-| clone-1 | clone | Eric01 | 5.28 | 5.52 | 6.72 | | | |
-| clone-2 | clone | Vale01 | 6.80 | 7.20 | 7.20 | | | |
-| clone-3 | clone | Eric01 | 4.00 | 4.48 | 5.20 | | | |
-| design-1 | design | deep, calm older male | 3.92 | 5.92 | 4.24 | | | |
-| design-2 | design | bright, energetic young female | 4.72 | 4.72 | 4.48 | | | |
-| design-3 | design | hoarse whisper | 4.08 | 4.88 | 4.64 | | | |
-| direction-1 | direction | Vale01, restrained and serious, "(clears throat)" | 4.88 | 4.24 | 5.84 | | | |
-| direction-2 | direction | Eric01, excited, barely containing laughter | 2.00 | 2.40 | 2.08 | | | |
-| direction-3 | direction | Vale01, sad, close to tears | 4.88 | 3.84 | 4.56 | | | |
-| plain-1 | plain | default voice | 5.28 | 4.88 | 5.12 | | | |
+| clone-1 | clone | Eric01 | 5.28 | 5.52 | 6.72 | ✓ | ✓ | |
+| clone-2 | clone | Vale01 | 6.80 | 7.20 | 7.20 | ✓ | ✓ | |
+| clone-3 | clone | Eric01 | 4.00 | 4.48 | 5.20 | ✓ | ✓ | |
+| design-1 | design | deep, calm older male | 3.92 | 5.92 | 4.24 | ✓ | ✓ | |
+| design-2 | design | bright, energetic young female | 4.72 | 4.72 | 4.48 | ✓ | ✓ | |
+| design-3 | design | hoarse whisper | 4.08 | 4.88 | 4.64 | ✓ | ✓ | |
+| direction-1 | direction | Vale01, restrained and serious, "(clears throat)" | 4.88 | 4.24 | 5.84 | ✓ | ✓ | bf16 sounds better acted than 8-bit |
+| direction-2 | direction | Eric01, excited, barely containing laughter | 2.00 | 2.40 | 2.08 | ✓ | ✓ | bf16 sounds better acted than 8-bit |
+| direction-3 | direction | Vale01, sad, close to tears | 4.88 | 3.84 | 4.56 | ✓ | ✓ | bf16 sounds better acted than 8-bit |
+| plain-1 | plain | default voice | 5.28 | 4.88 | 5.12 | ✓ | ✓ | |
 
 All 30 requests returned 200, and every length is plausible for its text. None ran away.
 
@@ -48,3 +48,12 @@ Mac lengths stay within 2 s of CUDA's (the widest gap is design-1 at 8-bit, 5.92
 direction-2 ("excited and fast") is short on all three: 2.00 s on CUDA, 2.40 s at 8-bit and
 2.08 s at bf16. That points to the model's pacing for this instruction rather than truncation;
 listening will confirm.
+
+## Verdict (the user, 2026-10-04)
+
+**SC-005 is met at both precisions.** All 10 prompts work on the Mac at 8-bit and at bf16:
+intelligible, with no artifacts, and matching the CUDA speaker or description.
+
+**Observed difference:** in the three voice-direction prompts, bf16 sounded better acted than
+8-bit. The instructed delivery (restrained and serious, excited, sad) comes through more
+convincingly. Clone, design and plain showed no difference worth noting.

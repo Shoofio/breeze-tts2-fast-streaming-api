@@ -43,16 +43,14 @@ recorded live result, as of the branch head after the T037 review fix (`ae6afd8`
 | SC-002a 8-bit meets SC-002; docs give the bf16 numbers | bf16 RTF 1.47–1.50 is published in the README and `docs/api.md`, which recommend 8-bit on 16 GB Macs | ✓ |
 | SC-003 SillyTavern `full` and C++ examples pass unchanged | <ul><li>C++ examples: `RESULT: OK` with 0 fail, in 3 CORS configurations.</li><li>SillyTavern: 30/34. The 4 failures are in the test suite (hard-coded `eric`/`vale` ids, a known popup race also seen on CUDA). The user accepted the run; fixing the suite is a follow-up.</li></ul> | ✓ (accepted, suite fix pending) |
 | SC-004 CUDA bench within 5%; GPU suite passes | T030 (user-reported pass) | ✓ |
-| SC-005 10-prompt listening test | `live-listening.md`: Mac 8-bit and bf16 generated, all 200. CUDA set and the user's judgements pending. | **Pending** |
+| SC-005 10-prompt listening test | `live-listening.md`: CUDA, Mac 8-bit and Mac bf16, all 30 returned 200. The user judged every Mac output intelligible, artifact-free and matching CUDA. Voice direction sounds better acted in bf16 than in 8-bit. | ✓ |
 | SC-006 no swap with a browser and editor; number set by the gate | `live-perf.md`: peak footprint 7.0 GB at 8-bit with no swap growth. SC-006 is set at ≤ 7.5 GB. | ✓ at 8-bit |
 | SC-007 every unsupported case gives a clear refusal | `tests/test_settings.py`, `tests/test_checkpoint_kind.py` (including a malformed `quantization`) and `live-us1.md` step 7. Each prints the usage line, the message and exit status 2. | ✓ |
 
 ## Open items
 
-1. **SC-005:** the CUDA listening set, which the `breezetts-linux` session is generating, and the
-   user's judgements.
-2. **SC-001:** a timed fresh-clone run, if the user wants it measured rather than inferred.
-3. **Follow-up after this feature:** update the SillyTavern suite:
+1. **SC-001:** a timed fresh-clone run, if the user wants it measured rather than inferred.
+2. **Follow-up after this feature:** update the SillyTavern suite:
    - use the current voice ids or make them configurable;
    - harden `acceptPopupIfPresent`;
    - sweep leftover `st_live_tmp` voices.
