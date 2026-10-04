@@ -47,6 +47,10 @@ TERMINAL_EVENTS = ("speech.completed", "speech.aborted", "speech.failed")
 # The kernel evicts a connection whose peer stops acknowledging after this long. Production
 # uses limits.TCP_USER_TIMEOUT_MS; short here so eviction can be observed.
 TEST_TCP_USER_TIMEOUT_MS = 2000
+# Tests that wait for the kernel to drop a stalled connection can only pass where the option exists.
+needs_kernel_eviction = pytest.mark.skipif(
+    not hasattr(socket, "TCP_USER_TIMEOUT"), reason="kernel eviction needs Linux TCP_USER_TIMEOUT"
+)
 
 
 def wait_until(condition: Callable[[], bool], timeout: float = 5.0) -> None:
@@ -169,7 +173,9 @@ class LiveServer:
         # Bound as production binds, then with a short TCP_USER_TIMEOUT by default (accepted
         # sockets inherit it) so the kernel's eviction of a stalled connection shows up quickly.
         [sock] = bind_http_sockets("127.0.0.1", 0)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, user_timeout_ms)
+        # Linux-only option: macOS has none, so there the server just runs without eviction.
+        if hasattr(socket, "TCP_USER_TIMEOUT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, user_timeout_ms)
         self.port = sock.getsockname()[1]
         self.url = f"http://127.0.0.1:{self.port}/speech"
         self.loop = asyncio.new_event_loop()
@@ -411,6 +417,7 @@ def stalled_client(port: int) -> socket.socket:
     return sock
 
 
+@needs_kernel_eviction
 def test_stalled_reader_hits_send_timeout_and_is_evicted(
     serve: Callable[[Rig], LiveServer], caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -442,6 +449,7 @@ def test_stalled_reader_hits_send_timeout_and_is_evicted(
         server.wait_for_no_connections(timeout=TEST_TCP_USER_TIMEOUT_MS / 1000 + 15)
 
 
+@needs_kernel_eviction
 def test_a_send_timeout_before_the_headers_leaves_the_connection_to_the_kernel(
     serve: Callable[[Rig], LiveServer], caplog: pytest.LogCaptureFixture
 ) -> None:

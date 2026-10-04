@@ -18,3 +18,10 @@ pytest>=8.0
 ruff>=0.12
 # Test dependency: real-server tests assert on incomplete chunked transfers.
 httpx==0.28.1
+
+# Apple Silicon only: the MLX backend (specs/005-mlx-mac-inference research R1, R2).
+mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@e1b19b9054bf163f5d812221a54fcc346f1890e9; sys_platform == "darwin" and platform_machine == "arm64"
+# mlx-audio only asks for mlx>=0.31.1; pin the version the backend was built and measured on, since
+# models/mlx_streaming.py relies on its attention-mask, cache and RoPE behaviour.
+mlx==0.32.3; sys_platform == "darwin" and platform_machine == "arm64"
+mlx-metal==0.32.3; sys_platform == "darwin" and platform_machine == "arm64"

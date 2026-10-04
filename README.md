@@ -22,15 +22,16 @@ Added in this fork:
 - Optional CORS (`--cors`).
 - Fast-path inference options, enabled together with `--fast-all`.
 - A native Windows launcher, `scripts/start_breeze.ps1`.
+- An MLX backend for Apple Silicon Macs, started with `scripts/start_breeze_mac.sh`. See [Quick start (macOS, Apple Silicon)](#quick-start-macos-apple-silicon).
 - CPU and GPU test suites.
 
 ## Requirements
 
-- An NVIDIA GPU with CUDA.
+- An NVIDIA GPU with CUDA, or an Apple Silicon Mac (M1 or later) with at least 16 GB of memory.
 - GPU memory: about 7.7 GiB for eager inference, about 14.4 GiB with `--fast-all`. A 12 GB GPU is recommended for eager and a 24 GB GPU for the fast path.
 - Python 3.12 (uv installs it).
 - [uv](https://docs.astral.sh/uv/).
-- Linux or WSL2, or native Windows 10/11.
+- Linux or WSL2, native Windows 10/11, or macOS 14 (Sonoma) or later on Apple Silicon.
 - On Windows, `--fast-all` needs the Visual Studio C++ build tools (MSVC). The launcher installs `triton-windows` for `torch.compile`, and it compiles through MSVC, which it finds from the Visual Studio install.
 
 ## Quick start (Linux / WSL)
@@ -93,6 +94,45 @@ Common parameters:
 | `-Reinstall` | Delete `.venv-win` and rebuild it. |
 
 Because it binds `0.0.0.0` by default, Windows Firewall will prompt on the first launch. `-BindHost 127.0.0.1` keeps the server local.
+
+## Quick start (macOS, Apple Silicon)
+
+Requirements: an Apple Silicon Mac (M1 or later), at least 16 GB of memory, and macOS 14 (Sonoma) or later, the oldest release MLX ships for. The server refuses to start on an Intel Mac or with less memory. Python 3.12 and [uv](https://docs.astral.sh/uv/) are needed, as on Linux.
+
+The Mac backend runs community MLX conversions of the model, in 8-bit or bf16. Download one, pinned to a revision so every install gets the same weights:
+
+```bash
+# 8-bit (default, recommended for 16 GB Macs)
+uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx-8bit --revision c6e4a2ff6ab9afba68b7853de802273ffe23fb49
+
+# bf16
+uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx --revision 3c8829fb7fd335818f085cd2ef49b4100c0e46c8
+```
+
+Then, from a clone of this repository:
+
+```bash
+scripts/start_breeze_mac.sh [--precision 8bit|bf16] [server options...]
+```
+
+The precision defaults to `8bit`. If the Python environment lacks `mlx`, the launcher installs the dependencies with `requirements-mac-overrides.txt`. It looks for the pinned snapshot in the HuggingFace cache (`$HF_HOME`, default `~/.cache/huggingface`), and if it is missing it prints the download command above and exits. It has the same defaults as `start_breeze.sh`: `0.0.0.0:8080` and CORS `*`. It doesn't pass `--fast-all`, which is CUDA-only. Extra arguments go to the server, and a later `--host` or `--cors` overrides the launcher's value. The warning under [Quick start (Linux / WSL)](#quick-start-linux--wsl) about the open defaults applies here too: pass `--host 127.0.0.1` to keep the server local.
+
+Measured on an Apple M5 with 16 GB with a browser and an editor open. The speed columns give the range of the per-case medians (10 runs each) over the five benchmark cases; the slowest single first audio was 0.42 s at 8-bit and 0.68 s at bf16. Peak memory is the server's physical footprint after medium-length requests.
+
+| Precision | First audio | Real-time factor (RTF) | Peak memory |
+| --- | --- | --- | --- |
+| 8-bit | 0.32–0.41 s | 0.84–0.88 | 7.0 GB |
+| bf16 | 0.49–0.55 s | 1.47–1.50 | 9.7 GB |
+
+An RTF below 1 means audio is produced faster than it plays. bf16 is slower than real time on this machine, so streamed audio can't keep up with playback, and its memory use pushed the Mac into swap during the run. Use 8-bit on a 16 GB Mac. The details are in `specs/005-mlx-mac-inference/research/live-perf.md`.
+
+The HTTP and WebSocket API is the same on both backends. [docs/api.md](docs/api.md#differences-on-the-mlx-backend) lists the differences.
+
+> [!NOTE]
+> `infer.py` is CUDA-only and doesn't run on the MLX backend. On a Mac, synthesis goes through the server.
+
+> [!IMPORTANT]
+> The MLX weights are an unofficial community conversion, published by [mlx-community](https://huggingface.co/mlx-community) and not affiliated with BreezeBlue. They are derivative models of Breeze TTS 2, so the [BreezeBlue Research and Non-Commercial License](https://huggingface.co/BreezeBlue/Breeze-TTS-2/blob/main/LICENSE) still applies: research and non-commercial use only. See [License and responsible use](#license-and-responsible-use).
 
 ## First request
 
@@ -176,8 +216,10 @@ bash docker/build.sh
 | Action | Command |
 | --- | --- |
 | Run the server (CORS open to every origin by default; narrow it with `--cors=http://127.0.0.1:8000`) | `scripts/start_breeze.sh` |
+| Run the server on an Apple Silicon Mac (MLX backend) | `scripts/start_breeze_mac.sh` |
 | Unit and integration tests (no GPU) | `.venv/bin/pytest` |
 | GPU tests | `BREEZE_MODEL=<path> .venv/bin/pytest -m gpu` |
+| MLX tests (Apple Silicon Mac) | `BREEZE_MLX_MODEL=<path> .venv/bin/pytest -m mlx` |
 | Lint | `.venv/bin/ruff check .` |
 | Benchmark | `.venv/bin/python -m breeze_infer.bench_api --url http://127.0.0.1:8080` (defaults `--warmup 3 --runs 10`) |
 | SillyTavern live test | `node tests/live/sillytavern/run.mjs <health\|voices\|speech\|full>` |
@@ -190,6 +232,7 @@ Environment variables:
 
 - `HF_HOME`: the HuggingFace cache the launchers read the model from.
 - `BREEZE_MODEL`: checkpoint path; enables the GPU tests (without it they skip).
+- `BREEZE_MLX_MODEL`: path to an MLX snapshot directory; enables the MLX tests (without it they skip).
 - `REFERENCE_VOICES_DIR`: used by the reference-voice GPU tests, `bench_api` and the live scripts. It expects `<dir>/eric/eric.wav` and `eric.txt`.
 - `BREEZE_CPP_ROOT`: path to a checkout of the C++ server, used by the C++ golden and docs tools.
 

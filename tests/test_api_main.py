@@ -48,7 +48,7 @@ from breeze_infer.limits import (
 from breeze_infer.model_loading import LoadedModel
 from breeze_infer.routes_health import Readiness
 from breeze_infer.routes_speech import CpuTokenizer
-from breeze_infer.settings import settings_from_args
+from breeze_infer.settings import Platform, settings_from_args
 from tests.fakes import (
     FakeRuntime,
     FakeTokenizer,
@@ -101,7 +101,8 @@ def test_bound_socket_has_tcp_user_timeout() -> None:
 @pytest.mark.skipif(os.name != "posix", reason="SO_REUSEADDR is set on POSIX only")
 def test_bound_socket_has_reuseaddr_and_is_listening() -> None:
     with _bind_one("127.0.0.1", 0) as sock:
-        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 1
+        # BSD/macOS returns the option's bit value (4) for "on", Linux returns 1.
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0
         # Listening already: a client can connect before uvicorn starts accepting.
         with socket.create_connection(sock.getsockname(), timeout=2):
             pass
@@ -256,8 +257,11 @@ def test_bc_30_ws_sockets_cover_every_address_the_host_resolves_to(
 
 
 def test_main_exits_non_zero_with_a_message_when_the_port_is_taken(
-    capsys: pytest.CaptureFixture[str],
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # A Mac defaults to the MLX backend, which refuses MODEL_DIR (no config.json) before the
+    # bind; a Linux platform keeps this test on the port-taken path everywhere.
+    monkeypatch.setattr(api.Platform, "detect", classmethod(lambda cls: Platform("linux", "x86_64", 64 * 2**30)))
     with socket.socket() as taken:
         taken.bind(("127.0.0.1", 0))
         taken.listen()
@@ -338,6 +342,18 @@ def test_cuda_device_follows_local_rank_then_rank(
 
     monkeypatch.setattr(api.torch.cuda, "is_available", lambda: False)
     assert api._cuda_device({"LOCAL_RANK": "1"}) == "cpu"
+
+
+def test_mlx_backend_selects_the_mlx_gpu_device_and_no_cuda_call(tmp_path: Path) -> None:
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "breeze_tts"}))
+    settings = settings_from_args(
+        [str(tmp_path)], platform=Platform("darwin", "arm64", 16 * 1024**3)
+    )
+
+    device, set_device = api.choose_device(settings, {})
+
+    assert device == "mlx:gpu"
+    assert set_device is api._select_no_device
 
 
 def test_first_signal_exits_gracefully_and_second_forces() -> None:

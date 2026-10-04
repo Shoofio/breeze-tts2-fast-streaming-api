@@ -1,0 +1,5 @@
+# Used only on the Mac install (`uv pip install -r requirements.txt --overrides requirements-mac-overrides.txt`).
+# mlx-audio declares transformers>=5.14 and huggingface_hub>=1.0, but its Breeze path uses neither
+# (specs/005-mlx-mac-inference research R2), so these pins keep one transformers version on every platform.
+transformers==4.57.3
+huggingface-hub==0.36.2
