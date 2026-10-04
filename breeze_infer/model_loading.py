@@ -101,7 +101,9 @@ def warmup_report(manifest: dict[str, Any]) -> dict[str, Any]:
 def load_model(
     settings: Settings, device: str, environ: MutableMapping[str, str]
 ) -> LoadedModel:
-    """Configure the compile cache, load the checkpoint, and warm up the fast paths."""
+    """Load the checkpoint for the chosen backend and warm it up before the server reports ready."""
+    if settings.backend == "mlx":
+        return _load_mlx_model(settings, device)
     cache_dir, torch_key = configure_compile_cache(settings.compile_cache_dir, environ)
     tokenizer, model, audio_tokenizer = load_runtime(
         settings.model_path,
@@ -114,6 +116,8 @@ def load_model(
     )
 
     report: dict[str, Any] = {
+        "backend": "cuda",
+        "weights": "bf16",
         "device": device,
         "compile_cache_dir": str(cache_dir),
         "torch_key": torch_key,
@@ -128,4 +132,28 @@ def load_model(
         )
         report.update(warmup_report(manifest))
     # On the GPU thread, before the server reports ready (`LoadedModel.from_runtime`).
+    return LoadedModel.from_runtime(runtime, report)
+
+
+def _load_mlx_model(settings: Settings, device: str) -> LoadedModel:
+    """Load the MLX checkpoint and compile its Metal kernels before the first request.
+
+    Imported here, not at the top: `models.mlx_streaming` needs mlx, which only a Mac has, and
+    this module must still import on Linux and Windows. There is no compile cache or torch key
+    on MLX, so those report fields are null.
+    """
+    from models.mlx_streaming import load_mlx_runtime
+
+    runtime = load_mlx_runtime(settings.model_path)
+    warmup_ms = runtime.warmup()
+    report: dict[str, Any] = {
+        "backend": "mlx",
+        "weights": settings.weights,
+        "device": device,
+        "compile_cache_dir": None,
+        "torch_key": None,
+        "warmup_ms": round(warmup_ms, 2),
+        "fx_graph_cache_hits": None,
+        "fx_graph_cache_misses": None,
+    }
     return LoadedModel.from_runtime(runtime, report)

@@ -590,6 +590,7 @@ def test_the_model_load_copies_the_tokenizer_on_the_gpu_thread(
     # Both copies -- the pre-gate check's and the anchor sizing's (review 34 finding 5) -- are
     # made here, on the GPU thread while loading, never on the event loop.
     pre_gate_copy, sizing_copy = tokenizer.copies
+    assert (loaded.report["backend"], loaded.report["weights"]) == ("cuda", "bf16")
     assert loaded.cpu_tokenizer is pre_gate_copy
     assert loaded.sizing_tokenizer is sizing_copy
     assert len(copied_on) == 2 and all(name.startswith("breeze-gpu") for name in copied_on)

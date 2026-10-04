@@ -355,7 +355,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
 
 **Independent Test**: quickstart steps 1 and 2.
 
-- [ ] T020 [US1] Add the MLX branch to `breeze_infer/model_loading.py` `load_model`.
+- [X] T020 [US1] Add the MLX branch to `breeze_infer/model_loading.py` `load_model`.
   - When `settings.backend == "mlx"`: skip `configure_compile_cache`, call
     `models.mlx_streaming.load_mlx_runtime(settings.model_path)`, then `warmup()`. Build the
     report as `{"backend": "mlx", "weights": settings.weights, "device": device, "compile_cache_dir": None, "torch_key": None, "warmup_ms": <ms>, "fx_graph_cache_hits": None, "fx_graph_cache_misses": None}`.
