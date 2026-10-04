@@ -182,18 +182,27 @@ synthesis, voice prefix cache and WebSocket code do not change.
 - **`model.device`.** The server uses it only as the `.to()` target for template tensors. The
   MLX runtime reports `"cpu"`, because the tensors are converted to MLX anyway.
 
-**Room arithmetic: same rule, so the same `400 text_too_long` behaviour.**
+**Room arithmetic: MLX matches CUDA's exact-length rule. No refactor.**
 - `room_for_length` and `max_new_tokens_room` decide when a request is refused for being too
-  long. Today they live as methods on `FastBreezeStreamingRuntime`, and they include
-  prefill-bucket padding (`_PREFILL_TOKEN_GRANULARITY = 32`, `MIN_SUFFIX_FRAMES`,
-  `MIN_SUFFIX_ROOM`).
-- FR-005 requires identical validation. So the MLX runtime uses **the same rule, padding
-  included**, rather than a tighter MLX-only one.
-- **Small refactor needed:** move the pure arithmetic out of `FastBreezeStreamingRuntime` into a
-  module-level function in `models/fast_streaming.py`, and call it from both runtimes. This
-  changes no CUDA behaviour. A unit test pins the CUDA numbers before and after. It is flagged
-  as touching a working code path, and it is allowed because the MLX runtime cannot meet FR-005
-  without it.
+  long (`400 text_too_long`) or clamped.
+- **The CUDA rule is not one fixed number.**
+  - `FastBreezeStreamingRuntime._prefill_plan` (`fast_streaming.py:1006`) returns the exact
+    length (`prefix_len + seq_len`) when `--fast-backbone-prefill` is off.
+  - With it on (`--fast-all`), it pads `seq_len` up to a 32-token bucket. That leaves up to 31
+    fewer frames of room, and only while the bucket still leaves `MIN_SUFFIX_FRAMES`.
+  - So CUDA's limit already depends on its launch flags. Room is `max_seq_len - prefill_len - 1`
+    either way, capped by `frame_cap`.
+- **The MLX backend has no prefill buckets**, so it uses the exact-length rule:
+  `min(frame_cap(requested), max_seq_len - (prefix_len + seq_len) - 1)`. That is what CUDA does
+  without `--fast-backbone-prefill`. The constants `MIN_SUFFIX_FRAMES` and `MIN_SUFFIX_ROOM` are
+  server-side limits the routes already apply, and they don't depend on the backend.
+- This meets FR-005: the MLX backend validates exactly as the CUDA backend does in its eager
+  configuration, and its limit is never tighter than CUDA's fast path.
+- `frame_cap` and the override validation (`_require_valid_overrides`) are reused by import from
+  `models.fast_streaming`, as `tests/fakes.py` already does.
+- **No change to `FastBreezeStreamingRuntime`.** An earlier draft of this plan proposed extracting
+  the arithmetic into a shared function. That was wrong: it assumed the CUDA rule was fixed, and
+  it would have touched working code for no gain.
 
 **Alternatives considered:**
 - **A `Protocol` or base class for runtimes.** Not added. Constitution II would allow it now that
@@ -209,8 +218,9 @@ synthesis, voice prefix cache and WebSocket code do not change.
   isn't given, the default is `mlx` on macOS arm64 and `cuda` everywhere else. The platform
   facts (`sys.platform`, `platform.machine()`, physical memory) are read once in `api.main` and
   passed into `settings_from_args` (Constitution III).
-- **Refusals before any weights load.** Each one exits non-zero with a one-line message naming
-  the cause:
+- **Refusals before any weights load.** Each one goes through `parser.error` (usage line, then
+  the message; exit status 2), like every existing option rejection. The message names the
+  cause:
   - `mlx` on anything other than macOS arm64 (this includes Intel Macs);
   - `cuda` on macOS;
   - `mlx` with less than 16 GB of physical memory;
@@ -309,7 +319,11 @@ working Linux launcher.
   - settings refusals;
   - backend default selection;
   - checkpoint and precision detection, from small `config.json` fixtures;
-  - the extracted room arithmetic, pinned to today's CUDA numbers.
+  - the MLX room rule: it equals the exact-length formula, and it matches `FakeRuntime`'s
+    `_context_room` (the exact-length model the HTTP tests already use) for the same inputs.
+    This needs no model; the test builds the runtime's room methods from a config view.
+    `models/mlx_streaming.py` must import without mlx installed (lazy mlx imports), so this
+    test runs on Linux too.
 - **New `mlx` marker.** It runs on macOS arm64 only when `BREEZE_MLX_MODEL` is set, and skips
   elsewhere. These tests use the real checkpoint:
   - token-id parity between `runtime.tokenizer` and the official tokenizer, on the existing

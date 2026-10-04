@@ -18,10 +18,14 @@ Lives on the frozen `Settings` (`breeze_infer/settings.py`). Validation runs in
 |---|---|---|
 | `system` | `str` | `sys.platform` |
 | `machine` | `str` | `platform.machine()` |
-| `memory_bytes` | `int` | `sysctl hw.memsize` on macOS; unused elsewhere |
+| `memory_bytes` | `int` | `os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")` |
 
-It is a frozen dataclass, built once in `api.main` and passed down (Constitution III). Tests build
-it directly, with no patching.
+It is a frozen dataclass in `breeze_infer/settings.py`. `Platform.detect()` reads the three facts
+(memory via `os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")`), and only `api.main` calls
+it. The result is passed to `settings_from_args(argv, platform=...)` (Constitution III). When
+`platform` is `None`, as in every existing test call, the backend defaults to `cuda`, and an
+explicit `--backend mlx` is refused as "not an Apple Silicon Mac". Existing tests keep today's
+behaviour on any machine. Tests build `Platform` directly, with no patching.
 
 ## Checkpoint kind (new, derived from `<checkpoint dir>/config.json`)
 
@@ -30,8 +34,10 @@ it directly, with no patching.
 | `format` | `"pytorch" \| "mlx"` | `model_type == "breeze"` → pytorch; `"breeze_tts"` → mlx; anything else is refused |
 | `weights` | `"bf16" \| "8bit"` | MLX only. No `quantization` → bf16; `{bits: 8, mode: "mxfp8"}` → 8bit; anything else is refused. PyTorch → `"bf16"` |
 
-It is read by a small pure function, `checkpoint_kind(config: dict) -> CheckpointKind`, which
-raises a `ValueError` carrying the refusal message. The file read stays at the entry point.
+It is computed by a small pure function, `checkpoint_kind(config: dict) -> CheckpointKind`, in
+`breeze_infer/settings.py`. The function raises a `ValueError` carrying the refusal message.
+`settings_from_args` reads `config.json` once, next to its existing `model_path` check, and turns
+the `ValueError` into `parser.error`.
 
 State rule: `format` must match `backend` (`pytorch`↔`cuda`, `mlx`↔`mlx`), or startup is refused.
 

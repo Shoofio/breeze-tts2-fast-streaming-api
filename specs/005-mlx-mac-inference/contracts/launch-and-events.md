@@ -22,8 +22,10 @@ precision from the checkpoint itself (research R3). There is no precision option
 
 ### Refusals
 
-Each refusal happens before any weights load. It prints exactly one line to stderr, with no
-traceback, and exits with status 2.
+Each refusal happens before any weights load, inside `settings_from_args`. It goes through
+`parser.error()`, as every existing launch-option rejection does: argparse prints the usage line
+and then `error: <message>` to stderr, with no traceback, and exits with status 2. The messages
+below are the `<message>` part.
 
 | Condition | Message (exact text, with `{…}` filled in) |
 |---|---|

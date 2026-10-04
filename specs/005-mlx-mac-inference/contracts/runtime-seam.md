@@ -27,8 +27,8 @@ calls each member.
 | Method | Contract |
 |---|---|
 | `frame_cap(requested: int \| None) -> int` | `None` → model default (750); clamp to `limits.MAX_NEW_TOKENS_CEILING` |
-| `max_new_tokens_room(requested, inputs, *, prefix_len=0) -> int` | min(cap, context room); ≤ 0 means no room. **Shared arithmetic** with CUDA (research R4) |
-| `room_for_length(requested, PromptLength, *, prefix_len=0) -> int` | Pure arithmetic, same shared function |
+| `max_new_tokens_room(requested, inputs, *, prefix_len=0) -> int` | `room_for_length(requested, prompt_length(inputs), prefix_len=…)` |
+| `room_for_length(requested, PromptLength, *, prefix_len=0) -> int` | Validates `requested` (`ValueError`), then `min(frame_cap(requested), context room)`. Context room is `max_seq_len - prefill_len - 1`, ≤ 0 meaning none. CUDA's `prefill_len` may include 32-token bucket padding under `--fast-backbone-prefill`; MLX's is always `prefix_len + seq_len` (research R4) |
 | `build_reference_prefix(prefix_inputs: dict) -> obj` | Returns an object with `.prefix_len: int`; everything else is opaque to the server. Raises `ValueError` when `prefix_len > max_reference_prefix_len(max_seq_len)` |
 | `iter_audio_chunks(inputs, *, request_id, seed, token_observer, prefix, temperature, top_k, top_p, repetition_penalty, max_new_tokens) -> Iterator[FastStreamingChunk]` | See below |
 

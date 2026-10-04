@@ -92,7 +92,7 @@ speaker or description. Record the results in `research/live-listening.md`.
 
 ## 7. Refusals (SC-007)
 
-Each of these must print the documented one-line message and exit with status 2
+Each of these must print the usage line and the documented error message, and exit with status 2
 (contracts/launch-and-events.md):
 - `--fast-all` on the Mac;
 - the PyTorch checkpoint with `--backend mlx`;
