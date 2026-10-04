@@ -122,8 +122,11 @@ the pin means re-running the `mlx`-marked tests and the live gate.
 
 | Precision | Repo | Revision (pinned) | Size |
 |---|---|---|---|
-| bf16 (default) | `mlx-community/Breeze-TTS-2-mlx` | `3c8829fb7fd335818f085cd2ef49b4100c0e46c8` | 6.9 GB |
-| 8-bit | `mlx-community/Breeze-TTS-2-mlx-8bit` | `c6e4a2ff6ab9afba68b7853de802273ffe23fb49` | 3.9 GB |
+| 8-bit (default) | `mlx-community/Breeze-TTS-2-mlx-8bit` | `c6e4a2ff6ab9afba68b7853de802273ffe23fb49` | 3.9 GB |
+| bf16 | `mlx-community/Breeze-TTS-2-mlx` | `3c8829fb7fd335818f085cd2ef49b4100c0e46c8` | 6.9 GB |
+
+8-bit is the default because bf16 can't stream in real time on the 16 GB reference Mac: RTF 1.45
+with every change applied (research/live-phase0.md, re-gate).
 
 - The server identifies an MLX checkpoint by `config.json` `model_type == "breeze_tts"`; the
   official one says `"breeze"`.
@@ -258,6 +261,10 @@ checkpoint/backend mismatch is refused.
     on the CUDA path without `--fast-codec`. Then yield a `FastStreamingChunk` (float32 numpy
     audio).
 - **Randomness.** One `mx.random.key(seed)` per request, split each step. No global seed.
+- **No per-token host syncs.** Sampling stays on the GPU: no `.item()`, `float()` or Python-side
+  check on an `mx.array` inside the frame. Stock mlx-audio does 16 such syncs per frame. Checks
+  that need a value on the host, such as EOS, read it at most once per frame, after that frame's
+  `mx.eval`.
 - **Evaluation.** One `mx.eval` per frame, so the work for each frame is a single graph.
 - **Warmup.** At load, one short synthetic generation (no CFG, then CFG) compiles the Metal
   kernels. That way the first real request meets SC-002. The time is reported as `warmup_ms`.
@@ -268,8 +275,30 @@ the float32 bug still in**. mlx-audio after the fix reports RTF 0.6 at bf16 on a
 `FastStreamingChunk` means `synthesis.ramp_pcm` and the server's flush ramp (`--chunk-first`,
 `--chunk-max`) work unchanged.
 
-**What is not done:** no `mx.compile` of the step function in the first release. It is the next
-lever if R7's numbers fall short, and it is measured before adoption, not added speculatively.
+**Measured (prototype, 2026-10-04; research/proto-2026-10-04.md):** at 8-bit on the M5:
+
+| Change | ms/frame, no CFG | ms/frame, CFG |
+|---|---|---|
+| stock | 114.0 | 207.4 |
+| + depth KV cache | 71.4 | 124.9 |
+| + CFG as batch 2 | 71.0 | 72.8 |
+| + no per-token syncs | **66.3** (RTF 0.83) | **68.0** (RTF 0.85) |
+| + `mx.compile`, fixed KV buffer | 65.6 | 67.5 |
+| + codec on a second GPU stream | 64.5 | 66.3 |
+
+**What is not done:** no `mx.compile` and no second GPU stream for the codec. They saved about
+1 ms per frame each, near noise, while adding fixed-capacity KV buffers and stream management
+(Constitution II). The first three changes already meet SC-002 at 8-bit. The prototype for all
+of them is kept for reference in `research/proto/`.
+
+**Numerical parity:** exact frame-for-frame equality with stock is not achievable once the depth
+decoder has a KV cache. MLX's quantized matmul uses different kernels for 1 token than for 2–16
+tokens, so near-tied logits can flip. The prototype's teacher-forced check
+(`research/proto/diag_teacher.py`) showed:
+- every argmax mismatch is a tie, meaning the reference's top-2 margin is at most twice the
+  observed logit error;
+- EOS is predicted at the same step.
+Tests compare with that rule, not with exact frames (T018).
 
 ## R7. Phase-0 gate: measure before building
 
@@ -300,8 +329,8 @@ No published numbers exist for a base M5 with 16 GB, for time to first audio, or
 4. execs the server with the same binding and CORS defaults as `start_breeze.sh`, but without
    `--fast-all`.
 
-`--precision bf16|8bit` is a launcher option: it picks the repo and is stripped before the
-server sees the arguments. All other arguments pass through.
+`--precision 8bit|bf16` is a launcher option, defaulting to `8bit`: it picks the repo and is
+stripped before the server sees the arguments. All other arguments pass through.
 
 **Rationale:**
 - A separate script leaves `start_breeze.sh` and `start_breeze.ps1` byte-identical (User

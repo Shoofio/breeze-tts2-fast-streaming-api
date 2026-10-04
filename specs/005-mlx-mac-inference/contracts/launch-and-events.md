@@ -46,7 +46,7 @@ The CUDA backend's options, defaults and refusals are unchanged.
 ## macOS launcher (new)
 
 ```
-scripts/start_breeze_mac.sh [--precision bf16|8bit] [server options…]
+scripts/start_breeze_mac.sh [--precision 8bit|bf16] [server options…]   # default 8bit
 ```
 
 - Refuses on anything other than macOS arm64.

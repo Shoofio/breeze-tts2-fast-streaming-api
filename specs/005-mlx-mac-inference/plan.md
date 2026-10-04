@@ -45,8 +45,9 @@ the 16 GB M5, before any code is written. Version 2.2.0.
 - **Project Type**: Single-process web service (HTTP and WebSocket on one event loop, one GPU
   thread).
 - **Performance Goals** (spec SC-002, SC-002a, SC-004):
-  - On the M5 16 GB at 8-bit: first audio under 2 s, and RTF ≤ 1.0. bf16 meets the same targets,
-    or the docs say why not.
+  - On the M5 16 GB at 8-bit (the default): first audio under 2 s, and RTF ≤ 1.0. A prototype
+    measured RTF 0.83 with CFG (research R6). bf16 measured RTF 1.45 and is documented as
+    not real time on 16 GB Macs.
   - CUDA within 5% of 2.1.0.
 - **Constraints**:
   - API byte-compatible across backends.

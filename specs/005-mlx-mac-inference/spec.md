@@ -30,7 +30,8 @@
   scope (see the next session).
 - Q: Where do the Mac weights come from? → A: **An existing community MLX conversion** from
   Hugging Face. The repository does not write its own converter.
-- Q: Which precisions? → A: **bf16 and 8-bit.** 4-bit is out of scope.
+- Q: Which precisions? → A: **bf16 and 8-bit.** 4-bit is out of scope. (The default was later
+  set to 8-bit; see the 2026-10-04 session.)
 - Q: Why not PyTorch MPS? → A: **The user tried it.** The existing PyTorch code runs on MPS, but
   it takes more than 5 seconds to generate each second of audio, which is too slow to stream.
 
@@ -43,6 +44,13 @@
   still accept it? → A: **No. Voices don't need to move between backends.** Each machine keeps
   its own voices directory. A voice file whose codec fingerprint doesn't match the running
   backend is skipped, as the server already does today.
+
+### Session 2026-10-04
+
+- Q: Which precision is the default on the Mac? → A: **8-bit.** On the 16 GB M5 the measured
+  prototype frame loop reaches RTF 0.83 with CFG at 8-bit, but bf16 only reaches RTF 1.45, so bf16
+  can't stream in real time there (research/live-phase0.md). bf16 stays available as an option
+  for Macs with more memory.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -223,7 +231,7 @@ the results with the 2.1.0 baseline.
   docs and launcher MUST pin the conversion to a specific repository and revision, so that every
   install gets the same weights. The README MUST say that the conversion is unofficial and
   unaffiliated with BreezeBlue, and that the BreezeBlue non-commercial licence still applies.
-- **FR-012**: The Mac backend MUST support bf16 and 8-bit weights, chosen at launch, with bf16
+- **FR-012**: The Mac backend MUST support bf16 and 8-bit weights, chosen at launch, with 8-bit
   as the default. 4-bit weights are out of scope. Choosing them MUST stop startup with a message
   that names the supported precisions.
 - **FR-013**: When the weights are missing, the macOS launcher MUST refuse to start and print the
@@ -282,10 +290,9 @@ the results with the 2.1.0 baseline.
 - **SC-002**: On the reference Mac, a one-sentence request with a saved voice produces its first
   audio in under 2 seconds. Over a passage of about one minute, the server produces audio at
   least as fast as it plays (no underrun at 1× playback).
-- **SC-002a**: 8-bit meets SC-002 on the reference Mac. bf16 must also meet it, unless the
-  measurements in the Phase-0 gate and the performance gate show the 16 GB reference Mac
-  can't. In that case the docs
-  recommend 8-bit for 16 GB Macs and give the measured bf16 numbers.
+- **SC-002a**: 8-bit, the default, meets SC-002 on the reference Mac. bf16 is not required to:
+  the prototype measured RTF 1.45 at bf16 on the 16 GB M5. The docs recommend 8-bit for 16 GB
+  Macs and give the measured bf16 numbers.
 - **SC-003**: The existing live acceptance checks (the SillyTavern `full` run and the C++ docs
   example check, both of which exercise the WebSocket API too) pass against the Mac server with
   no changes to the checks.

@@ -31,11 +31,15 @@ research R9 and R10. Don't add tests beyond those named in a task.
    - The main session reviews every agent's output before committing.
    - Agent briefs forbid `git stash`, `git checkout` and `git reset`, because agents share one
      working tree. Stage by path.
-3. **Verification**: every task ends with `.venv/bin/ruff check .` and `.venv/bin/pytest` passing,
-   with the real output shown.
+3. **Verification**: every task ends with `.venv/bin/ruff check breeze_infer tests models/mlx_streaming.py`
+   and `.venv/bin/pytest` passing, with the real output shown.
+   - `ruff check .` is not used: `main` already has 29 findings in upstream model code
+     (`models/generation_breeze.py`, `models/t5gemma2_compat.py`, `models/warmup_profile.py` and
+     others), which this feature doesn't touch.
    - From T009 on, the model-free suite must show **0 failures** on this Mac. Before T009 it has
      the 17 known failures listed in research R10.
-   - Tasks that say so also run `BREEZE_MLX_MODEL=<bf16 snapshot> .venv/bin/pytest -m mlx`.
+   - Tasks that say so also run `BREEZE_MLX_MODEL=<8-bit snapshot> .venv/bin/pytest -m mlx`.
+     8-bit is the default precision.
      Without `BREEZE_MLX_MODEL` every `mlx` test skips and still exits 0, which proves nothing.
    - The snapshot paths are under `$HF_HOME/hub/` (default `~/.cache/huggingface/hub/`):
      - bf16: `models--mlx-community--Breeze-TTS-2-mlx/snapshots/3c8829fb7fd335818f085cd2ef49b4100c0e46c8`
@@ -63,6 +67,11 @@ research R9 and R10. Don't add tests beyond those named in a task.
 9. **Mac-only imports are lazy.** `models/mlx_streaming.py` must import on Linux without mlx
    installed: import `mlx`/`mlx_audio` inside functions, never at module top.
 
+10. **Reference prototype.** `specs/005-mlx-mac-inference/research/proto/` holds the measured
+    prototype loop (`proto.py`) and the teacher-forced check (`diag_teacher.py`). T014–T018 follow
+    its structure. Don't import from it, and don't copy `mx.compile` or the second codec stream
+    (research R6).
+
 ---
 
 ## Phase 1: Setup
@@ -70,7 +79,10 @@ research R9 and R10. Don't add tests beyond those named in a task.
 - [ ] T001 Bump `__version__` to `2.2.0.dev1` in `breeze_infer/__init__.py`. Add an
   `## Unreleased` → `### Added` line to `CHANGELOG.md`: "MLX backend for Apple Silicon Macs
   (`--backend mlx`, `scripts/start_breeze_mac.sh`)". One commit.
-- [ ] T002 *(main)* **Phase-0 speed gate (research R7).** Do it before any other code task.
+- [X] T002 *(main)* **Phase-0 speed gate (research R7).** Do it before any other code task.
+  **Done 2026-10-04:** no-go on stock mlx-audio (8-bit CFG RTF 2.61). The user then asked for a
+  prototype re-gate: **go** at 8-bit (RTF 0.83 with CFG, re-run by the main session). See
+  `research/live-phase0.md`.
   - Use the scratch venv from the R2 probe, or a new one: `requirements.txt` plus
     `mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@e1b19b9054bf163f5d812221a54fcc346f1890e9`,
     installed with `--overrides` pinning `transformers==4.57.3` and `huggingface-hub==0.36.2`.
@@ -246,7 +258,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
       `tests/test_templates.py`), the token ids equal those of
       `AutoTokenizer.from_pretrained(official_model, fix_mistral_regex=False)`. Skip this check
       when `official_model` is `None`.
-  - Verify: T013 passes on the Mac. `pytest -m mlx` passes with bf16.
+  - Verify: T013 passes on the Mac. `pytest -m mlx` passes at 8-bit and at bf16.
 - [ ] T015 *(Opus)* `models/mlx_streaming.py`, part 2: the codec-encode adapter.
   - `audio_tokenizer` gets `.encode(wav: np.ndarray, sr: int)`, returning
     `{"audio_codes": [torch.LongTensor[frames, 16]]}`, using mlx-audio's Qwen3-TTS encoder. It
@@ -275,7 +287,11 @@ research R9 and R10. Don't add tests beyond those named in a task.
     - Randomness: `key = mx.random.key(seed if seed is not None else 0)`, split per sampling
       call. Never call `mx.random.seed`.
     - `token_observer(torch.tensor(frame_codes, dtype=torch.long))`, with pad frames included.
+    - No per-token host syncs: sampling stays on the GPU, with no `.item()` or `float()` on
+      an `mx.array` inside the frame. EOS is read at most once per frame, after that frame's
+      `mx.eval` (research R6).
     - One `mx.eval` per frame.
+    - Don't use `mx.compile`, and don't run the codec on a second stream (research R6).
   - **Codec:** run mlx-audio's codec `streaming_step` every `codec_chunk_frames` frames, and on
     the last frame. Yield `FastStreamingChunk(audio=<float32 numpy>, sample_rate, codec_frames, is_final, timing={})`.
   - **Stop** at EOS or at the room/frame limit, whichever comes first.
@@ -310,9 +326,17 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - `iter_audio_chunks(prefix=…)` seeds a **copy** of the snapshot into the request's cache and
     never mutates the cached arrays. Room uses `prefix_len`.
   - **mlx tests:**
-    - With a fixed seed, a request using a built prefix produces **exactly** the same frames as
-      the same request with the reference inline. If it doesn't, that is a bug in prefix
-      seeding: apply the two-strike rule. Don't loosen the assertion.
+    - **Teacher-forced parity, prefix vs inline.** Generate frames for one request with the
+      reference inline (seed 42). Then feed those exact frames through both paths, inline and
+      with the built prefix, and compare the logits at every sampling point (backbone and each
+      depth codebook), following `research/proto/diag_teacher.py`. Assert:
+      - (1) every argmax mismatch is a tie, meaning the inline path's top-2 margin is at most
+        twice the observed |inline − prefix| logit error at that point;
+      - (2) EOS is predicted at the same step.
+      Print the maximum logit error and the mismatch count. Exact frame equality is NOT the
+      criterion: prefix and inline run different matmul shapes (research R6, "Numerical
+      parity"). A mismatch that is not a tie is a bug in prefix seeding: apply the two-strike
+      rule.
     - Two requests sharing one prefix both succeed, and the prefix's arrays are unchanged.
 - [ ] T019 `models/mlx_streaming.py`, part 6: `warmup() -> float`. It runs one short synthetic
   generation without CFG and one with CFG (`cfg_scale=4`), each about 12 frames long, drains them,
@@ -340,7 +364,8 @@ research R9 and R10. Don't add tests beyond those named in a task.
   uvicorn with the MLX runtime. Reuse `tests.test_speech_abort.LiveServer`, or start
   `python -m breeze_infer.api` as a subprocess on a free port with `--backend mlx --ws-port disabled`.
   - `/health` goes from `503 loading` to `200`, with `sample_rate` 24000.
-  - The `model.loaded` event line on stdout has `backend=mlx`, `device=mlx:gpu`, `weights=bf16`.
+  - The `model.loaded` event line on stdout has `backend=mlx`, `device=mlx:gpu` and `weights`
+    matching the snapshot (`8bit` or `bf16`).
   - `POST /v1/audio/speech` with `text` streams s16le bytes, and the first bytes arrive before
     the response completes.
   - `GET /v1/audio/speech.wav` starts with a 44-byte RIFF header with sizes `0xFFFFFFFF`.
@@ -350,11 +375,12 @@ research R9 and R10. Don't add tests beyond those named in a task.
     `--split-chars`) streams every piece in order with no error. This exercises the anchor-codes
     path: piece 0's frames go through `token_observer` and come back as `input_values` for the
     later pieces.
-  - Run with `pytest -m mlx`, at bf16, and once at 8-bit (`BREEZE_MLX_MODEL=<8bit>`).
+  - Run with `pytest -m mlx`, at 8-bit, and once at bf16 (`BREEZE_MLX_MODEL=<bf16>`).
 - [ ] T022 [US1] Create `scripts/start_breeze_mac.sh` (POSIX `sh`, executable), modelled on
   `scripts/start_breeze.sh`, per research R8 and contracts/launch-and-events.md.
   - Refuse unless `uname -s` is `Darwin` and `uname -m` is `arm64`.
-  - Parse and strip a leading `--precision bf16|8bit` (default `bf16`); anything else is an error.
+  - Parse and strip a leading `--precision 8bit|bf16` (default `8bit`, spec FR-012); anything
+    else is an error.
   - If `.venv` is missing or `mlx` isn't importable, run
     `uv venv --python 3.12` (when there's no `.venv`), then
     `uv pip install -r requirements.txt --overrides requirements-mac-overrides.txt`.
@@ -363,7 +389,8 @@ research R9 and R10. Don't add tests beyond those named in a task.
     the exact `uvx --from huggingface_hub hf download <repo> --revision <sha>` command and exit 1.
   - `exec uv run python -m breeze_infer.api "$MODEL" --host 0.0.0.0 --port 8080 --cors '*' "$@"`,
     with no `--fast-all`.
-  - Verify by hand: `--precision 8bit` starts the 8-bit server, and a wrong `--precision` errors.
+  - Verify by hand: no option starts the 8-bit server, `--precision bf16` starts bf16, and a
+    wrong `--precision` errors.
   - Confirm `git diff --stat main -- scripts/start_breeze.sh scripts/start_breeze.ps1` is empty.
 - [ ] T023 [US1] *(main)* Live gate, quickstart steps 1, 2 and 7, on this Mac:
   - the launcher at both precisions;

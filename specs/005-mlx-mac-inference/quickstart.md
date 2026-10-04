@@ -26,13 +26,13 @@ continue.
 ## 1. Install and start (User Story 1)
 
 ```bash
-scripts/start_breeze_mac.sh                  # bf16
-scripts/start_breeze_mac.sh --precision 8bit # 8-bit
+scripts/start_breeze_mac.sh                  # 8-bit (default)
+scripts/start_breeze_mac.sh --precision bf16 # bf16
 ```
 
 **Expected:**
 - `/health` goes from `503 loading` to `200 {"status":"ok","sample_rate":24000,...}`.
-- The `model.loaded` event shows `backend=mlx`, `device=mlx:gpu` and `weights=bf16` (or `8bit`).
+- The `model.loaded` event shows `backend=mlx`, `device=mlx:gpu` and `weights=8bit` (or `bf16`).
 - SC-001: under 10 minutes from a fresh clone, with the weights already downloaded.
 
 ## 2. First requests (User Story 1)
