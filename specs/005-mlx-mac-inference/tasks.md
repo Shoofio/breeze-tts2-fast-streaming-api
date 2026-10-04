@@ -458,10 +458,12 @@ research R9 and R10. Don't add tests beyond those named in a task.
 
 **Independent Test**: quickstart step 9.
 
-- [ ] T029 [US4] *(main)* On this Mac, confirm that
+- [X] T029 [US4] *(main)* On this Mac, confirm that
   `git diff main --stat -- models/fast_streaming.py models/cudagraph models/stream_runtime breeze_infer/runtime.py infer.py scripts/start_breeze.sh scripts/start_breeze.ps1 docker`
   is empty. Confirm that `requirements.txt` differs from `main` only by the mlx-audio line and its
   comment.
+  **Done 2026-10-04 at `cd10c74`:** the protected-path diff is empty; `requirements.txt` adds
+  only the comment and the mlx-audio line.
 - [ ] T030 [US4] *(user)* On the CUDA machine, on this branch:
   - `uv pip install -r requirements.txt` (mlx-audio must **not** install);
   - `.venv/bin/pytest`, which must show 0 failures, including the R10 test fixes still passing on
