@@ -16,8 +16,9 @@ All notable changes to this project are documented here. See
   `mlx`, CUDA-only options, an Intel Mac, a Mac under 16 GB, and a checkpoint of the wrong kind
   are refused at startup with the reason and, where relevant, the download command.
 - `model.loaded` gains `backend` and `weights`.
-- `requirements.txt` installs `mlx-audio` (pinned git commit) on macOS arm64 only;
-  `requirements-mac-overrides.txt` keeps the server's `transformers`/`huggingface-hub` pins there.
+- `requirements.txt` installs `mlx-audio` (pinned git commit) and `mlx`/`mlx-metal` 0.32.3 on
+  macOS arm64 only (macOS 14 or later); `requirements-mac-overrides.txt` keeps the server's
+  `transformers`/`huggingface-hub` pins there.
 
 ### Changed
 

@@ -323,7 +323,8 @@ the results with the 2.1.0 baseline.
 - **Third-party runtime code.** If a community MLX runtime is adopted rather than only its
   weights, it is a new dependency. The plan must justify it and name the alternatives.
 - Apple Silicon only. Intel Macs are not supported. Minimum macOS version: whatever the chosen
-  MLX release requires.
+  MLX release requires, which is macOS 14 (Sonoma) for the pinned mlx 0.32.3 (its wheels start at
+  `macosx_14_0_arm64`).
 - The Mac backend has its own performance profile. The CUDA `--fast-*` options have no Mac
   equivalent. Any Mac speed-up options are designed in the plan phase and must earn their place
   (Constitution II).

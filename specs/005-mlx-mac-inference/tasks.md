@@ -463,7 +463,9 @@ research R9 and R10. Don't add tests beyond those named in a task.
   is empty. Confirm that `requirements.txt` differs from `main` only by the mlx-audio line and its
   comment.
   **Done 2026-10-04 at `cd10c74`:** the protected-path diff is empty; `requirements.txt` adds
-  only the comment and the mlx-audio line.
+  only the comment and the mlx-audio line. The final review (T037) then added `mlx==0.32.3` and
+  `mlx-metal==0.32.3` under the same darwin/arm64 marker; a Linux resolve still includes no mlx
+  package.
 - [X] T030 [US4] *(user)* On the CUDA machine, on this branch:
   - `uv pip install -r requirements.txt` (mlx-audio must **not** install);
   - `.venv/bin/pytest`, which must show 0 failures, including the R10 test fixes still passing on

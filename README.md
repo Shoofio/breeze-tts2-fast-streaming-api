@@ -31,7 +31,7 @@ Added in this fork:
 - GPU memory: about 7.7 GiB for eager inference, about 14.4 GiB with `--fast-all`. A 12 GB GPU is recommended for eager and a 24 GB GPU for the fast path.
 - Python 3.12 (uv installs it).
 - [uv](https://docs.astral.sh/uv/).
-- Linux or WSL2, native Windows 10/11, or macOS on Apple Silicon.
+- Linux or WSL2, native Windows 10/11, or macOS 14 (Sonoma) or later on Apple Silicon.
 - On Windows, `--fast-all` needs the Visual Studio C++ build tools (MSVC). The launcher installs `triton-windows` for `torch.compile`, and it compiles through MSVC, which it finds from the Visual Studio install.
 
 ## Quick start (Linux / WSL)
@@ -97,7 +97,7 @@ Because it binds `0.0.0.0` by default, Windows Firewall will prompt on the first
 
 ## Quick start (macOS, Apple Silicon)
 
-Requirements: an Apple Silicon Mac (M1 or later), at least 16 GB of memory, and macOS. The server refuses to start on an Intel Mac or with less memory. Python 3.12 and [uv](https://docs.astral.sh/uv/) are needed, as on Linux.
+Requirements: an Apple Silicon Mac (M1 or later), at least 16 GB of memory, and macOS 14 (Sonoma) or later, the oldest release MLX ships for. The server refuses to start on an Intel Mac or with less memory. Python 3.12 and [uv](https://docs.astral.sh/uv/) are needed, as on Linux.
 
 The Mac backend runs community MLX conversions of the model, in 8-bit or bf16. Download one, pinned to a revision so every install gets the same weights:
 
