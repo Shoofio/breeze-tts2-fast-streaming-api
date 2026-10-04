@@ -145,8 +145,11 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - Keep what each test proves on Linux.
   - Don't change `breeze_infer/voice_store.py`. If the behaviour itself is wrong on APFS, stop and
     report.
-- [ ] T009 *(main)* Run the full model-free suite on this Mac and require **0 failures**. Record
+- [X] T009 *(main)* Run the full model-free suite on this Mac and require **0 failures**. Record
   the before (17 failed) and after counts in the Phase 2 review notes.
+  **Done 2026-10-04:** before 17 failed / 2055 passed / 55 skipped; after 0 failed / 2069 passed /
+  58 skipped (2 eviction tests need Linux `TCP_USER_TIMEOUT`; 1 scan test needs a case-sensitive
+  filesystem).
 
 ### Backend selection and refusals (research R5, contracts/launch-and-events.md)
 
