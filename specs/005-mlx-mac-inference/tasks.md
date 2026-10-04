@@ -520,7 +520,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - the room limit equals CUDA's exact-length mode (R4);
   - the `model.loaded` fields;
   - measured speed from T032.
-- [ ] T036 Set `__version__ = "2.2.0"` in `breeze_infer/__init__.py`, and rename `## Unreleased`
+- [X] T036 Set `__version__ = "2.2.0"` in `breeze_infer/__init__.py`, and rename `## Unreleased`
   to `## 2.2.0 — <date>` in `CHANGELOG.md`, with Added, Changed (the macOS test fixes) and
   Documentation entries. Do this before any tag or deploy (CLAUDE.md).
 - [ ] T037 *(main)* Final review loop over the whole branch (standing rule 5). Confirm every FR

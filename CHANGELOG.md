@@ -4,13 +4,29 @@ All notable changes to this project are documented here. See
 `specs/003-cpp-compatible-api/spec.md` for the full breaking-changes list and rationale (IDs
 `BC-nn`).
 
-## Unreleased
+## 2.2.0 — 2026-10-04
 
 ### Added
 
-- MLX backend for Apple Silicon Macs (`--backend mlx`, `scripts/start_breeze_mac.sh`).
+- MLX backend for Apple Silicon Macs (`--backend mlx`, `scripts/start_breeze_mac.sh`). It serves
+  the same HTTP and WebSocket API, voice modes and saved voices as the CUDA backend, from the
+  community MLX conversions in 8-bit (the default; real time on a 16 GB M5) or bf16. See
+  `specs/005-mlx-mac-inference/`.
+- `--backend {cuda,mlx}` launch option. It defaults to `mlx` on macOS and `cuda` elsewhere. With
+  `mlx`, CUDA-only options, an Intel Mac, a Mac under 16 GB, and a checkpoint of the wrong kind
+  are refused at startup with the reason and, where relevant, the download command.
+- `model.loaded` gains `backend` and `weights`.
+- `requirements.txt` installs `mlx-audio` (pinned git commit) on macOS arm64 only;
+  `requirements-mac-overrides.txt` keeps the server's `transformers`/`huggingface-hub` pins there.
 
 ### Changed
+
+- With `--backend cuda` (the default off macOS), a checkpoint whose `config.json` says it holds
+  MLX weights is refused at startup with the PyTorch download command. Nothing else changes for
+  CUDA users.
+- Tests: the model-free suite now passes on macOS (17 Linux-only assumptions fixed: the
+  `TCP_USER_TIMEOUT` harness option, BSD's `SO_REUSEADDR` value, case-insensitive APFS); two
+  kernel-eviction tests and one case-duplicate scan test skip where the platform can't run them.
 
 - `scripts/start_breeze.sh` and `scripts/start_breeze.ps1` now enable CORS for every origin (`*`)
   by default; before, CORS was off unless asked for. This also turns off the cross-site `403`
@@ -25,6 +41,10 @@ All notable changes to this project are documented here. See
 
 ### Documentation
 
+- README: a macOS quick start with measured speed and memory; `docs/api.md`: `--backend`, which
+  options are CUDA-only, and "Differences on the MLX backend".
+- `docs/api.md`'s voice direction example now sends its text with `--form-string`: with `-F`, a
+  value starting with `(` is a nested multipart part to curl, so the text was never sent.
 - README rewritten as an overview with Linux/Windows quick starts and an explicit
   derivative/licence notice; the API reference moved unchanged to `docs/api.md`.
 

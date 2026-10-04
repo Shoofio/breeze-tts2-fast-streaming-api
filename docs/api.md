@@ -109,8 +109,8 @@ Fields may also come from the query string. A field present more than once, anyw
 26 MiB gets `413 payload_too_large`, whether or not `Content-Length` is set.
 
 **Version header**: every response — including errors, preflights and streamed speech — carries
-`X-Breeze-Version: 2.1.0` (the running server's version; a development build reports
-`2.1.0.devN`, plus a `+M` local label on a within-phase re-deploy), so clients can pin the
+`X-Breeze-Version: 2.2.0` (the running server's version; a development build reports
+`2.2.0.devN`, plus a `+M` local label on a within-phase re-deploy), so clients can pin the
 contract version.
 
 **Errors**: every error has body `{"error": "<message>", "code": "<code>"}` and
