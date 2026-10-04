@@ -68,8 +68,9 @@ if [ ! -d "$MODEL" ]; then
     exit 1
 fi
 
-# exec replaces this shell with the uv/python process, so a SIGTERM reaches
-# Python directly instead of being absorbed by an intermediate shell.
+# exec replaces this shell with `uv run`, which runs the server as its child
+# and forwards SIGTERM/SIGINT to it, so stopping this process stops the server.
+# (To suspend or inspect the server itself, target the .venv python child.)
 # Extra arguments pass straight through; a later --host or --cors wins.
 #
 # No --fast-all: those options are CUDA-only and the MLX backend refuses them.

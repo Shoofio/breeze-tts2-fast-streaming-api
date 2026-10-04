@@ -67,15 +67,18 @@ class Server:
             and (request_id is None or event.get("request_id") == request_id)
         ]
 
-    def wait_for_event(self, name: str, request_id: str, timeout: float = 10) -> dict[str, Any]:
-        """Events reach stdout a moment after the response ends, so poll for the one we need."""
+    def wait_for_event(
+        self, name: str, request_id: str | None = None, timeout: float = 10
+    ) -> dict[str, Any]:
+        """Events are parsed on a reader thread a moment after they are printed, so poll."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             found = self.events_named(name, request_id)
             if found:
                 return found[0]
             time.sleep(0.05)
-        raise AssertionError(f"no {name} event for {request_id} within {timeout} s")
+        which = f" for {request_id}" if request_id else ""
+        raise AssertionError(f"no {name} event{which} within {timeout} s")
 
     def connection(self, timeout: float = 120) -> http.client.HTTPConnection:
         return http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
@@ -176,7 +179,8 @@ def test_health_goes_from_loading_to_ok(server: Server) -> None:
 
 
 def test_model_loaded_event_reports_the_mlx_backend(server: Server, mlx_model: Path) -> None:
-    (loaded,) = server.events_named("model.loaded")
+    loaded = server.wait_for_event("model.loaded")
+    assert len(server.events_named("model.loaded")) == 1
 
     assert loaded["backend"] == "mlx"
     assert loaded["device"] == "mlx:gpu"
@@ -198,8 +202,9 @@ def test_speech_streams_pcm_before_generation_ends(server: Server) -> None:
 
     assert len(first) == 4096
     assert (len(first) + len(rest)) % 2 == 0  # whole s16le samples
-    # Streaming means the first bytes came before the response was complete.
-    assert first_byte_s < total_s
+    # Streaming means the first bytes came well before the end: a server that buffered the
+    # whole response would deliver them at about the same moment as the last ones.
+    assert first_byte_s < 0.5 * total_s
     print(f"\nfirst bytes after {first_byte_s:.2f} s, response complete after {total_s:.2f} s")
 
 
