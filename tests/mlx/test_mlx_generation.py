@@ -147,3 +147,15 @@ def test_nonfinite_logits_fail_before_the_frame_is_observed(mlx_runtime, monkeyp
         next(chunks)
     assert str(raised.value) == message
     assert observed == []
+
+
+def test_first_chunk_is_quick_after_warmup(mlx_runtime) -> None:
+    warmup_ms = mlx_runtime.warmup()
+    started = time.perf_counter()
+    chunks = mlx_runtime.iter_audio_chunks(inputs_for(mlx_runtime, SENTENCE), seed=6)
+    next(chunks)
+    first_chunk = time.perf_counter() - started
+    chunks.close()
+    print(f"warmup {warmup_ms:.0f} ms, time to first chunk {first_chunk * 1000:.0f} ms")
+    assert warmup_ms > 0
+    assert first_chunk < 2.0

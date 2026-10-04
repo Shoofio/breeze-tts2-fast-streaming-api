@@ -11,6 +11,7 @@ run on Linux CI), so every `mlx` and `mlx_audio` import is inside the function t
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +23,7 @@ import torch
 
 from breeze_infer.limits import MAX_NEW_TOKENS_CEILING
 from breeze_infer.reference_audio import predicted_frames
+from breeze_infer.templates import get_template, prepare_inputs
 
 from .cudagraph.sampling import (
     _NONFINITE_MESSAGE,
@@ -41,6 +43,12 @@ from .fast_streaming import (
     prompt_length,
     select_fast_cfg,
 )
+
+# `warmup()`'s requests: a short text with CUDA's warmup instruction (configs/fast.json), long
+# enough to run every kernel of the prefill, the frame loop and the codec.
+_WARMUP_TEXT = "Warm up."
+_WARMUP_INSTRUCTION = "Speak naturally and clearly."
+_WARMUP_FRAMES = 12
 
 # The backbone's context length. The CUDA runtime is launched with the same value, and request
 # validation must match it (contracts/runtime-seam.md, `config.max_seq_len`).
@@ -629,6 +637,26 @@ class MlxBreezeStreamingRuntime:
         _require_valid_overrides(max_new_tokens=requested)
         prefill_len = prefix_len + length.seq_len
         return min(self.frame_cap(requested), self.config.max_seq_len - prefill_len - 1)
+
+    def warmup(self) -> float:
+        """Compile the Metal kernels before the first real request (research R6): one short
+        generation without CFG and one with CFG (`cfg_scale` 4), each drained. Returns the
+        elapsed ms, which the server reports as `warmup_ms`."""
+        started = time.perf_counter()
+        request = {"text": _WARMUP_TEXT, "instruction": _WARMUP_INSTRUCTION}
+        for cfg_scale in (1.0, 4.0):
+            inputs = prepare_inputs(
+                self.tokenizer,
+                self.model,
+                [request],
+                get_template("tts_instruction"),
+                guidance_scale=cfg_scale,
+                guidance_scale_ref=None,
+                guidance_scale_ins=None,
+            )
+            for _ in self.iter_audio_chunks(inputs, seed=42, max_new_tokens=_WARMUP_FRAMES):
+                pass
+        return (time.perf_counter() - started) * 1000.0
 
     def build_reference_prefix(self, prefix_inputs: dict[str, Any]) -> MlxReferencePrefix:
         """Run a voice's reference prefix (`templates.prepare_prefix_inputs`) through the

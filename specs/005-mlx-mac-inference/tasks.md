@@ -341,7 +341,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
       parity"). A mismatch that is not a tie is a bug in prefix seeding: apply the two-strike
       rule.
     - Two requests sharing one prefix both succeed, and the prefix's arrays are unchanged.
-- [ ] T019 `models/mlx_streaming.py`, part 6: `warmup() -> float`. It runs one short synthetic
+- [X] T019 `models/mlx_streaming.py`, part 6: `warmup() -> float`. It runs one short synthetic
   generation without CFG and one with CFG (`cfg_scale=4`), each about 12 frames long, drains them,
   and returns the elapsed ms. Use `templates.prepare_inputs` with the runtime's tokenizer and the
   text "Warm up." **mlx test:** after `warmup()`, the time to first chunk of a one-sentence
