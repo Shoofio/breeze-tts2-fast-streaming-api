@@ -306,7 +306,8 @@ research R9 and R10. Don't add tests beyond those named in a task.
     - **abort:** calling `.close()` after 3 chunks returns within 1 s, and a following request
       works;
     - `max_new_tokens=24` stops at 24 frames or fewer;
-    - `token_observer` is called once per frame, with `1 + num_codebooks` codes.
+    - `token_observer` is called once per frame, with `num_codebooks` (16) codes: codebook 0
+      plus the 15 depth codes, as CUDA's `torch.cat([token, depth_tokens[0]])` sends.
   - Use `templates.prepare_inputs` to build inputs, exactly as `synthesis.prepare_piece` does.
 - [x] T017 *(Opus)* `models/mlx_streaming.py`, part 4: CFG.
   - When the inputs carry `cfg_scale` and `cfg_negative_*`, run the conditional and
