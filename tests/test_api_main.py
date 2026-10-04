@@ -101,7 +101,8 @@ def test_bound_socket_has_tcp_user_timeout() -> None:
 @pytest.mark.skipif(os.name != "posix", reason="SO_REUSEADDR is set on POSIX only")
 def test_bound_socket_has_reuseaddr_and_is_listening() -> None:
     with _bind_one("127.0.0.1", 0) as sock:
-        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) == 1
+        # BSD/macOS returns the option's bit value (4) for "on", Linux returns 1.
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR) != 0
         # Listening already: a client can connect before uvicorn starts accepting.
         with socket.create_connection(sock.getsockname(), timeout=2):
             pass

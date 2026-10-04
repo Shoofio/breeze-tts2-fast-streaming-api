@@ -135,7 +135,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - Every other failing test in this file, `tests/test_speech_wav_stream.py` and
     `tests/test_long_text.py` must then pass on this Mac with no other change.
   - List which tests were skipped, and why, in the commit message.
-- [ ] T007 [P] In `tests/test_api_main.py::test_bound_socket_has_reuseaddr_and_is_listening`,
+- [X] T007 [P] In `tests/test_api_main.py::test_bound_socket_has_reuseaddr_and_is_listening`,
   assert `!= 0` instead of `== 1`, with a comment explaining that BSD/macOS returns the option's
   bit value (4) for "on".
 - [ ] T008 [P] In `tests/test_voice_store.py`, fix `test_create_refuses_a_case_duplicate` and
