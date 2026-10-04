@@ -1,4 +1,4 @@
-"""The real server with the real MLX runtime, over real HTTP (tasks.md T021, FR-001, FR-005).
+"""The real server with the real MLX runtime, over real HTTP (tasks.md T021, T024, T025; FR-001, FR-005, FR-009, FR-010).
 
 One server process serves the whole module: loading the weights takes seconds and a 16 GB Mac has
 no room for two models. It runs as a subprocess (`python -m breeze_infer.api`), so these tests
@@ -8,7 +8,9 @@ a `seed`, so a run is repeatable.
 
 from __future__ import annotations
 
+import contextlib
 import http.client
+import io
 import json
 import socket
 import struct
@@ -16,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -58,6 +61,15 @@ class Server:
                 self.events.append(json.loads(line))
             except json.JSONDecodeError:
                 continue  # not an event line
+
+    def stop(self) -> None:
+        """Terminate the process; safe to call again."""
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
 
     def events_named(self, name: str, request_id: str | None = None) -> list[dict[str, Any]]:
         return [
@@ -118,8 +130,9 @@ def _free_port() -> int:
         return probe.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def server(mlx_model: Path) -> Iterator[Server]:
+@contextlib.contextmanager
+def running_server(mlx_model: Path, *extra_args: str) -> Iterator[Server]:
+    """Start the server, wait until it is ready, and always kill it on the way out."""
     process = subprocess.Popen(
         [
             sys.executable,
@@ -135,6 +148,7 @@ def server(mlx_model: Path) -> Iterator[Server]:
             str(port := _free_port()),
             "--host",
             "127.0.0.1",
+            *extra_args,
         ],
         cwd=REPO_ROOT,
         stdout=subprocess.PIPE,
@@ -157,12 +171,13 @@ def server(mlx_model: Path) -> Iterator[Server]:
             time.sleep(0.05)
         yield running
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+        running.stop()
+
+
+@pytest.fixture(scope="module")
+def server(mlx_model: Path) -> Iterator[Server]:
+    with running_server(mlx_model) as running:
+        yield running
 
 
 def _weights_of(snapshot: Path) -> str:
@@ -283,3 +298,84 @@ def test_a_long_text_streams_every_piece(server: Server) -> None:
     # path this test exists for did not run.
     assert not server.events_named("speech.anchor_skipped", request_id)
     print(f"\n{pieces} pieces, {len(audio) / 2 / SAMPLE_RATE:.1f} s of audio, {completed}")
+
+
+# --- Voice features (T024, T025) -------------------------------------------------------------
+
+REF_TEXT = SHORT_TEXT
+MIN_AUDIO_S = 0.5
+
+
+def _multipart(fields: dict[str, str], wav: bytes | None = None) -> tuple[bytes, str]:
+    boundary = "breezeboundary7d3f"
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        for name, value in fields.items()
+    ]
+    if wav is not None:
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="ref_audio"; filename="ref.wav"\r\n'
+            "Content-Type: audio/wav\r\n\r\n".encode()
+            + wav
+            + b"\r\n"
+        )
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def _post(server: Server, path: str, fields: dict[str, str], wav: bytes | None = None) -> tuple[int, bytes]:
+    body, content_type = _multipart(fields, wav)
+    connection = server.connection()
+    try:
+        connection.request("POST", path, body, {"Content-Type": content_type})
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+def _speech_seconds(server: Server, fields: dict[str, str], wav: bytes | None = None) -> float:
+    status, pcm = _post(server, "/v1/audio/speech", {"text": SHORT_TEXT, "seed": "1234", **fields}, wav)
+    assert status == 200, pcm[:300]
+    assert len(pcm) % 2 == 0
+    return len(pcm) / 2 / SAMPLE_RATE
+
+
+def _reference_wav(server: Server) -> bytes:
+    """A short reference clip made by the server itself, so the tests need no audio file.
+
+    The `.wav` route streams a header with unknown sizes (0xFFFFFFFF), which uploads would
+    reject, so the PCM after the 44-byte header is wrapped in a proper WAV.
+    """
+    connection = server.connection()
+    try:
+        connection.request("GET", "/v1/audio/speech.wav?" + urlencode({"text": REF_TEXT, "seed": 1234}))
+        response = connection.getresponse()
+        assert response.status == 200
+        pcm = response.read()[44:]
+    finally:
+        connection.close()
+    out = io.BytesIO()
+    with wave.open(out, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(SAMPLE_RATE)
+        writer.writeframes(pcm)
+    return out.getvalue()
+
+
+def test_voice_clone_design_and_direction_return_audio(server: Server) -> None:
+    reference = _reference_wav(server)
+    clone = _speech_seconds(server, {"ref_text": REF_TEXT}, reference)
+    design = _speech_seconds(
+        server, {"instruction": "A deep, calm older male voice.", "cfg_scale": "4"}
+    )
+    direction = _speech_seconds(
+        server,
+        {"ref_text": REF_TEXT, "instruction": "Speak slowly with a restrained, serious tone."},
+        reference,
+    )
+
+    assert min(clone, design, direction) > MIN_AUDIO_S
+    print(f"\nclone {clone:.2f} s, design {design:.2f} s, direction {direction:.2f} s")
+
