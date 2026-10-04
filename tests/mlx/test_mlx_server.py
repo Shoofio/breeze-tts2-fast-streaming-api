@@ -379,3 +379,45 @@ def test_voice_clone_design_and_direction_return_audio(server: Server) -> None:
     assert min(clone, design, direction) > MIN_AUDIO_S
     print(f"\nclone {clone:.2f} s, design {design:.2f} s, direction {direction:.2f} s")
 
+
+def test_saved_voices_survive_a_restart_and_a_foreign_fingerprint_is_skipped(
+    server: Server, mlx_model: Path, tmp_path: Path
+) -> None:
+    reference = _reference_wav(server)
+    # One 16 GB Mac holds one model: this test owns the machine from here, so the module
+    # server stops. It must be the last test in the module.
+    server.stop()
+
+    voices_dir = tmp_path / "voices"
+    with running_server(mlx_model, "--voices-dir", str(voices_dir)) as first:
+        status, body = _post(first, "/v1/voices", {"name": "alice", "ref_text": REF_TEXT}, reference)
+        assert status == 200, body
+        assert json.loads(body)["saved"] is True
+        assert _speech_seconds(first, {"voice_id": "alice"}) > MIN_AUDIO_S
+
+    # The same voice as another codec would have saved it.
+    saved = json.loads((voices_dir / "alice.voice.json").read_text())
+    saved["id"] = "foreign"
+    saved["codec_fingerprint"] = "not-this-codec"
+    (voices_dir / "foreign.voice.json").write_text(json.dumps(saved))
+
+    with running_server(mlx_model, "--voices-dir", str(voices_dir)) as second:
+        connection = second.connection()
+        try:
+            connection.request("GET", "/v1/voices")
+            listed = [voice["id"] for voice in json.loads(connection.getresponse().read())]
+        finally:
+            connection.close()
+        assert listed == ["alice"]
+        assert _speech_seconds(second, {"voice_id": "alice"}) > MIN_AUDIO_S
+
+        skipped = second.wait_for_event("voice.skipped")
+        assert skipped["file"] == "foreign.voice.json"
+        assert "codec_fingerprint" in skipped["reason"]
+        loaded = second.wait_for_event("voices.loaded")
+        assert (loaded["loaded"], loaded["skipped"]) == (1, 1)
+        print(f"\nvoices.loaded: {json.dumps(loaded)}\nvoice.skipped: {json.dumps(skipped)}")
+
+        status, body = _post(second, "/v1/audio/speech", {"text": SHORT_TEXT, "voice_id": "foreign"})
+        assert status == 404
+        assert json.loads(body)["code"] == "unknown_voice"
