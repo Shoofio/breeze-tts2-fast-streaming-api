@@ -44,7 +44,7 @@ matching the CUDA speaker or description.
 
 All 30 requests returned 200, and every length is plausible for its text. None ran away.
 
-Mac lengths stay within about ±1.5 s of CUDA's, and no prompt is an outlier on only one backend.
+Mac lengths stay within 2 s of CUDA's (the widest gap is design-1 at 8-bit, 5.92 s against 3.92 s), and no prompt runs away on any backend.
 direction-2 ("excited and fast") is short on all three: 2.00 s on CUDA, 2.40 s at 8-bit and
 2.08 s at bf16. That points to the model's pacing for this instruction rather than truncation;
 listening will confirm.
