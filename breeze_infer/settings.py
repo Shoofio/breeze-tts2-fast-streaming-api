@@ -252,7 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--backend",
         choices=("cuda", "mlx"),
         default=None,
-        help="Inference backend (default: mlx on an Apple Silicon Mac, else cuda)",
+        help="Inference backend (default: mlx on macOS, else cuda)",
     )
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"Bind address for HTTP and WebSocket (default: {DEFAULT_HOST})")
     parser.add_argument(

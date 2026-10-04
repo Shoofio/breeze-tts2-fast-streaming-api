@@ -88,7 +88,10 @@ differs:
   On the MLX backend `device` is `"mlx:gpu"`, and `compile_cache_dir`, `torch_key`,
   `fx_graph_cache_hits` and `fx_graph_cache_misses` are `null`. `model.load_failed` is unchanged.
   `GET /health` is unchanged.
-- **Speed and memory.** Measured on an Apple M5 with 16 GB, over all five benchmark cases:
+- **Speed and memory.** Measured on an Apple M5 with 16 GB. The speed columns give the range of
+  the per-case medians (10 runs each) over the five benchmark cases; the slowest single first
+  audio was 0.42 s at 8-bit and 0.68 s at bf16. Peak memory is the server's physical footprint
+  after medium-length requests:
 
   | Precision | First audio | Real-time factor | Peak memory |
   | --- | --- | --- | --- |

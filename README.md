@@ -117,7 +117,7 @@ scripts/start_breeze_mac.sh [--precision 8bit|bf16] [server options...]
 
 The precision defaults to `8bit`. If the Python environment lacks `mlx`, the launcher installs the dependencies with `requirements-mac-overrides.txt`. It looks for the pinned snapshot in the HuggingFace cache (`$HF_HOME`, default `~/.cache/huggingface`), and if it is missing it prints the download command above and exits. It has the same defaults as `start_breeze.sh`: `0.0.0.0:8080` and CORS `*`. It doesn't pass `--fast-all`, which is CUDA-only. Extra arguments go to the server, and a later `--host` or `--cors` overrides the launcher's value. The warning under [Quick start (Linux / WSL)](#quick-start-linux--wsl) about the open defaults applies here too: pass `--host 127.0.0.1` to keep the server local.
 
-Measured on an Apple M5 with 16 GB, over 10 runs of each case:
+Measured on an Apple M5 with 16 GB with a browser and an editor open. The speed columns give the range of the per-case medians (10 runs each) over the five benchmark cases; the slowest single first audio was 0.42 s at 8-bit and 0.68 s at bf16. Peak memory is the server's physical footprint after medium-length requests.
 
 | Precision | First audio | Real-time factor (RTF) | Peak memory |
 | --- | --- | --- | --- |
