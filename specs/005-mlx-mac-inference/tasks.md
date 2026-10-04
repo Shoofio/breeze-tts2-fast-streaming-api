@@ -395,7 +395,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - Verify by hand: no option starts the 8-bit server, `--precision bf16` starts bf16, and a
     wrong `--precision` errors.
   - Confirm `git diff --stat main -- scripts/start_breeze.sh scripts/start_breeze.ps1` is empty.
-- [ ] T023 [US1] *(main)* Live gate, quickstart steps 1, 2 and 7, on this Mac:
+- [X] T023 [US1] *(main)* Live gate, quickstart steps 1, 2 and 7, on this Mac:
   - the launcher at both precisions;
   - the README `curl` examples;
   - the `.wav` URL in Chrome and in Firefox;
@@ -464,7 +464,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
   comment.
   **Done 2026-10-04 at `cd10c74`:** the protected-path diff is empty; `requirements.txt` adds
   only the comment and the mlx-audio line.
-- [ ] T030 [US4] *(user)* On the CUDA machine, on this branch:
+- [X] T030 [US4] *(user)* On the CUDA machine, on this branch:
   - `uv pip install -r requirements.txt` (mlx-audio must **not** install);
   - `.venv/bin/pytest`, which must show 0 failures, including the R10 test fixes still passing on
     Linux;
@@ -478,7 +478,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
     `Ignoring mlx-audio: markers … don't match`, and the pins must match.
   - On Windows, if available: `.\scripts\start_breeze.ps1 -Reinstall`. mlx-audio must not
     install, and the server must reach `/health 200`.
-- [ ] T031 [US4] *(user)* Rollback drill (Constitution VII). On the CUDA machine, with 2.2.0
+- [X] T031 [US4] *(user)* Rollback drill (Constitution VII). On the CUDA machine, with 2.2.0
   running from `scripts/start_breeze.sh`:
   1. Stop it, `git checkout v2.1.0`, `uv pip install -r requirements.txt`, and start
      `scripts/start_breeze.sh` again.

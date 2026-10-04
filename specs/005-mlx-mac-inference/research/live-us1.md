@@ -39,7 +39,8 @@ The README `curl` commands were run unchanged against the running server.
   - A probe polled every 50 ms. It completed its first full request 1.10–1.18 s after the kill.
   - That time includes generating and reading the probe's own reply, about 0.7 s for a short
     text. So the gate was free within about 0.5 s.
-- **Browsers:** playing the `.wav` URL in Chrome and in Firefox is **pending the user**.
+- **Browsers:** the user played the `.wav` URL in Chrome and in Firefox on 2026-10-04: it plays
+  in both.
 
 ## Step 7: refusals (SC-007)
 
