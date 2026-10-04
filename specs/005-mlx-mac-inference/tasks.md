@@ -513,7 +513,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - a note that `infer.py` stays CUDA-only (FR-005a);
   - a note that the MLX weights are an unofficial community conversion and still under the
     BreezeBlue non-commercial licence (FR-011).
-- [ ] T035 [P] Update `docs/api.md` launch options with `--backend` and the CUDA-only options.
+- [x] T035 [P] Update `docs/api.md` launch options with `--backend` and the CUDA-only options.
   Add a "Differences on the MLX backend" subsection:
   - CUDA-only options are refused;
   - no kernel eviction of stalled readers (R10);

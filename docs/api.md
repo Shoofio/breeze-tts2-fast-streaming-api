@@ -28,6 +28,7 @@ failed to bind.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `model_path` (positional) | required | Path to the model checkpoint directory |
+| `--backend {cuda,mlx}` | `mlx` on macOS, `cuda` elsewhere | Inference backend. `mlx` needs an Apple Silicon Mac with at least 16 GB of memory and the MLX weights; `cuda` is not available on macOS. See [Differences on the MLX backend](#differences-on-the-mlx-backend) |
 | `--host HOST` | `127.0.0.1` | Bind address for HTTP and WebSocket |
 | `--port N` | `8080` | HTTP port, `1`–`65535` |
 | `--ws-port N\|disabled` | HTTP port + 1 | WebSocket port, `1`–`65535`, must differ from `--port`; `disabled` turns the WebSocket server off |
@@ -36,18 +37,66 @@ failed to bind.
 | `--chunk-first N` | `1` | Codec frames (1,920 samples each) in the first streamed chunk |
 | `--chunk-max N` | `25` | Codec frames the stream ramps up to |
 | `--voices-dir PATH` | `./voices` | Directory holding saved voice files |
-| `--fast-all` / `--no-fast-all` | unset | Enable or disable every fast-path stage at once |
-| `--fast-text-encoder` / `--no-fast-text-encoder` | off | Fast path for the text encoder stage |
-| `--fast-backbone-prefill` / `--no-fast-backbone-prefill` | off | Fast path for backbone prefill |
-| `--fast-backbone-decode` / `--no-fast-backbone-decode` | off | Fast path for backbone decode |
-| `--fast-depth-decoder` / `--no-fast-depth-decoder` | off | Fast path for the depth decoder |
-| `--fast-codec` / `--no-fast-codec` | off | Fast path for the codec |
-| `--attn-implementation {eager,sdpa}` | `eager` | Attention kernel for the backbone and text encoder (the fast text-encoder stage always runs `sdpa` regardless of this setting) |
-| `--compile-cache-dir PATH` | `$TORCHINDUCTOR_CACHE_DIR` if set, else `./.cache/torchinductor` | Where `torch.compile` artifacts persist between starts |
+| `--fast-all` / `--no-fast-all` | unset | Enable or disable every fast-path stage at once. CUDA only |
+| `--fast-text-encoder` / `--no-fast-text-encoder` | off | Fast path for the text encoder stage. CUDA only |
+| `--fast-backbone-prefill` / `--no-fast-backbone-prefill` | off | Fast path for backbone prefill. CUDA only |
+| `--fast-backbone-decode` / `--no-fast-backbone-decode` | off | Fast path for backbone decode. CUDA only |
+| `--fast-depth-decoder` / `--no-fast-depth-decoder` | off | Fast path for the depth decoder. CUDA only |
+| `--fast-codec` / `--no-fast-codec` | off | Fast path for the codec. CUDA only |
+| `--attn-implementation {eager,sdpa}` | `eager` | Attention kernel for the backbone and text encoder (the fast text-encoder stage always runs `sdpa` regardless of this setting). CUDA only |
+| `--compile-cache-dir PATH` | `$TORCHINDUCTOR_CACHE_DIR` if set, else `./.cache/torchinductor` | Where `torch.compile` artifacts persist between starts. CUDA only |
 
 `--port`, `--ws-port`, `--split-chars`, `--chunk-first` and `--chunk-max` must be plain unsigned
 integers (no leading `+`/`-`, no decimal point, no exponent). See
 [Fast Inference Options](#fast-inference-options) below for what each fast-path stage changes.
+
+Options marked "CUDA only" are refused with `--backend mlx`.
+
+### Differences on the MLX backend
+
+`--backend mlx` runs the model on the Mac's GPU through MLX and serves the same routes, fields,
+validation, error codes and audio format as the CUDA backend. Start it with
+`scripts/start_breeze_mac.sh`, or pass the MLX snapshot directory as `model_path`; the README's
+[macOS quick start](../README.md#quick-start-macos-apple-silicon) has the download commands. What
+differs:
+
+- **CUDA-only options are refused.** `--fast-all`, `--no-fast-all`, every `--fast-*` stage option
+  and its `--no-` form, `--attn-implementation` and `--compile-cache-dir` stop startup with
+  `<options> only apply to --backend cuda; remove them`. The server also refuses `--backend mlx`
+  on anything but an Apple Silicon Mac, and on a Mac with less than 16 GB of memory.
+- **The weights must be MLX weights.** The PyTorch checkpoint is refused with the download
+  command. The server reads bf16 or 8-bit from the checkpoint itself; there is no precision
+  option, and other quantizations are refused.
+- **A stalled reader is not evicted by the kernel.** On Linux the server also sets
+  `TCP_USER_TIMEOUT`, so the kernel drops the socket of a client that stops reading. macOS has no
+  such option, so the server doesn't set it. The application limits are the same on both
+  platforms: a send blocked for 30 s (600 s on the `.wav` route) ends the stream, and a client
+  reading slower than the minimum delivery rate is cut, in both cases releasing the GPU. What
+  macOS lacks is the last step: the socket of a client that never reads again stays open until
+  the client closes it or the server shuts down.
+- **The room limit is CUDA's exact-length limit.** The MLX backend doesn't pad prompts to
+  32-token buckets. It accepts the same text lengths as the CUDA backend without `--fast-all`,
+  which is up to 31 more frames than `--fast-all` accepts for the same prompt before
+  `400 text_too_long`.
+- **Saved voices don't move between backends.** Each backend saves voices with its own codec
+  fingerprint and skips, at startup, voices saved with a different one. The file format is
+  unchanged.
+- **`model.loaded` has two more fields, and some are null.** The startup log event gains
+  `backend` (`"cuda"` or `"mlx"`) and `weights` (`"bf16"` or `"8bit"`; always `"bf16"` on CUDA).
+  On the MLX backend `device` is `"mlx:gpu"`, and `compile_cache_dir`, `torch_key`,
+  `fx_graph_cache_hits` and `fx_graph_cache_misses` are `null`. `model.load_failed` is unchanged.
+  `GET /health` is unchanged.
+- **Speed and memory.** Measured on an Apple M5 with 16 GB, over all five benchmark cases:
+
+  | Precision | First audio | Real-time factor | Peak memory |
+  | --- | --- | --- | --- |
+  | 8-bit | 0.32–0.41 s | 0.84–0.88 | 7.0 GB |
+  | bf16 | 0.49–0.55 s | 1.47–1.50 | 9.7 GB |
+
+  A real-time factor above 1 means audio is produced more slowly than it plays, so bf16 can't
+  stream in real time on this machine, and it pushed the Mac into swap during the run. Use 8-bit
+  on a 16 GB Mac. Output is comparable to the CUDA backend's, not identical: the numerics and
+  random streams differ, so a `seed` does not reproduce CUDA audio.
 
 ### HTTP API
 
@@ -189,13 +238,16 @@ curl -X POST http://127.0.0.1:8080/v1/audio/speech \
   -F "cfg_scale=4" \
   -F "ref_audio=@reference.wav" \
   -F "ref_text=This is the exact transcript of the reference audio." \
-  -F "text=(clears throat) We need to discuss what happened last night." \
+  --form-string "text=(clears throat) We need to discuss what happened last night." \
   -F "instruction=Speak slowly with a restrained, serious tone." \
   -F "seed=42" \
   --output voice_direction.pcm
 ```
 
 The response is streaming mono 24 kHz signed 16-bit little-endian PCM.
+
+A `text` value that starts with `(` needs `--form-string`: curl's `-F` gives a leading `(`, `@` and
+`<` special meaning, so the text would not be sent as written.
 
 #### `GET /v1/audio/speech.wav`
 
