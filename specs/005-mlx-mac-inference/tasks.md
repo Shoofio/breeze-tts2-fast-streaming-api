@@ -261,7 +261,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
       `AutoTokenizer.from_pretrained(official_model, fix_mistral_regex=False)`. Skip this check
       when `official_model` is `None`.
   - Verify: T013 passes on the Mac. `pytest -m mlx` passes at 8-bit and at bf16.
-- [ ] T015 *(Opus)* `models/mlx_streaming.py`, part 2: the codec-encode adapter.
+- [x] T015 *(Opus)* `models/mlx_streaming.py`, part 2: the codec-encode adapter.
   - `audio_tokenizer` gets `.encode(wav: np.ndarray, sr: int)`, returning
     `{"audio_codes": [torch.LongTensor[frames, 16]]}`, using mlx-audio's Qwen3-TTS encoder. It
     also gets `.get_decode_upsample_rate() -> 1920` from the codec config.

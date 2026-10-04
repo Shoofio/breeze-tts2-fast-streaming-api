@@ -17,9 +17,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import torch
 
 from breeze_infer.limits import MAX_NEW_TOKENS_CEILING
+from breeze_infer.reference_audio import predicted_frames
 
 from .cudagraph.sampling import require_number
 from .fast_streaming import (
@@ -79,6 +81,42 @@ class MlxModelConfig:
         )
 
 
+class MlxAudioTokenizer:
+    """The server's `audio_tokenizer` (contracts/runtime-seam.md) over mlx-audio's Qwen3-TTS
+    codec: reference audio in, codec codes out, as the official tokenizer returns them."""
+
+    def __init__(self, codec: Any) -> None:
+        self._codec = codec
+
+    def get_decode_upsample_rate(self) -> int:
+        return int(self._codec.decode_upsample_rate)
+
+    def encode(self, wav: np.ndarray, sr: int) -> dict[str, list[torch.Tensor]]:
+        """Encode one waveform into `{"audio_codes": [LongTensor[frames, codebooks]]}`.
+
+        The steps are qwen_tts's (`Qwen3TTSTokenizer._normalize_audio_inputs`, then the 12 Hz
+        model's `encode`): downmix, `librosa.resample` with its defaults unless `sr` is already
+        the codec's rate, encode, then keep the frames that cover the audio. That frame count
+        is `reference_audio.predicted_frames`, which the server already uses to bound a
+        reference before encoding it.
+        """
+        # librosa takes seconds to import (numba), and only reference encoding needs it.
+        import librosa
+        import mlx.core as mx
+
+        wav = np.asarray(wav, dtype=np.float32)
+        if wav.ndim > 1:
+            wav = np.mean(wav, axis=-1)
+        frames = predicted_frames(wav.shape[0], int(sr))
+        target_sr = int(self._codec.input_sample_rate)
+        if int(sr) != target_sr:
+            wav = librosa.resample(y=wav, orig_sr=int(sr), target_sr=target_sr)
+        # The codec takes [batch, channels, samples] and returns [batch, codebooks, frames].
+        codes = self._codec.encode(mx.array(wav.astype(np.float32))[None, None, :])
+        codes = np.array(codes[0, :, :frames]).T.astype(np.int64)
+        return {"audio_codes": [torch.from_numpy(codes)]}
+
+
 class MlxBreezeStreamingRuntime:
     """The runtime seam (contracts/runtime-seam.md) on MLX.
 
@@ -106,6 +144,7 @@ class MlxBreezeStreamingRuntime:
     ) -> None:
         self._mlx_model = mlx_model
         self._codec = codec
+        self.audio_tokenizer = MlxAudioTokenizer(codec)
         self.tokenizer = tokenizer
         # The server only reads `.config` and uses `.device` as the `.to()` target for template
         # tensors, which are converted to MLX per request (research R4).

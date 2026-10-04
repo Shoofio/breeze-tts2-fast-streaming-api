@@ -6,7 +6,11 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import numpy as np
 import pytest
+import torch
+
+from breeze_infer.reference_audio import predicted_frames
 
 pytestmark = pytest.mark.mlx
 
@@ -59,3 +63,18 @@ def test_tokenizer_matches_the_official_one(mlx_runtime, official_model: Path | 
     mismatched = [t for t in texts if mlx_runtime.tokenizer(t)["input_ids"] != official(t)["input_ids"]]
     print(f"tokenizer parity: {len(texts)} texts, {len(mismatched)} mismatched")
     assert mismatched == []
+
+
+@pytest.mark.parametrize("sample_rate", [24000, 44100])
+@pytest.mark.parametrize("seconds", [0.5, 1.0, 3.7, 10.0])
+def test_encode_frames_match_the_predicted_count(mlx_runtime, seconds: float, sample_rate: int) -> None:
+    samples = round(seconds * sample_rate)
+    t = np.arange(samples) / sample_rate
+    noise = np.random.default_rng(samples).standard_normal(samples)
+    wav = (0.3 * np.sin(2 * np.pi * 220 * t) + 0.05 * noise).astype(np.float32)
+    encoded = mlx_runtime.audio_tokenizer.encode(wav, sr=sample_rate)
+    (codes,) = encoded["audio_codes"]
+    codebooks = mlx_runtime.model.config.num_codebooks
+    assert codes.dtype == torch.long
+    assert tuple(codes.shape) == (predicted_frames(samples, sample_rate), codebooks)
+    assert 0 <= int(codes.min()) and int(codes.max()) < mlx_runtime.model.config.codec_config.codebook_size
