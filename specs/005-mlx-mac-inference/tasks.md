@@ -525,9 +525,11 @@ research R9 and R10. Don't add tests beyond those named in a task.
 - [X] T036 Set `__version__ = "2.2.0"` in `breeze_infer/__init__.py`, and rename `## Unreleased`
   to `## 2.2.0 — <date>` in `CHANGELOG.md`, with Added, Changed (the macOS test fixes) and
   Documentation entries. Do this before any tag or deploy (CLAUDE.md).
-- [ ] T037 *(main)* Final review loop over the whole branch (standing rule 5). Confirm every FR
+- [X] T037 *(main)* Final review loop over the whole branch (standing rule 5). Confirm every FR
   and SC in spec.md maps to a passing test or a recorded live result, and list the mapping in
   `specs/005-mlx-mac-inference/research/done.md` (Constitution IX "Done means").
+  **Done 2026-10-04:** one finding (mlx unpinned), fixed in `ae6afd8`. `done.md` maps every FR
+  and SC; SC-005 (listening) is still pending and SC-001 is not timed end to end.
 
 ---
 
