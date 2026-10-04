@@ -21,6 +21,5 @@ htmlcov/
 .env.*
 !.env.example
 
-
+# The server's voice store: user voices, never committed
 voices/
-rver's voice store: user voices (eric, vale), never committed
