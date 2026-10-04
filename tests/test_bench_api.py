@@ -62,6 +62,19 @@ class _ReadErrorStream(httpx.SyncByteStream):
 # -- argument parsing -------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _default_reference_audio(monkeypatch):
+    # The real default comes from REFERENCE_VOICES_DIR, which a CPU-only checkout lacks.
+    monkeypatch.setattr(bench_api, "DEFAULT_REF_AUDIO", UNUSED_REF_AUDIO)
+
+
+def test_missing_reference_audio_is_rejected_only_when_a_case_needs_it(monkeypatch):
+    monkeypatch.setattr(bench_api, "DEFAULT_REF_AUDIO", None)
+    with pytest.raises(SystemExit):
+        parse_args(["--api", "new", "--cases", "short_inline"])
+    assert parse_args(["--api", "new", "--cases", "short_design"]).ref_audio is None
+
+
 def test_api_defaults_to_new_so_the_quickstart_command_works_without_it():
     config = parse_args(["--url", "http://127.0.0.1:8080", "--runs", "3"])
     assert config.api == "new"

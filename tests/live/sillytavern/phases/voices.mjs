@@ -16,6 +16,9 @@ const TMP_NAME = 'st_live_tmp';
 export default async function voices(page, config, events) {
     const { results, step } = makeRecorder();
 
+    if (!config.voicesDir) {
+        throw new Error('REFERENCE_VOICES_DIR is not set (expects <dir>/eric/eric.wav and eric.txt)');
+    }
     const sampleWav = path.join(config.voicesDir, 'eric', 'eric.wav');
     const sampleTranscript = fs.readFileSync(path.join(config.voicesDir, 'eric', 'eric.txt'), 'utf8').trim();
 

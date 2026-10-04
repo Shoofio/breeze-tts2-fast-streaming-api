@@ -23,7 +23,6 @@ deterministically, every run, whenever the fix regresses.
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -36,19 +35,9 @@ from breeze_infer.bench_api import DEFAULT_REF_AUDIO
 pytestmark = pytest.mark.gpu
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-# Reuse bench_api's default reference path as the source of truth for "the bench
-# reference wav", but stay overridable the same way tests/gpu/test_speech_http.py's
-# REFERENCE_VOICES_DIR is, for a machine without the reference-voices directory mounted at the
-# default path. Only join an *override* onto "eric/eric.wav" -- deriving that layout
-# from DEFAULT_REF_AUDIO itself (via .parent.parent) would silently go stale if
-# DEFAULT_REF_AUDIO's own directory shape ever changes, since nothing would then keep
-# the two in sync.
-_REFERENCE_VOICES_DIR_OVERRIDE = os.environ.get("REFERENCE_VOICES_DIR")
-REFERENCE_WAV = (
-    Path(_REFERENCE_VOICES_DIR_OVERRIDE) / "eric" / "eric.wav"
-    if _REFERENCE_VOICES_DIR_OVERRIDE
-    else DEFAULT_REF_AUDIO
-)
+# bench_api derives its default reference wav from REFERENCE_VOICES_DIR (None when unset),
+# so reuse it as the single source of truth for "the bench reference wav".
+REFERENCE_WAV = DEFAULT_REF_AUDIO
 
 # Three, not two: guards against a fix that happens to survive one lucky pair but not a
 # third process.
@@ -90,10 +79,10 @@ def test_same_reference_wav_encodes_identically_across_processes(
 ) -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    if not REFERENCE_WAV.is_file():
+    if REFERENCE_WAV is None or not REFERENCE_WAV.is_file():
         pytest.skip(
-            f"bench reference wav not found at {REFERENCE_WAV} "
-            "(override with REFERENCE_VOICES_DIR=<dir containing eric/eric.wav>)"
+            f"bench reference wav not found (REFERENCE_WAV={REFERENCE_WAV}); "
+            "set REFERENCE_VOICES_DIR to a directory containing eric/eric.wav"
         )
 
     # Each worker is its own fresh Python process with its own fresh cuDNN autotune

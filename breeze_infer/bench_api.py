@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
@@ -22,7 +23,12 @@ SPEECH_PATH = "/v1/audio/speech"
 VOICES_PATH = "/v1/voices"
 SAMPLE_RATE_FALLBACK = 24000  # only used if a response omits X-Sample-Rate
 DEFAULT_PORTS = {"old": 7860, "new": 8080}
-DEFAULT_REF_AUDIO = Path("$REFERENCE_VOICES_DIR/eric/eric.wav")
+# No machine-specific fallback: without the env var the caller must pass --ref-audio.
+DEFAULT_REF_AUDIO = (
+    Path(os.environ["REFERENCE_VOICES_DIR"]) / "eric" / "eric.wav"
+    if "REFERENCE_VOICES_DIR" in os.environ
+    else None
+)
 # HTTP never queues (contract): a 409 means "try again shortly", not "failed".
 BUSY_RETRY_INTERVAL_S = 1.0
 BUSY_RETRY_BUDGET_S = 60.0
@@ -58,7 +64,7 @@ class BenchConfig:
     url: str
     runs: int
     warmup: int
-    ref_audio: Path
+    ref_audio: Path | None  # None only when no case needs a reference
     ref_text: str | None  # None means "read <ref_audio> with a .txt suffix"
     cases: tuple[str, ...]
     voice_id: str | None
@@ -134,6 +140,8 @@ def parse_args(argv: list[str] | None = None) -> BenchConfig:
         parser.error("short_voice is only supported for --api new")
     if args.api == "old" and args.voice_id is not None:
         parser.error("--voice-id is only supported for --api new")
+    if args.ref_audio is None and needs_reference(cases, args.voice_id):
+        parser.error("pass --ref-audio or set REFERENCE_VOICES_DIR (expects <dir>/eric/eric.wav)")
 
     return BenchConfig(
         api=args.api,

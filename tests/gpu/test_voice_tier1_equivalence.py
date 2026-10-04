@@ -56,7 +56,7 @@ import numpy as np
 import pytest
 import torch
 
-from tests.gpu.test_speech_http import REFERENCE_VOICES_DIR
+from tests.gpu.test_speech_http import VOICE_DIR
 from tests.gpu.test_voice_equivalence import (  # noqa: F401
     register_voice_bytes,
     speak,
@@ -65,7 +65,6 @@ from tests.gpu.test_voice_equivalence import (  # noqa: F401
 
 pytestmark = pytest.mark.gpu
 
-VOICE_DIR = REFERENCE_VOICES_DIR / "eric"
 TEXT = "We need to discuss what happened last night before anyone else does."
 INSTRUCTION = "Speak slowly with a restrained, serious tone."
 MAX_NEW_TOKENS = 40
@@ -101,6 +100,11 @@ def _spy_iter_audio_chunks(runtime: Any) -> tuple[list[list[torch.Tensor]], Any]
 
 def test_codes_path_matches_inline_path_exactly(voices_app) -> None:  # noqa: F811
     client, events, components = voices_app
+    if VOICE_DIR is None:
+        pytest.skip(
+            "REFERENCE_VOICES_DIR is not set "
+            "(set it to a directory containing eric/eric.wav and eric.txt)"
+        )
     ref_wav = VOICE_DIR / "eric.wav"
     ref_txt = VOICE_DIR / "eric.txt"
     if not ref_wav.is_file() or not ref_txt.is_file():

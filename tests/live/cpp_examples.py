@@ -35,6 +35,7 @@ import contextlib
 import fnmatch
 import inspect
 import json
+import os
 import sys
 import time
 import uuid
@@ -45,8 +46,13 @@ from pathlib import Path
 import httpx
 from websockets.asyncio.client import ClientConnection, connect
 
-C_DOCS = Path("<Breeze-TTS-2.cpp checkout>/docs")
-DEFAULT_REF_WAV = Path("$REFERENCE_VOICES_DIR/eric/eric.wav")
+# No machine-specific fallbacks: both come from the environment, or --ref-wav is required.
+C_DOCS = Path(os.environ["BREEZE_CPP_ROOT"]) / "docs" if "BREEZE_CPP_ROOT" in os.environ else None
+DEFAULT_REF_WAV = (
+    Path(os.environ["REFERENCE_VOICES_DIR"]) / "eric" / "eric.wav"
+    if "REFERENCE_VOICES_DIR" in os.environ
+    else None
+)
 
 # Every voice this harness names starts with this prefix; the sweep deletes only these.
 TMP_PREFIX = "st_live_tmp_cpp"
@@ -945,7 +951,10 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--ref-wav", type=Path, default=DEFAULT_REF_WAV,
                         help="reference clip used as upload content; its transcript is the .txt beside it")
     parser.add_argument("--only", default="", help="comma-separated example numbers, e.g. 3,20")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.ref_wav is None:
+        parser.error("pass --ref-wav or set REFERENCE_VOICES_DIR (expects <dir>/eric/eric.wav)")
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -967,7 +976,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"GET {args.url}/health failed: {type(error).__name__}: {error}", file=sys.stderr)
             return 1
         print(f"C++ doc examples against {args.url} (WebSocket {ctx.ws_url or 'disabled'}), "
-              f"cors={args.cors or 'off'}, docs in {C_DOCS}")
+              f"cors={args.cors or 'off'}, docs in {C_DOCS or '(BREEZE_CPP_ROOT unset)'}")
         leftovers = sweep(ctx)
         if leftovers:
             print(f"removed leftover throwaway voices: {', '.join(leftovers)}")

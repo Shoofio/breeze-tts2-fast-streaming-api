@@ -12,11 +12,13 @@ set -eu
 # directory the caller ran this script from.
 cd "$(dirname "$0")/.."
 
-HUB=$HF_HOME/hub/models--BreezeBlue--Breeze-TTS-2
+# HF_HOME is HuggingFace's own variable for relocating its cache; fall back to
+# the default cache location when it is unset.
+HUB="${HF_HOME:-$HOME/.cache/huggingface}/hub/models--BreezeBlue--Breeze-TTS-2"
 REF_FILE="$HUB/refs/main"
 
 if [ ! -f "$REF_FILE" ]; then
-    echo "HuggingFace ref not found: $REF_FILE" >&2
+    echo "HuggingFace ref not found: $REF_FILE (set HF_HOME if the model cache lives elsewhere)" >&2
     exit 1
 fi
 

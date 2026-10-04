@@ -262,7 +262,7 @@ def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
 def _voice_sources(reference_clips) -> list[SimpleNamespace]:
     """The voices this test registers: two of `conftest.py`'s synthesized design clips, plus
     `bench_api.DEFAULT_REF_AUDIO` ("eric") and `$REFERENCE_VOICES_DIR/vale` when
-    the checkout has them -- real recordings alongside the synthetic ones, so the cross-voice
+    they are available -- real recordings alongside the synthetic ones, so the cross-voice
     calibration below isn't only comparing designs against each other. Skips a real voice
     whose sample or transcript is missing, rather than failing the whole test over it."""
     sources = [
@@ -276,9 +276,11 @@ def _voice_sources(reference_clips) -> list[SimpleNamespace]:
     ]
     real_voices = [
         ("eric", bench_api.DEFAULT_REF_AUDIO),
-        ("vale", REFERENCE_VOICES_DIR / "vale" / "vale.wav"),
+        ("vale", REFERENCE_VOICES_DIR / "vale" / "vale.wav" if REFERENCE_VOICES_DIR else None),
     ]
     for name, wav_path in real_voices:
+        if wav_path is None:
+            continue
         txt_path = wav_path.with_suffix(".txt")
         if not (wav_path.is_file() and txt_path.is_file()):
             continue
@@ -299,7 +301,11 @@ def _voice_sources(reference_clips) -> list[SimpleNamespace]:
 def test_prefix_path_matches_codes_path_for_the_same_voice(gpu_env, voices_app, reference_clips) -> None:
     client, events, _components = voices_app
     sources = _voice_sources(reference_clips)
-    assert len(sources) >= 3, f"need at least 3 voices for cross-voice calibration, got {sources!r}"
+    if len(sources) < 3:
+        pytest.skip(
+            "cross-voice calibration needs at least 3 voices; set REFERENCE_VOICES_DIR "
+            f"to a directory with eric/ and vale/ samples (got {len(sources)})"
+        )
 
     voices = [
         SimpleNamespace(source=source, record=register_voice(

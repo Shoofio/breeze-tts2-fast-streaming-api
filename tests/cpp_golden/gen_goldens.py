@@ -15,18 +15,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).parent
-DEFAULT_CPP_ROOT = Path("<Breeze-TTS-2.cpp checkout>")
+# No machine-specific fallback: the checkout location comes from the environment or --cpp-root.
+DEFAULT_CPP_ROOT = Path(os.environ["BREEZE_CPP_ROOT"]) if "BREEZE_CPP_ROOT" in os.environ else None
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--cpp-root", type=Path, default=DEFAULT_CPP_ROOT)
     root = parser.parse_args().cpp_root
+    if root is None:
+        parser.error("pass --cpp-root or set BREEZE_CPP_ROOT")
 
     with tempfile.TemporaryDirectory() as tmp:
         exe = Path(tmp) / "text_split_harness"

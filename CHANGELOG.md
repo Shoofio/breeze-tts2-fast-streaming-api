@@ -13,6 +13,11 @@ All notable changes to this project are documented here. See
   guard for these launches, so any web page can upload or delete voices and run synthesis. Pass
   `--cors=<allowlist>` (`-Cors <list>` on Windows) to narrow it. The server's own default, with
   no flag, is unchanged: CORS off.
+- The launch scripts now find the model under HuggingFace's standard cache (`$HF_HOME`, default
+  `~/.cache/huggingface`) instead of a hard-coded path, so set `HF_HOME` if the model lives
+  elsewhere. `bench_api`, the GPU reference-voice tests and the live scripts read
+  `REFERENCE_VOICES_DIR` (and `BREEZE_CPP_ROOT` for the C++ tools) with no machine-specific
+  fallback; without them the reference-voice GPU tests skip.
 
 ## 2.1.0 — 2026-10-01
 

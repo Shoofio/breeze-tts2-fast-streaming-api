@@ -23,8 +23,10 @@ you change `harness.cpp` and regenerate it.
 After adding or editing a case in `harness.cpp`'s `split_cases`/`drain_cases`:
 
 ```sh
-.venv/bin/python tests/cpp_golden/gen_goldens.py --cpp-root <Breeze-TTS-2.cpp checkout>
+.venv/bin/python tests/cpp_golden/gen_goldens.py --cpp-root <path to Breeze-TTS-2.cpp checkout>
 ```
+
+Set `BREEZE_CPP_ROOT` to the same path to leave `--cpp-root` out.
 
 Then run `.venv/bin/pytest -q tests/test_text_split.py`. A new case that the Python port
 intentionally answers differently fails until you add it to `INTENTIONAL_DIFFERENCES` in the

@@ -38,5 +38,6 @@ export const config = {
     launchArgs: ['--autoplay-policy=no-user-gesture-required'],
 
     // Reference voice samples (WAV + transcript) used for voice registration and throwaway uploads.
-    voicesDir: process.env.REFERENCE_VOICES_DIR ?? '$REFERENCE_VOICES_DIR',
+    // No default: the phase that needs them fails with a clear message when this is unset.
+    voicesDir: process.env.REFERENCE_VOICES_DIR,
 };

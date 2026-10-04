@@ -51,12 +51,12 @@ pytestmark = pytest.mark.gpu
 
 SPEECH_PATH = "/v1/audio/speech"
 REPO_ROOT = Path(__file__).resolve().parents[2]
-# Overridable so a machine without the reference-voices directory can still run the rest of this
+# Unset on a machine without the reference voices, which can still run the rest of this
 # file; the inline-reference test skips (rather than erroring) when the sample is absent.
-REFERENCE_VOICES_DIR = Path(
-    os.environ.get("REFERENCE_VOICES_DIR", "$REFERENCE_VOICES_DIR")
+REFERENCE_VOICES_DIR = (
+    Path(v) if (v := os.environ.get("REFERENCE_VOICES_DIR")) else None
 )
-VOICE_DIR = REFERENCE_VOICES_DIR / "eric"
+VOICE_DIR = REFERENCE_VOICES_DIR / "eric" if REFERENCE_VOICES_DIR else None
 SAMPLE_RATE = 24000
 # contracts/http-api.md "Chunks grow from --chunk-first to --chunk-max codec frames (1,920
 # samples per frame)": the largest possible ramp flush, used as the tolerance for matching
@@ -215,6 +215,11 @@ def test_voice_design_returns_plausible_audio(speech_app) -> None:
 
 def test_inline_reference_returns_plausible_audio(speech_app) -> None:
     client, events = speech_app
+    if VOICE_DIR is None:
+        pytest.skip(
+            "REFERENCE_VOICES_DIR is not set "
+            "(set it to a directory containing eric/eric.wav and eric.txt)"
+        )
     ref_wav = VOICE_DIR / "eric.wav"
     ref_txt = VOICE_DIR / "eric.txt"
     if not ref_wav.is_file() or not ref_txt.is_file():

@@ -41,7 +41,8 @@
 
 .PARAMETER ModelPath
     Override the checkpoint path. By default the current HuggingFace snapshot
-    is resolved from the hub cache's refs/main.
+    is resolved from the hub cache's refs/main. The cache is under $env:HF_HOME
+    when set, else ~/.cache/huggingface.
 
 .PARAMETER NoFastAll
     Run the eager path (~7.7 GiB VRAM) instead of the CUDA-graph fast path
@@ -98,7 +99,10 @@ $VenvDir    = Join-Path $RepoRoot '.venv-win'
 $VenvPy     = Join-Path $VenvDir 'Scripts\python.exe'
 $ReqFile    = Join-Path $RepoRoot 'requirements.txt'
 $StampFile  = Join-Path $VenvDir '.breeze-deps.sha256'
-$HubDir     = '$HF_HOME\hub\models--BreezeBlue--Breeze-TTS-2'
+# HF_HOME is HuggingFace's own variable for relocating its cache; fall back to
+# the default cache location when it is unset.
+$HfHome     = if ($env:HF_HOME) { $env:HF_HOME } else { Join-Path $HOME '.cache\huggingface' }
+$HubDir     = Join-Path $HfHome 'hub\models--BreezeBlue--Breeze-TTS-2'
 $TorchIndex = 'https://download.pytorch.org/whl/cu128'
 $PyVersion  = '3.12'
 # PyTorch ships no Triton for Windows, but --fast-all's depth-decoder stage
@@ -124,7 +128,7 @@ try {
     if (-not $ModelPath) {
         $refFile = Join-Path $HubDir 'refs\main'
         if (-not (Test-Path -LiteralPath $refFile)) {
-            throw "HuggingFace ref not found: $refFile`nPass -ModelPath to point at the checkpoint directly."
+            throw "HuggingFace ref not found: $refFile`nSet HF_HOME if the model cache lives elsewhere, or pass -ModelPath to point at the checkpoint directly."
         }
         # refs/main has no trailing newline, but trim defensively anyway.
         $sha = (Get-Content -Raw -LiteralPath $refFile).Trim()
