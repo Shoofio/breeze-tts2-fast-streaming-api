@@ -9,10 +9,15 @@ root that consumes ``compile_cache_dir``, not to argument parsing).
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import platform as platform_module
 import re
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Literal
 
 from breeze_infer.origins import canonical_origin
 
@@ -24,9 +29,84 @@ DEFAULT_CHUNK_MAX = 25
 DEFAULT_VOICES_DIR = Path("voices")
 DEFAULT_ATTN_IMPLEMENTATION = "eager"
 
+# The smallest Apple Silicon Mac with room for the bf16 weights, the codec and the KV cache
+# (research R5).
+MLX_MIN_MEMORY_BYTES = 16 * 1024**3
+
+# Where to get each backend's weights; named in the checkpoint/backend mismatch refusals.
+MLX_DOWNLOAD_COMMAND = (
+    "uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx "
+    "--revision 3c8829fb7fd335818f085cd2ef49b4100c0e46c8"
+)
+PYTORCH_DOWNLOAD_COMMAND = "uvx --from huggingface_hub hf download BreezeBlue/Breeze-TTS-2"
+
+_PYTORCH_MODEL_TYPE = "breeze"
+_MLX_MODEL_TYPE = "breeze_tts"
+
 # Sentinel distinguishing "--ws-port" absent (derive port + 1) from an
 # explicit "--ws-port disabled" (which resolves to None on Settings).
 _WS_PORT_UNSET = object()
+
+
+@dataclass(frozen=True)
+class Platform:
+    """The machine facts the backend choice depends on, read once at the entry point.
+
+    Passed into ``settings_from_args`` rather than read there, so the parser stays a pure
+    function of its arguments and tests build a ``Platform`` directly instead of patching.
+    """
+
+    system: str
+    machine: str
+    memory_bytes: int
+
+    @classmethod
+    def detect(cls) -> Platform:
+        return cls(
+            system=sys.platform,
+            machine=platform_module.machine(),
+            memory_bytes=os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"),
+        )
+
+    @property
+    def is_macos(self) -> bool:
+        return self.system == "darwin"
+
+    @property
+    def is_apple_silicon(self) -> bool:
+        return self.is_macos and self.machine == "arm64"
+
+
+@dataclass(frozen=True)
+class CheckpointKind:
+    """What a checkpoint directory holds, from its ``config.json``."""
+
+    format: Literal["pytorch", "mlx"]
+    weights: Literal["bf16", "8bit"]
+
+
+def checkpoint_kind(config: dict[str, Any], directory: Path | str = "checkpoint") -> CheckpointKind:
+    """Classify a parsed ``config.json``; ``ValueError`` carries the refusal message.
+
+    ``directory`` is only there so the message can name the checkpoint the user passed.
+    """
+    model_type = config.get("model_type")
+    if model_type == _PYTORCH_MODEL_TYPE:
+        return CheckpointKind("pytorch", "bf16")
+    if model_type != _MLX_MODEL_TYPE:
+        raise ValueError(
+            f"{directory} has model_type {model_type!r}; expected {_PYTORCH_MODEL_TYPE!r} "
+            f"(PyTorch) or {_MLX_MODEL_TYPE!r} (MLX)"
+        )
+    quantization = config.get("quantization")
+    if quantization is None:
+        return CheckpointKind("mlx", "bf16")
+    if quantization.get("bits") == 8 and quantization.get("mode") == "mxfp8":
+        return CheckpointKind("mlx", "8bit")
+    raise ValueError(
+        f"{directory} is {quantization.get('bits')}-bit {quantization.get('mode')}; "
+        "the MLX backend supports bf16 and 8-bit (mxfp8)"
+    )
 
 
 @dataclass(frozen=True)
@@ -65,6 +145,8 @@ class Settings:
     fast_codec: bool
     attn_implementation: str
     compile_cache_dir: Path | None
+    backend: Literal["cuda", "mlx"]
+    weights: Literal["bf16", "8bit"]
 
 
 # --port and --ws-port must be plain unsigned integers: no leading '+' or
@@ -74,6 +156,31 @@ class Settings:
 # separately. An explicit [0-9] class (rather than \d with re.ASCII) keeps
 # that ASCII-only intent visible at the call site.
 _STRICT_PORT_RE = re.compile(r"[0-9]+")
+
+
+class _CudaOnlyBoolean(argparse.BooleanOptionalAction):
+    """A ``--x/--no-x`` flag that records it was given, for the MLX backend's refusal.
+
+    Recording the option string (rather than comparing against the default) keeps argv order
+    for the message and also catches ``--no-x``, which leaves the default value unchanged.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        _note_cuda_only(namespace, option_string)
+        super().__call__(parser, namespace, values, option_string)
+
+
+class _CudaOnlyStore(argparse.Action):
+    """A store action that records it was given; see ``_CudaOnlyBoolean``."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        _note_cuda_only(namespace, option_string)
+        setattr(namespace, self.dest, values)
+
+
+def _note_cuda_only(namespace: argparse.Namespace, option_string: str | None) -> None:
+    given = getattr(namespace, "cuda_only_given", ())
+    namespace.cuda_only_given = (*given, option_string)
 
 
 def _parse_port(value: str) -> int:
@@ -135,6 +242,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Serve Breeze TTS 2 streaming inference"
     )
     parser.add_argument("model_path", type=Path, help="Path to the model directory")
+    parser.add_argument(
+        "--backend",
+        choices=("cuda", "mlx"),
+        default=None,
+        help="Inference backend (default: mlx on an Apple Silicon Mac, else cuda)",
+    )
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"Bind address for HTTP and WebSocket (default: {DEFAULT_HOST})")
     parser.add_argument(
         "--port",
@@ -196,25 +309,26 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Directory holding saved voices (default: ./{DEFAULT_VOICES_DIR})",
     )
     parser.add_argument(
-        "--fast-all", action=argparse.BooleanOptionalAction, default=None
+        "--fast-all", action=_CudaOnlyBoolean, default=None
     )
     parser.add_argument(
-        "--fast-text-encoder", action=argparse.BooleanOptionalAction, default=False
+        "--fast-text-encoder", action=_CudaOnlyBoolean, default=False
     )
     parser.add_argument(
-        "--fast-backbone-prefill", action=argparse.BooleanOptionalAction, default=False
+        "--fast-backbone-prefill", action=_CudaOnlyBoolean, default=False
     )
     parser.add_argument(
-        "--fast-backbone-decode", action=argparse.BooleanOptionalAction, default=False
+        "--fast-backbone-decode", action=_CudaOnlyBoolean, default=False
     )
     parser.add_argument(
-        "--fast-depth-decoder", action=argparse.BooleanOptionalAction, default=False
+        "--fast-depth-decoder", action=_CudaOnlyBoolean, default=False
     )
     parser.add_argument(
-        "--fast-codec", action=argparse.BooleanOptionalAction, default=False
+        "--fast-codec", action=_CudaOnlyBoolean, default=False
     )
     parser.add_argument(
         "--attn-implementation",
+        action=_CudaOnlyStore,
         # flash_attention_2 is deliberately absent: Hugging Face's FA2 path
         # rejects the backbone's 4D attention masks ("cu_seqlens_k must have
         # shape (batch_size + 1)") in both eager and CUDA-graph modes.
@@ -228,6 +342,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--compile-cache-dir",
+        action=_CudaOnlyStore,
         type=Path,
         default=None,
         help=(
@@ -238,7 +353,84 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def settings_from_args(argv: Sequence[str] | None = None) -> Settings:
+def _read_config(model_path: Path) -> dict[str, Any] | None:
+    """The checkpoint's ``config.json``, or ``None`` when it is missing or not a JSON object."""
+    try:
+        config = json.loads((model_path / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return config if isinstance(config, dict) else None
+
+
+def _choose_backend(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, platform: Platform | None
+) -> Literal["cuda", "mlx"]:
+    """The backend to run, refusing what this machine can't serve (FR-002, FR-003, FR-004).
+
+    ``platform`` is ``None`` for callers that never read the machine (every existing test),
+    which means "not a Mac": the default is cuda, as before this option existed.
+    """
+    # Any Mac defaults to mlx, so an Intel Mac is told it needs Apple Silicon rather than
+    # being sent to a CUDA backend that macOS can't run either.
+    on_macos = platform is not None and platform.is_macos
+    backend = args.backend or ("mlx" if on_macos else "cuda")
+
+    if backend == "cuda":
+        if on_macos:
+            parser.error("--backend cuda is not available on macOS; use --backend mlx (the default here)")
+        return "cuda"
+
+    if platform is None or not platform.is_apple_silicon:
+        machine = "unknown" if platform is None else f"{platform.system} {platform.machine}"
+        parser.error(f"--backend mlx needs an Apple Silicon Mac (this machine: {machine})")
+    if platform.memory_bytes < MLX_MIN_MEMORY_BYTES:
+        gigabytes = round(platform.memory_bytes / 1024**3, 1)
+        parser.error(f"--backend mlx needs at least 16 GB of memory (this machine: {gigabytes:g} GB)")
+    cuda_only = tuple(dict.fromkeys(getattr(args, "cuda_only_given", ())))
+    if cuda_only:
+        parser.error(f"{', '.join(cuda_only)} only apply to --backend cuda; remove them")
+    return "mlx"
+
+
+def _check_checkpoint(
+    parser: argparse.ArgumentParser,
+    model_path: Path,
+    backend: Literal["cuda", "mlx"],
+) -> Literal["bf16", "8bit"]:
+    """Refuse a checkpoint that doesn't match the backend; return its weight precision.
+
+    The CUDA path stays as lenient as it was before this check existed: a missing or odd
+    ``config.json`` is not its concern, and only a checkpoint that says it is MLX is refused.
+    The MLX backend reads the precision from the file, so there it must exist.
+    """
+    config = _read_config(model_path)
+    if backend == "cuda":
+        if config is not None and config.get("model_type") == _MLX_MODEL_TYPE:
+            parser.error(
+                f"{model_path} holds MLX weights; --backend cuda needs: {PYTORCH_DOWNLOAD_COMMAND}"
+            )
+        return "bf16"
+
+    if config is None:
+        parser.error(
+            f"{model_path} has no readable config.json; --backend mlx needs the MLX weights: "
+            f"{MLX_DOWNLOAD_COMMAND}"
+        )
+    try:
+        kind = checkpoint_kind(config, model_path)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if kind.format == "pytorch":
+        parser.error(
+            f"{model_path} is the PyTorch checkpoint; --backend mlx needs the MLX weights: "
+            f"{MLX_DOWNLOAD_COMMAND}"
+        )
+    return kind.weights
+
+
+def settings_from_args(
+    argv: Sequence[str] | None = None, platform: Platform | None = None
+) -> Settings:
     """Parse ``argv`` (``sys.argv[1:]`` when ``None``) into a validated ``Settings``.
 
     Every rejection goes through ``parser.error()``, which prints the usage
@@ -250,6 +442,9 @@ def settings_from_args(argv: Sequence[str] | None = None) -> Settings:
 
     if not args.model_path.is_dir():
         parser.error(f"model_path must be an existing directory (got {args.model_path})")
+
+    backend = _choose_backend(parser, args, platform)
+    weights = _check_checkpoint(parser, args.model_path, backend)
 
     port = args.port
     if not 1 <= port <= 65535:
@@ -309,4 +504,6 @@ def settings_from_args(argv: Sequence[str] | None = None) -> Settings:
         fast_codec=args.fast_codec,
         attn_implementation=args.attn_implementation,
         compile_cache_dir=args.compile_cache_dir,
+        backend=backend,
+        weights=weights,
     )

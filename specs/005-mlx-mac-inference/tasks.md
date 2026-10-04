@@ -180,7 +180,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
     - unknown `model_type` → `ValueError`.
   - **Checkpoint/backend mismatch:** through `settings_from_args`, using a `tmp_path` checkpoint
     dir with a `config.json`, both directions give the contract's messages.
-- [ ] T011 Implement in `breeze_infer/settings.py` until T010 passes.
+- [x] T011 Implement in `breeze_infer/settings.py` until T010 passes.
   - **`Platform`:** a frozen dataclass with `system: str`, `machine: str`, `memory_bytes: int`,
     and a `Platform.detect()` classmethod using `sys.platform`, `platform.machine()` and
     `os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")`.
