@@ -363,7 +363,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
   - The CUDA branch adds only `"backend": "cuda", "weights": "bf16"` to its existing report.
   - Extend the existing `model.loaded` test, if there is one in `tests/test_api_main.py`, to
     assert the two new CUDA fields. Otherwise add one assertion where the report is built.
-- [ ] T021 [US1] Write `tests/mlx/test_mlx_server.py`, which starts the **real** server on real
+- [X] T021 [US1] Write `tests/mlx/test_mlx_server.py`, which starts the **real** server on real
   uvicorn with the MLX runtime. Reuse `tests.test_speech_abort.LiveServer`, or start
   `python -m breeze_infer.api` as a subprocess on a free port with `--backend mlx --ws-port disabled`.
   - `/health` goes from `503 loading` to `200`, with `sample_rate` 24000.
