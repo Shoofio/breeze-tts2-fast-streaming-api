@@ -138,7 +138,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
 - [X] T007 [P] In `tests/test_api_main.py::test_bound_socket_has_reuseaddr_and_is_listening`,
   assert `!= 0` instead of `== 1`, with a comment explaining that BSD/macOS returns the option's
   bit value (4) for "on".
-- [ ] T008 [P] In `tests/test_voice_store.py`, fix `test_create_refuses_a_case_duplicate` and
+- [X] T008 [P] In `tests/test_voice_store.py`, fix `test_create_refuses_a_case_duplicate` and
   `test_scan_skips_a_case_duplicate_of_an_earlier_file` for case-insensitive filesystems (APFS).
   - Assert on the store's behaviour: the refusal raised, and the voices listed/skipped, with the
     skip event. Don't use `Path.exists()` on the differently-cased name.

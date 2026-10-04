@@ -105,7 +105,9 @@ def test_create_refuses_a_case_duplicate(tmp_path: Path):
     store.create(_voice("alice"))
     with pytest.raises(VoiceExists):
         store.create(_voice("ALICE"))
-    assert not (tmp_path / "ALICE.voice.json").exists()
+    # Directory listing, not Path.exists(): on a case-insensitive filesystem (APFS) exists()
+    # is true for ALICE.voice.json whenever alice.voice.json is there.
+    assert [p.name for p in tmp_path.iterdir()] == ["alice.voice.json"]
 
 
 def test_create_leaves_no_tmp_file_behind(tmp_path: Path):
@@ -252,6 +254,8 @@ def test_a_skipped_file_with_a_valid_name_reserves_that_name(tmp_path: Path):
 
 
 def test_scan_skips_a_case_duplicate_of_an_earlier_file(tmp_path: Path):
+    # Two files differing only by case can't coexist on a case-insensitive filesystem.
+    _require_case_sensitive(tmp_path)
     store = _store(tmp_path)
     store.create(_voice("alice"))
     # A second, case-differing, internally self-consistent file dropped directly on
