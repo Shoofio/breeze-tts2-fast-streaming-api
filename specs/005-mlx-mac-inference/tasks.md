@@ -429,7 +429,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
     - the server still serves the good voice;
     - a request for the skipped id gets `404` with code `unknown_voice` (spec, User Story 2
       scenario 4, Edge Cases).
-- [ ] T026 [US2] *(main)* Live gate, quickstart step 3, at both precisions. Record the results in
+- [X] T026 [US2] *(main)* Live gate, quickstart step 3, at both precisions. Record the results in
   `specs/005-mlx-mac-inference/research/live-us2.md`.
 
 ---
