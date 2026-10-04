@@ -37,3 +37,9 @@ def test_unsupported_quantization_is_refused() -> None:
 def test_unknown_model_type_is_refused(config: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         checkpoint_kind(config)
+
+
+@pytest.mark.parametrize("quantization", [True, 8, "mxfp8"])
+def test_a_non_mapping_quantization_is_refused_not_a_crash(quantization: object) -> None:
+    with pytest.raises(ValueError, match="the MLX backend supports bf16 and 8-bit"):
+        checkpoint_kind({"model_type": "breeze_tts", "quantization": quantization})

@@ -103,6 +103,10 @@ def checkpoint_kind(config: dict[str, Any], directory: Path | str = "checkpoint"
     quantization = config.get("quantization")
     if quantization is None:
         return CheckpointKind("mlx", "bf16")
+    # A hand-edited config could hold anything here; refuse it like any other unsupported
+    # quantization rather than crash the launch with a traceback.
+    if not isinstance(quantization, dict):
+        quantization = {}
     if quantization.get("bits") == 8 and quantization.get("mode") == "mxfp8":
         return CheckpointKind("mlx", "8bit")
     raise ValueError(
