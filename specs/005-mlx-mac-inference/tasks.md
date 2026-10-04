@@ -76,7 +76,7 @@ research R9 and R10. Don't add tests beyond those named in a task.
 
 ## Phase 1: Setup
 
-- [ ] T001 Bump `__version__` to `2.2.0.dev1` in `breeze_infer/__init__.py`. Add an
+- [X] T001 Bump `__version__` to `2.2.0.dev1` in `breeze_infer/__init__.py`. Add an
   `## Unreleased` → `### Added` line to `CHANGELOG.md`: "MLX backend for Apple Silicon Macs
   (`--backend mlx`, `scripts/start_breeze_mac.sh`)". One commit.
 - [X] T002 *(main)* **Phase-0 speed gate (research R7).** Do it before any other code task.

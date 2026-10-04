@@ -6,6 +6,10 @@ All notable changes to this project are documented here. See
 
 ## Unreleased
 
+### Added
+
+- MLX backend for Apple Silicon Macs (`--backend mlx`, `scripts/start_breeze_mac.sh`).
+
 ### Changed
 
 - `scripts/start_breeze.sh` and `scripts/start_breeze.ps1` now enable CORS for every origin (`*`)
