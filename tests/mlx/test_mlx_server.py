@@ -178,8 +178,9 @@ def running_server(mlx_model: Path, *extra_args: str) -> Iterator[Server]:
 @pytest.fixture(scope="module")
 def server(mlx_model: Path) -> Iterator[Server]:
     # The WebSocket listener is on for the shared server: the session test needs it, and a
-    # second model load would cost seconds and memory a 16 GB Mac does not have to spare. The
-    # later `--ws-port disabled` in `running_server` is overridden by this one (the last wins).
+    # second model load would cost seconds and memory a 16 GB Mac does not have to spare.
+    # `running_server` passes `--ws-port disabled` first; this later flag wins (argparse keeps
+    # the last value).
     with running_server(mlx_model, "--ws-port", str(_free_port())) as running:
         yield running
 
