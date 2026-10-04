@@ -32,7 +32,8 @@ the 16 GB M5, before any code is written. Version 2.2.0.
   - **New, macOS arm64 only:** `mlx-audio` at git `e1b19b9` (which brings `mlx` 0.32.x, scipy,
     miniaudio and sounddevice), installed with overrides that keep transformers 4.57.3 and
     huggingface-hub 0.36.2 (research R2).
-  - `qwen-tts` becomes non-macOS only.
+  - `qwen-tts` is unchanged and still installed everywhere. It is measured to coexist with
+    mlx-audio (R2).
 - **Storage**: N/A. Voice files are unchanged. Weights come from the Hugging Face cache.
 - **Testing**: pytest.
   - Model-free suite on every platform.
@@ -57,8 +58,9 @@ the 16 GB M5, before any code is written. Version 2.2.0.
   - New: `models/mlx_streaming.py` (about 500 lines), `scripts/start_breeze_mac.sh`,
     `requirements-mac-overrides.txt`, about 4 test files.
   - Changed: `settings.py`, `api.py`, `model_loading.py`, `models/fast_streaming.py` (room
-    arithmetic extracted, no behaviour change), `requirements.txt`, README, `docs/api.md`,
-    CHANGELOG, `breeze_infer/__init__.py`.
+    arithmetic extracted, no behaviour change), `requirements.txt` (one added line), README,
+    `docs/api.md`, CHANGELOG, `breeze_infer/__init__.py`.
+  - Test fixes so the existing model-free suite passes on macOS: 17 tests in 5 files (R10).
 
 No NEEDS CLARIFICATION items remain. [research.md](research.md) R1–R9 records every decision.
 **One open risk:** Mac speed is unmeasured until the R7 gate.
@@ -85,8 +87,12 @@ No NEEDS CLARIFICATION items remain. [research.md](research.md) R1–R9 records 
    function. The CUDA numbers are pinned by a test written **before** the move.
 2. **`--attn-implementation` default.** It becomes `None`, resolved to `eager` for CUDA, so that
    an explicit use can be detected. A settings test pins the CUDA result.
-3. **`requirements.txt`.** `qwen-tts` gains a `sys_platform != "darwin"` marker. Linux and
-   Windows install exactly what they install today.
+3. **Existing tests.** 17 tests fail on macOS today because they assume Linux (R10). They get
+   platform-correct assertions, and the harness guards `TCP_USER_TIMEOUT`. They must keep passing
+   on Linux.
+
+`requirements.txt` only gains the mlx-audio line. That line is inert on Linux and Windows (its
+platform marker), so it is not counted as a change to a working path.
 
 Result: **PASS**, with the three working-path changes above called out for approval.
 
@@ -126,12 +132,14 @@ scripts/
 ├── start_breeze.sh, start_breeze.ps1   # unchanged
 └── start_breeze_mac.sh                 # NEW
 
-requirements.txt                 # + markers: qwen-tts (non-darwin), mlx-audio (darwin arm64)
+requirements.txt                 # + one line: mlx-audio (darwin arm64 marker)
 requirements-mac-overrides.txt   # NEW: transformers, huggingface-hub pins
 pyproject.toml                   # + "mlx" pytest marker
 
 tests/
 ├── test_settings.py             # + backend default/refusal cases
+├── test_speech_abort.py, test_speech_wav_stream.py, test_long_text.py,
+│   test_api_main.py, test_voice_store.py   # macOS fixes only (R10)
 ├── test_checkpoint_kind.py      # NEW: config.json fixtures → kind/refusal
 ├── test_room_arithmetic.py      # NEW: pins CUDA numbers; MLX uses the same function
 ├── conftest.py                  # + mlx marker skip rule
@@ -151,8 +159,9 @@ points (`settings`, `api`, `model_loading`).
 
 1. **Gate (R7).** Measure stock mlx-audio on the M5 and record `research/live-phase0.md`. Stop
    and report if 8-bit with CFG has RTF > 1.3.
-2. **Packaging.** Add the markers and the overrides file, and confirm a clean Mac install. Run
-   the model-free suite on the Mac, and confirm the Linux install is unchanged.
+2. **Packaging and a green Mac baseline.** Add the mlx-audio line and the overrides file, and
+   confirm a clean Mac install. Fix the 17 macOS test failures (R10), then confirm the model-free
+   suite passes on both the Mac and Linux.
 3. **Room arithmetic.** Write the pinning test first, then extract.
 4. **Settings.** Add `--backend`, `Platform`, `checkpoint_kind` and the refusals, test-first.
 5. **The MLX runtime.**

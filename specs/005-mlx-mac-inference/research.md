@@ -67,11 +67,13 @@ spec in six ways, all confirmed in `breeze_tts.py`:
 ## R2. Packaging: one dependency set, with two overrides on the Mac
 
 **Decision:**
-- `requirements.txt` gains platform markers:
-  - `qwen-tts==0.1.1; sys_platform != "darwin"`. It hard-pins `transformers==4.57.3` and pulls in
-    SoX and onnxruntime. It is only used by the CUDA runtime, which imports it lazily in
-    `runtime.load_runtime`.
-  - `mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@e1b19b9…; sys_platform == "darwin" and platform_machine == "arm64"`
+- `requirements.txt` gains one line, the only change to that file:
+  `mlx-audio @ git+https://github.com/Blaizzy/mlx-audio@e1b19b9…; sys_platform == "darwin" and platform_machine == "arm64"`.
+- `qwen-tts` stays as it is, installed on every platform. Only the CUDA runtime uses it (a lazy
+  import in `runtime.load_runtime`), so the Mac backend never imports it. Leaving it installed on
+  the Mac keeps `requirements.txt` unchanged for Linux and Windows. It also keeps `librosa` (which
+  arrives only through `qwen-tts`) available to `tests/test_reference_audio.py:705`, which FR-018
+  needs passing on macOS.
 - A new file, `requirements-mac-overrides.txt`, holds `transformers==4.57.3` and
   `huggingface-hub==0.36.2`. The Mac install passes it with `uv pip install --overrides`.
 - Every other pin, torch included, is the same on every platform.
@@ -80,11 +82,16 @@ spec in six ways, all confirmed in `breeze_tts.py`:
 - mlx-audio declares `transformers>=5.14` and `huggingface_hub>=1.0`, but its Breeze path never
   imports transformers. In `sample_utils.py` the name appears only in a comment. It uses only
   `snapshot_download` from huggingface_hub, which 0.36 also has.
-- **Measured.** A clean Python 3.12 venv on the reference Mac, installed from `requirements.txt`
-  without qwen-tts, plus mlx-audio at the pin with the two overrides, imports all of these:
-  `mlx_audio…breeze_tts.Model`, the qwen3_tts codec, `models.fast_streaming`,
-  `breeze_infer.routes_speech` and `breeze_infer.templates`. Versions: transformers 4.57.3,
-  huggingface_hub 0.36.2, mlx 0.32.3, torch 2.9.1, and the MLX default device is `gpu`.
+- **Measured.** A clean Python 3.12 venv on the reference Mac was installed from the full
+  `requirements.txt` (qwen-tts included), plus mlx-audio at the pin, with the two overrides.
+  - It imports `mlx_audio…breeze_tts.Model`, the qwen3_tts codec, `qwen_tts`, `librosa`,
+    `models.fast_streaming`, `models.stream_runtime.core.compat`, `breeze_infer.routes_speech`
+    and `breeze_infer.templates`.
+  - Versions: transformers 4.57.3, huggingface_hub 0.36.2, mlx 0.32.3, torch 2.9.1,
+    accelerate 1.12.0. The MLX default device is `gpu`.
+  - qwen-tts's own `transformers==4.57.3` pin agrees with the override.
+  - The model-free test suite gives the same result in this venv as in the existing `.venv`:
+    2055 passed, 17 failed, 55 skipped. The 17 failures are already there on macOS (R10).
 - The result is one transformers version everywhere, so the server's tokenizer-facing code
   (`templates.py`) behaves identically on both backends.
 - Torch stays installed on the Mac, on the CPU only. The server's template code builds torch
@@ -101,6 +108,9 @@ spec in six ways, all confirmed in `breeze_tts.py`:
   pin bump breaks the overrides.
 - **`--no-deps` install.** Rejected. It leaves mlx-audio's real dependencies (mlx, scipy,
   miniaudio, sounddevice) undeclared (Constitution III).
+- **Marking `qwen-tts` non-macOS.** Rejected. It saves only install size on the Mac. It changes a
+  working line of `requirements.txt`. And it would remove `librosa` from the Mac, breaking
+  `tests/test_reference_audio.py` there unless `librosa` became a direct dependency.
 
 **Risk:** we call mlx-audio's private classes (`_Backbone`, `_DepthDecoder`,
 `_prompt_embeddings`). The exact-commit pin turns that into a deliberate upgrade step. Bumping
@@ -321,6 +331,35 @@ working Linux launcher.
   - the 10-prompt listening test at bf16 and 8-bit (SC-005);
   - `bench_api` and `pytest -m gpu` on the CUDA machine (SC-004).
 
+## R10. The existing test suite already fails on macOS
+
+**Finding:** on the reference Mac, the model-free suite gives 2055 passed, **17 failed**, 55
+skipped, in both the existing `.venv` and the R2 probe venv. So the failures predate this feature.
+FR-018 requires the model-free suite to pass on macOS, so fixing them is in scope. There are three
+causes, and all of them are assumptions in the tests about Linux:
+
+| Tests | Cause |
+|---|---|
+| 14 real-server tests in `test_speech_abort.py`, `test_speech_wav_stream.py`, `test_long_text.py` | The tests' server harness calls `socket.TCP_USER_TIMEOUT` unguarded (`test_speech_abort.py:172`), and that constant is Linux-only. Production code already guards it with `getattr` (`api.py:166`). |
+| `test_api_main.py::test_bound_socket_has_reuseaddr_and_is_listening` | It asserts `getsockopt(SO_REUSEADDR) == 1`. macOS returns the flag's bit value (4) for "on". The option is set correctly; the assertion should test for non-zero. |
+| 2 case-duplicate tests in `test_voice_store.py` | APFS is case-insensitive by default, so `ALICE.voice.json` "exists" when `alice.voice.json` does. The tests assume a case-sensitive filesystem. |
+
+**Decision:** fix the tests, not the production code.
+- Guard the harness's `TCP_USER_TIMEOUT`. On the Mac, skip only the tests that observe kernel
+  eviction, with a reason; the rest run.
+- Assert that SO_REUSEADDR is non-zero.
+- Make the case-duplicate assertions check the store's refusal and listing, not filesystem
+  existence. Each fix keeps the same tests passing on Linux.
+
+**A Mac behaviour gap found along the way (no change in this release):**
+- `TCP_USER_TIMEOUT` is how the server lets the kernel evict a client that stopped reading
+  (600 s; `streaming.py:42`). macOS has no such option, so on the Mac a stalled reader's
+  connection can stay open longer. The GPU isn't held: the `.wav` route already releases it when
+  generation ends, and the POST route has its own send timeout. Only an idle socket lingers.
+- This is recorded in the docs' list of Mac differences. macOS's `TCP_RXT_CONNDROPTIME` is a
+  possible later equivalent, but it isn't added, because nothing has shown it is needed
+  (Constitution II).
+
 ## Resolved unknowns
 
 | Unknown | Resolution |
@@ -332,3 +371,5 @@ working Linux launcher.
 | How does it plug into the server? | R4 |
 | Speed on a 16 GB M5? | **Unmeasured**. The R7 gate measures it before any build work |
 | Memory minimum and peak? | 16 GB provisional (R5). R7 measures the peak (SC-006) |
+| Do qwen-tts and mlx-audio install together? | R2: yes, measured |
+| Does today's test suite pass on macOS? | R10: no, 17 failures in the tests' Linux assumptions; fixed in scope |
