@@ -40,8 +40,8 @@ was not an MLX or model fault. In curl's `-F` syntax, a value that starts with `
 The captured request body and an instrumented server run showed this. Sending the same text with
 `--form-string` gives a normal-length result, 53 frames at 8-bit.
 
-The broken examples are `docs/api.md:192` and `README.md:173`. The problem is the same on CUDA
-and predates this feature.
+The only example affected is `docs/api.md:192`; no README example passes a value starting with
+`(`. The problem is the same on CUDA and predates this feature.
 
 The same investigation found the MLX path deterministic. A fixed seed gives bit-identical frames
 across fresh processes, with and without a reference.
