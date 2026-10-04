@@ -415,13 +415,13 @@ research R9 and R10. Don't add tests beyond those named in a task.
 
 **Independent Test**: quickstart step 3.
 
-- [ ] T024 [US2] Extend `tests/mlx/test_mlx_server.py` with real-server voice cases:
+- [x] T024 [US2] Extend `tests/mlx/test_mlx_server.py` with real-server voice cases:
   - a clone request with reference audio plus `ref_text` (use a short WAV synthesized by the
     server itself in an earlier step, with its text, so the test needs no external file);
   - a design request (instruction, `cfg_scale=4`);
   - a direction request (reference plus instruction).
   Each returns non-empty audio of plausible length (more than 0.5 s for one sentence).
-- [ ] T025 [US2] Extend `tests/mlx/test_mlx_server.py`, saved voices:
+- [x] T025 [US2] Extend `tests/mlx/test_mlx_server.py`, saved voices:
   - Upload through `/v1/voices`, synthesize with its `voice_id`, restart the server on the same
     `--voices-dir`, and synthesize again.
   - Copy that voice file with `codec_fingerprint` altered, restart, and assert:
