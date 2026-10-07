@@ -14,16 +14,18 @@ def test_defaults_change_nothing():
     speed = MlxSpeedOptions.from_env({})
     assert speed == MlxSpeedOptions()
     assert speed.quantize_parts() == []
-    assert speed.report() == {"quantize": None, "cache_limit_gb": None}
+    assert speed.report() == {"quantize": None, "cache_limit_gb": None, "compile_frame": False}
 
 
 def test_from_env_reads_every_setting():
     speed = MlxSpeedOptions.from_env(
-        {"BREEZE_MLX_QUANT": " depth:8, backbone:4 ", "BREEZE_MLX_GROUP": "32", "BREEZE_MLX_CACHE_GB": "1.5"}
+        {"BREEZE_MLX_QUANT": " depth:8, backbone:4 ", "BREEZE_MLX_GROUP": "32", "BREEZE_MLX_CACHE_GB": "1.5",
+         "BREEZE_MLX_COMPILE": "1"}
     )
     assert speed.quantize_parts() == [("depth", 8), ("backbone", 4)]
     assert speed.group_size == 32
     assert speed.cache_limit_gb == 1.5
+    assert speed.compile_frame
 
 
 @pytest.mark.parametrize("spec", ["depth", "depth:eight", "text_encoder:8", "depth:7", "depth:16"])

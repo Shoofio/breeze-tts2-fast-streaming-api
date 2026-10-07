@@ -81,11 +81,14 @@ class MlxSpeedOptions:
       the backbone exact and makes the frame loop about 30 % faster.
     - `cache_limit_gb` (BREEZE_MLX_CACHE_GB): cap MLX's buffer cache, which otherwise keeps every
       freed buffer for reuse and grew to ~6 GB after a few requests.
+    - `compile_frame` (BREEZE_MLX_COMPILE=1): run each frame's sampling and its 15 depth-decoder
+      steps as one `mx.compile` graph (see `_frame_function`).
     """
 
     quantize: str = ""
     group_size: int = 64
     cache_limit_gb: float | None = None
+    compile_frame: bool = False
 
     def __post_init__(self) -> None:
         for name, bits in self.quantize_parts():
@@ -113,11 +116,12 @@ class MlxSpeedOptions:
             quantize=env.get("BREEZE_MLX_QUANT", "").strip(),
             group_size=int(env.get("BREEZE_MLX_GROUP", "64")),
             cache_limit_gb=float(cache) if cache else None,
+            compile_frame=env.get("BREEZE_MLX_COMPILE", "") == "1",
         )
 
     def report(self) -> dict[str, Any]:
         """The `speed` field of the `model.loaded` event."""
-        return {"quantize": self.quantize or None, "cache_limit_gb": self.cache_limit_gb}
+        return {"quantize": self.quantize or None, "cache_limit_gb": self.cache_limit_gb, "compile_frame": self.compile_frame}
 
 
 def quantize_parts(mlx_model: Any, speed: MlxSpeedOptions) -> None:
@@ -464,10 +468,12 @@ class _Generation:
         repetition_penalty: float,
         seed: int | None,
         prefix: MlxReferencePrefix | None = None,
+        compile_frame: bool = False,
     ) -> None:
         import mlx.core as mx
 
         self._model = model
+        self._compile_frame = compile_frame
         self._guidance = guidance
         self._backbone_sampling = backbone_sampling
         self._depth_sampling = depth_sampling
@@ -543,6 +549,9 @@ class _Generation:
         frame loop's one host read covers them."""
         import mlx.core as mx
 
+        if self._compile_frame:
+            fn = _frame_function(self._model, self._backbone_sampling, self._depth_sampling, self._repetition_penalty)
+            return fn(self._hidden, self._seen, mx.array(self._guidance, dtype=mx.float32), self._next_key())
         first, backbone_ok = _sample(
             self.backbone_logits(), self._next_key(), self._backbone_sampling
         )
@@ -576,6 +585,89 @@ class _Generation:
 
         self._seen = self._seen | (mx.arange(self._seen.shape[0]) == codes[0])
         self._hidden = _backbone_step(self._model.backbone_model, self._cache, codes)
+
+
+def _frame_function(
+    model: Any,
+    backbone_sampling: Sampling,
+    depth_sampling: Sampling,
+    penalty: float,
+    *,
+    forced: bool = False,
+    compiled: bool = True,
+) -> Callable[..., Any]:
+    """`_Generation.frame` as one function of (hidden, seen, guidance, key), for `mx.compile`.
+
+    A frame is a few thousand small kernels built from Python (the backbone's head, CFG, the
+    repetition penalty, then 15 depth-decoder steps of 12 layers, each with its sampler). Compiled,
+    the graph is traced once per row count (1 plain, 2 under CFG) and replayed with the elementwise
+    ops fused. Under CFG the logits are identical to the uncompiled graph's; on a plain line the
+    fused graph rounds differently in bf16 (KL ~6e-5, ~100x below the int8 depth decoder's change).
+    The random stream is not the stock path's (one key per frame, split 16 ways); the distribution
+    is the same.
+
+    `forced=True` is the check variant: it takes the frame's codes as a fifth argument, feeds
+    those instead of its own draws, and also returns every depth step's guided logits.
+    Cached on the model per settings.
+    """
+    import mlx.core as mx
+    from mlx_audio.lm.models.cache import KVCache
+
+    cache = model.__dict__.setdefault("_frame_functions", {})
+    key = (backbone_sampling, depth_sampling, penalty, forced, compiled)
+    if key in cache:
+        return cache[key]
+    decoder = model.depth_decoder.model
+    heads = model.depth_decoder.codebooks_head.weight
+    last = model.num_codebooks - 1
+
+    def guided(logits: Any, guidance: Any) -> Any:
+        logits = logits.astype(mx.float32)
+        if logits.shape[0] == 1:
+            return logits
+        return logits[1:] + guidance * (logits[:1] - logits[1:])
+
+    def frame(hidden: Any, seen: Any, guidance: Any, rng: Any, given: Any = None) -> Any:
+        rows = hidden.shape[0]
+        keys = mx.random.split(rng, last + 1)
+        logits = guided(model.lm_head(hidden), guidance)
+        if penalty != 1.0:
+            logits = mx.where(seen, mx.where(logits > 0, logits / penalty, logits * penalty), logits)
+        first, backbone_ok = _sample(model._mask_reserved_codec_logits(logits), keys[0], backbone_sampling)
+        if given is not None:
+            first = given[:1]
+
+        def embed(code: Any, codebook: int) -> Any:
+            e = decoder.embed_tokens(code + codebook * decoder.vocab_size)
+            return mx.broadcast_to(e[None], (rows, 1, e.shape[-1]))
+
+        if decoder.backbone_hidden_state_projector is not None:
+            hidden = decoder.backbone_hidden_state_projector(hidden)
+        x = decoder.inputs_embeds_projector(mx.concatenate([hidden[:, None, :], embed(first, 0)], axis=1))
+        caches = [KVCache() for _ in decoder.layers]
+        mask: str | None = "causal"
+        codes, sampleable, step_logits = [first], [], []
+        for codebook in range(1, last + 1):
+            for layer, layer_cache in zip(decoder.layers, caches):
+                x = layer(x, mask, layer_cache)
+            step = guided(decoder.norm(x)[:, -1, :] @ heads[codebook - 1], guidance)
+            code, ok = _sample(model._mask_reserved_codec_logits(step), keys[codebook], depth_sampling)
+            if given is not None:
+                step_logits.append(step)
+                code = given[codebook : codebook + 1]
+            codes.append(code)
+            sampleable.append(ok)
+            if codebook < last:
+                x = decoder.inputs_embeds_projector(embed(code, codebook))
+                mask = None
+        flags = mx.where(mx.all(backbone_ok), 0, _BACKBONE_NONFINITE) + mx.where(
+            mx.all(mx.concatenate(sampleable)), 0, _DEPTH_NONFINITE
+        )
+        out = mx.concatenate([*codes, flags[None]]).astype(mx.int32)
+        return (out, mx.concatenate(step_logits)) if given is not None else out
+
+    cache[key] = mx.compile(frame) if compiled else frame
+    return cache[key]
 
 
 class _DepthSteps:
@@ -832,6 +924,7 @@ class MlxBreezeStreamingRuntime:
                 repetition_penalty=penalty,
                 seed=seed,
                 prefix=prefix,
+                compile_frame=self.speed.compile_frame,
             )
             yield from self._stream(generation, frames, token_observer)
         finally:
