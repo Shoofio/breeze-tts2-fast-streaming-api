@@ -151,11 +151,15 @@ It also fixes a streaming bug in the pinned mlx-audio that made the decoded audi
 
 Measured on an Apple M4 Pro (14-core CPU, 20-core GPU, 48 GB) with `scripts/bench_mac.py`: 24 lines of one to four Harvard sentences, two in three with a voice direction at CFG 2, a 24 s LibriSpeech reference (speaker 1272, dev-clean `1272-128104-0000` to `-0002`, CC BY 4.0) registered once. "Stall-free start" is the first audio plus any buffer playback needs so it never runs dry: `8bit` and `mixed` needed none on any line; `bf16`, at RTF 0.86, needed ~70 ms on every line (its default 25-frame chunks starve playback outright, hence `--chunk-max 4`).
 
-| Precision | Stall-free start, plain / directed (median) | RTF, directed | Memory |
+| Build | Stall-free start, plain / directed (median) | RTF, directed | Memory |
 | --- | --- | --- | --- |
+| BreezeBlue's PyTorch, bf16, on the Mac GPU (`model.generate`; its streaming path is CUDA-only) | no streaming: a one-sentence line takes ~6 s | 2.26 (plain lines) | 11 GB |
 | `8bit` (default) | 212 / 297 ms | 0.58 | 13 GB |
 | `bf16` (`--chunk-max 4`) | 380 / 456 ms | 0.86 | 15 GB |
 | `mixed` | 139 / 206 ms | 0.62 | 8.9 GB |
+| *For reference: RTX 3090 (power-capped at 250 W of 350 W), BreezeBlue's CUDA fast path via a small server wrapper, re-processing the reference on every line* | *87 / 160 ms* | *0.50* | *19.7 GB VRAM + 4 GB RAM* |
+
+On the same Mac, BreezeBlue's own PyTorch code runs at RTF 2.26 (over twice slower than real time) and can't stream; `mixed` is ~3.6x faster and streams its first audio in 139 / 206 ms. For scale, a power-capped RTX 3090 running BreezeBlue's CUDA fast path measured 87 / 160 ms in our setup. The MLX builds' memory includes MLX's buffer cache, uncapped in `8bit` and `bf16` (hence 13 GB for `8bit`) and capped at 1 GB in `mixed`.
 
 Quality against bf16, measured with `scripts/mlx_fidelity.py` (the same tokens through both models; KL of the samplers' logits, lower is closer):
 
