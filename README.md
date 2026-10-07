@@ -3,6 +3,9 @@
 > [!IMPORTANT]
 > This is an independent derivative of [breezeblue-ai/breeze-tts](https://github.com/breezeblue-ai/breeze-tts). It is not affiliated with or endorsed by BreezeBlue. The code is Apache 2.0. The Breeze TTS 2 model weights, derivative models and self-hosted outputs are under the [BreezeBlue Research and Non-Commercial License](https://huggingface.co/BreezeBlue/Breeze-TTS-2/blob/main/LICENSE): research and non-commercial use only. See [License and responsible use](#license-and-responsible-use).
 
+> [!NOTE]
+> This fork of [northcraftfoundries/breeze-tts2-fast-streaming-api](https://github.com/northcraftfoundries/breeze-tts2-fast-streaming-api) adds real-time streaming on Apple Silicon: first audio ~140 ms (plain) / ~210 ms (with a voice direction) on an M4 Pro. See [Real time on Apple Silicon](#real-time-on-apple-silicon---precision-mixed).
+
 ## What this is
 
 Breeze TTS 2 is an open-weight text-to-speech model by BreezeBlue. This repository takes the upstream PyTorch inference code and adds a streaming HTTP and WebSocket server around it.
@@ -132,6 +135,8 @@ An RTF below 1 means audio is produced faster than it plays. bf16 is slower than
 uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx --revision 3c8829fb7fd335818f085cd2ef49b4100c0e46c8
 scripts/start_breeze_mac.sh --precision mixed [server options...]
 ```
+
+The same model is also a ready-made checkpoint, [Shoof/Gust-MLX](https://huggingface.co/Shoof/Gust-MLX) (made with `scripts/make_mixed_checkpoint.py`, verified tensor-for-tensor): pass its directory to `python -m breeze_infer.api` and the server loads it as weights `mixed`.
 
 `mixed` loads the bf16 weights and turns on four settings, each also available on its own (`MlxSpeedOptions` in `models/mlx_streaming.py`):
 
