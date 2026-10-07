@@ -891,6 +891,39 @@ def _load_generation_configs(path: Path) -> tuple[Any, Any]:
     return model.generation_config, model.depth_decoder.generation_config
 
 
+def patch_codec_overlap_bias() -> None:
+    """Make mlx-audio's streaming codec decode independent of the chunk size.
+
+    `DecoderBlockUpsample.step` (the decoder blocks' ConvTranspose1d, kernel = 2 x stride) keeps
+    the last `trim_right` samples of each chunk's output and adds them to the start of the next
+    chunk's output. Both include the conv bias, so every chunk boundary got the bias twice, and
+    the streamed audio differed from a one-shot decode (up to 0.63 of full scale at one frame per
+    chunk, 0.21 at two, mostly in an utterance's first frames). This carries the tail without
+    its bias. Fixed upstream in Blaizzy/mlx-audio#1003; the pinned mlx-audio predates it, and the
+    replacement is still correct once it is fixed there. Idempotent.
+    """
+    from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import DecoderBlockUpsample
+
+    if getattr(DecoderBlockUpsample.step, "_bias_once", False):
+        return
+
+    def step(self: Any, x: Any) -> Any:
+        import mlx.core as mx
+
+        y = self.conv(x)
+        if self._overflow is not None:
+            n = self._overflow.shape[1]
+            y = mx.concatenate([y[:, :n, :] + self._overflow, y[:, n:, :]], axis=1)
+        if self.trim_right > 0:
+            tail = y[:, -self.trim_right :, :]
+            self._overflow = tail - self.conv.bias if "bias" in self.conv else tail
+            y = y[:, : -self.trim_right, :]
+        return y
+
+    step._bias_once = True  # type: ignore[attr-defined]
+    DecoderBlockUpsample.step = step
+
+
 def load_mlx_runtime(path: Path) -> MlxBreezeStreamingRuntime:
     """Load an MLX Breeze checkpoint (bf16 or mxfp8) into a runtime."""
     from mlx_audio.tts.utils import load
@@ -899,6 +932,7 @@ def load_mlx_runtime(path: Path) -> MlxBreezeStreamingRuntime:
     # mlx-audio's Breeze loader validates the weights and, in its post-load hook, loads the
     # codec from `path / "audio_tokenizer"` with its strict codec-weights check.
     mlx_model = load(path)
+    patch_codec_overlap_bias()
     # AutoTokenizer loads the MLX checkpoint directly with transformers 4.57.3, which this
     # backend pins (research R2): `tokenizer_config.json` names `GemmaTokenizerFast`, so the
     # unknown `breeze_tts` model type never comes into it. The files are the official ones
