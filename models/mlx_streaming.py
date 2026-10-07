@@ -83,12 +83,16 @@ class MlxSpeedOptions:
       freed buffer for reuse and grew to ~6 GB after a few requests.
     - `compile_frame` (BREEZE_MLX_COMPILE=1): run each frame's sampling and its 15 depth-decoder
       steps as one `mx.compile` graph (see `_frame_function`).
+    - `fast_first_frames` (BREEZE_MLX_FAST_FIRST, e.g. 6): send the first N frames one at a time,
+      each decoded before the next frame is queued (see `_stream`). With --chunk-first 1 and
+      --chunk-max 1 the first audio comes ~2 frames sooner (~90 ms on an M4 Pro).
     """
 
     quantize: str = ""
     group_size: int = 64
     cache_limit_gb: float | None = None
     compile_frame: bool = False
+    fast_first_frames: int = 0
 
     def __post_init__(self) -> None:
         for name, bits in self.quantize_parts():
@@ -117,11 +121,13 @@ class MlxSpeedOptions:
             group_size=int(env.get("BREEZE_MLX_GROUP", "64")),
             cache_limit_gb=float(cache) if cache else None,
             compile_frame=env.get("BREEZE_MLX_COMPILE", "") == "1",
+            fast_first_frames=int(env.get("BREEZE_MLX_FAST_FIRST", "0") or 0),
         )
 
     def report(self) -> dict[str, Any]:
         """The `speed` field of the `model.loaded` event."""
-        return {"quantize": self.quantize or None, "cache_limit_gb": self.cache_limit_gb, "compile_frame": self.compile_frame}
+        return {"quantize": self.quantize or None, "cache_limit_gb": self.cache_limit_gb, "compile_frame": self.compile_frame,
+                "fast_first_frames": self.fast_first_frames}
 
 
 def quantize_parts(mlx_model: Any, speed: MlxSpeedOptions) -> None:
@@ -956,6 +962,29 @@ class MlxBreezeStreamingRuntime:
         for step in range(frames):
             last = step == frames - 1
             codes = frame[:-1]
+            if step < self.speed.fast_first_frames and not last:
+                # The opening frames, one by one: read, decode and hand over each before queuing the
+                # next. MLX runs work in submission order, so a frame queued first would sit in front
+                # of the decode. Each costs a host round trip, so only until playback has a lead;
+                # then the pipelined path below, whose chunks arrive a frame later. The audio is the
+                # same either way (the codec decode is chunk-size independent, patch_codec_overlap_bias).
+                host = np.array(frame)
+                flags, host = int(host[-1]), host[:-1]
+                if flags & _BACKBONE_NONFINITE:
+                    raise NonFiniteLogitsError(f"backbone {_NONFINITE_MESSAGE}")
+                if int(host[0]) == eos:
+                    break
+                if flags & _DEPTH_NONFINITE:
+                    raise NonFiniteLogitsError(f"depth decoder {_NONFINITE_MESSAGE}")
+                if token_observer is not None:
+                    token_observer(torch.from_numpy(host.astype(np.int64)))
+                generation.advance(codes)
+                audio = None if (host == pad).all() else self._decode([codes])
+                frame = generation.frame()
+                mx.async_eval(frame)
+                if audio is not None:
+                    yield self._chunk(*audio, is_final=False)
+                continue
             if not last:
                 generation.advance(codes)
                 next_frame = generation.frame()

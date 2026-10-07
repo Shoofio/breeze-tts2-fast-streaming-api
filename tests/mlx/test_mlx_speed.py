@@ -88,3 +88,25 @@ def test_compiled_frames_stream_audio(mlx_runtime):
     audio = np.concatenate([c.audio for c in chunks])
     assert audio.size > 0 and np.isfinite(audio).all()
     assert chunks[-1].is_final
+
+
+def _audio(runtime, speed, inputs):
+    previous, runtime.speed = runtime.speed, speed
+    try:
+        chunks = list(runtime.iter_audio_chunks(inputs, seed=42, max_new_tokens=3 * FRAMES))
+    finally:
+        runtime.speed = previous
+    return chunks
+
+
+@pytest.mark.parametrize("cfg_scale", [1.0, 2.0], ids=["plain", "cfg"])
+def test_fast_first_frames_give_the_same_audio(mlx_runtime, cfg_scale):
+    """The opening frames sent one by one: the first chunk is one frame, and the audio equals the pipelined path's."""
+    inputs = _inputs(mlx_runtime, cfg_scale)
+    stock = _audio(mlx_runtime, dataclasses.replace(mlx_runtime.speed, fast_first_frames=0), inputs)
+    fast = _audio(mlx_runtime, dataclasses.replace(mlx_runtime.speed, fast_first_frames=6), inputs)
+    assert fast[0].codec_frames == 1
+    a, b = (np.concatenate([c.audio for c in chunks]) for chunks in (stock, fast))
+    assert a.shape == b.shape
+    np.testing.assert_allclose(a, b, atol=1e-4)
+
