@@ -18,6 +18,10 @@ MXFP4 = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
         ({"model_type": "breeze"}, CheckpointKind("pytorch", "bf16")),
         ({"model_type": "breeze_tts"}, CheckpointKind("mlx", "bf16")),
         ({"model_type": "breeze_tts", "quantization": MXFP8}, CheckpointKind("mlx", "8bit")),
+        (
+            {"model_type": "breeze_tts", "quantization": {"group_size": 64, "bits": 8, "mode": "affine"}},
+            CheckpointKind("mlx", "mixed"),
+        ),
     ],
 )
 def test_supported_checkpoints(config: dict[str, Any], expected: CheckpointKind) -> None:
@@ -29,7 +33,7 @@ def test_unsupported_quantization_is_refused() -> None:
     with pytest.raises(ValueError) as refused:
         checkpoint_kind(config, "snap")
     assert str(refused.value) == (
-        "snap is 4-bit mxfp4; the MLX backend supports bf16 and 8-bit (mxfp8)"
+        "snap is 4-bit mxfp4; the MLX backend supports bf16, 8-bit (mxfp8) and mixed (affine 8-bit)"
     )
 
 
@@ -41,5 +45,5 @@ def test_unknown_model_type_is_refused(config: dict[str, Any]) -> None:
 
 @pytest.mark.parametrize("quantization", [True, 8, "mxfp8"])
 def test_a_non_mapping_quantization_is_refused_not_a_crash(quantization: object) -> None:
-    with pytest.raises(ValueError, match="the MLX backend supports bf16 and 8-bit"):
+    with pytest.raises(ValueError, match="the MLX backend supports bf16, 8-bit"):
         checkpoint_kind({"model_type": "breeze_tts", "quantization": quantization})

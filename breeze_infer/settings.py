@@ -84,7 +84,7 @@ class CheckpointKind:
     """What a checkpoint directory holds, from its ``config.json``."""
 
     format: Literal["pytorch", "mlx"]
-    weights: Literal["bf16", "8bit"]
+    weights: Literal["bf16", "8bit", "mixed"]
 
 
 def checkpoint_kind(config: dict[str, Any], directory: Path | str = "checkpoint") -> CheckpointKind:
@@ -109,9 +109,13 @@ def checkpoint_kind(config: dict[str, Any], directory: Path | str = "checkpoint"
         quantization = {}
     if quantization.get("bits") == 8 and quantization.get("mode") == "mxfp8":
         return CheckpointKind("mlx", "8bit")
+    # scripts/make_mixed_checkpoint.py: bf16 with the depth decoder's linear layers in affine int8
+    # (mlx-audio quantizes exactly the layers whose weights come with scales).
+    if quantization.get("bits") == 8 and quantization.get("mode", "affine") == "affine":
+        return CheckpointKind("mlx", "mixed")
     raise ValueError(
         f"{directory} is {quantization.get('bits')}-bit {quantization.get('mode')}; "
-        "the MLX backend supports bf16 and 8-bit (mxfp8)"
+        "the MLX backend supports bf16, 8-bit (mxfp8) and mixed (affine 8-bit)"
     )
 
 
@@ -152,7 +156,7 @@ class Settings:
     attn_implementation: str
     compile_cache_dir: Path | None
     backend: Literal["cuda", "mlx"]
-    weights: Literal["bf16", "8bit"]
+    weights: Literal["bf16", "8bit", "mixed"]
 
 
 # --port and --ws-port must be plain unsigned integers: no leading '+' or
@@ -402,7 +406,7 @@ def _check_checkpoint(
     parser: argparse.ArgumentParser,
     model_path: Path,
     backend: Literal["cuda", "mlx"],
-) -> Literal["bf16", "8bit"]:
+) -> Literal["bf16", "8bit", "mixed"]:
     """Refuse a checkpoint that doesn't match the backend; return its weight precision.
 
     The CUDA path stays as lenient as it was before this check existed: a missing or odd

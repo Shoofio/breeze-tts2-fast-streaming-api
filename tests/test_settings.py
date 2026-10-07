@@ -818,7 +818,7 @@ def test_mlx_checkpoint_with_unsupported_quantization_is_refused(
     )
     err = _refusal([str(tmp_path)], capsys, platform=MAC)
     assert (
-        f"error: {tmp_path} is 4-bit mxfp4; the MLX backend supports bf16 and 8-bit (mxfp8)"
+        f"error: {tmp_path} is 4-bit mxfp4; the MLX backend supports bf16, 8-bit (mxfp8) and mixed (affine 8-bit)"
         in err
     )
 

@@ -37,7 +37,7 @@ below are the `<message>` part.
 | backend is `mlx`, and `{dir}/config.json` is missing or not a JSON object | `{dir} has no readable config.json; --backend mlx needs the MLX weights: uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx-8bit --revision c6e4a2ff6ab9afba68b7853de802273ffe23fb49` |
 | backend is `mlx`, and `model_type` is neither `breeze` nor `breeze_tts` | `{dir} has model_type {value!r}; expected 'breeze' (PyTorch) or 'breeze_tts' (MLX)` |
 | checkpoint is MLX-format, backend is `cuda` | `{dir} holds MLX weights; --backend cuda needs: uvx --from huggingface_hub hf download BreezeBlue/Breeze-TTS-2` |
-| MLX checkpoint with unsupported quantization | `{dir} is {bits}-bit {mode}; the MLX backend supports bf16 and 8-bit (mxfp8)` |
+| MLX checkpoint with unsupported quantization | `{dir} is {bits}-bit {mode}; the MLX backend supports bf16, 8-bit (mxfp8) and mixed (affine 8-bit)` |
 
 CUDA-only options: `--fast-all`, `--no-fast-all`, `--fast-text-encoder`,
 `--fast-backbone-prefill`, `--fast-backbone-decode`, `--fast-depth-decoder`, `--fast-codec`
