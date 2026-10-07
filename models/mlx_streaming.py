@@ -131,13 +131,20 @@ class MlxSpeedOptions:
 
 
 def quantize_parts(mlx_model: Any, speed: MlxSpeedOptions) -> None:
-    """Quantize the parts `speed.quantize` names, in place (no-op when it names none)."""
+    """Quantize the linear layers of the parts `speed.quantize` names, in place (no-op when it names none).
+
+    Embeddings stay as they are: they are row lookups (no bandwidth to save), and the depth decoder's
+    audio embedding is the backbone's too (mlx-audio's Breeze loader copies it across), so a saved
+    checkpoint must keep it unquantized for the backbone to load.
+    """
     import mlx.core as mx
     from mlx import nn
 
     modules = {"backbone": mlx_model.backbone_model, "depth": mlx_model.depth_decoder}
     for name, bits in speed.quantize_parts():
-        nn.quantize(modules[name], group_size=speed.group_size, bits=bits)
+        nn.quantize(
+            modules[name], group_size=speed.group_size, bits=bits, class_predicate=lambda _, m: isinstance(m, nn.Linear)
+        )
         mx.eval(modules[name].parameters())
 
 

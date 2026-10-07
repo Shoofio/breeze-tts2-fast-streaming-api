@@ -39,8 +39,12 @@ def test_quantize_parts_touches_only_the_named_part():
     pytest.importorskip("mlx.core")
     from mlx import nn
 
-    model = SimpleNamespace(backbone_model=nn.Sequential(nn.Linear(64, 64)), depth_decoder=nn.Sequential(nn.Linear(64, 64)))
+    model = SimpleNamespace(
+        backbone_model=nn.Sequential(nn.Linear(64, 64)),
+        depth_decoder=nn.Sequential(nn.Linear(64, 64), nn.Embedding(32, 64)),
+    )
     quantize_parts(model, MlxSpeedOptions(quantize="depth:8"))
     assert isinstance(model.depth_decoder.layers[0], nn.QuantizedLinear)
     assert model.depth_decoder.layers[0].bits == 8
+    assert type(model.depth_decoder.layers[1]) is nn.Embedding  # lookups stay exact
     assert type(model.backbone_model.layers[0]) is nn.Linear
