@@ -65,6 +65,72 @@ class Sampling(NamedTuple):
     do_sample: bool
 
 
+_QUANT_PARTS = ("backbone", "depth")
+_QUANT_BITS = (2, 3, 4, 5, 6, 8)
+
+
+@dataclass(frozen=True)
+class MlxSpeedOptions:
+    """Opt-in speed settings for the MLX runtime, read from the environment by `from_env`.
+
+    The frame loop is memory-bound on Apple Silicon: each frame reads the backbone once and the
+    depth decoder 15 times, so the depth decoder is about three quarters of the bytes moved.
+
+    - `quantize` (BREEZE_MLX_QUANT, e.g. "depth:8" or "depth:8,backbone:8"): quantize those parts
+      of a bf16 checkpoint at load, affine, `group_size` (BREEZE_MLX_GROUP, 64). "depth:8" keeps
+      the backbone exact and makes the frame loop about 30 % faster.
+    - `cache_limit_gb` (BREEZE_MLX_CACHE_GB): cap MLX's buffer cache, which otherwise keeps every
+      freed buffer for reuse and grew to ~6 GB after a few requests.
+    """
+
+    quantize: str = ""
+    group_size: int = 64
+    cache_limit_gb: float | None = None
+
+    def __post_init__(self) -> None:
+        for name, bits in self.quantize_parts():
+            if name not in _QUANT_PARTS or bits not in _QUANT_BITS:
+                raise ValueError(
+                    f"BREEZE_MLX_QUANT: {name}:{bits} is not one of {_QUANT_PARTS} with bits {_QUANT_BITS}"
+                )
+
+    def quantize_parts(self) -> list[tuple[str, int]]:
+        parts = []
+        for item in filter(None, (s.strip() for s in self.quantize.split(","))):
+            name, _, bits = item.partition(":")
+            if not bits.isdigit():
+                raise ValueError(f"BREEZE_MLX_QUANT: {item!r} is not part:bits, e.g. depth:8")
+            parts.append((name, int(bits)))
+        return parts
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> MlxSpeedOptions:
+        import os
+
+        env = os.environ if env is None else env
+        cache = env.get("BREEZE_MLX_CACHE_GB", "").strip()
+        return cls(
+            quantize=env.get("BREEZE_MLX_QUANT", "").strip(),
+            group_size=int(env.get("BREEZE_MLX_GROUP", "64")),
+            cache_limit_gb=float(cache) if cache else None,
+        )
+
+    def report(self) -> dict[str, Any]:
+        """The `speed` field of the `model.loaded` event."""
+        return {"quantize": self.quantize or None, "cache_limit_gb": self.cache_limit_gb}
+
+
+def quantize_parts(mlx_model: Any, speed: MlxSpeedOptions) -> None:
+    """Quantize the parts `speed.quantize` names, in place (no-op when it names none)."""
+    import mlx.core as mx
+    from mlx import nn
+
+    modules = {"backbone": mlx_model.backbone_model, "depth": mlx_model.depth_decoder}
+    for name, bits in speed.quantize_parts():
+        nn.quantize(modules[name], group_size=speed.group_size, bits=bits)
+        mx.eval(modules[name].parameters())
+
+
 class _PromptKeys(NamedTuple):
     """The template keys (`templates._collate_inputs`) that make up one backbone row."""
 
@@ -587,8 +653,10 @@ class MlxBreezeStreamingRuntime:
         generation_config: Mapping[str, Any],
         backbone_sampling: Sampling | None = None,
         depth_sampling: Sampling | None = None,
+        speed: MlxSpeedOptions | None = None,
     ) -> None:
         self._mlx_model = mlx_model
+        self.speed = speed or MlxSpeedOptions()
         self._codec = codec
         self._backbone_sampling = backbone_sampling
         self._depth_sampling = depth_sampling
@@ -924,15 +992,22 @@ def patch_codec_overlap_bias() -> None:
     DecoderBlockUpsample.step = step
 
 
-def load_mlx_runtime(path: Path) -> MlxBreezeStreamingRuntime:
-    """Load an MLX Breeze checkpoint (bf16 or mxfp8) into a runtime."""
+def load_mlx_runtime(path: Path, speed: MlxSpeedOptions | None = None) -> MlxBreezeStreamingRuntime:
+    """Load an MLX Breeze checkpoint (bf16 or mxfp8) into a runtime, with `speed`
+    (default: `MlxSpeedOptions.from_env()`)."""
+    import mlx.core as mx
     from mlx_audio.tts.utils import load
     from transformers import AutoTokenizer
 
+    speed = MlxSpeedOptions.from_env() if speed is None else speed
+    if speed.cache_limit_gb is not None:
+        mx.set_cache_limit(int(speed.cache_limit_gb * 1e9))
     # mlx-audio's Breeze loader validates the weights and, in its post-load hook, loads the
     # codec from `path / "audio_tokenizer"` with its strict codec-weights check.
     mlx_model = load(path)
     patch_codec_overlap_bias()
+    quantize_parts(mlx_model, speed)
+    mx.clear_cache()
     # AutoTokenizer loads the MLX checkpoint directly with transformers 4.57.3, which this
     # backend pins (research R2): `tokenizer_config.json` names `GemmaTokenizerFast`, so the
     # unknown `breeze_tts` model type never comes into it. The files are the official ones
@@ -949,4 +1024,5 @@ def load_mlx_runtime(path: Path) -> MlxBreezeStreamingRuntime:
         generation_config=backbone.to_dict(),
         backbone_sampling=_sampling(backbone),
         depth_sampling=_sampling(depth),
+        speed=speed,
     )

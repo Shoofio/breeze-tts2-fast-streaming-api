@@ -155,5 +155,6 @@ def _load_mlx_model(settings: Settings, device: str) -> LoadedModel:
         "warmup_ms": round(warmup_ms, 2),
         "fx_graph_cache_hits": None,
         "fx_graph_cache_misses": None,
+        "speed": runtime.speed.report(),
     }
     return LoadedModel.from_runtime(runtime, report)
