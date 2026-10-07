@@ -119,14 +119,18 @@ def test_prefix_matches_inline_reference_teacher_forced(mlx_runtime, reference_c
     comparison = Comparison()
     eos_steps: list[int | None] = [None, None]
     for step, frame in enumerate([*recorded, None]):
-        tops = comparison.add(step, "backbone", *(path.backbone_logits() for path in paths))
+        logits = [path.backbone_logits() for path in paths]
+        tops = comparison.add(step, "backbone", *logits)
         for index, top in enumerate(tops):
             if top == eos and eos_steps[index] is None:
                 eos_steps[index] = step
         if frame is None:
             break
-        # The replay is the recorded run: the inline path's argmax is the token it took.
-        assert tops[0] == frame[0], step
+        # The replay is the recorded run: the token it took is the inline path's argmax, or tied
+        # with it (top_k 1 keeps every token tied for the top logit and the draw picks among them;
+        # argmax takes the lowest index).
+        inline_logits = as_numpy(logits[0])[0]
+        assert inline_logits[frame[0]] == inline_logits.max(), step
         steps = [path.depth_steps(mx.array(frame[:1])) for path in paths]
         last = len(frame) - 1
         for codebook in range(1, last + 1):
