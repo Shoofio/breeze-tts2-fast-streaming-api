@@ -65,8 +65,11 @@ differs:
   `<options> only apply to --backend cuda; remove them`. The server also refuses `--backend mlx`
   on anything but an Apple Silicon Mac, and on a Mac with less than 16 GB of memory.
 - **The weights must be MLX weights.** The PyTorch checkpoint is refused with the download
-  command. The server reads bf16 or 8-bit from the checkpoint itself; there is no precision
-  option, and other quantizations are refused.
+  command. The server reads bf16, 8-bit (mxfp8) or mixed (affine 8-bit, from
+  `scripts/make_mixed_checkpoint.py`) from the checkpoint itself, and other checkpoint
+  quantizations are refused. `BREEZE_MLX_QUANT` (e.g. `depth:8`) quantizes parts of a bf16
+  checkpoint at load instead; it and the other `BREEZE_MLX_*` speed settings are described in the
+  README's [Real time on Apple Silicon](../README.md#real-time-on-apple-silicon---precision-mixed).
 - **A stalled reader is not evicted by the kernel.** On Linux the server also sets
   `TCP_USER_TIMEOUT`, so the kernel drops the socket of a client that stops reading. macOS has no
   such option, so the server doesn't set it. The application limits are the same on both
@@ -84,9 +87,11 @@ differs:
   do load on either backend, but each backend encodes reference audio slightly differently, so a
   voice saved on one may sound slightly different on the other.
 - **`model.loaded` has two more fields, and some are null.** The startup log event gains
-  `backend` (`"cuda"` or `"mlx"`) and `weights` (`"bf16"` or `"8bit"`; always `"bf16"` on CUDA).
+  `backend` (`"cuda"` or `"mlx"`) and `weights` (`"bf16"`, `"8bit"` or `"mixed"`; always `"bf16"` on CUDA).
   On the MLX backend `device` is `"mlx:gpu"`, and `compile_cache_dir`, `torch_key`,
-  `fx_graph_cache_hits` and `fx_graph_cache_misses` are `null`. `model.load_failed` is unchanged.
+  `fx_graph_cache_hits` and `fx_graph_cache_misses` are `null`, and `speed` holds the MLX speed
+  settings (`quantize`, `cache_limit_gb`, `compile_frame`, `fast_first_frames`).
+  `model.load_failed` is unchanged.
   `GET /health` is unchanged.
 - **Speed and memory.** Measured on an Apple M5 with 16 GB. The speed columns give the range of
   the per-case medians (10 runs each) over the five benchmark cases; the slowest single first

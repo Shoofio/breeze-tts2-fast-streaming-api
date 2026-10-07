@@ -112,7 +112,7 @@ uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx --revision
 Then, from a clone of this repository:
 
 ```bash
-scripts/start_breeze_mac.sh [--precision 8bit|bf16] [server options...]
+scripts/start_breeze_mac.sh [--precision 8bit|bf16|mixed] [server options...]
 ```
 
 The precision defaults to `8bit`. If the Python environment lacks `mlx`, the launcher installs the dependencies with `requirements-mac-overrides.txt`. It looks for the pinned snapshot in the HuggingFace cache (`$HF_HOME`, default `~/.cache/huggingface`), and if it is missing it prints the download command above and exits. It has the same defaults as `start_breeze.sh`: `0.0.0.0:8080` and CORS `*`. It doesn't pass `--fast-all`, which is CUDA-only. Extra arguments go to the server, and a later `--host` or `--cors` overrides the launcher's value. The warning under [Quick start (Linux / WSL)](#quick-start-linux--wsl) about the open defaults applies here too: pass `--host 127.0.0.1` to keep the server local.
@@ -125,6 +125,41 @@ Measured on an Apple M5 with 16 GB with a browser and an editor open. The speed 
 | bf16 | 0.49–0.55 s | 1.47–1.50 | 9.7 GB |
 
 An RTF below 1 means audio is produced faster than it plays. bf16 is slower than real time on this machine, so streamed audio can't keep up with playback, and its memory use pushed the Mac into swap during the run. Use 8-bit on a 16 GB Mac. The details are in `specs/005-mlx-mac-inference/research/live-perf.md`.
+
+### Real time on Apple Silicon: `--precision mixed`
+
+```bash
+uvx --from huggingface_hub hf download mlx-community/Breeze-TTS-2-mlx --revision 3c8829fb7fd335818f085cd2ef49b4100c0e46c8
+scripts/start_breeze_mac.sh --precision mixed [server options...]
+```
+
+`mixed` loads the bf16 weights and turns on four settings, each also available on its own (`MlxSpeedOptions` in `models/mlx_streaming.py`):
+
+| Setting | What it does |
+| --- | --- |
+| `BREEZE_MLX_QUANT=depth:8` | Quantizes only the depth decoder to int8 at load. The frame loop is memory-bound: each frame reads the backbone once and the depth decoder 15 times, so the depth decoder is about three quarters of the bytes. The backbone, which sets prosody and is where a voice direction lands, stays exact. |
+| `BREEZE_MLX_COMPILE=1` | Runs each frame's sampling and its 15 depth-decoder steps as one `mx.compile` graph. |
+| `BREEZE_MLX_FAST_FIRST=6` | Sends the first six frames one at a time, each decoded before the next frame is queued, with `--chunk-first 1 --chunk-max 1`. The first audio no longer waits for three frames. |
+| `BREEZE_MLX_CACHE_GB=1` | Caps MLX's buffer cache, which otherwise kept ~6 GB of freed buffers. |
+
+It also fixes a streaming bug in the pinned mlx-audio that made the decoded audio depend on the chunk size (the transposed convolutions' bias was added twice at every chunk boundary, worst in an utterance's first frames; fixed upstream in [Blaizzy/mlx-audio#1003](https://github.com/Blaizzy/mlx-audio/pull/1003)). This applies to every precision.
+
+Measured on an Apple M4 Pro (14-core CPU, 20-core GPU, 48 GB) with `scripts/bench_mac.py`: 24 lines of one to four Harvard sentences, two in three with a voice direction at CFG 2, a 24 s LibriSpeech reference (speaker 1272, dev-clean `1272-128104-0000` to `-0002`, CC BY 4.0) registered once. "Stall-free start" is the first audio plus any buffer playback needs so it never runs dry: `8bit` and `mixed` needed none on any line; `bf16`, at RTF 0.86, needed ~70 ms on every line (its default 25-frame chunks starve playback outright, hence `--chunk-max 4`).
+
+| Precision | Stall-free start, plain / directed (median) | RTF, directed | Memory |
+| --- | --- | --- | --- |
+| `8bit` (default) | 212 / 297 ms | 0.58 | 13 GB |
+| `bf16` (`--chunk-max 4`) | 380 / 456 ms | 0.86 | 15 GB |
+| `mixed` | 139 / 206 ms | 0.62 | 8.9 GB |
+
+Quality against bf16, measured with `scripts/mlx_fidelity.py` (the same tokens through both models; KL of the samplers' logits, lower is closer):
+
+| Precision | Backbone KL, directed | Depth decoder KL, directed |
+| --- | --- | --- |
+| `8bit` (mxfp8) | 0.0030 (plain lines: 0.0011) | 0.0067 |
+| `mixed` | 0 (exact) | 0.0020 |
+
+Voice directions amplify quantization error, because CFG multiplies the gap between its two rows; `8bit` quantizes the backbone too, `mixed` doesn't. In a blind listening test (one listener, ten lines, the same four builds), `8bit` was judged worst on seven lines and best on none, while `bf16`, `mixed` and an all-int8 build tied.
 
 The HTTP and WebSocket API is the same on both backends. [docs/api.md](docs/api.md#differences-on-the-mlx-backend) lists the differences.
 

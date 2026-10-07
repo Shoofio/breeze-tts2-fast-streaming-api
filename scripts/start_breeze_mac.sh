@@ -2,9 +2,13 @@
 # Starts the Breeze TTS streaming API on an Apple Silicon Mac (the MLX backend).
 # Linux/WSL counterpart: scripts/start_breeze.sh.
 #
-# Usage: scripts/start_breeze_mac.sh [--precision 8bit|bf16] [server options...]
+# Usage: scripts/start_breeze_mac.sh [--precision 8bit|bf16|mixed] [server options...]
 # 8-bit is the default: bf16 doesn't stream in real time on a 16 GB Mac
 # (specs/005-mlx-mac-inference spec FR-012, research R3).
+# mixed: the bf16 weights with the depth decoder quantized to int8 at load (the backbone stays
+# exact), the frame compiled, the first frames sent one by one and a 1 GB MLX cache cap, with
+# one-frame chunks; each BREEZE_MLX_* setting can be overridden from the environment
+# (models/mlx_streaming.py, MlxSpeedOptions; README "Real time on Apple Silicon").
 
 # Plain sh (see shebang), so no pipefail -- it isn't defined outside bash/zsh.
 set -eu
@@ -35,8 +39,17 @@ case "$precision" in
         REPO="mlx-community/Breeze-TTS-2-mlx"
         REVISION="3c8829fb7fd335818f085cd2ef49b4100c0e46c8"
         ;;
+    mixed)
+        REPO="mlx-community/Breeze-TTS-2-mlx"
+        REVISION="3c8829fb7fd335818f085cd2ef49b4100c0e46c8"
+        export BREEZE_MLX_QUANT="${BREEZE_MLX_QUANT-depth:8}"
+        export BREEZE_MLX_COMPILE="${BREEZE_MLX_COMPILE-1}"
+        export BREEZE_MLX_FAST_FIRST="${BREEZE_MLX_FAST_FIRST-6}"
+        export BREEZE_MLX_CACHE_GB="${BREEZE_MLX_CACHE_GB-1}"
+        CHUNKS="--chunk-first 1 --chunk-max 1"
+        ;;
     *)
-        echo "--precision must be 8bit or bf16 (got $precision)" >&2
+        echo "--precision must be 8bit, bf16 or mixed (got $precision)" >&2
         exit 1
         ;;
 esac
@@ -78,6 +91,7 @@ fi
 # clients such as SillyTavern work without extra flags. That also turns off the
 # server's cross-site 403 guard: any web page can upload or delete voices and
 # run synthesis. --cors=http://127.0.0.1:8000 narrows it.
+# shellcheck disable=SC2086  # CHUNKS is two flags, or empty
 exec uv run python -m breeze_infer.api "$MODEL" \
-    --host 0.0.0.0 --port 8080 --cors '*' \
+    --host 0.0.0.0 --port 8080 --cors '*' ${CHUNKS:-} \
     "$@"
